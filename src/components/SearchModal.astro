@@ -1,0 +1,161 @@
+---
+/**
+ * Pagefind search modal — triggered by ⌘K (macOS) or Ctrl+K (others).
+ *
+ * Pagefind generates its own JS bundle at /pagefind/pagefind.js during `npm run build`.
+ * In dev mode the index doesn't exist yet, so we gracefully skip.
+ *
+ * The modal reuses Pagefind's default UI for zero-config polish; styles are
+ * overridden via CSS variables to match our dark palette.
+ */
+---
+
+<div
+  id="search-modal"
+  class="fixed inset-0 z-50 hidden items-start justify-center pt-[15vh] px-4"
+  style="background: rgba(10, 14, 26, 0.85); backdrop-filter: blur(4px);"
+  aria-hidden="true"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Search"
+>
+  <div
+    class="w-full max-w-2xl rounded-lg overflow-hidden"
+    style="background: var(--color-surface); border: 1px solid var(--color-border-strong);"
+  >
+    <div id="pagefind-search-container"></div>
+  </div>
+</div>
+
+<script>
+  // --- Keyboard shortcut & modal lifecycle ---
+  const modal = document.getElementById('search-modal');
+  const trigger = document.getElementById('search-trigger');
+  const container = document.getElementById('pagefind-search-container');
+
+  let pagefindUILoaded = false;
+
+  async function loadPagefindUI() {
+    if (pagefindUILoaded) return;
+    try {
+      // Pagefind UI is copied to /pagefind/ at build time by `pagefind --site dist`.
+      // In dev mode these files don't exist; the fetch will 404 and we show an empty state.
+      await import(
+        /* @vite-ignore */ `${window.location.origin}/pagefind/pagefind-ui.js`
+      );
+      // @ts-expect-error — PagefindUI is a global set by the imported script
+      new window.PagefindUI({
+        element: '#pagefind-search-container',
+        showSubResults: true,
+        showImages: false,
+        translations: {
+          placeholder: '딥다이브 검색... (제목, 본문, 태그)',
+          clear_search: '초기화',
+          load_more: '더 불러오기',
+          search_label: '검색',
+          filters_label: '필터',
+          zero_results: '"[SEARCH_TERM]"에 대한 결과가 없습니다',
+          many_results: '"[SEARCH_TERM]"에 대한 결과 [COUNT]개',
+          one_result: '"[SEARCH_TERM]"에 대한 결과 1개',
+          alt_search: '"[SEARCH_TERM]"에 대한 결과 없음 · "[DIFFERENT_TERM]"으로 검색',
+          search_suggestion: '다음 검색어를 시도하세요: [DIFFERENT_TERM]',
+          searching: '"[SEARCH_TERM]" 검색 중...',
+        },
+      });
+      pagefindUILoaded = true;
+    } catch {
+      if (container) {
+        container.innerHTML =
+          '<div style="padding: 2rem; text-align: center; color: var(--color-text-tertiary); font-family: var(--font-mono); font-size: 12px;">// search index not built yet — run `npm run build`</div>';
+      }
+    }
+  }
+
+  function openModal() {
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    modal.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+    loadPagefindUI().then(() => {
+      const input = modal.querySelector('input[type="text"]');
+      if (input instanceof HTMLElement) input.focus();
+    });
+  }
+
+  function closeModal() {
+    if (!modal) return;
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+    modal.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+  }
+
+  trigger?.addEventListener('click', openModal);
+
+  document.addEventListener('keydown', (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && e.key === 'k') {
+      e.preventDefault();
+      if (modal?.classList.contains('hidden')) openModal();
+      else closeModal();
+    }
+    if (e.key === 'Escape') closeModal();
+  });
+
+  modal?.addEventListener('click', (e) => {
+    if (e.target === modal) closeModal();
+  });
+</script>
+
+<style is:global>
+  /* Pagefind UI theming — tokens override Pagefind's defaults */
+  :root {
+    --pagefind-ui-scale: 0.9;
+    --pagefind-ui-primary: var(--color-accent-cyan);
+    --pagefind-ui-text: var(--color-text-primary);
+    --pagefind-ui-background: var(--color-surface);
+    --pagefind-ui-border: var(--color-border-strong);
+    --pagefind-ui-tag: var(--color-elevated);
+    --pagefind-ui-border-width: 1px;
+    --pagefind-ui-border-radius: 8px;
+    --pagefind-ui-image-border-radius: 6px;
+    --pagefind-ui-image-box-ratio: 3 / 2;
+    --pagefind-ui-font: var(--font-sans);
+  }
+
+  /* Remove Pagefind's own box since we're rendering inside our modal frame */
+  .pagefind-ui__form {
+    border: none !important;
+    padding: 0.75rem 0.75rem 0 !important;
+  }
+  .pagefind-ui__search-input {
+    background: var(--color-surface) !important;
+    color: var(--color-text-primary) !important;
+    border: 1px solid var(--color-border-subtle) !important;
+  }
+  .pagefind-ui__search-input:focus {
+    border-color: var(--color-accent-cyan) !important;
+    outline: none !important;
+  }
+  .pagefind-ui__drawer {
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .pagefind-ui__result {
+    border-bottom: 1px solid var(--color-border-subtle) !important;
+  }
+  .pagefind-ui__result-title a {
+    color: var(--color-text-primary) !important;
+  }
+  .pagefind-ui__result-title a:hover {
+    color: var(--color-accent-cyan) !important;
+  }
+  .pagefind-ui__result-excerpt {
+    color: var(--color-text-secondary) !important;
+  }
+  .pagefind-ui__result-excerpt mark {
+    background: var(--color-accent-cyan-dim) !important;
+    color: var(--color-accent-cyan) !important;
+  }
+</style>

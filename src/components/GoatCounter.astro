@@ -1,0 +1,19 @@
+---
+import { GOATCOUNTER } from '@/consts';
+
+const configured = GOATCOUNTER.code.length > 0;
+const endpoint = configured
+  ? `https://${GOATCOUNTER.code}.goatcounter.com/count`
+  : null;
+---
+
+{
+  configured && (
+    <script
+      is:inline
+      data-goatcounter={endpoint}
+      src="//gc.zgo.at/count.js"
+      async
+    />
+  )
+}

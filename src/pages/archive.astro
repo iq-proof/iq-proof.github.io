@@ -1,0 +1,80 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import CategoryBadge from '@/components/CategoryBadge.astro';
+import { getArchive, formatDate } from '@/utils/posts';
+
+const archive = await getArchive();
+const totalPosts = archive.reduce(
+  (sum, year) =>
+    sum + year.months.reduce((s, month) => s + month.posts.length, 0),
+  0,
+);
+---
+
+<BaseLayout title="Archive" description="Full chronological archive of IQ Lab posts.">
+  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
+    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
+      // archive
+    </div>
+    <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      Archive
+    </h1>
+    <p class="text-sm" style="color: var(--color-text-tertiary);">
+      연/월 기준 전체 글 · 총 {totalPosts}편
+    </p>
+  </section>
+
+  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
+    {
+      archive.length === 0 ? (
+        <div
+          class="font-mono text-xs py-12 text-center rounded-md"
+          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+        >
+          // no posts yet
+        </div>
+      ) : (
+        archive.map(({ year, months }) => (
+          <div class="mb-10">
+            <h2
+              class="font-mono text-lg font-medium mb-4 pb-2"
+              style="color: var(--color-accent-cyan); border-bottom: 1px solid var(--color-border-subtle);"
+            >
+              {year}
+            </h2>
+            {months.map(({ month, posts }) => (
+              <div class="mb-6">
+                <h3
+                  class="font-mono text-xs mb-3"
+                  style="color: var(--color-text-tertiary);"
+                >
+                  {String(month).padStart(2, '0')} · {posts.length} posts
+                </h3>
+                <ul class="space-y-2">
+                  {posts.map((post) => (
+                    <li class="flex items-baseline gap-3">
+                      <span
+                        class="font-mono text-[11px] flex-shrink-0"
+                        style="color: var(--color-text-tertiary); min-width: 5.5rem;"
+                      >
+                        {formatDate(post.data.pubDate)}
+                      </span>
+                      <CategoryBadge category={post.data.category} />
+                      <a
+                        href={`/posts/${post.id}`}
+                        class="text-sm transition-colors"
+                        style="color: var(--color-text-primary);"
+                      >
+                        {post.data.title}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        ))
+      )
+    }
+  </section>
+</BaseLayout>

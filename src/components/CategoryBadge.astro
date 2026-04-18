@@ -1,0 +1,23 @@
+---
+import { CATEGORIES, type CategorySlug } from '@/consts';
+
+interface Props {
+  category: CategorySlug;
+  size?: 'sm' | 'md';
+}
+
+const { category, size = 'sm' } = Astro.props;
+const meta = CATEGORIES[category];
+
+const sizeStyles = {
+  sm: 'font-mono text-[10px] px-1.5 py-0.5',
+  md: 'font-mono text-xs px-2 py-1',
+};
+---
+
+<span
+  class={`inline-flex items-center rounded ${sizeStyles[size]}`}
+  style={`background: ${meta.accentDim}; color: ${meta.accent}; border: 1px solid ${meta.accentLine};`}
+>
+  {meta.label.toUpperCase()}
+</span>

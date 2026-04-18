@@ -1,0 +1,169 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SOCIAL } from '@/consts';
+
+const devLabGroups = [
+  {
+    title: 'Java Core',
+    count: 7,
+    highlight: ['java-concurrency-deep-dive', 'jvm-deep-dive'],
+  },
+  {
+    title: 'Spring Ecosystem',
+    count: 8,
+    highlight: ['spring-core-deep-dive', 'spring-webflux-deep-dive'],
+  },
+  {
+    title: 'Architecture & Design',
+    count: 5,
+    highlight: ['ddd-deep-dive', 'msa-deep-dive'],
+  },
+  {
+    title: 'Infrastructure & DevOps',
+    count: 7,
+    highlight: ['kubernetes-deep-dive', 'observability-deep-dive'],
+  },
+  {
+    title: 'Database',
+    count: 6,
+    highlight: ['database-internals', 'postgresql-deep-dive'],
+  },
+  {
+    title: 'Messaging & Streaming',
+    count: 2,
+    highlight: ['kafka-deep-dive', 'rabbitmq-deep-dive'],
+  },
+];
+
+const aiLabLayers = [
+  { layer: 0, title: 'Mathematics', count: 10 },
+  { layer: 1, title: 'ML Theory', count: 5 },
+  { layer: 2, title: 'Neural Network Theory', count: 4 },
+  { layer: 3, title: 'Architectures', count: 5 },
+  { layer: '4', title: 'RL · LLM · CV · NLP · Audio', count: 16 },
+  { layer: 5, title: 'Systems', count: 4 },
+  { layer: 6, title: 'Frontier LLM', count: 3 },
+];
+---
+
+<BaseLayout title="Projects" description="Companion deep-dive repositories in iq-dev-lab and iq-ai-lab.">
+  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
+    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
+      // projects · companion repos
+    </div>
+    <h1 class="text-3xl font-medium mb-4" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      Projects
+    </h1>
+    <p class="text-sm" style="color: var(--color-text-secondary); line-height: 1.7; max-width: 40rem;">
+      블로그 글과 짝을 이루는 두 개의 딥다이브 저장소. 글은 짧게, 저장소는 깊게.
+    </p>
+  </section>
+
+  <!-- iq-dev-lab -->
+  <section class="mx-auto px-6 pb-10" style="max-width: var(--container-max);">
+    <div class="flex items-end justify-between mb-5">
+      <div>
+        <div class="mono-label mb-1" style="color: var(--color-accent-cyan);">
+          // iq-dev-lab
+        </div>
+        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+          Backend Deep Dive
+        </h2>
+      </div>
+      <a
+        href={SOCIAL.devLab}
+        target="_blank"
+        rel="noopener"
+        class="font-mono text-xs transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        ↗ github
+      </a>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {
+        devLabGroups.map((group) => (
+          <div
+            class="p-4 rounded-md"
+            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+          >
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
+                {group.title}
+              </h3>
+              <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
+                {group.count} repos
+              </span>
+            </div>
+            <ul class="space-y-1">
+              {group.highlight.map((repo) => (
+                <li class="font-mono text-[11px]">
+                  <a
+                    href={`https://github.com/iq-dev-lab/${repo}`}
+                    target="_blank"
+                    rel="noopener"
+                    style="color: var(--color-accent-cyan);"
+                  >
+                    {repo}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- iq-ai-lab -->
+  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
+    <div class="flex items-end justify-between mb-5">
+      <div>
+        <div class="mono-label mb-1" style="color: var(--color-accent-violet);">
+          // iq-ai-lab
+        </div>
+        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+          AI/ML Deep Dive
+        </h2>
+      </div>
+      <a
+        href={SOCIAL.aiLab}
+        target="_blank"
+        rel="noopener"
+        class="font-mono text-xs transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        ↗ github
+      </a>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {
+        aiLabLayers.map((l) => (
+          <div
+            class="p-4 rounded-md"
+            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+          >
+            <div class="flex items-center justify-between mb-1">
+              <div class="flex items-baseline gap-2">
+                <span
+                  class="font-mono text-[11px]"
+                  style="color: var(--color-accent-violet);"
+                >
+                  Layer {l.layer}
+                </span>
+                <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  {l.title}
+                </h3>
+              </div>
+              <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
+                {l.count} repos
+              </span>
+            </div>
+          </div>
+        ))
+      }
+    </div>
+  </section>
+</BaseLayout>

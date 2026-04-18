@@ -1,0 +1,73 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SITE, SOCIAL } from '@/consts';
+---
+
+<BaseLayout title="About" description={`About ${SITE.author.name} and IQ Lab.`}>
+  <section class="mx-auto px-6 pt-16 pb-16" style="max-width: var(--reading-max);">
+    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
+      // about
+    </div>
+    <h1 class="text-3xl font-medium mb-8" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      About
+    </h1>
+
+    <div class="prose" style="max-width: none;">
+      <h2>{SITE.name}</h2>
+      <p>
+        <strong>{SITE.name}</strong>은 백엔드 시스템과 AI의 수학적 기반을 파고드는 딥다이브 기록입니다.
+        표면적인 사용법이 아닌, <em>왜 이 수식인가 — 가정부터 증명까지</em>를 집요하게 파고듭니다.
+      </p>
+
+      <h2>작성자</h2>
+      <p>
+        <strong>{SITE.author.name}</strong>. INTP, 주짓수, 양자역학 자가학습, 알고리즘 대회.
+        중앙대학교 소프트웨어학부, 우아한테크코스 8기 백엔드 트랙.
+      </p>
+      <p>
+        <em>"수식을 쓸 줄 아는 것과, 수식이 왜 그렇게 생겼는지 아는 것은 다르다."</em>
+      </p>
+
+      <h2>방법론</h2>
+      <p>
+        모든 글은 다음 다섯 단계를 거칩니다.
+      </p>
+      <ol>
+        <li><strong>Explore</strong> — 논문·공식 레퍼런스에서 탐구할 개념 선정</li>
+        <li><strong>Formulate</strong> — 수학적 선행 조건 정리, 수식 구조 파악</li>
+        <li><strong>Prove</strong> — 가정 → 보조정리 → 정리, 한 줄씩 완전 유도</li>
+        <li><strong>Implement</strong> — 프레임워크 없이 직접 구현·검증</li>
+        <li><strong>Document</strong> — 증명·직관·한계를 나만의 언어로 정리</li>
+      </ol>
+
+      <h2>연결된 프로젝트</h2>
+      <ul>
+        <li>
+          <a href={SOCIAL.devLab} target="_blank" rel="noopener">
+            <strong>iq-dev-lab</strong>
+          </a> — 백엔드 엔지니어링 딥다이브 (Java/Spring/DB/MSA/Infra)
+        </li>
+        <li>
+          <a href={SOCIAL.aiLab} target="_blank" rel="noopener">
+            <strong>iq-ai-lab</strong>
+          </a> — AI/ML 수학적 기반 연구 (Math/ML/NN/Arch/RL/LLM/CV/NLP)
+        </li>
+      </ul>
+
+      <h2>Contact</h2>
+      <ul>
+        <li>
+          GitHub · <a href={SITE.author.github} target="_blank" rel="noopener">@{SITE.author.handle}</a>
+        </li>
+        <li>
+          RSS · <a href={SOCIAL.rss}>{SITE.url}/rss.xml</a>
+        </li>
+      </ul>
+
+      <h2>라이선스</h2>
+      <p>
+        블로그 글은 <strong>CC BY-NC-SA 4.0</strong>, 블로그 코드는 <strong>MIT</strong>로 공개합니다.
+      </p>
+    </div>
+  </section>
+</BaseLayout>

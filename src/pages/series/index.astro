@@ -1,0 +1,59 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getAllSeries } from '@/utils/posts';
+import { formatDate } from '@/utils/posts';
+
+const series = await getAllSeries();
+---
+
+<BaseLayout title="Series" description="Multi-part deep-dive series on IQ Lab.">
+  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
+    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
+      // all series
+    </div>
+    <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      Series
+    </h1>
+    <p class="text-sm" style="color: var(--color-text-secondary); line-height: 1.7; max-width: 36rem;">
+      특정 주제를 여러 편에 걸쳐 완전히 파고드는 연속 시리즈.
+    </p>
+    <p class="text-sm mt-3" style="color: var(--color-text-tertiary);">
+      총 {series.length}개의 시리즈
+    </p>
+  </section>
+
+  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
+    {
+      series.length === 0 ? (
+        <div
+          class="font-mono text-xs py-12 text-center rounded-md"
+          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+        >
+          // no series yet
+        </div>
+      ) : (
+        <div class="space-y-3">
+          {series.map(({ slug, title, count, latest }) => (
+            <a
+              href={`/series/${slug}`}
+              class="block p-5 rounded-md transition-colors"
+              style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+            >
+              <div class="flex items-center justify-between mb-1">
+                <h2 class="text-base font-medium" style="color: var(--color-text-primary); letter-spacing: -0.015em;">
+                  📚 {title}
+                </h2>
+                <span class="font-mono text-xs" style="color: var(--color-text-tertiary);">
+                  {count} posts
+                </span>
+              </div>
+              <div class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
+                latest · {formatDate(latest)}
+              </div>
+            </a>
+          ))}
+        </div>
+      )
+    }
+  </section>
+</BaseLayout>

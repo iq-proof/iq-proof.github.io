@@ -1,0 +1,44 @@
+---
+interface Props {
+  title: string;
+  subtitle?: string;
+  accent?: string;
+  viewAllHref?: string;
+  viewAllLabel?: string;
+}
+
+const {
+  title,
+  subtitle,
+  accent,
+  viewAllHref,
+  viewAllLabel = 'view all →',
+} = Astro.props;
+---
+
+<div class="flex items-end justify-between mb-4">
+  <div>
+    {
+      accent && (
+        <div class="mono-label mb-1" style={`color: ${accent};`}>
+          {subtitle}
+        </div>
+      )
+    }
+    <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+      {title}
+    </h2>
+  </div>
+
+  {
+    viewAllHref && (
+      <a
+        href={viewAllHref}
+        class="font-mono text-xs transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        {viewAllLabel}
+      </a>
+    )
+  }
+</div>

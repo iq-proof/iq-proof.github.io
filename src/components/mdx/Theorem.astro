@@ -1,0 +1,40 @@
+---
+interface Props {
+  kind?: 'theorem' | 'definition' | 'lemma' | 'corollary' | 'proposition' | 'axiom';
+  number?: string;
+  title?: string;
+}
+
+const { kind = 'theorem', number, title } = Astro.props;
+
+const LABELS = {
+  theorem: '정리',
+  definition: '정의',
+  lemma: '보조정리',
+  corollary: '따름정리',
+  proposition: '명제',
+  axiom: '공리',
+} as const;
+
+const label = LABELS[kind];
+const heading = number ? `${label} ${number}` : label;
+---
+
+<div
+  class="my-6 px-5 py-4 rounded-md"
+  style="background: var(--color-surface); border: 1px solid var(--color-accent-cyan-line); border-left: 3px solid var(--color-accent-cyan);"
+>
+  <div class="flex items-baseline gap-2 mb-2" style="border-bottom: 1px solid var(--color-border-subtle); padding-bottom: 0.5rem;">
+    <span class="font-mono text-xs font-medium" style="color: var(--color-accent-cyan); letter-spacing: 0.05em;">
+      {heading.toUpperCase()}
+    </span>
+    {title && (
+      <span class="text-sm" style="color: var(--color-text-primary);">
+        · {title}
+      </span>
+    )}
+  </div>
+  <div style="color: var(--color-text-secondary); line-height: 1.8;">
+    <slot />
+  </div>
+</div>

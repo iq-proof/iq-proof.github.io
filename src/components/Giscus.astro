@@ -1,0 +1,45 @@
+---
+import { GISCUS } from '@/consts';
+
+const configured =
+  GISCUS.repo.length > 0 && GISCUS.repoId.length > 0 && GISCUS.categoryId.length > 0;
+---
+
+{
+  configured ? (
+    <div class="giscus-wrapper">
+      <script
+        is:inline
+        src="https://giscus.app/client.js"
+        data-repo={GISCUS.repo}
+        data-repo-id={GISCUS.repoId}
+        data-category={GISCUS.category}
+        data-category-id={GISCUS.categoryId}
+        data-mapping={GISCUS.mapping}
+        data-strict={GISCUS.strict}
+        data-reactions-enabled={GISCUS.reactionsEnabled}
+        data-emit-metadata={GISCUS.emitMetadata}
+        data-input-position={GISCUS.inputPosition}
+        data-theme={GISCUS.theme}
+        data-lang={GISCUS.lang}
+        data-loading={GISCUS.loading}
+        crossorigin="anonymous"
+        async
+      />
+    </div>
+  ) : (
+    <div
+      class="font-mono text-xs py-6 px-4 rounded-md text-center"
+      style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+    >
+      // Giscus not configured yet — fill in GISCUS.repoId and GISCUS.categoryId in src/consts.ts
+    </div>
+  )
+}
+
+<style>
+  .giscus-wrapper {
+    margin-top: 1rem;
+  }
+  /* Giscus iframe inherits dark bg automatically from `noborder_dark` theme */
+</style>

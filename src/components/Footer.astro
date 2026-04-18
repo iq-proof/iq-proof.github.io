@@ -1,0 +1,38 @@
+---
+import { SITE, SOCIAL } from '@/consts';
+const year = new Date().getFullYear();
+---
+
+<footer class="mt-24" style="border-top: 1px solid var(--color-border-subtle);">
+  <div class="mx-auto px-6 py-10" style="max-width: var(--container-max);">
+    <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
+      <div>
+        <div class="flex items-center gap-2.5 mb-2">
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" fill="none" stroke="var(--color-accent-cyan)" stroke-width="2" />
+            <circle cx="12" cy="12" r="5" fill="var(--color-accent-cyan)" />
+          </svg>
+          <span class="text-sm font-medium" style="color: var(--color-text-primary);">{SITE.name}</span>
+        </div>
+        <p class="font-mono text-xs" style="color: var(--color-text-tertiary);">
+          © {year} {SITE.author.name} · built with Astro
+        </p>
+      </div>
+
+      <div class="flex items-center gap-4 font-mono text-xs" style="color: var(--color-text-tertiary);">
+        <a href={SOCIAL.devLab} target="_blank" rel="noopener" class="transition-colors hover:text-[var(--color-accent-cyan)]">
+          ↗ iq-dev-lab
+        </a>
+        <a href={SOCIAL.aiLab} target="_blank" rel="noopener" class="transition-colors hover:text-[var(--color-accent-violet)]">
+          ↗ iq-ai-lab
+        </a>
+        <a href={SOCIAL.github} target="_blank" rel="noopener" class="transition-colors hover:text-[var(--color-text-primary)]">
+          ↗ github
+        </a>
+        <a href={SOCIAL.rss} class="transition-colors hover:text-[var(--color-text-primary)]">
+          rss
+        </a>
+      </div>
+    </div>
+  </div>
+</footer>

@@ -1,0 +1,48 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import PostCard from '@/components/PostCard.astro';
+import { getAllSeries, getPostsBySeries } from '@/utils/posts';
+
+export async function getStaticPaths() {
+  const series = await getAllSeries();
+  return series.map((s) => ({
+    params: { series: s.slug },
+    props: { slug: s.slug, title: s.title, count: s.count },
+  }));
+}
+
+interface Props {
+  slug: string;
+  title: string;
+  count: number;
+}
+
+const { slug, title, count } = Astro.props;
+const posts = await getPostsBySeries(slug);
+---
+
+<BaseLayout title={title} description={`${count}편으로 구성된 시리즈: ${title}`}>
+  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
+    <a
+      href="/series"
+      class="inline-flex items-center gap-1 font-mono text-xs mb-6 transition-colors"
+      style="color: var(--color-text-tertiary);"
+    >
+      ← all series
+    </a>
+
+    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
+      // series · {slug}
+    </div>
+    <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      📚 {title}
+    </h1>
+    <p class="text-sm" style="color: var(--color-text-tertiary);">
+      총 {count}편 · 순서대로 읽기를 권장
+    </p>
+  </section>
+
+  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
+    {posts.map((post) => <PostCard post={post} />)}
+  </section>
+</BaseLayout>

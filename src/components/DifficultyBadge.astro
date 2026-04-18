@@ -1,0 +1,35 @@
+---
+interface Props {
+  level: 'beginner' | 'intermediate' | 'advanced';
+}
+
+const { level } = Astro.props;
+
+const LEVELS = {
+  beginner: { label: 'Beginner', dots: 1 },
+  intermediate: { label: 'Intermediate', dots: 2 },
+  advanced: { label: 'Advanced', dots: 3 },
+} as const;
+
+const meta = LEVELS[level];
+---
+
+<span
+  class="inline-flex items-center gap-1.5 font-mono text-[10px] px-2 py-0.5 rounded"
+  style="background: var(--color-elevated); color: var(--color-text-tertiary); border: 1px solid var(--color-border-subtle);"
+  aria-label={`Difficulty: ${meta.label}`}
+>
+  <span class="flex gap-[2px]" aria-hidden="true">
+    {
+      Array.from({ length: 3 }).map((_, i) => (
+        <span
+          class="inline-block rounded-full"
+          style={`width: 4px; height: 4px; background: ${
+            i < meta.dots ? 'var(--color-accent-cyan)' : 'var(--color-border-strong)'
+          };`}
+        />
+      ))
+    }
+  </span>
+  <span>{meta.label}</span>
+</span>

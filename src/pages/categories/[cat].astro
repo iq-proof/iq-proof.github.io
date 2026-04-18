@@ -1,0 +1,53 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import PostCard from '@/components/PostCard.astro';
+import { CATEGORIES, type CategorySlug } from '@/consts';
+import { getPostsByCategory } from '@/utils/posts';
+
+export async function getStaticPaths() {
+  return (Object.keys(CATEGORIES) as CategorySlug[]).map((slug) => ({
+    params: { cat: slug },
+    props: { categorySlug: slug },
+  }));
+}
+
+interface Props {
+  categorySlug: CategorySlug;
+}
+
+const { categorySlug } = Astro.props;
+const meta = CATEGORIES[categorySlug];
+const posts = await getPostsByCategory(categorySlug);
+---
+
+<BaseLayout title={meta.label} description={meta.description}>
+  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
+    <div class="mono-label mb-2" style={`color: ${meta.accent};`}>
+      // category · {meta.slug}
+    </div>
+    <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
+      {meta.label}
+    </h1>
+    <p class="text-base" style="color: var(--color-text-secondary); line-height: 1.7;">
+      {meta.description}
+    </p>
+    <p class="text-sm mt-3" style="color: var(--color-text-tertiary);">
+      총 {posts.length}개의 글
+    </p>
+  </section>
+
+  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
+    {
+      posts.length === 0 ? (
+        <div
+          class="font-mono text-xs py-12 text-center rounded-md"
+          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+        >
+          // no posts yet in {meta.label.toLowerCase()}
+        </div>
+      ) : (
+        posts.map((post) => <PostCard post={post} />)
+      )
+    }
+  </section>
+</BaseLayout>

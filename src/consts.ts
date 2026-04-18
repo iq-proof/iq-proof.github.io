@@ -16,7 +16,7 @@ export const SITE = {
   name: 'IQ Lab',
   tagline: 'deep-dive.engineering(ai)',
   description:
-    '백엔드 시스템과 AI의 수학적 기반을 파고드는 마스터의 딥다이브 로그. 표면적인 사용법이 아닌, 본질을 증명하는 기록.',
+      '백엔드 시스템과 AI의 수학적 기반을 파고드는 마스터의 딥다이브 로그. 표면적인 사용법이 아닌, 본질을 증명하는 기록.',
   url: 'https://iq-proof.github.io',
   lang: 'ko',
   locale: 'ko-KR',
@@ -78,9 +78,9 @@ export const SOCIAL = {
  */
 export const GISCUS = {
   repo: 'iq-proof/iq-proof.github.io',
-  repoId: '',
+  repoId: 'R_kgDOSE5sbQ',
   category: 'Comments',
-  categoryId: '',
+  categoryId: 'DIC_kwDOSE5sbc4C7CBO',
   mapping: 'pathname',
   strict: '0',
   reactionsEnabled: '1',
@@ -96,5 +96,5 @@ export const GISCUS = {
  * e.g. code: 'iq-proof'  →  https://iq-proof.goatcounter.com
  */
 export const GOATCOUNTER = {
-  code: '',
+  code: 'iq-proof',
 } as const;

@@ -1,0 +1,20 @@
+---
+interface Props {
+  tag: string;
+  count?: number;
+}
+
+const { tag, count } = Astro.props;
+---
+
+<a
+  href={`/tags/${tag}`}
+  class="inline-flex items-center gap-1 font-mono text-xs px-2 py-0.5 rounded transition-colors"
+  style="background: var(--color-elevated); color: var(--color-text-secondary); border: 1px solid var(--color-border-subtle);"
+>
+  <span style="color: var(--color-text-tertiary);">#</span>
+  <span>{tag}</span>
+  {count !== undefined && (
+    <span style="color: var(--color-text-tertiary);">· {count}</span>
+  )}
+</a>

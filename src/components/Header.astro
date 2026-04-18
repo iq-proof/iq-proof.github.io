@@ -1,0 +1,52 @@
+---
+import { SITE, NAV } from '@/consts';
+const currentPath = Astro.url.pathname;
+---
+
+<header class="sticky top-0 z-40 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--color-border-subtle);">
+  <div class="mx-auto flex items-center justify-between px-6 py-4" style="max-width: var(--container-max);">
+    <!-- Logo -->
+    <a href="/" class="flex items-center gap-2.5" aria-label={SITE.name}>
+      <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" fill="none" stroke="var(--color-accent-cyan)" stroke-width="2" />
+        <circle cx="12" cy="12" r="5" fill="var(--color-accent-cyan)" />
+      </svg>
+      <span class="text-base font-medium tracking-tight" style="color: var(--color-text-primary);">{SITE.name}</span>
+    </a>
+
+    <!-- Nav -->
+    <nav class="hidden md:flex items-center gap-7" aria-label="Primary">
+      {
+        NAV.map(({ href, label }) => {
+          const active = href === '/' ? currentPath === '/' : currentPath.startsWith(href);
+          return (
+            <a
+              href={href}
+              class="text-sm transition-colors"
+              style={`color: ${active ? 'var(--color-accent-cyan)' : 'var(--color-text-secondary)'};`}
+              aria-current={active ? 'page' : undefined}
+            >
+              {label}
+            </a>
+          );
+        })
+      }
+    </nav>
+
+    <!-- Search trigger -->
+    <button
+      id="search-trigger"
+      type="button"
+      class="flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors"
+      style="background: var(--color-surface); border: 1px solid var(--color-border-subtle); color: var(--color-text-tertiary);"
+      aria-label="Search"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <circle cx="11" cy="11" r="8"/>
+        <path d="m21 21-4.35-4.35"/>
+      </svg>
+      <span class="hidden sm:inline text-xs">Search</span>
+      <kbd class="hidden sm:inline font-mono text-[10px]">⌘K</kbd>
+    </button>
+  </div>
+</header>

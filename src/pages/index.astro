@@ -1,51 +1,129 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { SITE } from '@/consts';
+import PostCard from '@/components/PostCard.astro';
+import { SITE, CATEGORIES } from '@/consts';
+import { getPostsByCategory } from '@/utils/posts';
+
+const devPosts = (await getPostsByCategory('dev')).slice(0, 5);
+const aiPosts = (await getPostsByCategory('ai')).slice(0, 5);
+
+const devCount = (await getPostsByCategory('dev')).length;
+const aiCount = (await getPostsByCategory('ai')).length;
 ---
 
 <BaseLayout>
-  <main class="max-w-3xl mx-auto px-6 py-24">
-    <div class="mono-label" style="color: var(--color-accent-cyan);">
+  <!-- Hero -->
+  <section class="mx-auto px-6 pt-24 pb-16" style="max-width: var(--container-max);">
+    <div class="mono-label mb-4" style="color: var(--color-accent-cyan);">
       // {SITE.tagline}
     </div>
 
     <h1
-      class="mt-4 mb-4 text-3xl md:text-4xl font-medium leading-tight"
-      style="letter-spacing: -0.025em; color: var(--color-text-primary);"
+      class="text-3xl md:text-4xl font-medium mb-5"
+      style="letter-spacing: -0.025em; line-height: 1.3; color: var(--color-text-primary); max-width: 42rem;"
     >
       표면적인 사용법이 아닌,<br />
       <span style="color: var(--color-accent-cyan);">본질을 증명하는</span> 기록.
     </h1>
 
-    <p class="text-base" style="color: var(--color-text-secondary);">
+    <p
+      class="text-base mb-8"
+      style="color: var(--color-text-secondary); line-height: 1.7; max-width: 36rem;"
+    >
       {SITE.description}
     </p>
 
-    <div class="flex gap-3 mt-8">
-      <span
-        class="font-mono text-xs px-3 py-1.5 rounded-md border"
-        style="
-          background: var(--color-accent-cyan-dim);
-          color: var(--color-accent-cyan);
-          border-color: var(--color-accent-cyan-line);
-        "
+    <div class="flex gap-3">
+      <a
+        href="/categories/dev"
+        class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
+        style={`background: ${CATEGORIES.dev.accentDim}; color: ${CATEGORIES.dev.accent}; border-color: ${CATEGORIES.dev.accentLine};`}
       >
-        Dev · 0 posts
-      </span>
-      <span
-        class="font-mono text-xs px-3 py-1.5 rounded-md border"
-        style="
-          background: var(--color-accent-violet-dim);
-          color: var(--color-accent-violet);
-          border-color: var(--color-accent-violet-line);
-        "
+        Dev · {devCount} posts
+      </a>
+      <a
+        href="/categories/ai"
+        class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
+        style={`background: ${CATEGORIES.ai.accentDim}; color: ${CATEGORIES.ai.accent}; border-color: ${CATEGORIES.ai.accentLine};`}
       >
-        AI · 0 posts
-      </span>
+        AI · {aiCount} posts
+      </a>
+    </div>
+  </section>
+
+  <!-- Dev section -->
+  <section class="mx-auto px-6 py-8" style="max-width: var(--container-max);">
+    <div class="flex items-end justify-between mb-4">
+      <div>
+        <div class="mono-label mb-1" style={`color: ${CATEGORIES.dev.accent};`}>
+          // {CATEGORIES.dev.description.toLowerCase()}
+        </div>
+        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+          Dev
+        </h2>
+      </div>
+      <a
+        href="/categories/dev"
+        class="font-mono text-xs transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        view all →
+      </a>
     </div>
 
-    <p class="font-mono text-xs mt-16" style="color: var(--color-text-tertiary);">
-      // scaffold ready · Step A complete → proceeding to Step B
-    </p>
-  </main>
+    {
+      devPosts.length === 0 ? (
+        <div
+          class="font-mono text-xs py-8 text-center rounded-md"
+          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+        >
+          // no posts yet — coming soon
+        </div>
+      ) : (
+        <div>
+          {devPosts.map((post) => (
+            <PostCard post={post} />
+          ))}
+        </div>
+      )
+    }
+  </section>
+
+  <!-- AI section -->
+  <section class="mx-auto px-6 py-8" style="max-width: var(--container-max);">
+    <div class="flex items-end justify-between mb-4">
+      <div>
+        <div class="mono-label mb-1" style={`color: ${CATEGORIES.ai.accent};`}>
+          // {CATEGORIES.ai.description.toLowerCase()}
+        </div>
+        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+          AI
+        </h2>
+      </div>
+      <a
+        href="/categories/ai"
+        class="font-mono text-xs transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        view all →
+      </a>
+    </div>
+
+    {
+      aiPosts.length === 0 ? (
+        <div
+          class="font-mono text-xs py-8 text-center rounded-md"
+          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+        >
+          // no posts yet — coming soon
+        </div>
+      ) : (
+        <div>
+          {aiPosts.map((post) => (
+            <PostCard post={post} />
+          ))}
+        </div>
+      )
+    }
+  </section>
 </BaseLayout>

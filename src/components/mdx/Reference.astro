@@ -1,0 +1,38 @@
+---
+interface Props {
+  title: string;
+  authors?: string;
+  year?: number | string;
+  venue?: string;
+  url?: string;
+}
+
+const { title, authors, year, venue, url } = Astro.props;
+---
+
+<div
+  class="my-4 px-4 py-3 rounded-md"
+  style="background: var(--color-surface); border: 1px solid var(--color-border-subtle); font-size: 0.9em;"
+>
+  <div class="flex items-start gap-2">
+    <span class="mono-label flex-shrink-0 mt-0.5" style="color: var(--color-accent-cyan);">REF</span>
+    <div style="color: var(--color-text-secondary); line-height: 1.7;">
+      {authors && <span style="color: var(--color-text-tertiary);">{authors}</span>}
+      {authors && year && <span style="color: var(--color-text-tertiary);"> · </span>}
+      {year && <span style="color: var(--color-text-tertiary);">{year}</span>}
+      {(authors || year) && <span style="color: var(--color-text-tertiary);"> · </span>}
+      {
+        url ? (
+          <a href={url} target="_blank" rel="noopener" style="color: var(--color-text-primary);">
+            {title}
+          </a>
+        ) : (
+          <span style="color: var(--color-text-primary);">{title}</span>
+        )
+      }
+      {venue && (
+        <span style="color: var(--color-text-tertiary);"> · <em>{venue}</em></span>
+      )}
+    </div>
+  </div>
+</div>

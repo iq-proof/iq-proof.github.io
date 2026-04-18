@@ -1,0 +1,52 @@
+---
+import type { Post } from '@/utils/posts';
+import { formatDate, getReadingTime } from '@/utils/posts';
+import CategoryBadge from './CategoryBadge.astro';
+import DifficultyBadge from './DifficultyBadge.astro';
+
+interface Props {
+  post: Post;
+  showDivider?: boolean;
+}
+
+const { post, showDivider = true } = Astro.props;
+const { minutes } = getReadingTime(post.body ?? '');
+const href = `/posts/${post.id}`;
+---
+
+<article
+  class="py-5 group"
+  style={showDivider ? 'border-top: 1px solid var(--color-border-subtle);' : ''}
+>
+  <!-- Meta row -->
+  <div class="flex flex-wrap items-center gap-2 mb-2">
+    <CategoryBadge category={post.data.category} />
+    <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
+      {formatDate(post.data.pubDate)} · {minutes} min
+    </span>
+    {post.data.difficulty && <DifficultyBadge level={post.data.difficulty} />}
+    {
+      post.data.series && (
+        <span
+          class="font-mono text-[11px] px-1.5 py-0.5 rounded"
+          style="background: var(--color-elevated); color: var(--color-text-tertiary);"
+        >
+          {post.data.series.title} · {post.data.series.order}
+        </span>
+      )
+    }
+  </div>
+
+  <!-- Title + description -->
+  <a href={href} class="block">
+    <h3
+      class="text-base font-medium mb-1 transition-colors group-hover:text-[var(--color-accent-cyan)]"
+      style="letter-spacing: -0.015em; line-height: 1.4; color: var(--color-text-primary);"
+    >
+      {post.data.title}
+    </h3>
+    <p class="text-sm" style="color: var(--color-text-secondary); line-height: 1.6;">
+      {post.data.description}
+    </p>
+  </a>
+</article>
