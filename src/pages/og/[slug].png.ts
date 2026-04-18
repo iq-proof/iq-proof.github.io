@@ -11,11 +11,11 @@ import { SITE } from '@/consts';
  */
 async function loadFonts() {
   const pretendard = await fetch(
-    'https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/packages/pretendard/dist/web/static/woff2/Pretendard-Medium.woff2',
+    'https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/packages/pretendard/dist/public/static/Pretendard-Medium.ttf',
   ).then((r) => r.arrayBuffer());
 
   const jetbrains = await fetch(
-    'https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono@latest/latin-500-normal.woff',
+    'https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono@latest/latin-500-normal.ttf',
   ).then((r) => r.arrayBuffer());
 
   return [
