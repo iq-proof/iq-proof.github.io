@@ -10,3 +10,5 @@ Thumbs.db
 # Temp
 *.tmp
 *.swp
+
+node_modules/
