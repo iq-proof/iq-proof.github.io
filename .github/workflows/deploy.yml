@@ -25,13 +25,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Install dependencies
-        # Using npm install instead of npm ci to work around npm bug #4828
-        # (platform-specific optional deps like @rollup/rollup-linux-x64-gnu
-        # not being installed when package-lock.json was generated on macOS)
-        run: npm install --include=optional
+        # Workaround for npm bug #4828 (platform-specific optional deps
+        # like @rollup/rollup-linux-x64-gnu not being recorded properly
+        # when package-lock.json is generated on macOS).
+        # Delete the lock file so npm regenerates it for Linux.
+        run: |
+          rm -f package-lock.json
+          npm install
 
       - name: Build Astro site
         run: npm run build
