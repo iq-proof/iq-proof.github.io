@@ -1,0 +1,51 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SITE } from '@/consts';
+---
+
+<BaseLayout>
+  <main class="max-w-3xl mx-auto px-6 py-24">
+    <div class="mono-label" style="color: var(--color-accent-cyan);">
+      // {SITE.tagline}
+    </div>
+
+    <h1
+      class="mt-4 mb-4 text-3xl md:text-4xl font-medium leading-tight"
+      style="letter-spacing: -0.025em; color: var(--color-text-primary);"
+    >
+      표면적인 사용법이 아닌,<br />
+      <span style="color: var(--color-accent-cyan);">본질을 증명하는</span> 기록.
+    </h1>
+
+    <p class="text-base" style="color: var(--color-text-secondary);">
+      {SITE.description}
+    </p>
+
+    <div class="flex gap-3 mt-8">
+      <span
+        class="font-mono text-xs px-3 py-1.5 rounded-md border"
+        style="
+          background: var(--color-accent-cyan-dim);
+          color: var(--color-accent-cyan);
+          border-color: var(--color-accent-cyan-line);
+        "
+      >
+        Dev · 0 posts
+      </span>
+      <span
+        class="font-mono text-xs px-3 py-1.5 rounded-md border"
+        style="
+          background: var(--color-accent-violet-dim);
+          color: var(--color-accent-violet);
+          border-color: var(--color-accent-violet-line);
+        "
+      >
+        AI · 0 posts
+      </span>
+    </div>
+
+    <p class="font-mono text-xs mt-16" style="color: var(--color-text-tertiary);">
+      // scaffold ready · Step A complete → proceeding to Step B
+    </p>
+  </main>
+</BaseLayout>
