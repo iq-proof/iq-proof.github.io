@@ -23,7 +23,7 @@ const posts = await getPostsByCategory(categorySlug);
 <BaseLayout title={meta.label} description={meta.description}>
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <div class="mono-label mb-2" style={`color: ${meta.accent};`}>
-      // category · {meta.slug}
+      category · {meta.slug}
     </div>
     <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
       {meta.label}
@@ -43,7 +43,7 @@ const posts = await getPostsByCategory(categorySlug);
           class="font-mono text-xs py-12 text-center rounded-md"
           style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
         >
-          // no posts yet in {meta.label.toLowerCase()}
+          no posts yet in {meta.label.toLowerCase()}
         </div>
       ) : (
         posts.map((post) => <PostCard post={post} />)

@@ -14,7 +14,7 @@ const totalPosts = archive.reduce(
 <BaseLayout title="Archive" description="Full chronological archive of IQ Lab posts.">
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
-      // archive
+      archive
     </div>
     <h1 class="text-3xl font-medium mb-3" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
       Archive
@@ -31,7 +31,7 @@ const totalPosts = archive.reduce(
           class="font-mono text-xs py-12 text-center rounded-md"
           style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
         >
-          // no posts yet
+          no posts yet
         </div>
       ) : (
         archive.map(({ year, months }) => (
