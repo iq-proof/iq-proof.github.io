@@ -2,11 +2,14 @@
 /**
  * Pagefind search modal — triggered by ⌘K (macOS) or Ctrl+K (others).
  *
- * Pagefind generates its own JS bundle at /pagefind/pagefind.js during `npm run build`.
- * In dev mode the index doesn't exist yet, so we gracefully skip.
+ * Pagefind generates its own JS/CSS bundle at /pagefind/ during `npm run build`
+ * (specifically the `pagefind --site dist` step after `astro build`).
  *
- * The modal reuses Pagefind's default UI for zero-config polish; styles are
- * overridden via CSS variables to match our dark palette.
+ * `pagefind-ui.js` is a UMD bundle that attaches `PagefindUI` to `window` — it
+ * is NOT an ES module, so we must load it via <script> tag. Dynamic import()
+ * of the UI bundle will fail with a "not a module" error.
+ *
+ * In dev mode the index doesn't exist yet; we show a graceful empty state.
  */
 ---
 
@@ -28,47 +31,96 @@
 </div>
 
 <script>
-  // --- Keyboard shortcut & modal lifecycle ---
+  // --- Pagefind UI loader (script-tag based) ---
+  //
+  // pagefind-ui.js is a UMD bundle, not an ES module. We load it by injecting
+  // <script> and <link> tags and waiting for window.PagefindUI to be defined.
+
   const modal = document.getElementById('search-modal');
   const trigger = document.getElementById('search-trigger');
   const container = document.getElementById('pagefind-search-container');
 
-  let pagefindUILoaded = false;
+  let pagefindUILoading: Promise<boolean> | null = null;
 
-  async function loadPagefindUI() {
-    if (pagefindUILoaded) return;
-    try {
-      // Pagefind UI is copied to /pagefind/ at build time by `pagefind --site dist`.
-      // In dev mode these files don't exist; the fetch will 404 and we show an empty state.
-      await import(
-        /* @vite-ignore */ `${window.location.origin}/pagefind/pagefind-ui.js`
-      );
-      // @ts-expect-error — PagefindUI is a global set by the imported script
-      new window.PagefindUI({
-        element: '#pagefind-search-container',
-        showSubResults: true,
-        showImages: false,
-        translations: {
-          placeholder: '딥다이브 검색... (제목, 본문, 태그)',
-          clear_search: '초기화',
-          load_more: '더 불러오기',
-          search_label: '검색',
-          filters_label: '필터',
-          zero_results: '"[SEARCH_TERM]"에 대한 결과가 없습니다',
-          many_results: '"[SEARCH_TERM]"에 대한 결과 [COUNT]개',
-          one_result: '"[SEARCH_TERM]"에 대한 결과 1개',
-          alt_search: '"[SEARCH_TERM]"에 대한 결과 없음 · "[DIFFERENT_TERM]"으로 검색',
-          search_suggestion: '다음 검색어를 시도하세요: [DIFFERENT_TERM]',
-          searching: '"[SEARCH_TERM]" 검색 중...',
-        },
-      });
-      pagefindUILoaded = true;
-    } catch {
-      if (container) {
-        container.innerHTML =
-          '<div style="padding: 2rem; text-align: center; color: var(--color-text-tertiary); font-family: var(--font-mono); font-size: 12px;">// search index not built yet — run `npm run build`</div>';
+  function loadScript(src: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      // Avoid double-load
+      if (document.querySelector(`script[data-pagefind-ui]`)) {
+        resolve();
+        return;
       }
-    }
+      const script = document.createElement('script');
+      script.src = src;
+      script.dataset.pagefindUi = 'true';
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error(`Failed to load ${src}`));
+      document.head.appendChild(script);
+    });
+  }
+
+  function loadStylesheet(href: string): void {
+    if (document.querySelector(`link[data-pagefind-ui]`)) return;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.dataset.pagefindUi = 'true';
+    document.head.appendChild(link);
+  }
+
+  async function loadPagefindUI(): Promise<boolean> {
+    if (pagefindUILoading) return pagefindUILoading;
+
+    pagefindUILoading = (async () => {
+      const base = window.location.origin;
+      const uiJs = `${base}/pagefind/pagefind-ui.js`;
+      const uiCss = `${base}/pagefind/pagefind-ui.css`;
+
+      try {
+        // Check index exists first — gives a cleaner error in dev mode
+        const probe = await fetch(`${base}/pagefind/pagefind.js`, { method: 'HEAD' });
+        if (!probe.ok) throw new Error('pagefind index missing');
+
+        loadStylesheet(uiCss);
+        await loadScript(uiJs);
+
+        // @ts-expect-error — PagefindUI is a global set by the loaded script
+        if (typeof window.PagefindUI !== 'function') {
+          throw new Error('PagefindUI constructor not found on window');
+        }
+
+        // @ts-expect-error — same global reference
+        new window.PagefindUI({
+          element: '#pagefind-search-container',
+          showSubResults: true,
+          showImages: false,
+          resetStyles: false,
+          translations: {
+            placeholder: '딥다이브 검색... (제목, 본문, 태그)',
+            clear_search: '초기화',
+            load_more: '더 불러오기',
+            search_label: '검색',
+            filters_label: '필터',
+            zero_results: '"[SEARCH_TERM]"에 대한 결과가 없습니다',
+            many_results: '"[SEARCH_TERM]"에 대한 결과 [COUNT]개',
+            one_result: '"[SEARCH_TERM]"에 대한 결과 1개',
+            alt_search: '"[SEARCH_TERM]"에 대한 결과 없음 · "[DIFFERENT_TERM]"으로 검색',
+            search_suggestion: '다음 검색어를 시도하세요: [DIFFERENT_TERM]',
+            searching: '"[SEARCH_TERM]" 검색 중...',
+          },
+        });
+
+        return true;
+      } catch (err) {
+        console.warn('[search] Pagefind UI load failed:', err);
+        if (container) {
+          container.innerHTML =
+            '<div style="padding: 2rem; text-align: center; color: var(--color-text-tertiary); font-family: var(--font-mono); font-size: 12px;">// 검색 인덱스를 불러올 수 없습니다. 빌드 후 다시 시도하세요.</div>';
+        }
+        return false;
+      }
+    })();
+
+    return pagefindUILoading;
   }
 
   function openModal() {
@@ -77,9 +129,14 @@
     modal.classList.add('flex');
     modal.setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
-    loadPagefindUI().then(() => {
-      const input = modal.querySelector('input[type="text"]');
-      if (input instanceof HTMLElement) input.focus();
+
+    loadPagefindUI().then((ok) => {
+      if (!ok) return;
+      // Focus the search input once PagefindUI has rendered it
+      requestAnimationFrame(() => {
+        const input = modal.querySelector<HTMLInputElement>('.pagefind-ui__search-input');
+        input?.focus();
+      });
     });
   }
 
@@ -100,7 +157,9 @@
       if (modal?.classList.contains('hidden')) openModal();
       else closeModal();
     }
-    if (e.key === 'Escape') closeModal();
+    if (e.key === 'Escape' && !modal?.classList.contains('hidden')) {
+      closeModal();
+    }
   });
 
   modal?.addEventListener('click', (e) => {
@@ -141,21 +200,44 @@
   .pagefind-ui__drawer {
     max-height: 60vh;
     overflow-y: auto;
+    padding: 0 0.75rem 0.75rem !important;
   }
   .pagefind-ui__result {
     border-bottom: 1px solid var(--color-border-subtle) !important;
+    padding: 0.75rem 0 !important;
+  }
+  .pagefind-ui__result:last-child {
+    border-bottom: none !important;
+  }
+  .pagefind-ui__result-title {
+    font-size: 1rem !important;
+    margin-bottom: 0.25rem !important;
   }
   .pagefind-ui__result-title a {
     color: var(--color-text-primary) !important;
+    text-decoration: none !important;
   }
   .pagefind-ui__result-title a:hover {
     color: var(--color-accent-cyan) !important;
   }
   .pagefind-ui__result-excerpt {
     color: var(--color-text-secondary) !important;
+    font-size: 0.875rem !important;
+    line-height: 1.5 !important;
   }
   .pagefind-ui__result-excerpt mark {
-    background: var(--color-accent-cyan-dim) !important;
+    background: rgba(0, 217, 255, 0.15) !important;
     color: var(--color-accent-cyan) !important;
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+  .pagefind-ui__button {
+    background: var(--color-elevated) !important;
+    color: var(--color-text-primary) !important;
+    border: 1px solid var(--color-border-subtle) !important;
+  }
+  .pagefind-ui__message {
+    color: var(--color-text-secondary) !important;
+    padding: 0.5rem 0 !important;
   }
 </style>
