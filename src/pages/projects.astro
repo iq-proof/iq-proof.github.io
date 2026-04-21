@@ -1,49 +1,10 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { SOCIAL } from '@/consts';
+import { SOCIAL, DEV_LAB_GROUPS, AI_LAB_LAYERS } from '@/consts';
 
-const devLabGroups = [
-  {
-    title: 'Java Core',
-    count: 7,
-    highlight: ['java-concurrency-deep-dive', 'jvm-deep-dive'],
-  },
-  {
-    title: 'Spring Ecosystem',
-    count: 8,
-    highlight: ['spring-core-deep-dive', 'spring-webflux-deep-dive'],
-  },
-  {
-    title: 'Architecture & Design',
-    count: 5,
-    highlight: ['ddd-deep-dive', 'msa-deep-dive'],
-  },
-  {
-    title: 'Infrastructure & DevOps',
-    count: 7,
-    highlight: ['kubernetes-deep-dive', 'observability-deep-dive'],
-  },
-  {
-    title: 'Database',
-    count: 6,
-    highlight: ['database-internals', 'postgresql-deep-dive'],
-  },
-  {
-    title: 'Messaging & Streaming',
-    count: 2,
-    highlight: ['kafka-deep-dive', 'rabbitmq-deep-dive'],
-  },
-];
-
-const aiLabLayers = [
-  { layer: 0, title: 'Mathematics', count: 10 },
-  { layer: 1, title: 'ML Theory', count: 5 },
-  { layer: 2, title: 'Neural Network Theory', count: 4 },
-  { layer: 3, title: 'Architectures', count: 5 },
-  { layer: '4', title: 'RL · LLM · CV · NLP · Audio', count: 16 },
-  { layer: 5, title: 'Systems', count: 4 },
-  { layer: 6, title: 'Frontier LLM', count: 3 },
-];
+// Totals for header copy
+const devLabTotal = DEV_LAB_GROUPS.reduce((sum, g) => sum + g.repos.length, 0);
+const aiLabTotal = AI_LAB_LAYERS.reduce((sum, l) => sum + l.repos.length, 0);
 ---
 
 <BaseLayout title="Projects" description="Companion deep-dive repositories in iq-dev-lab and iq-ai-lab.">
@@ -56,6 +17,9 @@ const aiLabLayers = [
     </h1>
     <p class="text-sm" style="color: var(--color-text-secondary); line-height: 1.7; max-width: 40rem;">
       블로그 글과 짝을 이루는 두 개의 딥다이브 저장소. 글은 짧게, 저장소는 깊게.
+    </p>
+    <p class="text-xs mt-3 font-mono" style="color: var(--color-text-tertiary);">
+      iq-dev-lab · {devLabTotal} repos &nbsp;·&nbsp; iq-ai-lab · {aiLabTotal} repos
     </p>
   </section>
 
@@ -83,34 +47,36 @@ const aiLabLayers = [
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
       {
-        devLabGroups.map((group) => (
-          <div
-            class="p-4 rounded-md"
+        DEV_LAB_GROUPS.map((group) => (
+          <details
+            class="group-card p-4 rounded-md"
             style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
           >
-            <div class="flex items-center justify-between mb-2">
+            <summary class="flex items-center justify-between mb-2 cursor-pointer list-none">
               <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
                 {group.title}
               </h3>
-              <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
-                {group.count} repos
+              <span class="font-mono text-[11px] flex items-center gap-2" style="color: var(--color-text-tertiary);">
+                <span>{group.repos.length} repos</span>
+                <span class="toggle-icon">+</span>
               </span>
-            </div>
-            <ul class="space-y-1">
-              {group.highlight.map((repo) => (
+            </summary>
+            <ul class="space-y-1 mt-2">
+              {group.repos.map((repo) => (
                 <li class="font-mono text-[11px]">
                   <a
-                    href={`https://github.com/iq-dev-lab/${repo}`}
+                    href={`https://github.com/iq-dev-lab/${repo.slug}`}
                     target="_blank"
                     rel="noopener"
                     style="color: var(--color-accent-cyan);"
+                    title={repo.title}
                   >
-                    {repo}
+                    {repo.slug}
                   </a>
                 </li>
               ))}
             </ul>
-          </div>
+          </details>
         ))
       }
     </div>
@@ -140,30 +106,67 @@ const aiLabLayers = [
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
       {
-        aiLabLayers.map((l) => (
-          <div
-            class="p-4 rounded-md"
+        AI_LAB_LAYERS.map((l) => (
+          <details
+            class="group-card p-4 rounded-md"
             style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
           >
-            <div class="flex items-center justify-between mb-1">
+            <summary class="flex items-center justify-between mb-1 cursor-pointer list-none">
               <div class="flex items-baseline gap-2">
-                <span
-                  class="font-mono text-[11px]"
-                  style="color: var(--color-accent-violet);"
-                >
+                <span class="font-mono text-[11px]" style="color: var(--color-accent-violet);">
                   Layer {l.layer}
                 </span>
                 <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
                   {l.title}
                 </h3>
               </div>
-              <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
-                {l.count} repos
+              <span class="font-mono text-[11px] flex items-center gap-2" style="color: var(--color-text-tertiary);">
+                <span>{l.repos.length} repos</span>
+                <span class="toggle-icon">+</span>
               </span>
-            </div>
-          </div>
+            </summary>
+            <ul class="space-y-1 mt-2">
+              {l.repos.map((repo) => (
+                <li class="font-mono text-[11px]">
+                  <a
+                    href={`https://github.com/iq-ai-lab/${repo.slug}`}
+                    target="_blank"
+                    rel="noopener"
+                    style="color: var(--color-accent-violet);"
+                    title={repo.title}
+                  >
+                    {repo.slug}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
         ))
       }
     </div>
   </section>
 </BaseLayout>
+
+<style>
+  /* Hide default <details> marker across browsers */
+  details.group-card > summary::-webkit-details-marker {
+    display: none;
+  }
+  details.group-card > summary::marker {
+    content: '';
+  }
+
+  /* +/− toggle indicator */
+  details.group-card[open] .toggle-icon {
+    transform: rotate(45deg);
+  }
+  details.group-card .toggle-icon {
+    display: inline-block;
+    transition: transform 160ms ease;
+  }
+
+  /* Subtle hover affordance on the whole card */
+  details.group-card > summary:hover h3 {
+    opacity: 0.9;
+  }
+</style>
