@@ -65,10 +65,18 @@ export const NAV = [
   { href: '/about', label: 'About' },
 ] as const;
 
+/**
+ * External links.
+ * - `github`       : personal profile (the author)
+ * - `devLab` / `aiLab`       : GitHub organization (source repos)
+ * - `devLabSite` / `aiLabSite`: GitHub Pages site (rendered knowledge map)
+ */
 export const SOCIAL = {
   github: 'https://github.com/e9ua1',
   devLab: 'https://github.com/iq-dev-lab',
   aiLab: 'https://github.com/iq-ai-lab',
+  devLabSite: 'https://iq-dev-lab.github.io',
+  aiLabSite: 'https://iq-ai-lab.github.io',
   rss: '/rss.xml',
 } as const;
 
