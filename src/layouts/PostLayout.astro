@@ -20,25 +20,26 @@ const { post } = Astro.props;
 const { minutes } = getReadingTime(post.body ?? '');
 const { prev, next } = await getSeriesNeighbors(post);
 const seriesSiblings = post.data.series
-  ? await getPostsBySeries(post.data.series.slug)
-  : [];
+    ? await getPostsBySeries(post.data.series.slug)
+    : [];
 ---
 
 <BaseLayout
-  title={post.data.title}
-  description={post.data.description}
-  ogImage={`/og/${post.id}.png`}
-  pubDate={post.data.pubDate}
-  updatedDate={post.data.updatedDate}
-  ogType="article"
-  tags={post.data.tags}
+    title={post.data.title}
+    description={post.data.description}
+    ogImage={`/og/${post.id}.png`}
+    pubDate={post.data.pubDate}
+    updatedDate={post.data.updatedDate}
+    ogType="article"
+    tags={post.data.tags}
+    category={post.data.category}
 >
   <article class="mx-auto px-6 pt-16 pb-12" style="max-width: var(--reading-max);">
     <!-- Back to posts -->
     <a
-      href="/posts"
-      class="inline-flex items-center gap-1 font-mono text-xs mb-8 transition-colors"
-      style="color: var(--color-text-tertiary);"
+        href="/posts"
+        class="inline-flex items-center gap-1 font-mono text-xs mb-8 transition-colors"
+        style="color: var(--color-text-tertiary);"
     >
       ← all posts
     </a>
@@ -54,8 +55,8 @@ const seriesSiblings = post.data.series
 
     <!-- Title & description -->
     <h1
-      class="text-3xl md:text-[2rem] font-medium mb-4"
-      style="letter-spacing: -0.025em; line-height: 1.3; color: var(--color-text-primary);"
+        class="text-3xl md:text-[2rem] font-medium mb-4"
+        style="letter-spacing: -0.025em; line-height: 1.3; color: var(--color-text-primary);"
     >
       {post.data.title}
     </h1>
@@ -65,53 +66,53 @@ const seriesSiblings = post.data.series
 
     <!-- Series banner -->
     {
-      post.data.series && (
-        <div
-          class="px-4 py-3 mb-8 rounded-md"
-          style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-        >
-          <div class="flex items-center justify-between mb-2">
-            <a
-              href={`/series/${post.data.series.slug}`}
-              class="font-mono text-[11px] transition-colors"
-              style="color: var(--color-accent-cyan);"
+        post.data.series && (
+            <div
+                class="px-4 py-3 mb-8 rounded-md"
+                style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
             >
-              📚 {post.data.series.title}
-            </a>
-            <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
+              <div class="flex items-center justify-between mb-2">
+                <a
+                    href={`/series/${post.data.series.slug}`}
+                    class="font-mono text-[11px] transition-colors"
+                    style="color: var(--color-accent-cyan);"
+                >
+                  📚 {post.data.series.title}
+                </a>
+                <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
               {post.data.series.order} / {seriesSiblings.length}
             </span>
-          </div>
-          <ol class="space-y-1 text-sm" style="color: var(--color-text-secondary);">
-            {
-              seriesSiblings.map((sibling) => (
-                <li class="flex gap-2">
+              </div>
+              <ol class="space-y-1 text-sm" style="color: var(--color-text-secondary);">
+                {
+                  seriesSiblings.map((sibling) => (
+                      <li class="flex gap-2">
                   <span
-                    class="font-mono text-xs"
-                    style={`color: ${
-                      sibling.id === post.id
-                        ? 'var(--color-accent-cyan)'
-                        : 'var(--color-text-tertiary)'
-                    };`}
+                      class="font-mono text-xs"
+                      style={`color: ${
+                          sibling.id === post.id
+                              ? 'var(--color-accent-cyan)'
+                              : 'var(--color-text-tertiary)'
+                      };`}
                   >
                     {String(sibling.data.series!.order).padStart(2, '0')}
                   </span>
-                  {sibling.id === post.id ? (
-                    <span style="color: var(--color-text-primary);">{sibling.data.title}</span>
-                  ) : (
-                    <a
-                      href={`/posts/${sibling.id}`}
-                      class="transition-colors hover:text-[var(--color-accent-cyan)]"
-                    >
-                      {sibling.data.title}
-                    </a>
-                  )}
-                </li>
-              ))
-            }
-          </ol>
-        </div>
-      )
+                        {sibling.id === post.id ? (
+                            <span style="color: var(--color-text-primary);">{sibling.data.title}</span>
+                        ) : (
+                            <a
+                                href={`/posts/${sibling.id}`}
+                                class="transition-colors hover:text-[var(--color-accent-cyan)]"
+                            >
+                              {sibling.data.title}
+                            </a>
+                        )}
+                      </li>
+                  ))
+                }
+              </ol>
+            </div>
+        )
     }
 
     <hr style="border: none; border-top: 1px solid var(--color-border-subtle); margin: 1.5rem 0 2.5rem;" />
@@ -123,60 +124,60 @@ const seriesSiblings = post.data.series
 
     <!-- Tags -->
     {
-      post.data.tags.length > 0 && (
-        <div class="flex flex-wrap gap-2 mt-12 pt-6" style="border-top: 1px solid var(--color-border-subtle);">
-          {post.data.tags.map((tag) => <TagPill tag={tag} />)}
-        </div>
-      )
+        post.data.tags.length > 0 && (
+            <div class="flex flex-wrap gap-2 mt-12 pt-6" style="border-top: 1px solid var(--color-border-subtle);">
+              {post.data.tags.map((tag) => <TagPill tag={tag} />)}
+            </div>
+        )
     }
 
     <!-- Updated note -->
     {
-      post.data.updatedDate && (
-        <p class="font-mono text-xs mt-6" style="color: var(--color-text-tertiary);">
-          // last updated: {formatDate(post.data.updatedDate)}
-        </p>
-      )
+        post.data.updatedDate && (
+            <p class="font-mono text-xs mt-6" style="color: var(--color-text-tertiary);">
+              // last updated: {formatDate(post.data.updatedDate)}
+            </p>
+        )
     }
 
     <!-- Series prev/next -->
     {
-      (prev || next) && (
-        <nav class="mt-12 pt-6 grid grid-cols-1 md:grid-cols-2 gap-4" style="border-top: 1px solid var(--color-border-subtle);">
-          {prev ? (
-            <a
-              href={`/posts/${prev.id}`}
-              class="p-4 rounded-md transition-colors"
-              style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-            >
-              <div class="font-mono text-[11px] mb-1" style="color: var(--color-text-tertiary);">
-                ← previous
-              </div>
-              <div class="text-sm" style="color: var(--color-text-primary);">
-                {prev.data.title}
-              </div>
-            </a>
-          ) : (
-            <div />
-          )}
-          {next ? (
-            <a
-              href={`/posts/${next.id}`}
-              class="p-4 rounded-md transition-colors text-right"
-              style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-            >
-              <div class="font-mono text-[11px] mb-1" style="color: var(--color-text-tertiary);">
-                next →
-              </div>
-              <div class="text-sm" style="color: var(--color-text-primary);">
-                {next.data.title}
-              </div>
-            </a>
-          ) : (
-            <div />
-          )}
-        </nav>
-      )
+        (prev || next) && (
+            <nav class="mt-12 pt-6 grid grid-cols-1 md:grid-cols-2 gap-4" style="border-top: 1px solid var(--color-border-subtle);">
+              {prev ? (
+                  <a
+                      href={`/posts/${prev.id}`}
+                      class="p-4 rounded-md transition-colors"
+                      style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+                  >
+                    <div class="font-mono text-[11px] mb-1" style="color: var(--color-text-tertiary);">
+                      ← previous
+                    </div>
+                    <div class="text-sm" style="color: var(--color-text-primary);">
+                      {prev.data.title}
+                    </div>
+                  </a>
+              ) : (
+                  <div />
+              )}
+              {next ? (
+                  <a
+                      href={`/posts/${next.id}`}
+                      class="p-4 rounded-md transition-colors text-right"
+                      style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+                  >
+                    <div class="font-mono text-[11px] mb-1" style="color: var(--color-text-tertiary);">
+                      next →
+                    </div>
+                    <div class="text-sm" style="color: var(--color-text-primary);">
+                      {next.data.title}
+                    </div>
+                  </a>
+              ) : (
+                  <div />
+              )}
+            </nav>
+        )
     }
 
     <!-- Comments — Giscus (GitHub Discussions) -->
