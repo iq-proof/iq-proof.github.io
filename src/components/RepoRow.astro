@@ -1,0 +1,92 @@
+---
+/**
+ * RepoRow.astro — individual repo entry as a compact row.
+ *
+ * Hovering highlights the row; clicking navigates to GitHub.
+ *
+ * Usage:
+ *   <RepoRow
+ *     href="https://github.com/iq-dev-lab/jvm-deep-dive"
+ *     slug="jvm-deep-dive"
+ *     title="JVM Deep Dive"
+ *     description="클래스 로딩·GC·JIT·메모리 모델 완전 해부"
+ *     color="#F59E0B"
+ *   />
+ */
+
+interface Props {
+  href: string;
+  slug: string;
+  title: string;
+  description: string;
+  color: string;
+}
+
+const { href, slug, title, description, color } = Astro.props;
+---
+
+<a
+  href={href}
+  target="_blank"
+  rel="noopener noreferrer"
+  class="repo-row group flex items-start gap-3 py-2.5 px-3 -mx-3 rounded-md transition-all"
+  style={`--hover-color: ${color};`}
+>
+  <!-- Color dot indicator -->
+  <div
+    class="flex-shrink-0 mt-2 w-1 h-1 rounded-full transition-all group-hover:w-1.5 group-hover:h-1.5"
+    style={`background: ${color};`}
+  ></div>
+
+  <!-- Title · slug · description -->
+  <div class="flex-1 min-w-0">
+    <div class="flex items-baseline gap-2 flex-wrap">
+      <span
+        class="text-[13.5px] font-medium transition-colors"
+        style="color: var(--color-text-primary);"
+      >
+        {title}
+      </span>
+      <span
+        class="font-mono text-[10.5px] transition-colors"
+        style="color: var(--color-text-tertiary);"
+      >
+        {slug}
+      </span>
+    </div>
+    <p
+      class="text-[12px] mt-0.5 leading-relaxed transition-colors"
+      style="color: var(--color-text-secondary);"
+    >
+      {description}
+    </p>
+  </div>
+
+  <!-- Arrow indicator -->
+  <svg
+    class="arrow w-3.5 h-3.5 flex-shrink-0 mt-1.5 transition-transform"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    style="color: var(--color-text-tertiary);"
+    aria-hidden="true"
+  >
+    <path d="M7 17L17 7M7 7h10v10" />
+  </svg>
+</a>
+
+<style>
+  .repo-row:hover {
+    background: color-mix(in srgb, var(--hover-color) 6%, transparent);
+  }
+  .repo-row:hover .arrow {
+    transform: translate(2px, -2px);
+    color: var(--hover-color) !important;
+  }
+  .repo-row:hover span {
+    color: var(--color-text-primary) !important;
+  }
+</style>

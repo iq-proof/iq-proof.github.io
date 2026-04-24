@@ -1,324 +1,305 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { SITE, SOCIAL, DEV_LAB_GROUPS, AI_LAB_LAYERS } from '@/consts';
+import CategoryHeader from '@/components/CategoryHeader.astro';
+import RepoRow from '@/components/RepoRow.astro';
+import { DEV_LAB_GROUPS, AI_LAB_LAYERS, SOCIAL } from '@/consts';
 
-// Totals for header copy
-const devLabTotal = DEV_LAB_GROUPS.reduce((sum, g) => sum + g.repos.length, 0);
-const aiLabTotal = AI_LAB_LAYERS.reduce((sum, l) => sum + l.repos.length, 0);
+const DEV_LAB_REPO_BASE = 'https://github.com/iq-dev-lab';
+const AI_LAB_REPO_BASE = 'https://github.com/iq-ai-lab';
+
+const devRepoCount = DEV_LAB_GROUPS.reduce((sum, g) => sum + g.repos.length, 0);
+const aiRepoCount = AI_LAB_LAYERS.reduce((sum, l) => sum + l.repos.length, 0);
 ---
 
-<BaseLayout title="Projects" description="Companion deep-dive repositories in iq-dev-lab and iq-ai-lab.">
-  <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
-    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
-      projects · companion repos
-    </div>
-    <h1 class="text-3xl font-medium mb-4" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
-      Projects
-    </h1>
-    <p class="text-sm" style="color: var(--color-text-secondary); line-height: 1.7; max-width: 40rem;">
-      블로그 글과 짝을 이루는 두 개의 딥다이브 저장소. 글은 짧게, 저장소는 깊게.
-    </p>
-    <p class="text-xs mt-3 font-mono" style="color: var(--color-text-tertiary);">
-      iq-dev-lab · {devLabTotal} repos &nbsp;·&nbsp; iq-ai-lab · {aiLabTotal} repos
-    </p>
-  </section>
-
-  <!-- iq-dev-lab -->
-  <section class="mx-auto px-6 pb-10" style="max-width: var(--container-max);">
-    <div class="flex items-end justify-between mb-5 flex-wrap gap-3">
-      <div>
-        <div class="mono-label mb-1" style="color: var(--color-accent-cyan);">
-          iq-dev-lab
-        </div>
-        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
-          Backend Deep Dive
-        </h2>
+<BaseLayout
+  title="Projects"
+  description="iq-dev-lab과 iq-ai-lab — 86개 딥다이브 레포지토리로 구축한 백엔드와 AI의 지식 지도"
+>
+  <div class="mx-auto px-6 pt-16 pb-24" style="max-width: var(--container-max);">
+    <!-- Page header -->
+    <header class="mb-16 text-center">
+      <div
+        class="font-mono text-[11px] mb-3"
+        style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ KNOWLEDGE MAP
       </div>
-      <div class="flex items-center gap-3 font-mono text-xs">
+      <h1
+        class="text-3xl md:text-4xl font-medium mb-4"
+        style="letter-spacing: -0.025em; color: var(--color-text-primary);"
+      >
+        Projects
+      </h1>
+      <p class="text-base mx-auto mb-2" style="color: var(--color-text-primary); max-width: 560px; line-height: 1.7;">
+        본질을 파고드는 공간들.
+      </p>
+      <p class="text-sm mx-auto" style="color: var(--color-text-secondary); max-width: 560px; line-height: 1.7;">
+        이 블로그의 글은 아래 {devRepoCount + aiRepoCount}개의 저장소에서 자랍니다.
+      </p>
+      <p
+        class="font-mono text-[11px] mt-5"
+        style="color: var(--color-text-tertiary); letter-spacing: 0.5px;"
+      >
+        카테고리를 클릭해 펼치기 ↓
+      </p>
+    </header>
+
+    <!-- ═════════════════════════════════════════════════════
+         IQ DEV LAB
+         ═════════════════════════════════════════════════════ -->
+    <section class="mb-20">
+      <!-- Section header -->
+      <div
+        class="flex items-start justify-between gap-4 mb-8 pb-5"
+        style="border-bottom: 1px solid var(--color-border-subtle);"
+      >
+        <div>
+          <div
+            class="font-mono text-[11px] mb-2"
+            style="color: var(--color-accent-cyan); letter-spacing: 2px;"
+          >
+            IQ-DEV-LAB
+          </div>
+          <h2
+            class="text-2xl font-medium mb-2"
+            style="letter-spacing: -0.02em; color: var(--color-text-primary);"
+          >
+            Backend Deep Dive
+          </h2>
+          <p
+            class="text-sm"
+            style="color: var(--color-text-tertiary); line-height: 1.6;"
+          >
+            Java·Spring·DB·Infra의 내부를 파헤치는 {devRepoCount}개 레포
+          </p>
+        </div>
+        <div class="flex items-center gap-3 flex-shrink-0 mt-2">
+          <a
+            href={SOCIAL.devLabSite}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="font-mono text-xs transition-colors hover:underline"
+            style="color: var(--color-accent-cyan);"
+          >
+            ↗ site
+          </a>
+          <a
+            href={SOCIAL.devLab}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="font-mono text-xs transition-colors hover:underline"
+            style="color: var(--color-text-tertiary);"
+          >
+            ↗ github
+          </a>
+        </div>
+      </div>
+
+      <!-- Category list (collapsible) -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-2">
+        {DEV_LAB_GROUPS.map((group) => (
+          <details
+            id={`dev-${group.slug}`}
+            class="category-block"
+            style={`--cat-color: ${group.color};`}
+          >
+            <summary class="category-summary">
+              <CategoryHeader
+                icon={group.icon}
+                color={group.color}
+                title={group.title}
+                description={group.description}
+                count={group.repos.length}
+                collapsible
+              />
+            </summary>
+            <div class="repo-list py-2 pl-2">
+              {group.repos.map((repo) => (
+                <RepoRow
+                  href={`${DEV_LAB_REPO_BASE}/${repo.slug}`}
+                  slug={repo.slug}
+                  title={repo.title}
+                  description={repo.description}
+                  color={group.color}
+                />
+              ))}
+            </div>
+          </details>
+        ))}
+      </div>
+    </section>
+
+    <!-- ═════════════════════════════════════════════════════
+         IQ AI LAB
+         ═════════════════════════════════════════════════════ -->
+    <section>
+      <!-- Section header -->
+      <div
+        class="flex items-start justify-between gap-4 mb-8 pb-5"
+        style="border-bottom: 1px solid var(--color-border-subtle);"
+      >
+        <div>
+          <div
+            class="font-mono text-[11px] mb-2"
+            style="color: var(--color-accent-violet); letter-spacing: 2px;"
+          >
+            IQ-AI-LAB
+          </div>
+          <h2
+            class="text-2xl font-medium mb-2"
+            style="letter-spacing: -0.02em; color: var(--color-text-primary);"
+          >
+            AI Foundations
+          </h2>
+          <p
+            class="text-sm"
+            style="color: var(--color-text-tertiary); line-height: 1.6;"
+          >
+            수학에서 Frontier LLM까지 — {AI_LAB_LAYERS.length}개 레이어 {aiRepoCount}개 레포
+          </p>
+        </div>
+        <div class="flex items-center gap-3 flex-shrink-0 mt-2">
+          <a
+            href={SOCIAL.aiLabSite}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="font-mono text-xs transition-colors hover:underline"
+            style="color: var(--color-accent-violet);"
+          >
+            ↗ site
+          </a>
+          <a
+            href={SOCIAL.aiLab}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="font-mono text-xs transition-colors hover:underline"
+            style="color: var(--color-text-tertiary);"
+          >
+            ↗ github
+          </a>
+        </div>
+      </div>
+
+      <!-- Layers (collapsible) -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-2">
+        {AI_LAB_LAYERS.map((layer) => (
+          <details
+            id={`ai-${layer.slug}`}
+            class="category-block"
+            style={`--cat-color: ${layer.color};`}
+          >
+            <summary class="category-summary">
+              <CategoryHeader
+                icon={layer.icon}
+                color={layer.color}
+                title={layer.title}
+                description={layer.description}
+                count={layer.repos.length}
+                layer={layer.layer}
+                collapsible
+              />
+            </summary>
+            <div class="repo-list py-2 pl-2">
+              {layer.repos.map((repo) => (
+                  <RepoRow
+                  href={`${AI_LAB_REPO_BASE}/${repo.slug}`}
+                  slug={repo.slug}
+                  title={repo.title}
+                  description={repo.description}
+                  color={layer.color}
+                />
+              ))}
+            </div>
+          </details>
+        ))}
+      </div>
+    </section>
+
+    <!-- Footer note -->
+    <div
+      class="mt-20 pt-8 text-center"
+      style="border-top: 1px solid var(--color-border-subtle);"
+    >
+      <p
+        class="font-mono text-[11px] mb-2"
+        style="color: var(--color-text-tertiary); letter-spacing: 1.5px;"
+      >
+        총 {devRepoCount + aiRepoCount}개 레포 · 지속적으로 업데이트
+      </p>
+      <p class="text-sm" style="color: var(--color-text-tertiary);">
+        마인드맵으로 보고 싶다면 →
         <a
           href={SOCIAL.devLabSite}
           target="_blank"
-          rel="noopener"
-          class="transition-colors site-link"
+          rel="noopener noreferrer"
+          class="transition-colors hover:underline"
           style="color: var(--color-accent-cyan);"
         >
-          ↗ site
+          Dev Lab
         </a>
-        <span style="color: var(--color-border-subtle);">·</span>
-        <a
-          href={SOCIAL.devLab}
-          target="_blank"
-          rel="noopener"
-          class="transition-colors"
-          style="color: var(--color-text-tertiary);"
-        >
-          ↗ github
-        </a>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {
-        DEV_LAB_GROUPS.map((group) => (
-          <details
-            class="group-card p-4 rounded-md"
-            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-          >
-            <summary class="flex items-center justify-between mb-2 cursor-pointer list-none">
-              <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
-                {group.title}
-              </h3>
-              <span class="font-mono text-[11px] flex items-center gap-2" style="color: var(--color-text-tertiary);">
-                <span>{group.repos.length} repos</span>
-                <span class="toggle-icon">+</span>
-              </span>
-            </summary>
-            <ul class="space-y-1 mt-2">
-              {group.repos.map((repo) => (
-                <li class="font-mono text-[11px]">
-                  <a
-                    href={`https://github.com/iq-dev-lab/${repo.slug}`}
-                    target="_blank"
-                    rel="noopener"
-                    style="color: var(--color-accent-cyan);"
-                    title={repo.title}
-                  >
-                    {repo.slug}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </details>
-        ))
-      }
-    </div>
-  </section>
-
-  <!-- iq-ai-lab -->
-  <section class="mx-auto px-6 pb-16" style="max-width: var(--container-max);">
-    <div class="flex items-end justify-between mb-5 flex-wrap gap-3">
-      <div>
-        <div class="mono-label mb-1" style="color: var(--color-accent-violet);">
-          iq-ai-lab
-        </div>
-        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
-          AI/ML Deep Dive
-        </h2>
-      </div>
-      <div class="flex items-center gap-3 font-mono text-xs">
+        ·
         <a
           href={SOCIAL.aiLabSite}
           target="_blank"
-          rel="noopener"
-          class="transition-colors site-link"
+          rel="noopener noreferrer"
+          class="transition-colors hover:underline"
           style="color: var(--color-accent-violet);"
         >
-          ↗ site
+          AI Lab
         </a>
-        <span style="color: var(--color-border-subtle);">·</span>
-        <a
-          href={SOCIAL.aiLab}
-          target="_blank"
-          rel="noopener"
-          class="transition-colors"
-          style="color: var(--color-text-tertiary);"
-        >
-          ↗ github
-        </a>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {
-        AI_LAB_LAYERS.map((l) => (
-          <details
-            class="group-card p-4 rounded-md"
-            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-          >
-            <summary class="flex items-center justify-between mb-1 cursor-pointer list-none">
-              <div class="flex items-baseline gap-2">
-                <span class="font-mono text-[11px]" style="color: var(--color-accent-violet);">
-                  Layer {l.layer}
-                </span>
-                <h3 class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  {l.title}
-                </h3>
-              </div>
-              <span class="font-mono text-[11px] flex items-center gap-2" style="color: var(--color-text-tertiary);">
-                <span>{l.repos.length} repos</span>
-                <span class="toggle-icon">+</span>
-              </span>
-            </summary>
-            <ul class="space-y-1 mt-2">
-              {l.repos.map((repo) => (
-                <li class="font-mono text-[11px]">
-                  <a
-                    href={`https://github.com/iq-ai-lab/${repo.slug}`}
-                    target="_blank"
-                    rel="noopener"
-                    style="color: var(--color-accent-violet);"
-                    title={repo.title}
-                  >
-                    {repo.slug}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </details>
-        ))
-      }
-    </div>
-  </section>
-
-  <!-- Ecosystem -->
-  <section
-    class="mx-auto px-6 pb-20"
-    style="max-width: var(--container-max);"
-  >
-    <div style="border-top: 1px solid var(--color-border-subtle); padding-top: 2.5rem;">
-      <div class="mono-label mb-2" style="color: var(--color-text-tertiary);">
-        ecosystem · around iq lab
-      </div>
-      <h2 class="text-xl font-medium mb-2" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
-        Explore further
-      </h2>
-      <p class="text-sm mb-8" style="color: var(--color-text-secondary); line-height: 1.7; max-width: 40rem;">
-        블로그를 넘어 연결된 공간들. 사람 · 두 연구소 · 각각의 지식 지도.
       </p>
-
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <!-- Personal profile -->
-        <a
-          href={SOCIAL.github}
-          target="_blank"
-          rel="noopener"
-          class="eco-card p-4 rounded-md"
-          style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-        >
-          <div class="flex items-center justify-between mb-1">
-            <span class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
-              person
-            </span>
-            <span class="font-mono text-[11px] eco-arrow" style="color: var(--color-text-tertiary);">
-              ↗
-            </span>
-          </div>
-          <div class="text-sm font-medium mb-1" style="color: var(--color-text-primary);">
-            {SITE.author.handle}
-          </div>
-          <div class="font-mono text-[11px]" style="color: var(--color-text-tertiary);">
-            github.com/{SITE.author.handle}
-          </div>
-          <div class="text-[11px] mt-2" style="color: var(--color-text-tertiary); line-height: 1.6;">
-            저자의 개인 프로필. 연구소 밖의 작업들.
-          </div>
-        </a>
-
-        <!-- IQ Dev Lab site -->
-        <a
-          href={SOCIAL.devLabSite}
-          target="_blank"
-          rel="noopener"
-          class="eco-card p-4 rounded-md"
-          style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-        >
-          <div class="flex items-center justify-between mb-1">
-            <span class="font-mono text-[11px]" style="color: var(--color-accent-cyan);">
-              iq-dev-lab
-            </span>
-            <span class="font-mono text-[11px] eco-arrow" style="color: var(--color-text-tertiary);">
-              ↗
-            </span>
-          </div>
-          <div class="text-sm font-medium mb-1" style="color: var(--color-text-primary);">
-            Backend Knowledge Map
-          </div>
-          <div class="font-mono text-[11px]" style="color: var(--color-accent-cyan);">
-            iq-dev-lab.github.io
-          </div>
-          <div class="text-[11px] mt-2" style="color: var(--color-text-tertiary); line-height: 1.6;">
-            Java 백엔드 딥다이브 전체 지도를 시각적으로 탐색.
-          </div>
-        </a>
-
-        <!-- IQ AI Lab site -->
-        <a
-          href={SOCIAL.aiLabSite}
-          target="_blank"
-          rel="noopener"
-          class="eco-card p-4 rounded-md"
-          style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
-        >
-          <div class="flex items-center justify-between mb-1">
-            <span class="font-mono text-[11px]" style="color: var(--color-accent-violet);">
-              iq-ai-lab
-            </span>
-            <span class="font-mono text-[11px] eco-arrow" style="color: var(--color-text-tertiary);">
-              ↗
-            </span>
-          </div>
-          <div class="text-sm font-medium mb-1" style="color: var(--color-text-primary);">
-            AI/ML Knowledge Map
-          </div>
-          <div class="font-mono text-[11px]" style="color: var(--color-accent-violet);">
-            iq-ai-lab.github.io
-          </div>
-          <div class="text-[11px] mt-2" style="color: var(--color-text-tertiary); line-height: 1.6;">
-            Layer 0~6, AI의 수학적 기반 탐구 지도.
-          </div>
-        </a>
-      </div>
     </div>
-  </section>
+  </div>
 </BaseLayout>
 
 <style>
-  /* Hide default <details> marker across browsers */
-  details.group-card > summary::-webkit-details-marker {
-    display: none;
+  .category-block {
+    scroll-margin-top: 5rem;
   }
-  details.group-card > summary::marker {
+
+  .category-summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+    padding: 0.25rem 0;
+    border-radius: 6px;
+    transition: background 0.15s;
+  }
+
+  /* Remove native markers */
+  .category-summary::-webkit-details-marker,
+  .category-summary::marker {
+    display: none;
     content: '';
   }
 
-  /* +/− toggle indicator */
-  details.group-card[open] .toggle-icon {
-    transform: rotate(45deg);
-  }
-  details.group-card .toggle-icon {
-    display: inline-block;
-    transition: transform 160ms ease;
+  /* Smooth expand animation via CSS grid trick would add complexity;
+     details tag snaps open/close which is fine for our minimal aesthetic. */
+
+  /* Open state — slight left border accent */
+  details[open] > .category-summary {
+    background: transparent;
   }
 
-  /* Subtle hover affordance on the whole card */
-  details.group-card > summary:hover h3 {
-    opacity: 0.9;
+  details[open] .repo-list {
+    animation: fadeIn 0.3s ease-out;
   }
 
-  /* Section-header site link — slightly more emphasis than github link */
-  .site-link {
-    font-weight: 500;
-  }
-  .site-link:hover {
-    opacity: 0.8;
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 
-  /* Ecosystem cards — subtle lift on hover */
-  .eco-card {
-    display: block;
-    text-decoration: none;
-    transition:
-      border-color 160ms ease,
-      transform 160ms ease;
-  }
-  .eco-card:hover {
-    border-color: var(--color-text-tertiary) !important;
-    transform: translateY(-1px);
-  }
-  .eco-card:hover .eco-arrow {
-    color: var(--color-text-primary) !important;
-  }
-  .eco-arrow {
-    transition: color 160ms ease;
+  /* Reduce motion */
+  @media (prefers-reduced-motion: reduce) {
+    details[open] .repo-list {
+      animation: none;
+    }
   }
 </style>

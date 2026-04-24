@@ -1,0 +1,107 @@
+---
+/**
+ * CategoryHeader.astro — header row for a category/layer section.
+ *
+ * When wrapped in <details><summary>, pass collapsible={true} to show a chevron
+ * indicator that rotates based on open state.
+ */
+
+import Icon from '@/components/Icon.astro';
+
+interface Props {
+  icon: string;
+  color: string;
+  title: string;
+  description: string;
+  count: number;
+  layer?: string;
+  collapsible?: boolean;
+}
+
+const {
+  icon,
+  color,
+  title,
+  description,
+  count,
+  layer,
+  collapsible = false,
+} = Astro.props;
+---
+
+<div
+  class="category-header flex items-center gap-3.5 py-2 px-2 -mx-2 rounded-md transition-colors"
+  style={`--cat-color: ${color};`}
+>
+  <!-- Icon badge -->
+  <div
+    class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg transition-all"
+    style={`background: ${color}18; border: 1px solid ${color}38; color: ${color};`}
+  >
+    <Icon name={icon} size={20} />
+  </div>
+
+  <!-- Title + description -->
+  <div class="flex-1 min-w-0">
+    <div class="flex items-center gap-2 mb-0.5 flex-wrap">
+      {layer && (
+        <span
+          class="font-mono text-[10px] px-1.5 py-0.5 rounded"
+          style={`color: ${color}; background: ${color}14; border: 1px solid ${color}30; letter-spacing: 0.5px;`}
+        >
+          L{layer}
+        </span>
+      )}
+      <h3
+        class="text-base font-medium tracking-tight"
+        style="color: var(--color-text-primary);"
+      >
+        {title}
+      </h3>
+    </div>
+    <p
+      class="text-[12.5px] leading-relaxed"
+      style="color: var(--color-text-tertiary);"
+    >
+      {description}
+    </p>
+  </div>
+
+  <!-- Count badge -->
+  <div
+    class="flex-shrink-0 font-mono text-[10px] px-2 py-1 rounded-full whitespace-nowrap"
+    style={`color: ${color}; background: ${color}10; border: 1px solid ${color}28;`}
+  >
+    {count} repos
+  </div>
+
+  <!-- Chevron (only when collapsible) -->
+  {collapsible && (
+    <svg
+      class="chevron-indicator flex-shrink-0 w-4 h-4 transition-transform"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      style="color: var(--color-text-tertiary);"
+      aria-hidden="true"
+    >
+      <path d="M9 18l6-6-6-6" />
+    </svg>
+  )}
+</div>
+
+<style>
+  /* Rotate chevron when <details> is open */
+  :global(details[open]) > :global(summary) .chevron-indicator {
+    transform: rotate(90deg);
+    color: var(--cat-color);
+  }
+
+  /* Subtle hover on summary */
+  :global(summary:hover) .category-header {
+    background: color-mix(in srgb, var(--cat-color) 5%, transparent);
+  }
+</style>
