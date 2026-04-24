@@ -1,72 +1,587 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { SITE, SOCIAL } from '@/consts';
+import { SITE } from '@/consts';
+
+const AUTHOR_EMAIL = 'lee038129@naver.com';
+const AUTHOR_LINKEDIN = 'https://www.linkedin.com/in/%EB%8F%99%ED%9D%AC-%ED%95%9C-984b78311/';
 ---
 
-<BaseLayout title="About" description={`About ${SITE.author.name} and IQ Lab.`}>
-  <section class="mx-auto px-6 pt-16 pb-16" style="max-width: var(--reading-max);">
-    <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
-      about
-    </div>
-    <h1 class="text-3xl font-medium mb-8" style="letter-spacing: -0.025em; color: var(--color-text-primary);">
-      About
-    </h1>
-
-    <div class="prose" style="max-width: none;">
-      <h2>{SITE.name}</h2>
-      <p>
-        <strong>{SITE.name}</strong>은 백엔드 시스템과 AI의 수학적 기반을 파고드는 딥다이브 기록입니다.
-        표면적인 사용법이 아닌, <em>왜 이 수식인가 — 가정부터 증명까지</em>를 집요하게 파고듭니다.
+<BaseLayout
+    title="About"
+    description="작성자 소개와 트랙 레코드."
+>
+  <article class="mx-auto px-6 pt-16 pb-24" style="max-width: var(--reading-max);">
+    <!-- Page header -->
+    <header class="mb-12">
+      <div
+          class="font-mono text-[11px] mb-3"
+          style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ ABOUT
+      </div>
+      <h1
+          class="text-3xl md:text-4xl font-medium mb-4"
+          style="letter-spacing: -0.025em; color: var(--color-text-primary);"
+      >
+        About
+      </h1>
+      <p
+          class="text-base"
+          style="color: var(--color-text-secondary); line-height: 1.75; max-width: 36rem;"
+      >
+        표면을 지나 내부로 — 원리와 증명을 추적하는 기록자의 공간.
       </p>
+    </header>
 
-      <h2>작성자</h2>
-      <p>
-        <strong>{SITE.author.name}</strong>. 중앙대학교 소프트웨어학부 졸업예정, 우아한테크코스 8기 백엔드 크루.
-      </p>
-      <p>
-        <em>"수식을 쓸 줄 아는 것과, 수식이 왜 그렇게 생겼는지 아는 것은 다르다."</em>
-      </p>
+    <!-- ═══════════════════ 작성자 ═══════════════════ -->
+    <section class="mb-14">
+      <div
+          class="font-mono text-[11px] mb-3"
+          style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ AUTHOR
+      </div>
+      <h2
+          class="text-xl font-medium"
+          style="letter-spacing: -0.015em; color: var(--color-text-primary); margin-bottom: 1.0rem;"
+      >
+        작성자
+      </h2>
 
-      <h2>방법론</h2>
-      <p>
-        모든 글은 다음 다섯 단계를 거칩니다.
-      </p>
-      <ol>
-        <li><strong>Explore</strong> — 논문·공식 레퍼런스에서 탐구할 개념 선정</li>
-        <li><strong>Formulate</strong> — 수학적 선행 조건 정리, 수식 구조 파악</li>
-        <li><strong>Prove</strong> — 가정 → 보조정리 → 정리, 한 줄씩 완전 유도</li>
-        <li><strong>Implement</strong> — 프레임워크 없이 직접 구현·검증</li>
-        <li><strong>Document</strong> — 증명·직관·한계를 나만의 언어로 정리</li>
-      </ol>
+      <div class="space-y-1.5 text-[14.5px]" style="color: var(--color-text-secondary); line-height: 1.8;">
+        <p style="color: var(--color-text-primary); font-weight: 500;">아이큐.</p>
+        <p>인하대학교 공간정보공학과(2019–2022)를 거쳐</p>
+        <p>중앙대학교 소프트웨어학부(2023–2025)에서 졸업을 앞두고 있으며,</p>
+        <p>2026년부터 우아한테크코스 8기 백엔드 크루로 참여 중입니다.</p>
+      </div>
+    </section>
 
-      <h2>연결된 프로젝트</h2>
-      <ul>
-        <li>
-          <a href={SOCIAL.devLab} target="_blank" rel="noopener">
-            <strong>iq-dev-lab</strong>
-          </a> — 백엔드 엔지니어링 딥다이브 (Java/Spring/DB/MSA/Infra)
-        </li>
-        <li>
-          <a href={SOCIAL.aiLab} target="_blank" rel="noopener">
-            <strong>iq-ai-lab</strong>
-          </a> — AI/ML 수학적 기반 연구 (Math/ML/NN/Arch/RL/LLM/CV/NLP)
-        </li>
-      </ul>
+    <!-- ═══════════════════ Track Record ═══════════════════ -->
+    <section class="pt-10" style="border-top: 1px solid var(--color-border-subtle);">
+      <div
+          class="font-mono text-[11px] mb-2"
+          style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ TRACK RECORD
+      </div>
+      <h2
+          class="text-xl font-medium mb-12"
+          style="letter-spacing: -0.015em; color: var(--color-text-primary);"
+      >
+        트랙 레코드
+      </h2>
 
-      <h2>Contact</h2>
-      <ul>
-        <li>
-          GitHub · <a href={SITE.author.github} target="_blank" rel="noopener">@{SITE.author.handle}</a>
-        </li>
-        <li>
-          RSS · <a href={SOCIAL.rss}>{SITE.url}/rss.xml</a>
-        </li>
-      </ul>
+      <!-- Education -->
+      <div class="mb-12">
+        <div
+            class="font-mono text-[10px] mb-5 mt-4"
+            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
+        >
+          EDUCATION
+        </div>
+        <div class="space-y-3">
+          <!-- 우테코 -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2026~
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  우아한테크코스 8기
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+                >
+                  Backend
+                </span>
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                우아한형제들 운영 백엔드 교육 과정 ·
+                <a
+                    href="https://github.com/Woowa-8th-BE-IQ"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="color: var(--color-accent-cyan);"
+                >
+                  IQ Archive ↗
+                </a>
+              </div>
+            </div>
+          </div>
 
-      <h2>라이선스</h2>
-      <p>
-        블로그 글은 <strong>CC BY-NC-SA 4.0</strong>, 블로그 코드는 <strong>MIT</strong>로 공개합니다.
-      </p>
-    </div>
-  </section>
+          <!-- 중앙대 -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2023–2025
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                중앙대학교 소프트웨어학부
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Chung-Ang University · School of Software
+              </div>
+            </div>
+          </div>
+
+          <!-- 인하대 -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2019–2022
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                인하대학교 공간정보공학과
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Inha University · Geoinformatic Engineering
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Programming Contest -->
+      <div class="mb-12">
+        <div
+            class="font-mono text-[10px] mb-5"
+            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
+        >
+          PROGRAMMING CONTEST
+        </div>
+        <div class="space-y-3">
+          <!-- SCPC -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2025
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  SCPC — Samsung Collegiate Programming Cup
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style="color: var(--color-accent-cyan); background: var(--color-accent-cyan-dim); border: 1px solid var(--color-accent-cyan-line);"
+                >
+                  Finalist
+                </span>
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Algorithm Track 본선 진출 ·
+                <a
+                    href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/SCPC_2025_Poster.jpg"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="color: var(--color-accent-cyan);"
+                >
+                  공식 포스터 ↗
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- ACPC -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2025
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  ACPC — AWS × Codetree Programming Contest
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style="color: var(--color-accent-cyan); background: var(--color-accent-cyan-dim); border: 1px solid var(--color-accent-cyan-line);"
+                >
+                  Finalist
+                </span>
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                본선 진출 ·
+                <a
+                    href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/ACPC_2025_Poster.png"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="color: var(--color-accent-cyan);"
+                >
+                  공식 포스터 ↗
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- YouTube -->
+      <div class="mb-12">
+        <div
+            class="font-mono text-[10px] mb-5"
+            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
+        >
+          YOUTUBE
+        </div>
+        <div class="flex items-start gap-4">
+          <div
+              class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+              style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+          >
+            2026~
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+              See Why
+            </div>
+            <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+              수학·AI·알고리즘의 핵심 직관을 manim으로 시각화 ·
+              <a
+                  href="https://www.youtube.com/@SeeWhy-l3n"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style="color: var(--color-accent-cyan);"
+              >
+                @SeeWhy-l3n ↗
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Certifications -->
+      <div>
+        <div
+            class="font-mono text-[10px] mb-5"
+            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
+        >
+          CERTIFICATIONS
+        </div>
+        <div class="space-y-3">
+          <!-- 정보처리기사 -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2024.09
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                정보처리기사
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Engineer Information Processing · 한국산업인력공단
+              </div>
+            </div>
+          </div>
+
+          <!-- 빅데이터분석기사 -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2025.07
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                빅데이터분석기사
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Engineer Big Data Analysis · 한국데이터산업진흥원
+              </div>
+            </div>
+          </div>
+
+          <!-- SQLD -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2024.09
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                SQLD
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                SQL Developer · 한국데이터산업진흥원
+              </div>
+            </div>
+          </div>
+
+          <!-- ADsP -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2024.11
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
+                ADsP
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Data Analytics Semi-Professional · 한국데이터산업진흥원
+              </div>
+            </div>
+          </div>
+
+          <!-- TOPCIT -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2025.05
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  TOPCIT
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+                >
+                  Lv.3
+                </span>
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Test of Practical Competency in IT · 정보통신기획평가원
+              </div>
+            </div>
+          </div>
+
+          <!-- PCCP -->
+          <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+            >
+              2025.02
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
+                  PCCP [C++]
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+                >
+                  Lv.2
+                </span>
+              </div>
+              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
+                Certified Coding Professional · 프로그래머스
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 연결된 연구소 ═══════════════════ -->
+    <section class="pt-10 mt-14" style="border-top: 1px solid var(--color-border-subtle);">
+      <div
+          class="font-mono text-[11px] mb-2"
+          style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ PROJECTS
+      </div>
+      <h2
+          class="text-xl font-medium"
+          style="letter-spacing: -0.015em; color: var(--color-text-primary); margin-bottom: 1.5rem;"
+      >
+        연결된 연구소
+      </h2>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <a
+            href="https://github.com/iq-dev-lab"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="block p-4 rounded-md transition-all hover:-translate-y-0.5"
+            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+        >
+          <div class="flex items-center gap-2 mb-1">
+            <span
+                class="w-1.5 h-1.5 rounded-full"
+                style="background: var(--color-accent-cyan);"
+            ></span>
+            <span
+                class="font-mono text-[11px]"
+                style="color: var(--color-accent-cyan); letter-spacing: 0.5px;"
+            >
+              iq-dev-lab
+            </span>
+          </div>
+          <div class="text-sm font-medium mb-0.5" style="color: var(--color-text-primary);">
+            Backend Deep Dive
+          </div>
+          <div class="text-[12.5px]" style="color: var(--color-text-tertiary);">
+            Java·Spring·DB·Infra 엔지니어링 딥다이브
+          </div>
+        </a>
+
+        <a
+            href="https://github.com/iq-ai-lab"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="block p-4 rounded-md transition-all hover:-translate-y-0.5"
+            style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
+        >
+          <div class="flex items-center gap-2 mb-1">
+            <span
+                class="w-1.5 h-1.5 rounded-full"
+                style="background: var(--color-accent-violet);"
+            ></span>
+            <span
+                class="font-mono text-[11px]"
+                style="color: var(--color-accent-violet); letter-spacing: 0.5px;"
+            >
+              iq-ai-lab
+            </span>
+          </div>
+          <div class="text-sm font-medium mb-0.5" style="color: var(--color-text-primary);">
+            AI Foundations
+          </div>
+          <div class="text-[12.5px]" style="color: var(--color-text-tertiary);">
+            수학·ML·LLM의 수학적 기반 연구
+          </div>
+        </a>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ Contact ═══════════════════ -->
+    <section class="pt-10 mt-14" style="border-top: 1px solid var(--color-border-subtle);">
+      <div
+          class="font-mono text-[11px] mb-2"
+          style="color: var(--color-text-tertiary); letter-spacing: 2px;"
+      >
+        ◈ CONTACT
+      </div>
+      <h2
+          class="text-xl font-medium"
+          style="letter-spacing: -0.015em; color: var(--color-text-primary); margin-bottom: 1.0rem;"
+      >
+        연락처
+      </h2>
+
+      <div class="space-y-3">
+        <!-- Email -->
+        <a
+            href={`mailto:${AUTHOR_EMAIL}`}
+            class="contact-row group flex items-center gap-4 py-3 px-4 -mx-4 rounded-md transition-colors"
+        >
+          <div
+              class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+              style="background: var(--color-accent-cyan-dim); border: 1px solid var(--color-accent-cyan-line); color: var(--color-accent-cyan);"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <path d="m3 7 9 6 9-6" />
+            </svg>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="font-mono text-[10px] mb-0.5" style="color: var(--color-text-tertiary); letter-spacing: 1px;">
+              EMAIL
+            </div>
+            <div class="font-mono text-[13px]" style="color: var(--color-text-primary);">
+              {AUTHOR_EMAIL}
+            </div>
+          </div>
+          <svg class="arrow w-3.5 h-3.5 transition-transform" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--color-text-tertiary);" aria-hidden="true">
+            <path d="M7 17L17 7M7 7h10v10" />
+          </svg>
+        </a>
+
+        <!-- GitHub -->
+        <a
+            href={SITE.author.github}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="contact-row group flex items-center gap-4 py-3 px-4 -mx-4 rounded-md transition-colors"
+        >
+          <div
+              class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+              style="background: var(--color-elevated); border: 1px solid var(--color-border-strong); color: var(--color-text-primary);"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55v-2.02c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.04-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.95.1-.74.4-1.25.73-1.54-2.55-.29-5.23-1.28-5.23-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.47.11-3.07 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.2-1.49 3.18-1.18 3.18-1.18.63 1.6.23 2.78.11 3.07.74.81 1.19 1.83 1.19 3.09 0 4.43-2.69 5.4-5.25 5.68.41.36.77 1.06.77 2.13v3.16c0 .31.21.66.79.55C20.22 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5Z" />
+            </svg>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="font-mono text-[10px] mb-0.5" style="color: var(--color-text-tertiary); letter-spacing: 1px;">
+              GITHUB
+            </div>
+            <div class="font-mono text-[13px]" style="color: var(--color-text-primary);">
+              @{SITE.author.handle}
+            </div>
+          </div>
+          <svg class="arrow w-3.5 h-3.5 transition-transform" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--color-text-tertiary);" aria-hidden="true">
+            <path d="M7 17L17 7M7 7h10v10" />
+          </svg>
+        </a>
+
+        <!-- LinkedIn -->
+        <a
+            href={AUTHOR_LINKEDIN}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="contact-row group flex items-center gap-4 py-3 px-4 -mx-4 rounded-md transition-colors"
+        >
+          <div
+              class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+              style="background: rgba(10, 102, 194, 0.12); border: 1px solid rgba(10, 102, 194, 0.3); color: #0a66c2;"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 0 1-2.063-2.065 2.063 2.063 0 1 1 2.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
+            </svg>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="font-mono text-[10px] mb-0.5" style="color: var(--color-text-tertiary); letter-spacing: 1px;">
+              LINKEDIN
+            </div>
+            <div class="font-mono text-[13px]" style="color: var(--color-text-primary);">
+              한동희
+            </div>
+          </div>
+          <svg class="arrow w-3.5 h-3.5 transition-transform" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--color-text-tertiary);" aria-hidden="true">
+            <path d="M7 17L17 7M7 7h10v10" />
+          </svg>
+        </a>
+      </div>
+    </section>
+  </article>
 </BaseLayout>
+
+<style>
+  .contact-row:hover {
+    background: var(--color-surface);
+  }
+  .contact-row:hover .arrow {
+    transform: translate(2px, -2px);
+    color: var(--color-text-primary) !important;
+  }
+</style>
