@@ -7,9 +7,11 @@ import { getPostsByCategory } from '@/utils/posts';
 
 const devPosts = (await getPostsByCategory('dev')).slice(0, 5);
 const aiPosts = (await getPostsByCategory('ai')).slice(0, 5);
+const agentPosts = (await getPostsByCategory('agent')).slice(0, 5);
 
 const devCount = (await getPostsByCategory('dev')).length;
 const aiCount = (await getPostsByCategory('ai')).length;
+const agentCount = (await getPostsByCategory('agent')).length;
 ---
 
 <BaseLayout>
@@ -17,12 +19,12 @@ const aiCount = (await getPostsByCategory('ai')).length;
   <!-- Hero -->
   <section class="mx-auto px-6 pt-24 pb-16" style="max-width: var(--container-max);">
     <div class="mono-label mb-4" style="color: var(--color-accent-cyan);">
-          {SITE.tagline}
+      {SITE.tagline}
     </div>
 
     <h1
-      class="text-3xl md:text-4xl font-medium mb-5"
-      style="letter-spacing: -0.025em; line-height: 1.3; color: var(--color-text-primary); max-width: 42rem;"
+        class="text-3xl md:text-4xl font-medium mb-5"
+        style="letter-spacing: -0.025em; line-height: 1.3; color: var(--color-text-primary); max-width: 42rem;"
     >
       표면적인 사용법이 아닌,<br />
       <span style="color: var(--color-accent-cyan);">본질을 증명하는</span> 기록.
@@ -35,20 +37,27 @@ const aiCount = (await getPostsByCategory('ai')).length;
       시스템과 이론, 코드와 수식을 오가는 딥다이브 로그.
     </p>
 
-    <div class="flex gap-3">
+    <div class="flex gap-3 flex-wrap">
       <a
-        href="/categories/dev"
-        class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
-        style={`background: ${CATEGORIES.dev.accentDim}; color: ${CATEGORIES.dev.accent}; border-color: ${CATEGORIES.dev.accentLine};`}
+          href="/categories/dev"
+          class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
+          style={`background: ${CATEGORIES.dev.accentDim}; color: ${CATEGORIES.dev.accent}; border-color: ${CATEGORIES.dev.accentLine};`}
       >
         Dev · {devCount} posts
       </a>
       <a
-        href="/categories/ai"
-        class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
-        style={`background: ${CATEGORIES.ai.accentDim}; color: ${CATEGORIES.ai.accent}; border-color: ${CATEGORIES.ai.accentLine};`}
+          href="/categories/ai"
+          class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
+          style={`background: ${CATEGORIES.ai.accentDim}; color: ${CATEGORIES.ai.accent}; border-color: ${CATEGORIES.ai.accentLine};`}
       >
         AI · {aiCount} posts
+      </a>
+      <a
+          href="/categories/agent"
+          class="font-mono text-xs px-3 py-1.5 rounded-md border transition-colors"
+          style={`background: ${CATEGORIES.agent.accentDim}; color: ${CATEGORIES.agent.accent}; border-color: ${CATEGORIES.agent.accentLine};`}
+      >
+        Agent · {agentCount} posts
       </a>
     </div>
   </section>
@@ -65,9 +74,9 @@ const aiCount = (await getPostsByCategory('ai')).length;
         </h2>
       </div>
       <a
-        href="/categories/dev"
-        class="font-mono text-xs transition-colors"
-        style="color: var(--color-text-tertiary);"
+          href="/categories/dev"
+          class="font-mono text-xs transition-colors"
+          style="color: var(--color-text-tertiary);"
       >
         view all →
       </a>
@@ -75,18 +84,18 @@ const aiCount = (await getPostsByCategory('ai')).length;
 
     {
       devPosts.length === 0 ? (
-        <div
-          class="font-mono text-xs py-8 text-center rounded-md"
-          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
-        >
-          no posts yet — coming soon
-        </div>
+          <div
+              class="font-mono text-xs py-8 text-center rounded-md"
+              style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+          >
+            no posts yet — coming soon
+          </div>
       ) : (
-        <div>
-          {devPosts.map((post) => (
-            <PostCard post={post} />
-          ))}
-        </div>
+          <div>
+            {devPosts.map((post) => (
+                <PostCard post={post} />
+            ))}
+          </div>
       )
     }
   </section>
@@ -103,9 +112,9 @@ const aiCount = (await getPostsByCategory('ai')).length;
         </h2>
       </div>
       <a
-        href="/categories/ai"
-        class="font-mono text-xs transition-colors"
-        style="color: var(--color-text-tertiary);"
+          href="/categories/ai"
+          class="font-mono text-xs transition-colors"
+          style="color: var(--color-text-tertiary);"
       >
         view all →
       </a>
@@ -113,18 +122,56 @@ const aiCount = (await getPostsByCategory('ai')).length;
 
     {
       aiPosts.length === 0 ? (
-        <div
-          class="font-mono text-xs py-8 text-center rounded-md"
-          style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
-        >
-          no posts yet — coming soon
-        </div>
+          <div
+              class="font-mono text-xs py-8 text-center rounded-md"
+              style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+          >
+            no posts yet — coming soon
+          </div>
       ) : (
-        <div>
-          {aiPosts.map((post) => (
-            <PostCard post={post} />
-          ))}
+          <div>
+            {aiPosts.map((post) => (
+                <PostCard post={post} />
+            ))}
+          </div>
+      )
+    }
+  </section>
+
+  <!-- Agent section -->
+  <section class="mx-auto px-6 py-8" style="max-width: var(--container-max);">
+    <div class="flex items-end justify-between mb-4">
+      <div>
+        <div class="mono-label mb-1" style={`color: ${CATEGORIES.agent.accent};`}>
+          {CATEGORIES.agent.description.toLowerCase()}
         </div>
+        <h2 class="text-xl font-medium" style="letter-spacing: -0.015em; color: var(--color-text-primary);">
+          Agent
+        </h2>
+      </div>
+      <a
+          href="/categories/agent"
+          class="font-mono text-xs transition-colors"
+          style="color: var(--color-text-tertiary);"
+      >
+        view all →
+      </a>
+    </div>
+
+    {
+      agentPosts.length === 0 ? (
+          <div
+              class="font-mono text-xs py-8 text-center rounded-md"
+              style="background: var(--color-surface); color: var(--color-text-tertiary); border: 1px dashed var(--color-border-subtle);"
+          >
+            no posts yet — coming soon
+          </div>
+      ) : (
+          <div>
+            {agentPosts.map((post) => (
+                <PostCard post={post} />
+            ))}
+          </div>
       )
     }
   </section>
