@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import PostCard from '@/components/PostCard.astro';
 import { getAllTags, getPostsByTag } from '@/utils/posts';
 
@@ -20,6 +21,7 @@ const posts = await getPostsByTag(tag);
 ---
 
 <BaseLayout title={`#${tag}`} description={`Posts tagged with ${tag}.`}>
+  <CursorLight mode="blend" />
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
       tag

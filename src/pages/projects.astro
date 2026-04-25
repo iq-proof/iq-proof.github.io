@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import CategoryHeader from '@/components/CategoryHeader.astro';
 import RepoRow from '@/components/RepoRow.astro';
 import { DEV_LAB_GROUPS, AI_LAB_LAYERS, SOCIAL } from '@/consts';
@@ -12,9 +13,10 @@ const aiRepoCount = AI_LAB_LAYERS.reduce((sum, l) => sum + l.repos.length, 0);
 ---
 
 <BaseLayout
-  title="Projects"
-  description="iq-dev-lab과 iq-ai-lab — 86개 딥다이브 레포지토리로 구축한 백엔드와 AI의 지식 지도"
+    title="Projects"
+    description="iq-dev-lab과 iq-ai-lab — 86개 딥다이브 레포지토리로 구축한 백엔드와 AI의 지식 지도"
 >
+  <CursorLight mode="blend" />
   <div class="mx-auto px-6 pt-16 pb-24" style="max-width: var(--container-max);">
     <!-- Page header -->
     <header class="mb-16 text-center">

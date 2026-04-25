@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import TagPill from '@/components/TagPill.astro';
 import { getAllTags } from '@/utils/posts';
 
@@ -7,6 +8,7 @@ const tags = await getAllTags();
 ---
 
 <BaseLayout title="Tags" description="All tags on IQ Lab.">
+  <CursorLight mode="blend" />
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <div class="mono-label mb-2" style="color: var(--color-accent-cyan);">
       all tags

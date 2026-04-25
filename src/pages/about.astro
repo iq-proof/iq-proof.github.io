@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import { SITE, SOCIAL } from '@/consts';
 
 const AUTHOR_EMAIL = 'lee038129@naver.com';
@@ -16,8 +17,7 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
     title="About"
     description="작성자 소개와 트랙 레코드."
 >
-  <!-- ════ Cursor light follower (A4) ════ -->
-  <div id="cursor-light" aria-hidden="true"></div>
+  <CursorLight mode="adaptive" />
 
   <article class="mx-auto px-6 pt-16 pb-24" style="max-width: var(--reading-max);">
     <!-- Page header -->
@@ -735,38 +735,6 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
 </BaseLayout>
 
 <style>
-  /* ═══════════════════ Cursor light follower (B4) ═══════════════════ */
-  #cursor-light {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 480px;
-    height: 480px;
-    border-radius: 50%;
-    pointer-events: none;
-    z-index: 1;
-    transform: translate(-50%, -50%);
-    background: radial-gradient(
-        circle at center,
-        var(--cursor-color, rgba(0, 217, 255, 0.08)) 0%,
-        transparent 70%
-    );
-    opacity: 0;
-    transition: opacity 0.4s ease, background 0.6s ease;
-    will-change: transform, background;
-    filter: blur(20px);
-  }
-  #cursor-light.active {
-    opacity: 1;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    #cursor-light { display: none; }
-  }
-  @media (max-width: 768px) {
-    #cursor-light { display: none; }
-  }
-
   /* ═══════════════════ Terminal typing (A1) ═══════════════════ */
   .terminal-container {
     min-height: 132px;  /* prevents layout shift */
@@ -987,73 +955,6 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
   }
 
   // ════════════════════════════════════════════════════════
-  // B4 — Cursor light follower
-  // ════════════════════════════════════════════════════════
-  function initCursorLight() {
-    const light = document.getElementById('cursor-light');
-    if (!light) return;
-
-    // Skip on mobile / reduced motion (CSS handles hiding too)
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-    if (window.matchMedia('(max-width: 768px)').matches) return;
-
-    let targetX = 0;
-    let targetY = 0;
-    let currentX = 0;
-    let currentY = 0;
-    let raf: number | null = null;
-
-    // Smooth interpolation
-    function animate() {
-      currentX += (targetX - currentX) * 0.12;
-      currentY += (targetY - currentY) * 0.12;
-      light.style.transform = `translate(${currentX}px, ${currentY}px) translate(-50%, -50%)`;
-      raf = requestAnimationFrame(animate);
-    }
-
-    document.addEventListener('mousemove', (e) => {
-      targetX = e.clientX;
-      targetY = e.clientY;
-      if (!light.classList.contains('active')) {
-        light.classList.add('active');
-      }
-
-      // Detect hovered element and adjust color
-      const target = e.target as HTMLElement;
-      const card = target.closest<HTMLElement>('.card-row, .cert-card, .contact-row');
-      if (card) {
-        const accent = getComputedStyle(card).getPropertyValue('--accent').trim();
-        if (accent) {
-          light.style.setProperty('--cursor-color', hexToRgba(accent, 0.12));
-        }
-      } else {
-        // Default cyan when not over a card
-        light.style.setProperty('--cursor-color', 'rgba(0, 217, 255, 0.08)');
-      }
-    });
-
-    document.addEventListener('mouseleave', () => {
-      light.classList.remove('active');
-    });
-
-    function hexToRgba(hex: string, alpha: number): string {
-      // Handle CSS variables that resolve to hex/rgb already
-      hex = hex.trim();
-      if (hex.startsWith('rgb')) return hex;
-      if (hex.startsWith('var') || hex.startsWith('#') === false) {
-        return `rgba(0, 217, 255, ${alpha})`;
-      }
-      const h = hex.replace('#', '');
-      const r = parseInt(h.substring(0, 2), 16);
-      const g = parseInt(h.substring(2, 4), 16);
-      const b = parseInt(h.substring(4, 6), 16);
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
-
-    animate();
-  }
-
-  // ════════════════════════════════════════════════════════
   // D10 — Closing quote fade-in on scroll
   // ════════════════════════════════════════════════════════
   function initClosingQuote() {
@@ -1084,7 +985,6 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
   // ════════════════════════════════════════════════════════
   function init() {
     runTypingAnimation();
-    initCursorLight();
     initClosingQuote();
   }
 

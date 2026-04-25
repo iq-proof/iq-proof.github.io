@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import PostCard from '@/components/PostCard.astro';
 import { CATEGORIES, type CategorySlug } from '@/consts';
 import { getPostsByCategory } from '@/utils/posts';
@@ -18,9 +19,13 @@ interface Props {
 const { categorySlug } = Astro.props;
 const meta = CATEGORIES[categorySlug];
 const posts = await getPostsByCategory(categorySlug);
+
+// 카테고리에 따라 빛 색깔 결정
+const cursorMode = categorySlug === 'dev' ? 'cyan' : 'violet';
 ---
 
 <BaseLayout title={meta.label} description={meta.description}>
+  <CursorLight mode={cursorMode} />
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <div class="mono-label mb-2" style={`color: ${meta.accent};`}>
       category · {meta.slug}

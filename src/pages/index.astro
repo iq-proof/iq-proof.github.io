@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import PostCard from '@/components/PostCard.astro';
 import { SITE, CATEGORIES } from '@/consts';
 import { getPostsByCategory } from '@/utils/posts';
@@ -12,6 +13,7 @@ const aiCount = (await getPostsByCategory('ai')).length;
 ---
 
 <BaseLayout>
+  <CursorLight mode="blend" />
   <!-- Hero -->
   <section class="mx-auto px-6 pt-24 pb-16" style="max-width: var(--container-max);">
     <div class="mono-label mb-4" style="color: var(--color-accent-cyan);">

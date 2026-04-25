@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import CursorLight from '@/components/CursorLight.astro';
 import PostCard from '@/components/PostCard.astro';
 import { getAllSeries, getPostsBySeries } from '@/utils/posts';
 
@@ -22,6 +23,7 @@ const posts = await getPostsBySeries(slug);
 ---
 
 <BaseLayout title={title} description={`${count}편으로 구성된 시리즈: ${title}`}>
+  <CursorLight mode="blend" />
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <a
       href="/series"
