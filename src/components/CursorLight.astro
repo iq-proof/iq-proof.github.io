@@ -1,18 +1,18 @@
 ---
 /**
- * CursorLight.astro — Mouse-following light effect.
- *
- * Modes:
- *   - "cyan"     : Single cyan light (Dev pages)
- *   - "violet"   : Single violet light (AI pages)
- *   - "blend"    : Cyan + violet gradient (Home/Posts/Projects — site default)
- *   - "adaptive" : Blend mode + per-card color override on hover (About)
- *
- * Disabled on mobile and when prefers-reduced-motion is set.
- */
+    * CursorLight.astro — Mouse-following light effect.
+    *
+    * Modes:
+    *   - "cyan"     : Single cyan light (Dev pages)
+    *   - "violet"   : Single violet light (AI pages)
+    *   - "blend"    : Cyan + violet gradient (Home/Posts/Projects — site default)
+    *   - "adaptive" : Blend mode + per-card color override on hover (About)
+    *
+    * Disabled on mobile and when prefers-reduced-motion is set.
+    */
 
 interface Props {
-    mode?: 'cyan' | 'violet' | 'blend' | 'adaptive';
+  mode?: 'cyan' | 'violet' | 'blend' | 'adaptive';
 }
 
 const { mode = 'blend' } = Astro.props;
@@ -26,165 +26,165 @@ const { mode = 'blend' } = Astro.props;
 ></div>
 
 <style>
-    .cursor-light {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 520px;
-        height: 520px;
-        border-radius: 50%;
-        pointer-events: none;
-        z-index: 1;
-        transform: translate(-50%, -50%);
-        opacity: 0;
-        transition: opacity 0.4s ease;
-        will-change: transform;
-        filter: blur(24px);
-    }
+  .cursor-light {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 340px;
+    height: 340px;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 1;
+    transform: translate(-50%, -50%);
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    will-change: transform;
+    filter: blur(14px);
+  }
 
-    .cursor-light.active {
-        opacity: 1;
-    }
+  .cursor-light.active {
+    opacity: 1;
+  }
 
-    /* ───────────────────── Mode: cyan only (Dev) ──────────────── */
-    .cursor-light--cyan {
-        background: radial-gradient(
-                circle at center,
-                rgba(0, 217, 255, 0.09) 0%,
-                rgba(0, 217, 255, 0.04) 35%,
-                transparent 70%
+  /* ───────────────────── Mode: cyan only (Dev) ──────────────── */
+  .cursor-light--cyan {
+    background: radial-gradient(
+        circle at center,
+        rgba(0, 217, 255, 0.18) 0%,
+        rgba(0, 217, 255, 0.07) 40%,
+        transparent 75%
+    );
+  }
+
+  /* ───────────────────── Mode: violet only (AI) ──────────────── */
+  .cursor-light--violet {
+    background: radial-gradient(
+        circle at center,
+        rgba(167, 139, 250, 0.18) 0%,
+        rgba(167, 139, 250, 0.07) 40%,
+        transparent 75%
+    );
+  }
+
+  /* ───────────────────── Mode: blend (cyan + violet) ──────────────── */
+  /* Two offset gradients overlap to create a flowing blend effect.
+     Cyan on the left, violet on the right, mixing in the center. */
+  .cursor-light--blend {
+    background:
+        radial-gradient(
+            circle at 38% 50%,
+            rgba(0, 217, 255, 0.13) 0%,
+            rgba(0, 217, 255, 0.04) 35%,
+            transparent 70%
+        ),
+        radial-gradient(
+            circle at 62% 50%,
+            rgba(167, 139, 250, 0.13) 0%,
+            rgba(167, 139, 250, 0.04) 35%,
+            transparent 70%
         );
-    }
+  }
 
-    /* ───────────────────── Mode: violet only (AI) ──────────────── */
-    .cursor-light--violet {
-        background: radial-gradient(
-                circle at center,
-                rgba(167, 139, 250, 0.09) 0%,
-                rgba(167, 139, 250, 0.04) 35%,
-                transparent 70%
+  /* ───────────────────── Mode: adaptive (About) ──────────────── */
+  /* Same as blend by default, but JS overrides background on card hover */
+  .cursor-light--adaptive {
+    background:
+        radial-gradient(
+            circle at 38% 50%,
+            rgba(0, 217, 255, 0.13) 0%,
+            rgba(0, 217, 255, 0.04) 35%,
+            transparent 70%
+        ),
+        radial-gradient(
+            circle at 62% 50%,
+            rgba(167, 139, 250, 0.13) 0%,
+            rgba(167, 139, 250, 0.04) 35%,
+            transparent 70%
         );
-    }
+    transition: opacity 0.4s ease, background 0.6s ease;
+  }
 
-    /* ───────────────────── Mode: blend (cyan + violet) ──────────────── */
-    /* Two offset gradients overlap to create a flowing blend effect.
-       Cyan on the left, violet on the right, mixing in the center. */
-    .cursor-light--blend {
-        background:
-                radial-gradient(
-                        circle at 38% 50%,
-                        rgba(0, 217, 255, 0.08) 0%,
-                        rgba(0, 217, 255, 0.02) 30%,
-                        transparent 55%
-                ),
-                radial-gradient(
-                        circle at 62% 50%,
-                        rgba(167, 139, 250, 0.08) 0%,
-                        rgba(167, 139, 250, 0.02) 30%,
-                        transparent 55%
-                );
-    }
-
-    /* ───────────────────── Mode: adaptive (About) ──────────────── */
-    /* Same as blend by default, but JS overrides background on card hover */
-    .cursor-light--adaptive {
-        background:
-                radial-gradient(
-                        circle at 38% 50%,
-                        rgba(0, 217, 255, 0.08) 0%,
-                        rgba(0, 217, 255, 0.02) 30%,
-                        transparent 55%
-                ),
-                radial-gradient(
-                        circle at 62% 50%,
-                        rgba(167, 139, 250, 0.08) 0%,
-                        rgba(167, 139, 250, 0.02) 30%,
-                        transparent 55%
-                );
-        transition: opacity 0.4s ease, background 0.6s ease;
-    }
-
-    /* Disabled on mobile / reduced motion */
-    @media (prefers-reduced-motion: reduce) {
-        .cursor-light { display: none; }
-    }
-    @media (max-width: 768px) {
-        .cursor-light { display: none; }
-    }
+  /* Disabled on mobile / reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    .cursor-light { display: none; }
+  }
+  @media (max-width: 768px) {
+    .cursor-light { display: none; }
+  }
 </style>
 
 <script>
-    /**
-     * Cursor light interpolation + adaptive color logic.
-     * Runs on every page load (Astro view transitions safe).
-     */
-    function initCursorLight() {
-        const light = document.getElementById('cursor-light');
-        if (!light) return;
+  /**
+   * Cursor light interpolation + adaptive color logic.
+   * Runs on every page load (Astro view transitions safe).
+   */
+  function initCursorLight() {
+    const light = document.getElementById('cursor-light');
+    if (!light) return;
 
-        // Skip on mobile / reduced motion (CSS handles hiding too)
-        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-        if (window.matchMedia('(max-width: 768px)').matches) return;
+    // Skip on mobile / reduced motion (CSS handles hiding too)
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (window.matchMedia('(max-width: 768px)').matches) return;
 
-        const mode = (light as HTMLElement).dataset.mode;
-        const isAdaptive = mode === 'adaptive';
+    const mode = (light as HTMLElement).dataset.mode;
+    const isAdaptive = mode === 'adaptive';
 
-        let targetX = 0;
-        let targetY = 0;
-        let currentX = window.innerWidth / 2;
-        let currentY = window.innerHeight / 2;
-        let raf: number | null = null;
+    let targetX = 0;
+    let targetY = 0;
+    let currentX = window.innerWidth / 2;
+    let currentY = window.innerHeight / 2;
+    let raf: number | null = null;
 
-        // Smooth interpolation (lerp)
-        function animate() {
-            currentX += (targetX - currentX) * 0.12;
-            currentY += (targetY - currentY) * 0.12;
-            light!.style.transform = `translate(${currentX}px, ${currentY}px) translate(-50%, -50%)`;
-            raf = requestAnimationFrame(animate);
-        }
-
-        document.addEventListener('mousemove', (e) => {
-            targetX = e.clientX;
-            targetY = e.clientY;
-            if (!light.classList.contains('active')) {
-                light.classList.add('active');
-            }
-
-            // Adaptive mode: detect hovered card and switch color
-            if (isAdaptive) {
-                const target = e.target as HTMLElement;
-                const card = target.closest<HTMLElement>('.card-row, .cert-card, .contact-row');
-                if (card) {
-                    const accent = getComputedStyle(card).getPropertyValue('--accent').trim();
-                    if (accent && accent.startsWith('#')) {
-                        const rgba = hexToRgba(accent, 0.1);
-                        light.style.background = `radial-gradient(circle at center, ${rgba} 0%, transparent 65%)`;
-                        return;
-                    }
-                }
-                // Reset to blend gradient when not over a card
-                light.style.background = '';
-            }
-        });
-
-        document.addEventListener('mouseleave', () => {
-            light.classList.remove('active');
-        });
-
-        function hexToRgba(hex: string, alpha: number): string {
-            const h = hex.replace('#', '');
-            const r = parseInt(h.substring(0, 2), 16);
-            const g = parseInt(h.substring(2, 4), 16);
-            const b = parseInt(h.substring(4, 6), 16);
-            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-        }
-
-        animate();
+    // Smooth interpolation (lerp)
+    function animate() {
+      currentX += (targetX - currentX) * 0.12;
+      currentY += (targetY - currentY) * 0.12;
+      light!.style.transform = `translate(${currentX}px, ${currentY}px) translate(-50%, -50%)`;
+      raf = requestAnimationFrame(animate);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initCursorLight);
-    } else {
-        initCursorLight();
+    document.addEventListener('mousemove', (e) => {
+      targetX = e.clientX;
+      targetY = e.clientY;
+      if (!light.classList.contains('active')) {
+        light.classList.add('active');
+      }
+
+      // Adaptive mode: detect hovered card and switch color
+      if (isAdaptive) {
+        const target = e.target as HTMLElement;
+        const card = target.closest<HTMLElement>('.card-row, .cert-card, .contact-row');
+        if (card) {
+          const accent = getComputedStyle(card).getPropertyValue('--accent').trim();
+          if (accent && accent.startsWith('#')) {
+            const rgba = hexToRgba(accent, 0.17);
+            light.style.background = `radial-gradient(circle at center, ${rgba} 0%, transparent 70%)`;
+            return;
+          }
+        }
+        // Reset to blend gradient when not over a card
+        light.style.background = '';
+      }
+    });
+
+    document.addEventListener('mouseleave', () => {
+      light.classList.remove('active');
+    });
+
+    function hexToRgba(hex: string, alpha: number): string {
+      const h = hex.replace('#', '');
+      const r = parseInt(h.substring(0, 2), 16);
+      const g = parseInt(h.substring(2, 4), 16);
+      const b = parseInt(h.substring(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     }
+
+    animate();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initCursorLight);
+  } else {
+    initCursorLight();
+  }
 </script>
