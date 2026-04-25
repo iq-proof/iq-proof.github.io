@@ -20,7 +20,7 @@ export const SITE = {
   locale: 'ko-KR',
   timezone: 'Asia/Seoul',
   author: {
-    name: '마스터',
+    name: '아이큐',
     handle: 'e9ua1',
     github: 'https://github.com/e9ua1',
   },
