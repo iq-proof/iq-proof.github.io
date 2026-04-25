@@ -16,6 +16,9 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
     title="About"
     description="작성자 소개와 트랙 레코드."
 >
+  <!-- ════ Cursor light follower (A4) ════ -->
+  <div id="cursor-light" aria-hidden="true"></div>
+
   <article class="mx-auto px-6 pt-16 pb-24" style="max-width: var(--reading-max);">
     <!-- Page header -->
     <header class="mb-12">
@@ -39,7 +42,7 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
       </p>
     </header>
 
-    <!-- ═══════════════════ 작성자 ═══════════════════ -->
+    <!-- ═══════════════════ 작성자 (with typing animation) ═══════════════════ -->
     <section class="mb-14">
       <div
           class="font-mono text-[11px] mb-3"
@@ -54,11 +57,15 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
         작성자
       </h2>
 
-      <div class="space-y-1.5 text-[14.5px]" style="color: var(--color-text-secondary); line-height: 1.8;">
-        <p style="color: var(--color-text-primary); font-weight: 500;">아이큐.</p>
-        <p>AI와 백엔드, 본질부터 파고드는 엔지니어.</p>
-        <p>지금은 두 영역이 만나는 에이전트 시스템에 깊은 관심이 있으며,</p>
-        <p>이를 기반으로 한 창업을 준비 중입니다.</p>
+      <div
+          id="terminal"
+          class="terminal-container space-y-1.5 text-[14.5px]"
+          style="color: var(--color-text-secondary); line-height: 1.8;"
+      >
+        <p class="terminal-line" data-line="0" data-text="아이큐." data-strong="true"></p>
+        <p class="terminal-line" data-line="1" data-text="AI와 백엔드, 본질부터 파고드는 엔지니어."></p>
+        <p class="terminal-line" data-line="2" data-text="지금은 두 영역이 만나는 에이전트 시스템에 깊은 관심이 있으며,"></p>
+        <p class="terminal-line" data-line="3" data-text="이를 기반으로 한 창업을 준비 중입니다."></p>
       </div>
     </section>
 
@@ -715,15 +722,100 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
         </a>
       </div>
     </section>
+
+    <!-- ═══════════════════ Closing Quote (D10) ═══════════════════ -->
+    <section class="closing-quote pt-20 mt-20">
+      <blockquote>
+        <p class="quote-mark" aria-hidden="true">"</p>
+        <p class="quote-line">I Question,</p>
+        <p class="quote-line emphasis">therefore I am.</p>
+      </blockquote>
+    </section>
   </article>
 </BaseLayout>
 
 <style>
-  /* Track Record cards (Education / Contest / YouTube) */
+  /* ═══════════════════ Cursor light follower (B4) ═══════════════════ */
+  #cursor-light {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 480px;
+    height: 480px;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 1;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(
+        circle at center,
+        var(--cursor-color, rgba(0, 217, 255, 0.08)) 0%,
+        transparent 70%
+    );
+    opacity: 0;
+    transition: opacity 0.4s ease, background 0.6s ease;
+    will-change: transform, background;
+    filter: blur(20px);
+  }
+  #cursor-light.active {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #cursor-light { display: none; }
+  }
+  @media (max-width: 768px) {
+    #cursor-light { display: none; }
+  }
+
+  /* ═══════════════════ Terminal typing (A1) ═══════════════════ */
+  .terminal-container {
+    min-height: 132px;  /* prevents layout shift */
+  }
+
+  .terminal-line {
+    position: relative;
+    display: block;
+    visibility: hidden;
+  }
+
+  .terminal-line.typing {
+    visibility: visible;
+  }
+
+  .terminal-line.typing::before {
+    content: '> ';
+    color: var(--color-accent-cyan);
+    font-family: var(--font-mono);
+    opacity: 0.6;
+    margin-right: 0.25rem;
+  }
+
+  .terminal-line[data-strong="true"].typing {
+    color: var(--color-text-primary);
+    font-weight: 500;
+  }
+
+  .terminal-cursor {
+    display: inline-block;
+    width: 0.5em;
+    height: 1em;
+    background: var(--color-accent-cyan);
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    animation: blink 1s steps(1) infinite;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  /* ═══════════════════ Track Record cards ═══════════════════ */
   .card-row {
     background: var(--color-surface);
     border: 1px solid var(--color-border-subtle);
     transition: all 0.2s ease;
+    position: relative;
+    z-index: 2;
   }
   .card-row:hover {
     border-color: color-mix(in srgb, var(--accent) 35%, transparent);
@@ -740,6 +832,8 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
     background: var(--color-surface);
     border: 1px solid var(--color-border-subtle);
     transition: all 0.2s ease;
+    position: relative;
+    z-index: 2;
   }
   .cert-card:hover {
     border-color: color-mix(in srgb, var(--accent) 35%, transparent);
@@ -748,6 +842,10 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
   }
 
   /* Contact rows */
+  .contact-row {
+    position: relative;
+    z-index: 2;
+  }
   .contact-row:hover {
     background: var(--color-surface);
   }
@@ -755,4 +853,244 @@ const COLOR_CERT = '#10b981';    // emerald — Certifications
     transform: translate(2px, -2px);
     color: var(--color-text-primary) !important;
   }
+
+  /* ═══════════════════ Closing quote (D10) ═══════════════════ */
+  .closing-quote {
+    text-align: center;
+    opacity: 0;
+    transition: opacity 1.2s ease, transform 1.2s ease;
+    transform: translateY(12px);
+    position: relative;
+    z-index: 2;
+  }
+  .closing-quote.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .closing-quote blockquote {
+    margin: 0 auto;
+    max-width: 28rem;
+    position: relative;
+  }
+
+  .quote-mark {
+    font-family: 'Times New Roman', serif;
+    font-size: 4rem;
+    line-height: 1;
+    color: var(--color-accent-cyan);
+    opacity: 0.25;
+    margin-bottom: -0.75rem;
+    user-select: none;
+  }
+
+  .quote-line {
+    font-size: 1rem;
+    color: var(--color-text-secondary);
+    line-height: 1.85;
+    letter-spacing: 0.02em;
+    font-style: italic;
+  }
+
+  .quote-line.emphasis {
+    color: var(--color-text-primary);
+    font-weight: 500;
+    font-size: 1.15rem;
+    margin-top: 0.25rem;
+    letter-spacing: 0.01em;
+  }
+
+  .quote-attr {
+    margin-top: 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--color-text-tertiary);
+    letter-spacing: 1.5px;
+  }
+
+  .quote-dash {
+    margin-right: 0.5rem;
+    color: var(--color-accent-cyan);
+    opacity: 0.6;
+  }
+
+  .quote-name {
+    text-transform: uppercase;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .closing-quote {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+  }
 </style>
+
+<script>
+  // ════════════════════════════════════════════════════════
+  // A1 — Typing animation for author intro
+  // ════════════════════════════════════════════════════════
+  function runTypingAnimation() {
+    const lines = document.querySelectorAll<HTMLElement>('.terminal-line');
+    if (lines.length === 0) return;
+
+    // Respect reduced motion
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      lines.forEach(line => {
+        const text = line.dataset.text || '';
+        line.classList.add('typing');
+        line.textContent = text;
+      });
+      return;
+    }
+
+    const TYPE_SPEED = 28;       // ms per character
+    const LINE_PAUSE = 280;      // pause between lines
+    const INITIAL_DELAY = 200;   // delay before starting
+
+    function typeLine(line: HTMLElement, onComplete: () => void) {
+      const text = line.dataset.text || '';
+      line.classList.add('typing');
+
+      // Add cursor span
+      const cursor = document.createElement('span');
+      cursor.className = 'terminal-cursor';
+      line.appendChild(cursor);
+
+      let i = 0;
+      function tick() {
+        if (i < text.length) {
+          // Insert character before cursor
+          const char = document.createTextNode(text[i]);
+          line.insertBefore(char, cursor);
+          i++;
+          setTimeout(tick, TYPE_SPEED);
+        } else {
+          // Remove cursor and proceed
+          cursor.remove();
+          onComplete();
+        }
+      }
+      tick();
+    }
+
+    function typeAll(index: number) {
+      if (index >= lines.length) return;
+      const currentLine = lines[index];
+      typeLine(currentLine, () => {
+        setTimeout(() => typeAll(index + 1), LINE_PAUSE);
+      });
+    }
+
+    setTimeout(() => typeAll(0), INITIAL_DELAY);
+  }
+
+  // ════════════════════════════════════════════════════════
+  // B4 — Cursor light follower
+  // ════════════════════════════════════════════════════════
+  function initCursorLight() {
+    const light = document.getElementById('cursor-light');
+    if (!light) return;
+
+    // Skip on mobile / reduced motion (CSS handles hiding too)
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (window.matchMedia('(max-width: 768px)').matches) return;
+
+    let targetX = 0;
+    let targetY = 0;
+    let currentX = 0;
+    let currentY = 0;
+    let raf: number | null = null;
+
+    // Smooth interpolation
+    function animate() {
+      currentX += (targetX - currentX) * 0.12;
+      currentY += (targetY - currentY) * 0.12;
+      light.style.transform = `translate(${currentX}px, ${currentY}px) translate(-50%, -50%)`;
+      raf = requestAnimationFrame(animate);
+    }
+
+    document.addEventListener('mousemove', (e) => {
+      targetX = e.clientX;
+      targetY = e.clientY;
+      if (!light.classList.contains('active')) {
+        light.classList.add('active');
+      }
+
+      // Detect hovered element and adjust color
+      const target = e.target as HTMLElement;
+      const card = target.closest<HTMLElement>('.card-row, .cert-card, .contact-row');
+      if (card) {
+        const accent = getComputedStyle(card).getPropertyValue('--accent').trim();
+        if (accent) {
+          light.style.setProperty('--cursor-color', hexToRgba(accent, 0.12));
+        }
+      } else {
+        // Default cyan when not over a card
+        light.style.setProperty('--cursor-color', 'rgba(0, 217, 255, 0.08)');
+      }
+    });
+
+    document.addEventListener('mouseleave', () => {
+      light.classList.remove('active');
+    });
+
+    function hexToRgba(hex: string, alpha: number): string {
+      // Handle CSS variables that resolve to hex/rgb already
+      hex = hex.trim();
+      if (hex.startsWith('rgb')) return hex;
+      if (hex.startsWith('var') || hex.startsWith('#') === false) {
+        return `rgba(0, 217, 255, ${alpha})`;
+      }
+      const h = hex.replace('#', '');
+      const r = parseInt(h.substring(0, 2), 16);
+      const g = parseInt(h.substring(2, 4), 16);
+      const b = parseInt(h.substring(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    animate();
+  }
+
+  // ════════════════════════════════════════════════════════
+  // D10 — Closing quote fade-in on scroll
+  // ════════════════════════════════════════════════════════
+  function initClosingQuote() {
+    const quote = document.querySelector<HTMLElement>('.closing-quote');
+    if (!quote) return;
+
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      quote.classList.add('visible');
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting) {
+              quote.classList.add('visible');
+              observer.unobserve(quote);
+            }
+          });
+        },
+        { threshold: 0.3 }
+    );
+    observer.observe(quote);
+  }
+
+  // ════════════════════════════════════════════════════════
+  // Initialize all
+  // ════════════════════════════════════════════════════════
+  function init() {
+    runTypingAnimation();
+    initCursorLight();
+    initClosingQuote();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+</script>
