@@ -4,6 +4,12 @@ import { SITE } from '@/consts';
 
 const AUTHOR_EMAIL = 'lee038129@naver.com';
 const AUTHOR_LINKEDIN = 'https://www.linkedin.com/in/%EB%8F%99%ED%9D%AC-%ED%95%9C-984b78311/';
+
+// Category accent colors
+const COLOR_EDU = '#00d9ff';     // cyan — Education
+const COLOR_CONTEST = '#fbbf24'; // amber — Programming Contest
+const COLOR_YOUTUBE = '#ef4444'; // red — YouTube
+const COLOR_CERT = '#10b981';    // emerald — Certifications
 ---
 
 <BaseLayout
@@ -71,330 +77,466 @@ const AUTHOR_LINKEDIN = 'https://www.linkedin.com/in/%EB%8F%99%ED%9D%AC-%ED%95%9
         트랙 레코드
       </h2>
 
-      <!-- Education -->
-      <div class="mb-12">
-        <div
-            class="font-mono text-[10px] mb-5 mt-4"
-            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
-        >
-          EDUCATION
+      <!-- ═════ Education ═════ -->
+      <div class="mb-14">
+        <div class="flex items-center gap-2 mb-5 mt-4">
+          <span
+              class="font-mono text-[10px]"
+              style={`color: ${COLOR_EDU}; letter-spacing: 1.5px;`}
+          >
+            EDUCATION
+          </span>
+          <span class="flex-1 h-px" style={`background: ${COLOR_EDU}24;`}></span>
         </div>
+
         <div class="space-y-3">
           <!-- 우테코 -->
+          <div class="card-row p-4 rounded-md" style={`--accent: ${COLOR_EDU};`}>
+            <div class="flex items-start gap-4">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                  style={`background: ${COLOR_EDU}18; border: 1px solid ${COLOR_EDU}38; color: ${COLOR_EDU};`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 10v6M2 10l10-5 10 5-10 5z" />
+                  <path d="M6 12v5c3 3 9 3 12 0v-5" />
+                </svg>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-baseline gap-2 flex-wrap mb-1">
+                  <span class="text-[15px] font-medium" style="color: var(--color-text-primary);">
+                    우아한테크코스 8기
+                  </span>
+                  <span
+                      class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                      style={`color: ${COLOR_EDU}; background: ${COLOR_EDU}14; border: 1px solid ${COLOR_EDU}30;`}
+                  >
+                    Backend
+                  </span>
+                </div>
+                <div class="text-[12.5px]" style="color: var(--color-text-tertiary); line-height: 1.6;">
+                  우아한형제들 운영 백엔드 교육 과정 ·
+                  <a
+                      href="https://github.com/Woowa-8th-BE-IQ"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={`color: ${COLOR_EDU};`}
+                  >
+                    IQ Archive ↗
+                  </a>
+                </div>
+              </div>
+              <div
+                  class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                  style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                2026~
+              </div>
+            </div>
+          </div>
+
+          <!-- 중앙대 -->
+          <div class="card-row p-4 rounded-md" style={`--accent: ${COLOR_EDU};`}>
+            <div class="flex items-start gap-4">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                  style={`background: ${COLOR_EDU}18; border: 1px solid ${COLOR_EDU}38; color: ${COLOR_EDU};`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 10v6M2 10l10-5 10 5-10 5z" />
+                  <path d="M6 12v5c3 3 9 3 12 0v-5" />
+                </svg>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-[15px] font-medium mb-1" style="color: var(--color-text-primary);">
+                  중앙대학교 소프트웨어학부
+                </div>
+                <div class="text-[12.5px]" style="color: var(--color-text-tertiary);">
+                  Chung-Ang University · School of Computer Science and Engineering
+                </div>
+              </div>
+              <div
+                  class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                  style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                2023–2025
+              </div>
+            </div>
+          </div>
+
+          <!-- 인하대 -->
+          <div class="card-row p-4 rounded-md" style={`--accent: ${COLOR_EDU};`}>
+            <div class="flex items-start gap-4">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                  style={`background: ${COLOR_EDU}18; border: 1px solid ${COLOR_EDU}38; color: ${COLOR_EDU};`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 10v6M2 10l10-5 10 5-10 5z" />
+                  <path d="M6 12v5c3 3 9 3 12 0v-5" />
+                </svg>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-[15px] font-medium mb-1" style="color: var(--color-text-primary);">
+                  인하대학교 공간정보공학과
+                </div>
+                <div class="text-[12.5px]" style="color: var(--color-text-tertiary);">
+                  Inha University · Geoinformatic Engineering
+                </div>
+              </div>
+              <div
+                  class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                  style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                2019–2022
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═════ Programming Contest ═════ -->
+      <div class="mb-14">
+        <div class="flex items-center gap-2 mb-5">
+          <span
+              class="font-mono text-[10px]"
+              style={`color: ${COLOR_CONTEST}; letter-spacing: 1.5px;`}
+          >
+            PROGRAMMING CONTEST
+          </span>
+          <span class="flex-1 h-px" style={`background: ${COLOR_CONTEST}24;`}></span>
+        </div>
+
+        <div class="space-y-3">
+          <!-- SCPC -->
+          <a
+              href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/SCPC_2025_Poster.jpg"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="card-row card-link block p-4 rounded-md"
+              style={`--accent: ${COLOR_CONTEST};`}
+          >
+            <div class="flex items-start gap-4">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                  style={`background: ${COLOR_CONTEST}18; border: 1px solid ${COLOR_CONTEST}38; color: ${COLOR_CONTEST};`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" />
+                  <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" />
+                  <path d="M4 22h16" />
+                  <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22" />
+                  <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22" />
+                  <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z" />
+                </svg>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-baseline gap-2 flex-wrap mb-1">
+                  <span class="text-[15px] font-medium" style="color: var(--color-text-primary);">
+                    SCPC — Samsung Collegiate Programming Cup
+                  </span>
+                  <span
+                      class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                      style={`color: ${COLOR_CONTEST}; background: ${COLOR_CONTEST}14; border: 1px solid ${COLOR_CONTEST}30;`}
+                  >
+                    Finalist
+                  </span>
+                </div>
+                <div class="text-[12.5px]" style="color: var(--color-text-tertiary); line-height: 1.6;">
+                  Algorithm Track 본선 진출 ·
+                  <span style={`color: ${COLOR_CONTEST};`}>공식 포스터 ↗</span>
+                </div>
+              </div>
+              <div
+                  class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                  style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                2025
+              </div>
+            </div>
+          </a>
+
+          <!-- ACPC -->
+          <a
+              href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/ACPC_2025_Poster.png"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="card-row card-link block p-4 rounded-md"
+              style={`--accent: ${COLOR_CONTEST};`}
+          >
+            <div class="flex items-start gap-4">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                  style={`background: ${COLOR_CONTEST}18; border: 1px solid ${COLOR_CONTEST}38; color: ${COLOR_CONTEST};`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" />
+                  <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" />
+                  <path d="M4 22h16" />
+                  <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22" />
+                  <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22" />
+                  <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z" />
+                </svg>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-baseline gap-2 flex-wrap mb-1">
+                  <span class="text-[15px] font-medium" style="color: var(--color-text-primary);">
+                    ACPC — AWS × Codetree Programming Contest
+                  </span>
+                  <span
+                      class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                      style={`color: ${COLOR_CONTEST}; background: ${COLOR_CONTEST}14; border: 1px solid ${COLOR_CONTEST}30;`}
+                  >
+                    Finalist
+                  </span>
+                </div>
+                <div class="text-[12.5px]" style="color: var(--color-text-tertiary); line-height: 1.6;">
+                  본선 진출 ·
+                  <span style={`color: ${COLOR_CONTEST};`}>공식 포스터 ↗</span>
+                </div>
+              </div>
+              <div
+                  class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
+                  style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                2025
+              </div>
+            </div>
+          </a>
+        </div>
+      </div>
+
+      <!-- ═════ YouTube ═════ -->
+      <div class="mb-14">
+        <div class="flex items-center gap-2 mb-5">
+          <span
+              class="font-mono text-[10px]"
+              style={`color: ${COLOR_YOUTUBE}; letter-spacing: 1.5px;`}
+          >
+            YOUTUBE
+          </span>
+          <span class="flex-1 h-px" style={`background: ${COLOR_YOUTUBE}24;`}></span>
+        </div>
+
+        <a
+            href="https://www.youtube.com/@SeeWhy-l3n"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="card-row card-link block p-4 rounded-md"
+            style={`--accent: ${COLOR_YOUTUBE};`}
+        >
           <div class="flex items-start gap-4">
+            <div
+                class="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-lg"
+                style={`background: ${COLOR_YOUTUBE}18; border: 1px solid ${COLOR_YOUTUBE}38; color: ${COLOR_YOUTUBE};`}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 17a24.12 24.12 0 0 1 0-10 2 2 0 0 1 1.4-1.4 49.56 49.56 0 0 1 16.2 0A2 2 0 0 1 21.5 7a24.12 24.12 0 0 1 0 10 2 2 0 0 1-1.4 1.4 49.55 49.55 0 0 1-16.2 0A2 2 0 0 1 2.5 17" />
+                <path d="m10 15 5-3-5-3z" fill="currentColor" />
+              </svg>
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap mb-1">
+                <span class="text-[15px] font-medium" style="color: var(--color-text-primary);">
+                  See Why
+                </span>
+                <span
+                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
+                    style={`color: ${COLOR_YOUTUBE}; background: ${COLOR_YOUTUBE}14; border: 1px solid ${COLOR_YOUTUBE}30;`}
+                >
+                  @SeeWhy-l3n
+                </span>
+              </div>
+              <div class="text-[12.5px]" style="color: var(--color-text-tertiary); line-height: 1.6;">
+                수학·AI·알고리즘의 핵심 직관을 manim으로 시각화
+              </div>
+            </div>
             <div
                 class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
                 style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
             >
               2026~
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex items-baseline gap-2 flex-wrap">
-                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  우아한테크코스 8기
-                </span>
-                <span
-                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
-                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-                >
-                  Backend
-                </span>
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                우아한형제들 운영 백엔드 교육 과정 ·
-                <a
-                    href="https://github.com/Woowa-8th-BE-IQ"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style="color: var(--color-accent-cyan);"
-                >
-                  IQ Archive ↗
-                </a>
-              </div>
-            </div>
           </div>
-
-          <!-- 중앙대 -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2023–2025
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                중앙대학교 소프트웨어학부
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Chung-Ang University · School of Software
-              </div>
-            </div>
-          </div>
-
-          <!-- 인하대 -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2019–2022
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                인하대학교 공간정보공학과
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Inha University · Geoinformatic Engineering
-              </div>
-            </div>
-          </div>
-        </div>
+        </a>
       </div>
 
-      <!-- Programming Contest -->
-      <div class="mb-12">
-        <div
-            class="font-mono text-[10px] mb-5"
-            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
-        >
-          PROGRAMMING CONTEST
-        </div>
-        <div class="space-y-3">
-          <!-- SCPC -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2025
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex items-baseline gap-2 flex-wrap">
-                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  SCPC — Samsung Collegiate Programming Cup
-                </span>
-                <span
-                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
-                    style="color: var(--color-accent-cyan); background: var(--color-accent-cyan-dim); border: 1px solid var(--color-accent-cyan-line);"
-                >
-                  Finalist
-                </span>
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Algorithm Track 본선 진출 ·
-                <a
-                    href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/SCPC_2025_Poster.jpg"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style="color: var(--color-accent-cyan);"
-                >
-                  공식 포스터 ↗
-                </a>
-              </div>
-            </div>
-          </div>
-
-          <!-- ACPC -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2025
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex items-baseline gap-2 flex-wrap">
-                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  ACPC — AWS × Codetree Programming Contest
-                </span>
-                <span
-                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
-                    style="color: var(--color-accent-cyan); background: var(--color-accent-cyan-dim); border: 1px solid var(--color-accent-cyan-line);"
-                >
-                  Finalist
-                </span>
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                본선 진출 ·
-                <a
-                    href="https://raw.githubusercontent.com/e9ua1/e9ua1/main/cpc/ACPC_2025_Poster.png"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style="color: var(--color-accent-cyan);"
-                >
-                  공식 포스터 ↗
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- YouTube -->
-      <div class="mb-12">
-        <div
-            class="font-mono text-[10px] mb-5"
-            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
-        >
-          YOUTUBE
-        </div>
-        <div class="flex items-start gap-4">
-          <div
-              class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-              style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-          >
-            2026~
-          </div>
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-              See Why
-            </div>
-            <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-              수학·AI·알고리즘의 핵심 직관을 manim으로 시각화 ·
-              <a
-                  href="https://www.youtube.com/@SeeWhy-l3n"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style="color: var(--color-accent-cyan);"
-              >
-                @SeeWhy-l3n ↗
-              </a>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Certifications -->
+      <!-- ═════ Certifications (compact 3-col grid) ═════ -->
       <div>
-        <div
-            class="font-mono text-[10px] mb-5"
-            style="color: var(--color-accent-cyan); letter-spacing: 1.5px;"
-        >
-          CERTIFICATIONS
+        <div class="flex items-center gap-2 mb-5">
+          <span
+              class="font-mono text-[10px]"
+              style={`color: ${COLOR_CERT}; letter-spacing: 1.5px;`}
+          >
+            CERTIFICATIONS
+          </span>
+          <span class="flex-1 h-px" style={`background: ${COLOR_CERT}24;`}></span>
         </div>
-        <div class="space-y-3">
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           <!-- 정보처리기사 -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2024.09
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2024.09
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                정보처리기사
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Engineer Information Processing · 한국산업인력공단
-              </div>
+            <div class="text-[13.5px] font-medium mb-0.5" style="color: var(--color-text-primary);">
+              정보처리기사
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              한국산업인력공단
             </div>
           </div>
 
           <!-- 빅데이터분석기사 -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2025.07
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2025.07
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                빅데이터분석기사
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Engineer Big Data Analysis · 한국데이터산업진흥원
-              </div>
+            <div class="text-[13.5px] font-medium mb-0.5" style="color: var(--color-text-primary);">
+              빅데이터분석기사
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              한국데이터산업진흥원
             </div>
           </div>
 
           <!-- SQLD -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2024.09
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2024.09
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                SQLD
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                SQL Developer · 한국데이터산업진흥원
-              </div>
+            <div class="text-[13.5px] font-medium mb-0.5" style="color: var(--color-text-primary);">
+              SQLD
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              한국데이터산업진흥원
             </div>
           </div>
 
           <!-- ADsP -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2024.11
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2024.11
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--color-text-primary);">
-                ADsP
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Data Analytics Semi-Professional · 한국데이터산업진흥원
-              </div>
+            <div class="text-[13.5px] font-medium mb-0.5" style="color: var(--color-text-primary);">
+              ADsP
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              한국데이터산업진흥원
             </div>
           </div>
 
           <!-- TOPCIT -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2025.05
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2025.05
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex items-baseline gap-2 flex-wrap">
-                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  TOPCIT
-                </span>
-                <span
-                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
-                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-                >
-                  Lv.3
-                </span>
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Test of Practical Competency in IT · 정보통신기획평가원
-              </div>
+            <div class="flex items-baseline gap-2 mb-0.5">
+              <span class="text-[13.5px] font-medium" style="color: var(--color-text-primary);">
+                TOPCIT
+              </span>
+              <span
+                  class="font-mono text-[9.5px] px-1.5 py-0.5 rounded"
+                  style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                Lv.3
+              </span>
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              정보통신기획평가원
             </div>
           </div>
 
           <!-- PCCP -->
-          <div class="flex items-start gap-4">
-            <div
-                class="flex-shrink-0 font-mono text-[10px] mt-1 px-1.5 py-0.5 rounded whitespace-nowrap"
-                style="color: var(--color-text-tertiary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-            >
-              2025.02
+          <div class="cert-card p-3.5 rounded-md" style={`--accent: ${COLOR_CERT};`}>
+            <div class="flex items-center gap-2 mb-2">
+              <div
+                  class="flex-shrink-0 flex items-center justify-center w-7 h-7 rounded"
+                  style={`background: ${COLOR_CERT}18; border: 1px solid ${COLOR_CERT}38; color: ${COLOR_CERT};`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="m9 14 2 2 4-4" />
+                </svg>
+              </div>
+              <span class="font-mono text-[10px]" style="color: var(--color-text-tertiary); letter-spacing: 0.5px;">
+                2025.02
+              </span>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex items-baseline gap-2 flex-wrap">
-                <span class="text-sm font-medium" style="color: var(--color-text-primary);">
-                  PCCP [C++]
-                </span>
-                <span
-                    class="font-mono text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap"
-                    style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
-                >
-                  Lv.2
-                </span>
-              </div>
-              <div class="text-[12.5px] mt-0.5" style="color: var(--color-text-tertiary);">
-                Certified Coding Professional · 프로그래머스
-              </div>
+            <div class="flex items-baseline gap-2 mb-0.5">
+              <span class="text-[13.5px] font-medium" style="color: var(--color-text-primary);">
+                PCCP [C++]
+              </span>
+              <span
+                  class="font-mono text-[9.5px] px-1.5 py-0.5 rounded"
+                  style="color: var(--color-text-secondary); background: var(--color-elevated); border: 1px solid var(--color-border-subtle);"
+              >
+                Lv.2
+              </span>
+            </div>
+            <div class="text-[11px]" style="color: var(--color-text-tertiary); line-height: 1.5;">
+              프로그래머스
             </div>
           </div>
         </div>
@@ -577,6 +719,35 @@ const AUTHOR_LINKEDIN = 'https://www.linkedin.com/in/%EB%8F%99%ED%9D%AC-%ED%95%9
 </BaseLayout>
 
 <style>
+  /* Track Record cards (Education / Contest / YouTube) */
+  .card-row {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border-subtle);
+    transition: all 0.2s ease;
+  }
+  .card-row:hover {
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 4%, var(--color-surface));
+    transform: translateY(-1px);
+  }
+  .card-link {
+    display: block;
+    text-decoration: none;
+  }
+
+  /* Compact certification cards */
+  .cert-card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border-subtle);
+    transition: all 0.2s ease;
+  }
+  .cert-card:hover {
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 4%, var(--color-surface));
+    transform: translateY(-1px);
+  }
+
+  /* Contact rows */
   .contact-row:hover {
     background: var(--color-surface);
   }
