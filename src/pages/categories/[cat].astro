@@ -21,7 +21,10 @@ const meta = CATEGORIES[categorySlug];
 const posts = await getPostsByCategory(categorySlug);
 
 // 카테고리에 따라 빛 색깔 결정
-const cursorMode = categorySlug === 'dev' ? 'cyan' : 'violet';
+const cursorMode =
+    categorySlug === 'dev' ? 'cyan' :
+        categorySlug === 'ai' ? 'violet' :
+            'coral';
 ---
 
 <BaseLayout title={meta.label} description={meta.description}>

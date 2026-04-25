@@ -50,6 +50,15 @@ export const CATEGORIES = {
     accentDim: 'var(--color-accent-violet-dim)',
     accentLine: 'var(--color-accent-violet-line)',
   },
+  agent: {
+    slug: 'agent',
+    label: 'Agent',
+    description: 'AI 에이전트 시스템과 자동화 인프라 — 자율 시스템의 설계와 운영 기록.',
+    color: 'coral',
+    accent: 'var(--color-accent-coral)',
+    accentDim: 'var(--color-accent-coral-dim)',
+    accentLine: 'var(--color-accent-coral-line)',
+  },
 } as const;
 
 export type CategorySlug = keyof typeof CATEGORIES;
@@ -59,6 +68,7 @@ export const NAV = [
   { href: '/posts', label: 'Posts' },
   { href: '/categories/dev', label: 'Dev' },
   { href: '/categories/ai', label: 'AI' },
+  { href: '/categories/agent', label: 'Agent' },
   { href: '/projects', label: 'Projects' },
   { href: '/about', label: 'About' },
 ] as const;

@@ -19,15 +19,21 @@ const currentPath = Astro.url.pathname;
       {
         NAV.map(({ href, label }) => {
           const active = href === '/' ? currentPath === '/' : currentPath.startsWith(href);
+
+          // 카테고리별 active 색
+          let activeColor = 'var(--color-accent-cyan)';
+          if (href === '/categories/ai') activeColor = 'var(--color-accent-violet)';
+          else if (href === '/categories/agent') activeColor = 'var(--color-accent-coral)';
+
           return (
-            <a
-              href={href}
-              class="text-sm transition-colors"
-              style={`color: ${active ? 'var(--color-accent-cyan)' : 'var(--color-text-secondary)'};`}
-              aria-current={active ? 'page' : undefined}
-            >
-              {label}
-            </a>
+              <a
+                  href={href}
+                  class="text-sm transition-colors"
+                  style={`color: ${active ? activeColor : 'var(--color-text-secondary)'};`}
+                  aria-current={active ? 'page' : undefined}
+              >
+                {label}
+              </a>
           );
         })
       }
@@ -35,11 +41,11 @@ const currentPath = Astro.url.pathname;
 
     <!-- Search trigger -->
     <button
-      id="search-trigger"
-      type="button"
-      class="flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors"
-      style="background: var(--color-surface); border: 1px solid var(--color-border-subtle); color: var(--color-text-tertiary);"
-      aria-label="Search"
+        id="search-trigger"
+        type="button"
+        class="flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors"
+        style="background: var(--color-surface); border: 1px solid var(--color-border-subtle); color: var(--color-text-tertiary);"
+        aria-label="Search"
     >
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
         <circle cx="11" cy="11" r="8"/>

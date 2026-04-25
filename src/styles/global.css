@@ -21,11 +21,16 @@
 
   /* Accents */
   --color-accent-cyan: #00d9ff;
-  --color-accent-cyan-dim: rgba(0, 217, 255, 0.08);
-  --color-accent-cyan-line: rgba(0, 217, 255, 0.25);
+  --color-accent-cyan-dim: rgba(0, 217, 255, 0.12);
+  --color-accent-cyan-line: rgba(0, 217, 255, 0.3);
+
   --color-accent-violet: #a78bfa;
-  --color-accent-violet-dim: rgba(167, 139, 250, 0.08);
-  --color-accent-violet-line: rgba(167, 139, 250, 0.25);
+  --color-accent-violet-dim: rgba(167, 139, 250, 0.12);
+  --color-accent-violet-line: rgba(167, 139, 250, 0.3);
+
+  --color-accent-coral: #cc785c;
+  --color-accent-coral-dim: rgba(204, 120, 92, 0.12);
+  --color-accent-coral-line: rgba(204, 120, 92, 0.3);
 
   /* Typography */
   --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
@@ -366,6 +371,10 @@ body[data-category="dev"] {
 body[data-category="ai"] {
   --bloom-color-1: rgba(167, 139, 250, 0.13);
   --bloom-color-2: rgba(167, 139, 250, 0.07);
+}
+body[data-category="agent"] {
+  --bloom-color-1: rgba(204, 120, 92, 0.13);
+  --bloom-color-2: rgba(204, 120, 92, 0.07);
 }
 
 @media (prefers-reduced-motion: reduce) {

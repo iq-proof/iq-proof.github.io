@@ -12,7 +12,7 @@
     */
 
 interface Props {
-  mode?: 'cyan' | 'violet' | 'blend' | 'adaptive';
+  mode?: 'cyan' | 'violet' | 'coral' | 'blend' | 'adaptive';
 }
 
 const { mode = 'blend' } = Astro.props;
@@ -62,6 +62,16 @@ const { mode = 'blend' } = Astro.props;
         circle at center,
         rgba(167, 139, 250, 0.18) 0%,
         rgba(167, 139, 250, 0.07) 40%,
+        transparent 75%
+    );
+  }
+
+  /* ───────────────────── Mode: coral only (Agent) ──────────────── */
+  .cursor-light--coral {
+    background: radial-gradient(
+        circle at center,
+        rgba(204, 120, 92, 0.18) 0%,
+        rgba(204, 120, 92, 0.07) 40%,
         transparent 75%
     );
   }

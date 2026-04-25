@@ -36,7 +36,7 @@ export async function getOGFonts(): Promise<SatoriOptions['fonts']> {
 
 export interface OGTemplateProps {
   title: string;
-  category?: 'dev' | 'ai';
+  category?: 'dev' | 'ai' | 'agent';
   difficulty?: 'beginner' | 'intermediate' | 'advanced';
   description?: string;
 }
@@ -44,11 +44,13 @@ export interface OGTemplateProps {
 const CATEGORY_COLORS = {
   dev: '#00d9ff',
   ai: '#a78bfa',
+  agent: '#cc785c',
 } as const;
 
 const CATEGORY_LABELS = {
   dev: 'DEV',
   ai: 'AI',
+  agent: 'AGENT',
 } as const;
 
 /**

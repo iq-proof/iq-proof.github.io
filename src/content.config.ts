@@ -26,7 +26,7 @@ const posts = defineCollection({
       updatedDate: z.coerce.date().optional(),
 
       // Taxonomy
-      category: z.enum(['dev', 'ai']),
+      category: z.enum(['dev', 'ai', 'agent']),
       tags: z.array(z.string()).default([]),
 
       // Optional series membership
