@@ -1,0 +1,172 @@
+---
+title: "Autoregressive 모델은 왜 모든 modality를 생성할 수 있는가"
+description: "확률의 chain rule이 항등식인 이유부터 PixelCNN의 masked convolution, WaveNet의 dilated causal conv, GPT의 scaling law까지, AR 생성 모델의 통일 철학을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [autoregressive, chain-rule, pixelcnn, wavenet, transformer]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Autoregressive(AR) 모델은 텍스트, 이미지, 오디오, 비디오를 동일한 원리로 생성한다. 이 통일성은 우연이 아니다. 그 뿌리에는 단 하나의 수학적 항등식이 있다. AR 모델의 모든 architectural 결정은 결국 같은 질문으로 수렴한다 — "어떻게 하면 $p(x_i \mid x_{<i})$ 를 순서대로, 빠르게, 정확하게 계산하는가?"
+
+## 출발점: 가정 없는 항등식
+
+AR 모델의 기반은 확률의 chain rule이다.
+
+$$
+p(x_1, \ldots, x_n) = \prod_{i=1}^n p(x_i \mid x_{<i})
+$$
+
+이 식은 **항등식**이다. 독립 가정도, Markov 가정도 필요 없다. 조건부 확률의 정의만으로 성립한다. 따라서 AR 모델은 분포에 대한 어떠한 가정도 하지 않고 임의의 joint distribution을 표현할 수 있다.
+
+<Theorem kind="theorem" number="1" title="AR의 Universal Approximation">
+각 $p_\theta(x_i \mid x_{<i})$ 가 universal approximator(충분히 큰 NN)이면, $p_\theta$ 는 임의의 joint distribution $p$ 를 KL divergence sense로 임의로 잘 근사할 수 있다.
+</Theorem>
+
+<Proof>
+$\text{KL}(p \| p_\theta) = \sum_i \mathbb{E}[\text{KL}(p(x_i \mid x_{<i}) \| p_\theta(x_i \mid x_{<i}))]$. 각 conditional이 $\epsilon$-가까이 근사되면 합은 $n\epsilon$. Universal Approximation Theorem으로 각 conditional을 임의로 근사 가능. $\square$
+</Proof>
+
+이 항등식이 주는 두 번째 선물은 **tractable likelihood**다.
+
+$$
+\log p_\theta(x) = \sum_i \log p_\theta(x_i \mid x_{<i})
+$$
+
+Teacher forcing 덕분에 학습 시 $x_{<i}$ 가 이미 알려져 있으므로, 모든 위치의 conditional을 **한 번의 forward pass**에서 병렬로 평가한다. 반면 sampling은 각 $x_i$ 를 순서대로 생성해야 하므로 sequential이다. 이 비대칭이 AR의 핵심 trade-off다.
+
+## 이미지에서의 AR: Masked Convolution
+
+van den Oord 2016의 PixelCNN은 chain rule을 이미지에 적용한 첫 본격적 성공이다. $H \times W$ 이미지의 각 픽셀을 raster-scan 순서로 배열하면 1D sequence가 된다.
+
+$$
+p(I) = \prod_{i=1}^H \prod_{j=1}^W p(I_{ij} \mid I_{<ij})
+$$
+
+문제는 표준 CNN이 미래 픽셀도 함께 보다는 점이다. PixelCNN의 해결책은 **masked convolution** — kernel의 일부를 0으로 마스킹해 미래를 차단한다.
+
+```
+Mask A (첫 layer, 자기 자신 차단):    Mask B (깊은 layer, 자기 자신 허용):
+1 1 1                                  1 1 1
+1 0 0   ← center                      1 1 0   ← center
+0 0 0                                  0 0 0
+```
+
+Mask A가 첫 layer에서 반드시 필요한 이유는 명확하다. $p(x_{ij} \mid x_{<ij})$ 를 예측하려면 $x_{ij}$ 자체를 입력으로 받으면 안 된다. 그런데 Mask B를 deeper layer에서 써도 괜찮은 이유는, 첫 layer에서 Mask A로 만들어진 feature $h^{(1)}_{ij}$ 에 $x_{ij}$ 정보가 없기 때문이다. Deeper layer가 center를 봐도 실제로는 $x_{<ij}$ 만 본다.
+
+RGB 채널은 같은 픽셀 안에서도 R → G → B 순서로 factorize된다.
+
+$$
+p(R_{ij}, G_{ij}, B_{ij} \mid I_{<ij}) = p(R_{ij} \mid I_{<ij}) \cdot p(G_{ij} \mid I_{<ij}, R_{ij}) \cdot p(B_{ij} \mid I_{<ij}, R_{ij}, G_{ij})
+$$
+
+<Callout type="note" title="트레이드오프">
+Masked convolution은 parallel training이 가능하고 구현이 단순하다. 대신 **bounded receptive field**라는 제약이 따른다. Gated PixelCNN이 vertical + horizontal stack으로 blind spot 문제를 해결하기 전까지, 기본 mask A 구조는 같은 row의 오른쪽 위 일부 영역을 영원히 보지 못했다.
+</Callout>
+
+## 오디오에서의 AR: Receptive Field를 지수적으로
+
+16kHz 오디오 1초는 16,000 샘플이다. 표준 stacked conv는 $L$ layer에 kernel $k$ 면 RF $= L(k-1)+1$ — 30 layer with $k=3$ 이면 61 samples, 4ms에 불과하다. 음악적 의미가 없다.
+
+WaveNet (van den Oord 2016)의 해결책은 **dilated causal convolution**이다.
+
+$$
+y_i = \sum_{j=0}^{k-1} W_j \cdot x_{i - d \cdot j}
+$$
+
+dilation rate $d$ 만큼 건너뛰며 입력을 샘플링한다. $d_l = 2^{l-1}$ 로 지수 증가시키면:
+
+$$
+RF_L = 1 + \sum_{l=1}^{L} (k-1) d_l = 2^L
+$$
+
+$L=10$ 이면 RF $= 1024$ samples (64ms), $L=30$ 이면 RF $\approx 10^9$. 같은 layer 수로 conv의 선형 RF 대신 **지수적 RF**를 달성한다.
+
+실전 WaveNet은 pure exponential 대신 **cycled dilation** $d = 1, 2, 4, \ldots, 512, 1, 2, \ldots$ 을 사용한다. 큰 dilation만으로는 short-range dependency의 gradient가 약해지기 때문이다. 각 cycle이 local pattern(음소)과 global pattern(악구)을 동시에 모델링한다.
+
+sampling 비용은 PixelCNN과 같은 문제를 더 극단적인 규모로 겪는다. 1초 오디오 = 16,000 sequential forward pass. Parallel WaveNet (van den Oord 2017)은 IAF distillation으로 student 모델이 parallel sampling을 하도록 해결했다.
+
+$$
+\text{KL}(p_S \| p_T) = \mathbb{E}_{x \sim p_S}[\log p_S(x) - \log p_T(x)]
+$$
+
+Teacher AR WaveNet에서 병렬 student를 蒸留(distill)해, 음질 손실을 최소화하면서 속도를 1000배 향상시켰다.
+
+## Transformer: RF를 $T$로
+
+PixelCNN은 conv를 깊게 쌓아 RF를 늘렸고, WaveNet은 dilation으로 지수 확장했다. Transformer는 더 직접적인 답을 제시한다 — **한 layer가 전체 context를 한 번에 본다**.
+
+$$
+\text{Attention}(X) = \text{softmax}\left(\frac{QK^\top + M}{\sqrt{d_k}}\right) V
+$$
+
+causal mask $M_{ij} = -\infty$ (if $j > i$), else $0$. 이 mask 하나로 chain rule의 dependency를 강제한다. token $i$ 는 정확히 token $\leq i$ 만 attend한다.
+
+KV cache는 generation의 비용 구조를 바꾼다. naive sampling은 각 step $t$ 마다 전체 sequence에 attention을 재계산해 총 $O(T^3)$이지만, KV cache로 이전 step의 $K, V$ 를 재사용하면 $O(T^2 d)$로 줄어든다.
+
+가장 강력한 점은 **modality-agnostic**하다는 것이다. Transformer에 입력은 단지 임의 차원의 token sequence다. Modality별 차이는 tokenizer에만 있다.
+
+| Modality | Tokenizer | Vocabulary |
+|----------|-----------|------------|
+| Text | BPE | 50k |
+| Image | VQ-VAE codebook | 8k |
+| Audio | EnCodec | 1k–16k |
+| Video | MAGVIT | 8k |
+
+Tokenize하면 모두 sequence가 되고, 같은 GPT architecture가 처리한다. 이것이 GPT-4V, Gemini의 multimodal 생성 기반이다.
+
+## Scaling: 구조가 아니라 크기
+
+GPT 계열이 밝혀낸 가장 놀라운 사실은 **architecture 혁신보다 scale이 더 중요할 수 있다**는 것이다. Kaplan 2020은 language modeling loss가 모델 크기 $N$, 데이터 $D$에 대해 power law를 따름을 보였다.
+
+$$
+L(N, D) = \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\right)^{\alpha_D} + L_\infty
+$$
+
+$\alpha_N \approx 0.076$, $\alpha_D \approx 0.095$. Hoffmann 2022 (Chinchilla)는 compute-optimal 분배가 $D / N \approx 20$ tokens/parameter임을 보였다 — Kaplan의 추정보다 데이터에 훨씬 더 많이 투자해야 한다는 뜻이다. 70B params + 1.4T tokens의 Chinchilla가 175B params + 300B tokens의 GPT-3를 여러 벤치마크에서 앞섰다.
+
+<Aside label="통일 철학">
+Chain rule → masked conv(PixelCNN) → dilated causal conv(WaveNet) → causal self-attention(GPT). 이 진화의 공통 질문은 하나다 — "어떻게 하면 $p(x_i \mid x_{<i})$ 의 receptive field를 충분히 키우면서 parallel training과 sequential sampling을 유지하는가?" Transformer는 RF 문제를 $O(T^2)$ attention으로 해결했고, scale은 그 위에서 작동한다.
+</Aside>
+
+## 정리
+
+- Chain rule은 **항등식**이다. 분포에 대한 가정 없이 모든 AR 모델의 이론적 기반이 된다.
+- **Tractable likelihood**(parallel training)와 **sequential sampling**의 비대칭은 AR의 근본 trade-off다. KV cache, Parallel WaveNet, speculative decoding은 모두 이 비대칭을 완화하는 시도다.
+- PixelCNN의 masked conv, WaveNet의 dilated causal conv, GPT의 causal self-attention은 각각 같은 문제(충분한 RF + causal dependency)에 대한 다른 답이다.
+- Tokenizer가 임의 modality를 sequence로 바꾸면, 같은 AR Transformer가 text, image, audio, video를 생성할 수 있다.
+
+수식 하나($\prod p(x_i \mid x_{<i})$) 뒤에는 세 개의 서로 다른 architecture가 각각 다른 modality의 구조에 최적화되어 있다는 엔지니어링 현실이 숨어 있다.
+
+<Reference
+  title="Pixel Recurrent Neural Networks"
+  authors="van den Oord et al."
+  year={2016}
+  venue="ICML"
+  url="https://arxiv.org/abs/1601.06759"
+/>
+<Reference
+  title="WaveNet: A Generative Model for Raw Audio"
+  authors="van den Oord et al."
+  year={2016}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1609.03499"
+/>
+<Reference
+  title="Scaling Laws for Neural Language Models"
+  authors="Kaplan et al."
+  year={2020}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2001.

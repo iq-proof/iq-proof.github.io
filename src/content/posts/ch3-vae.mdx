@@ -1,0 +1,168 @@
+---
+title: "VAE는 왜 latent를 포기하는가"
+description: "ELBO의 reconstruction-regularization 분해부터 posterior collapse의 근본 원인, reparameterization trick의 수학, β-VAE의 information bottleneck 해석, VQ-VAE의 discrete 전환까지 — VAE 설계 결정의 연쇄를 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [vae, elbo, variational-inference, generative-model, latent-variable]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+VAE의 모든 설계 결정은 하나의 긴장에서 비롯된다 — encoder가 latent에 정보를 담으려는 힘과, KL 페널티가 latent를 prior로 밀어넣으려는 힘의 충돌. ELBO를 최대화하는 과정에서 이 두 힘이 균형을 이루지 못하면 encoder는 조용히 일을 멈춘다. 왜 이 구조가 이런 실패를 내재하고, 각 후속 모델은 그것을 어떻게 다르게 풀었는가?
+
+## ELBO: reconstruction과 regularization의 분해
+
+VAE의 출발점은 intractable한 주변 우도 $\log p_\theta(x)$를 직접 최적화할 수 없다는 사실이다. 대신 tractable한 variational distribution $q_\phi(z|x)$를 도입해 다음 등식을 얻는다.
+
+$$
+\log p_\theta(x) = \mathcal{L}(\theta, \phi; x) + \text{KL}(q_\phi(z|x) \| p_\theta(z|x))
+$$
+
+$\text{KL} \geq 0$이므로 $\mathcal{L}$은 $\log p(x)$의 하한 — Evidence Lower BOund. 그리고 이 ELBO는 다시 분해된다.
+
+$$
+\mathcal{L} = \underbrace{\mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]}_{\text{Reconstruction}} - \underbrace{\text{KL}(q_\phi(z|x) \| p(z))}_{\text{Regularization}}
+$$
+
+<Theorem kind="theorem" number="1" title="ELBO의 KL split 유도">
+$\log p_\theta(x) = \mathcal{L}(\theta, \phi; x) + \text{KL}(q_\phi(z|x) \| p_\theta(z|x))$
+</Theorem>
+
+<Proof>
+Bayes: $p_\theta(z|x) = p_\theta(x,z)/p_\theta(x)$. 이를 KL 전개에 대입하면
+
+$$
+\text{KL}(q_\phi(z|x) \| p_\theta(z|x)) = \mathbb{E}_{q_\phi}\!\left[\log q_\phi(z|x) - \log p_\theta(x,z) + \log p_\theta(x)\right] = -\mathcal{L} + \log p_\theta(x)
+$$
+
+이항하면 등식 성립. $\text{KL} \geq 0$이므로 $\log p_\theta(x) \geq \mathcal{L}$. 등호는 $q_\phi = p_\theta(z|x)$일 때. $\square$
+</Proof>
+
+reconstruction 항은 $z$가 $x$의 정보를 많이 담을수록 커진다. KL 항은 $q_\phi(z|x)$가 prior $p(z)$와 다를수록 커진다. 둘은 필연적으로 충돌한다.
+
+Gaussian VAE에서 KL은 closed form으로 계산된다. $q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \mathrm{diag}(\sigma_\phi^2(x)))$, $p(z) = \mathcal{N}(0, I)$이면:
+
+$$
+\text{KL}(q_\phi \| p) = \frac{1}{2}\sum_{i=1}^{k}\left(\mu_i^2 + \sigma_i^2 - 1 - \log\sigma_i^2\right)
+$$
+
+## Reparameterization: stochastic node를 통과하는 gradient
+
+reconstruction 항 $\mathbb{E}_{q_\phi}[\log p_\theta(x|z)]$의 $\phi$에 대한 gradient가 문제다. expectation의 분포 자체가 $\phi$에 의존하기 때문에 단순 backprop이 통하지 않는다.
+
+순진한 해결책인 REINFORCE(score function estimator)는 다음을 사용한다.
+
+$$
+\nabla_\phi \mathbb{E}_q[f(z)] = \mathbb{E}_q[f(z)\nabla_\phi \log q_\phi(z)]
+$$
+
+이는 unbiased하지만 variance가 극단적으로 높다. 특정 예로 $z \sim \mathcal{N}(\mu, 1)$, $f(z) = z^2$일 때 REINFORCE의 variance는 $O(\mu^4)$으로 증가하지만, reparameterization estimator의 variance는 상수 4로 유지된다.
+
+reparameterization trick은 stochastic node를 input 쪽으로 밀어낸다.
+
+```
+이전:  x → μ → [z ~ N(μ, σ)] → loss
+                    ↑
+              gradient 막힘
+
+이후:  ε ~ N(0, 1)
+                ↓
+       x → μ → z = μ + σε → loss
+       x → σ ↗
+```
+
+$z = \mu_\phi(x) + \sigma_\phi(x) \odot \epsilon$으로 쓰면, $\epsilon$은 $\phi$와 무관하므로 gradient가 $z$를 통해 $\mu, \sigma$까지 자유롭게 흐른다.
+
+<Callout type="note" title="Variance 비교">
+path-wise(reparameterization)와 score function(REINFORCE)의 실증 측정에서 전자가 후자 대비 $10^2 \sim 10^3$배 낮은 variance를 보인다. 이 차이가 VAE 훈련을 가능하게 만드는 실질적 이유다.
+</Callout>
+
+## β와 information bottleneck: trade-off의 조절
+
+표준 VAE($\beta = 1$)의 latent는 disentangled되지 않는다 — 하나의 차원이 여러 변동 요인을 섞어 표현한다. β-VAE는 KL 항에 $\beta$를 곱하는 한 줄 수정이다.
+
+$$
+\mathcal{L}_\beta = \mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)] - \beta \cdot \text{KL}(q_\phi(z|x) \| p(z))
+$$
+
+$\beta > 1$이면 KL 페널티가 강해져 encoder가 prior의 axis-aligned Gaussian에 더 가까워지도록 압박받는다. 이 압박이 각 latent 차원을 독립적으로 만들고, 데이터의 각 변동 요인을 분리된 차원에 매핑하는 경향을 만든다.
+
+information bottleneck 관점에서 이 KL 항은 다음으로 분해된다.
+
+$$
+\mathbb{E}_{p_d(x)}[\text{KL}(q(z|x) \| p(z))] = I(X; Z) + \text{KL}(q(z) \| p(z))
+$$
+
+$\beta$는 latent가 입력에 대해 갖는 상호정보량 $I(X; Z)$에 직접 penalty를 가하는 channel capacity bound다. 각 $\beta$ 값은 rate-distortion 곡선 위의 다른 점에 해당한다 — $\beta$ 증가는 rate(압축)를 줄이고 distortion(재구성 오류)를 늘린다.
+
+<Aside label="설계 함의">
+$\beta \to \infty$의 극단은 $\text{KL} = 0$ 강제 → encoder가 prior와 동일한 분포를 출력 → latent가 $x$의 정보를 전혀 담지 않음. 이것이 posterior collapse다.
+</Aside>
+
+## Posterior Collapse: encoder가 일을 멈추는 순간
+
+posterior collapse는 $q_\phi(z|x) \to p(z)$, 즉 encoder의 출력이 입력 $x$와 무관하게 prior와 같아지는 현상이다. KL = 0이 되어 페널티가 사라지고, decoder가 latent 없이 reconstruction을 수행한다.
+
+이 현상의 원인은 optimization landscape에 있다. decoder가 충분히 강력하면(예: autoregressive PixelCNN), latent에서 정보를 추출하지 않아도 reconstruction이 가능하다. 그 경우 KL 페널티를 피하기 위해 encoder가 latent 사용을 포기하는 것이 ELBO 최대화에 유리하다.
+
+진단 지표는 **active dimensions** — $\text{KL}_i > \lambda$인 latent 차원의 수다. collapse 시 이 값이 0에 가까워진다.
+
+주요 해결책은 세 계열로 나뉜다.
+
+**KL annealing** (Bowman 2016): 훈련 초기에 $\beta(t) = \min(1, t/T)$로 KL을 점진적으로 켠다. 초기에 encoder가 informative latent를 학습한 후 regularization을 추가한다.
+
+**Free bits** (Kingma 2016): $\sum_i \max(\lambda, \text{KL}_i)$로 각 차원이 최소 $\lambda$ nats의 정보를 사용하도록 강제한다. KL을 0으로 줄이는 incentive를 제거한다.
+
+**δ-VAE** (Razavi 2019): encoder의 출력 분산에 상한 $\sigma_\phi^2 \leq 1 - \delta$를 두어 KL이 물리적으로 0이 될 수 없게 만든다.
+
+<Callout type="warning" title="Language VAE의 특수성">
+자연어는 강한 sequential structure를 가지므로 LSTM/Transformer decoder가 latent 없이도 next-token을 잘 예측한다. 따라서 language VAE는 KL annealing과 word dropout(입력 단어의 일부를 마스킹해 decoder가 latent에 의존하도록 강제)을 함께 써도 collapse가 빈번하다.
+</Callout>
+
+## VQ-VAE: discrete codebook으로 collapse를 구조적으로 우회
+
+VQ-VAE(van den Oord 2017)는 continuous latent 대신 discrete codebook을 도입해 collapse 문제를 구조적으로 우회한다.
+
+encoder가 $z_e \in \mathbb{R}^D$를 출력하면, codebook $\{e_1, \ldots, e_K\}$에서 가장 가까운 entry를 선택한다.
+
+$$
+k^* = \arg\min_k \|z_e - e_k\|_2, \quad z_q = e_{k^*}
+$$
+
+이 quantization의 KL은 $\log K$(상수)다 — encoder 출력이 항상 하나의 codebook entry로 확정되므로 prior와의 거리가 고정된다. "KL을 0으로 줄인다"는 mode 자체가 존재하지 않는다.
+
+문제는 $\arg\min$이 미분 불가능하다는 것이다. Straight-Through Estimator(STE)가 이를 해결한다.
+
+```python
+# Forward: z_q == e[k_star]
+# Backward: ∂z_q / ∂z_e = 1 (identity pass-through)
+z_q = z_e + (e[k_star] - z_e).detach()
+```
+
+loss는 세 항으로 구성된다.
+
+$$
+\mathcal{L} = \|x - \hat{x}\|^2 + \|\mathrm{sg}(z_e) - e_{k^*}\|^2 + \beta\|z_e - \mathrm{sg}(e_{k^*})\|^2
+$$
+
+stop-gradient(`sg`)의 위치가 중요하다. codebook loss는 codebook만 학습하고, commitment loss는 encoder만 학습한다. 각 항이 서로 다른 parameter를 학습하도록 분리해 optimization을 안정시킨다.
+
+discrete token은 AR Transformer와 자연스럽게 결합된다. VQ-VAE encoder로 이미지를 token sequence로 압축한 뒤, GPT-style 모델이 그 sequence의 분포를 학습한다. DALL-E, Parti, MUSE가 모두 이 two-stage 구조를 따른다.
+
+## 정리
+
+VAE 계열의 진화는 하나의 긴장을 다루는 다양한 방식이다.
+
+- ELBO = reconstruction + KL regularization. 두 항의 충돌이 VAE의 모든 실패와 개선의 원천이다.
+- reparameterization trick은 stochastic gradient의 variance를 $10^2 \sim 10^3$배 줄여 backprop을 가

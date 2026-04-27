@@ -1,0 +1,158 @@
+---
+title: "DDPM의 수학은 하나의 질문으로 수렴한다"
+description: "Forward process의 closed-form 유도부터 Score-SDE의 통합 프레임워크, Classifier-Free Guidance의 암묵적 분류기까지 — 확산 모델 설계의 단일 원리를 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [diffusion-model, ddpm, score-matching, classifier-free-guidance, sde]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DDPM, Score-Based Model, Score-SDE, Classifier-Free Guidance — 이 네 챕터는 각각 다른 출발점에서 시작한다. 그러나 끝까지 따라가면 하나의 질문으로 수렴한다. **"노이즈를 예측하는 것이 왜 생성 모델이 되는가?"**
+
+## 모든 것의 출발점: Forward Process의 닫힌 형태
+
+확산 모델의 첫 번째 핵심 관찰은 Forward process가 **학습되지 않는다**는 사실이다. VAE의 인코더는 학습되어 posterior collapse를 일으킬 수 있지만, DDPM의 Forward process는 고정된 Markov chain이다.
+
+$$q(x_t | x_{t-1}) = \mathcal{N}(\sqrt{1 - \beta_t}\, x_{t-1},\, \beta_t I)$$
+
+이 설계가 결정적인 이유는 귀납적 합성으로 단일 Gaussian이 도출되기 때문이다.
+
+<Theorem kind="theorem" number="1" title="Closed-Form Forward (DDPM)">
+$\alpha_t = 1 - \beta_t$, $\bar\alpha_t = \prod_{s=1}^t \alpha_s$로 정의하면:
+
+$$q(x_t | x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_t}\, x_0,\; (1 - \bar\alpha_t) I\right)$$
+
+즉, reparameterization으로 임의 $t$의 $x_t$를 한 번에 샘플링할 수 있다:
+
+$$x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+</Theorem>
+
+<Proof>
+귀납법. $t=1$에서 성립. 귀납 가정 $q(x_{t-1}|x_0) = \mathcal{N}(\sqrt{\bar\alpha_{t-1}} x_0, (1-\bar\alpha_{t-1})I)$하에 $x_t = \sqrt{\alpha_t} x_{t-1} + \sqrt{\beta_t}\epsilon_t$를 전개하면 두 독립 Gaussian의 합산으로
+
+$$\text{Var} = \alpha_t(1 - \bar\alpha_{t-1}) + \beta_t = 1 - \bar\alpha_t \quad \square$$
+</Proof>
+
+이 closed-form이 DDPM 학습 효율의 근거다. 1000 step Markov chain을 순서대로 시뮬레이션할 필요 없이, 임의의 $t$에서 직접 $x_t$를 구성해 학습 신호를 만든다.
+
+## 노이즈 예측이 역방향 과정으로 환원되는 이유
+
+두 번째 챕터의 핵심 발견은 $L_\text{simple}$이다. ELBO를 전개하면 각 step의 KL은 다음 형태로 환원된다.
+
+$$L_{t-1} = \frac{\beta_t^2}{2\sigma_t^2 \alpha_t (1 - \bar\alpha_t)} \cdot \mathbb{E}\!\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+
+Ho 2020의 핵심 발견은 이 가중치를 **무시**하는 것이 sample quality를 오히려 향상시킨다는 사실이다.
+
+$$L_\text{simple} = \mathbb{E}_{t, x_0, \epsilon}\!\left[\|\epsilon - \epsilon_\theta(\sqrt{\bar\alpha_t}\, x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon,\, t)\|^2\right]$$
+
+<Callout type="note" title="가중치를 버리는 이유">
+ELBO 가중치는 small $t$ (고신호 영역)에 학습을 집중시킨다. $L_\text{simple}$의 균등 가중치는 high-noise step에도 동등한 학습 기회를 준다. FID로 측정되는 perceptual quality는 고노이즈 step의 올바른 denoising에 더 의존한다.
+</Callout>
+
+Reverse mean의 parameterization을 전개하면 $\epsilon_\theta$가 왜 자연스러운 학습 목표인지 드러난다.
+
+$$\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t, t)\right)$$
+
+이 형태는 ground-truth posterior mean $\tilde\mu_t(x_t, x_0)$과 정확히 같은 구조다. NN은 $\epsilon$만 예측하면 되고, 나머지는 schedule에서 파생된다.
+
+## Score와 노이즈 예측의 동치
+
+세 번째 챕터(NCSN)는 완전히 다른 출발점에서 출발한다. Score $\nabla_x \log p(x)$를 직접 학습하면 partition function 없이 Langevin dynamics로 샘플링할 수 있다.
+
+$$x_{t+1} = x_t + \frac{\delta}{2} s_\theta(x_t) + \sqrt{\delta}\, z_t, \quad z_t \sim \mathcal{N}(0, I)$$
+
+Denoising Score Matching은 계산 불가능한 divergence항을 피해 Gaussian perturbation의 closed-form score를 학습 목표로 쓴다.
+
+$$\mathcal{L}_\text{DSM} = \mathbb{E}\!\left[\left\|s_\theta(\tilde x) + \frac{\tilde x - x}{\sigma^2}\right\|^2\right]$$
+
+<Theorem kind="proposition" number="2" title="DDPM = Weighted DSM">
+DDPM forward의 score는 $\nabla_{x_t} \log q(x_t | x_0) = -\epsilon / \sqrt{1-\bar\alpha_t}$이므로:
+
+$$\epsilon_\theta \text{ 학습} \iff s_\theta = -\epsilon_\theta / \sqrt{1-\bar\alpha_t} \text{ 학습}$$
+
+$L_\text{simple}$을 score 형태로 쓰면 $(1-\bar\alpha_t)$으로 가중된 DSM과 동일하다.
+</Theorem>
+
+DDPM과 NCSN은 서로 독립적으로 개발되었지만, 수식 수준에서 같은 목표를 가중치만 다르게 최적화하고 있었다.
+
+## Score-SDE: 이산 과정의 연속 극한
+
+네 번째 챕터는 이 등치를 연속시간으로 확장한다. $T \to \infty$, $\Delta t \to 0$ 극한에서 DDPM의 discrete chain은 Itô SDE로 수렴한다.
+
+$$dx = -\frac{1}{2}\beta(t)\, x\, dt + \sqrt{\beta(t)}\, dW \quad \text{(VP-SDE)}$$
+
+Anderson 1982의 역방향 SDE 정리에 의해 이 forward process의 역방향도 score만 있으면 정의된다.
+
+$$dx = \left[f(x,t) - g(t)^2 \nabla_x \log p_t(x)\right] dt + g(t)\, d\bar W$$
+
+<Aside label="Probability Flow ODE">
+동일한 주변분포 $p_t$를 보존하면서 확률적 항을 제거한 결정론적 ODE도 존재한다. $dx/dt = f - (g^2/2)\nabla \log p_t$. 이 ODE는 DDIM의 일반화이며, Continuous Normalizing Flow 프레임워크를 통해 **exact likelihood** 계산을 가능하게 한다.
+</Aside>
+
+VP-SDE는 DDPM, VE-SDE는 NCSN의 연속 극한임이 증명된다. 이 프레임워크 안에서 노이즈 스케줄, parameterization, 샘플러 선택이 모두 하나의 수학적 언어로 분석된다.
+
+## Classifier-Free Guidance: Bayes의 미분
+
+다섯 번째 챕터는 조건부 생성으로 넘어간다. Bayes' rule을 $x$에 대해 미분하면:
+
+$$\nabla_x \log p(x | y) = \nabla_x \log p(x) + \nabla_x \log p(y | x)$$
+
+분류기 gradient가 score에 더해지면 조건 $y$를 더 강하게 따르는 샘플링이 된다. Classifier-Free Guidance는 이 분류기 gradient를 **별도 네트워크 없이** 구현한다. 동일한 $\epsilon_\theta$가 조건부($y$)와 비조건부($\emptyset$)를 모두 학습하면:
+
+$$\nabla_x \log p(y | x) = s_\theta(x, y) - s_\theta(x, \emptyset)$$
+
+이 등치가 성립한다. 샘플링 시 guidance scale $w$로 이 항을 증폭한다.
+
+$$\tilde\epsilon = (1 + w)\,\epsilon_\theta(x_t, y) - w\,\epsilon_\theta(x_t, \emptyset)$$
+
+<Callout type="warning" title="트레이드오프: Quality vs Diversity">
+guided distribution은 $\tilde p(x|y) \propto p(x)\,p(y|x)^{1+w}$가 된다. $w$가 커질수록 분류기 확신 영역에 mass가 집중되어 sharpness는 높아지지만 다양성은 감소한다. Stable Diffusion의 기본값 $w=7.5$는 이 trade-off의 경험적 sweet spot이다.
+</Callout>
+
+## 정리
+
+다섯 챕터를 관통하는 단일 원리는 다음이다. **확산 모델의 모든 설계 결정은 "어떤 목표로, 어떤 가중치로 score를 학습하는가"로 환원된다.**
+
+- Forward process를 fixed Gaussian chain으로 설계하면 closed-form $x_t$와 stable supervision이 생긴다.
+- ELBO 가중치를 버린 $L_\text{simple}$은 이론적 sub-optimality에도 불구하고 perceptual quality를 향상시킨다.
+- DDPM의 $\epsilon$ 예측과 NCSN의 score 예측은 가중치만 다른 같은 목표다.
+- Score-SDE는 모든 변형을 하나의 연속시간 프레임워크로 통합하고, Probability Flow ODE를 통해 exact likelihood를 개방한다.
+- Classifier-Free Guidance는 Bayes 미분 하나로 별도 분류기 없는 조건부 생성을 구현한다.
+
+노이즈를 예측하는 것이 생성 모델인 이유 — 그것은 score를 근사하는 것이고, score는 데이터 manifold로 향하는 방향이기 때문이다.
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho, Jain, Abbeel"
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
+/>
+
+<Reference
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song, Sohl-Dickstein, Kingma, Kumar, Ermon, Poole"
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
+/>
+
+<Reference
+  title="Classifier-Free Diffusion Guidance"
+  authors="Ho, Salimans"
+  year={2022}
+  venue="NeurIPS Workshop"
+  url="https://arxiv.org/abs/2207.12598"
+/>

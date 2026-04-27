@@ -1,0 +1,167 @@
+---
+title: "GAN은 왜 그토록 불안정한가"
+description: "Minimax 정식화부터 JSD 환원, Mode Collapse의 수학적 원인, Wasserstein 거리, Spectral Normalization까지 — GAN 훈련 불안정성의 뿌리를 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [gan, wasserstein, mode-collapse, spectral-norm, generative-model]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Goodfellow 2014 의 GAN 은 단순하고 우아하다. Generator 와 Discriminator 가 서로를 이기려는 게임을 하면서 데이터 분포를 학습한다. 이론은 깔끔하게 $p_g = p_d$ 라는 유일한 Nash equilibrium 으로 수렴한다. 그런데 왜 실전 GAN 은 그토록 자주 무너지는가?
+
+## Minimax 의 수학적 구조
+
+GAN 의 목적함수는 다음 minimax 게임이다.
+
+$$
+\min_G \max_D V(D, G) = \mathbb{E}_{x \sim p_d}[\log D(x)] + \mathbb{E}_{z \sim p_z}[\log(1 - D(G(z)))]
+$$
+
+Fixed $G$ 에 대해 이 objective 를 최대화하는 optimal discriminator 는 closed-form 으로 존재한다.
+
+<Theorem kind="theorem" number="1" title="Optimal Discriminator">
+Fixed $G$ (따라서 fixed $p_g$) 에 대해 $V(D, G)$ 를 최대화하는 discriminator 는 다음과 같다.
+
+$$D^*(x) = \frac{p_d(x)}{p_d(x) + p_g(x)}$$
+</Theorem>
+
+<Proof>
+$V(D, G) = \int [p_d(x) \log D(x) + p_g(x) \log(1 - D(x))] \, dx$. 각 $x$ 에서 integrand 를 $D(x)$ 에 대해 미분하여 0 으로 놓으면 $D^*(x) = p_d(x) / (p_d(x) + p_g(x))$.
+</Proof>
+
+$D^* = 1/2$ everywhere 는 $p_g = p_d$ 일 때만 가능하다 — Discriminator 가 진짜와 가짜를 구별하지 못하는 상태. 이것이 이론적 equilibrium 이다.
+
+## JSD 환원 — 아름답지만 위험한 이유
+
+$D^*$ 를 $V$ 에 대입하면 놀라운 등식이 나온다.
+
+$$
+V(D^*, G) = 2 \cdot \text{JSD}(p_d \| p_g) - \log 4
+$$
+
+여기서 $\text{JSD}(p, q) = \frac{1}{2}\text{KL}(p \| m) + \frac{1}{2}\text{KL}(q \| m)$, $m = (p + q) / 2$. GAN 이 **Jensen-Shannon Divergence 의 최소화**와 정확히 동치임을 보여준다. $\text{JSD} \geq 0$, $\text{JSD} = 0 \iff p_d = p_g$ 이므로 최솟값 $-\log 4$ 는 $p_g = p_d$ 일 때 유일하게 도달한다.
+
+그런데 JSD 에는 치명적인 성질이 있다.
+
+<Callout type="warning" title="JSD Saturation">
+$p_d$ 와 $p_g$ 의 support 가 disjoint 이면 $\text{JSD}(p_d \| p_g) = \log 2$ (상수). 이때 $\nabla_G V(D^*, G) = 0$ — generator 의 학습이 멈춘다.
+</Callout>
+
+훈련 초기에 random generator 는 데이터 분포와 support 가 거의 겹치지 않는다. JSD 가 포화되고 gradient 는 사라진다. 이것이 GAN 훈련 불안정성의 첫 번째 수학적 뿌리다.
+
+## Mode Collapse — Reverse KL 이 만드는 함정
+
+Generator 의 non-saturating loss $L_G = -\mathbb{E}_{p_z}[\log D(G(z))]$ 는 saturating loss 의 초기 gradient 문제를 해결한다. 그러나 optimal $D^*$ 를 대입하면 다음 등식이 성립한다.
+
+$$
+L_G^{\text{NS}} = \text{KL}(p_g \| p_d) - 2\,\text{JSD}(p_d \| p_g) + \log 4
+$$
+
+$\text{KL}(p_g \| p_d)$ 는 **reverse KL** 이다. 이 발산의 성질은 비대칭적이다.
+
+- $p_d > 0$ 이지만 $p_g = 0$: 페널티 없음 (missing mode 허용)
+- $p_g > 0$ 이지만 $p_d = 0$: 무한 페널티
+
+결과적으로 $p_g$ 는 $p_d$ 의 high-density 영역 일부에만 집중하는 **mode-seeking** 전략이 최적이 된다. MNIST 10개 숫자 중 2개만 완벽히 생성해도 generator loss 가 낮을 수 있다. 이것이 mode collapse 의 수학적 원인이다.
+
+<Aside label="Forward vs Reverse KL">
+VAE 나 MLE 가 $\text{KL}(p_d \| p_g)$ (forward KL) 를 최소화하면 mass-covering — blurry 하지만 모든 mode 를 cover 한다. Reverse KL 은 sharp 하지만 mode 를 놓친다. GAN 의 "선명한 샘플" 과 "mode collapse" 는 같은 동전의 양면이다.
+</Aside>
+
+## Wasserstein 거리 — 포화를 우회하는 지도
+
+Arjovsky 2017 의 WGAN 은 JSD 를 **Wasserstein-1 거리** 로 교체한다.
+
+$$
+W_1(p, q) = \inf_{\gamma \in \Pi(p, q)} \mathbb{E}_{(x,y) \sim \gamma}[\|x - y\|]
+$$
+
+흙더미를 한 분포에서 다른 분포로 옮기는 최소 비용 — Earth Mover's Distance. 두 점 분포 $p = \delta_a$, $q = \delta_b$ 에서 $\text{JSD} = \log 2$ (상수) 이지만 $W_1 = \|a - b\|$ (거리에 비례). Support 가 disjoint 여도 informative gradient 가 살아있다.
+
+직접 계산은 어렵지만 Kantorovich-Rubinstein duality 로 우회한다.
+
+$$
+W_1(p_d, p_g) = \sup_{\|f\|_L \leq 1} \mathbb{E}_{p_d}[f] - \mathbb{E}_{p_g}[f]
+$$
+
+1-Lipschitz 함수 $f$ (WGAN 의 critic) 로 supremum 을 추정하면 된다. 이 1-Lipschitz 제약을 어떻게 강제하느냐가 WGAN → WGAN-GP → Spectral Norm 으로 이어지는 발전의 핵심이다.
+
+<Callout type="note" title="트레이드오프">
+Weight clipping (WGAN): 구현 단순하지만 critic capacity 를 강하게 제한하고 weight 가 $\pm c$ 경계에 모이는 pathology 발생. Gradient Penalty (WGAN-GP): tight 1-Lipschitz 이지만 gradient of gradient 로 2배 backward 비용. Spectral Normalization: per-layer architecture 제약, cheap 하지만 conservative upper bound.
+</Callout>
+
+## Spectral Normalization — 구조 자체가 제약
+
+Miyato 2018 의 Spectral Normalization (SN) 은 1-Lipschitz 를 loss term 이 아닌 **architecture 수준** 에서 강제한다.
+
+각 weight $W \in \mathbb{R}^{m \times n}$ 의 spectral norm:
+
+$$
+\sigma(W) = \max_{\|x\|=1} \|Wx\| = \sigma_{\max}(W)
+$$
+
+$\bar{W} = W / \sigma(W)$ 로 정규화하면 $\sigma(\bar{W}) = 1$. ReLU/LeakyReLU 처럼 1-Lipschitz 활성화와 결합하면 전체 네트워크가 1-Lipschitz 로 bound 된다.
+
+$$
+\|f\|_L \leq \prod_l \sigma(W_l) = 1
+$$
+
+$\sigma(W)$ 의 정확한 계산은 SVD 가 필요하지만, power iteration 으로 per-step 1회만 수행해도 충분히 정확하다.
+
+```python
+# 1회 power iteration
+v = (W.T @ u); v = v / v.norm()
+u = (W @ v); u = u / u.norm()
+sigma = u @ W @ v
+W_normalized = W / sigma
+```
+
+$u$, $v$ 를 buffer 로 저장하고 매 step 업데이트하면 SVD 없이 online 으로 $\sigma(W)$ 를 추적한다. BigGAN, SAGAN, StyleGAN2 가 SN 을 표준으로 채택한 이유다.
+
+## 정리
+
+GAN 의 불안정성은 단일 버그가 아니라 수학적 구조에서 나오는 필연이다.
+
+- Minimax 의 Nash equilibrium 은 이론적으로 유일하지만, non-convex NN 에서 alternating SGD 는 oscillation 하거나 saddle 근처에 갇힌다.
+- JSD 는 disjoint support 에서 포화되어 gradient 를 죽인다 — 훈련 초기에 가장 치명적이다.
+- Non-saturating loss 의 reverse KL 성향이 mode collapse 를 유도한다 — sharp sample 의 대가다.
+- Wasserstein 거리는 포화 없이 informative gradient 를 보존하지만, 1-Lipschitz 강제의 비용이 따른다.
+- Spectral Normalization 은 그 비용을 architecture 로 흡수해 modern GAN 의 default 가 됐다.
+
+GAN 의 역사는 하나의 목적함수에서 출발해 수학적 한계를 하나씩 발견하고 우회하는 과정이다. 다음 글에서는 이 한계를 근본적으로 다른 방식으로 해결하는 Diffusion Model 의 forward/reverse process 를 추적한다.
+
+<Reference
+  title="Generative Adversarial Nets"
+  authors="Goodfellow et al."
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1406.2661"
+/>
+
+<Reference
+  title="Wasserstein GAN"
+  authors="Arjovsky et al."
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1701.07875"
+/>
+
+<Reference
+  title="Spectral Normalization for Generative Adversarial Networks"
+  authors="Miyato et al."
+  year={2018}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1802.05957"
+/>

@@ -1,0 +1,141 @@
+---
+title: "생성 모델의 다섯 계보는 왜 하나의 질문에서 갈라지는가"
+description: "AR · VAE · Flow · GAN · Diffusion 의 likelihood, 샘플링 속도, 품질 트레이드오프부터 Consistency Model, EBM, 프런티어 응용까지, 생성 모델의 설계 철학을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [generative-models, diffusion, consistency-model, energy-based-model, flow-matching]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+생성 모델은 표면적으로 서로 다른 알고리즘처럼 보인다. AR은 토큰을 순서대로 예측하고, GAN은 판별자를 속이며, Diffusion은 노이즈를 단계적으로 제거한다. 그러나 더 깊이 들여다보면 이 다섯 계보는 모두 같은 질문에서 출발한다. **"데이터 분포 $p_d(x)$를 어떻게 근사하는가?"** — 그리고 이 질문에 답하는 방식의 차이가 각 계보의 모든 설계 결정을 결정한다.
+
+## 하나의 목표, 다섯 가지 타협
+
+다섯 계보는 사실 동일한 KL 최소화 문제 $\min_\theta \text{KL}(p_d \| p_\theta)$의 서로 다른 근사다.
+
+| Family | KL 최소화 전략 |
+|--------|---------------|
+| **AR** | 체인 룰로 $\log p$ 직접 계산 |
+| **Flow** | 변수 변환으로 정확한 likelihood |
+| **VAE** | ELBO (하한) 최적화 |
+| **Diffusion** | 노이즈 레벨별 가중 KL |
+| **GAN** | JSD (다른 메트릭, KL 아님) |
+
+이 전략의 차이가 곧 트레이드오프의 원천이다.
+
+$$\mathcal{L}_\text{AR} = -\sum_i \log p_\theta(x_i \mid x_{<i}), \quad \mathcal{L}_\text{Diffusion} = \mathbb{E}_{t, x_0, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+
+AR은 exact likelihood를 갖지만 샘플링이 $O(n)$ 순차적이다. GAN은 likelihood가 없는 대신 단일 forward pass로 샘플을 생성하며 가장 빠르다. Diffusion은 ELBO이지만 PF-ODE를 통해 정확한 likelihood에 근접하고, 2022년 기준 CIFAR-10에서 EDM이 FID 1.79를 달성해 사실상 모든 family를 압도한다.
+
+<Callout type="note" title="트레이드오프">
+"항상 최선인 family"는 없다. Diffusion이 image quality에서 SOTA이지만, 실시간 TTS vocoder에서는 HiFi-GAN이 여전히 표준이다. 16kHz 오디오는 초당 16,000 샘플을 처리해야 하는데, Diffusion의 50-step은 800,000 NN 연산/초를 요구해 실시간 처리가 불가능하다. **태스크의 compute 제약이 architecture를 선택한다.**
+</Callout>
+
+## GAN 이후 Diffusion이 지배하게 된 이유
+
+2020년 이전에는 GAN이 image generation의 표준이었다. StyleGAN2가 FID 3.0을 달성했을 때, 생성 모델 연구의 중심은 GAN stability와 mode coverage였다.
+
+2020년 이후 Diffusion이 이를 역전한 이유는 품질 수치 하나가 아니다. 구조적 이유가 있다.
+
+GAN은 reverse KL 성향을 가진다 — mode-seeking이므로 sharp하지만 mode collapse가 빈번하다. Vanilla GAN은 8-Gaussian 벤치마크에서 흔히 3-5개 mode만 커버한다. Diffusion은 forward KL로 모든 mode를 커버하고, per-timestep supervised training으로 학습이 안정적이며, U-Net에서 DiT까지 architecture 선택이 자유롭다. 무엇보다 대규모 데이터와 모델 크기에서 잘 스케일된다는 것이 DALL-E와 Imagen으로 증명됐다.
+
+<Aside label="남아 있는 GAN의 영역">
+GAN은 완전히 사라지지 않았다. Single forward pass의 속도 우위가 결정적인 실시간 응용 — 얼굴 편집(StyleGAN), vocoder(HiFi-GAN), 엣지 추론 — 에서 GAN은 여전히 합리적 선택이다.
+</Aside>
+
+## Diffusion의 속도 문제와 두 해법
+
+Diffusion의 유일한 약점은 $T = 50$-$1000$ step 샘플링이다. 이를 해소하는 두 패러다임이 2022-2023년 등장했다.
+
+**Rectified Flow** (Liu 2022)는 데이터와 노이즈 사이를 직선으로 보간한다.
+
+$$x_t = (1 - t)x_0 + t\epsilon, \quad \frac{dx}{dt} = v_\theta(x, t), \quad \mathcal{L} = \mathbb{E}\left[\|v_\theta(x_t, t) - (\epsilon - x_0)\|^2\right]$$
+
+직선 궤적에서는 vector field가 경로를 따라 상수다. 이상적 경우 $v = \epsilon - x_0$이면 Euler step 하나로 정확한 역방향 적분이 가능하다.
+
+$$x(0) = x(1) + (-1) \cdot (\epsilon - x_0) = \epsilon - (\epsilon - x_0) = x_0 \checkmark$$
+
+**Consistency Model** (Song 2023)은 다른 방향에서 접근한다. 어떤 $t$에서도 직접 $x_0$를 예측하는 함수 $f_\theta(x_t, t) = x_0$를 학습한다.
+
+<Theorem kind="definition" number="1" title="Self-Consistency">
+같은 trajectory의 인접한 두 시점에서 예측이 일치해야 한다.
+
+$$\mathcal{L}_\text{CT} = \mathbb{E}\left[d\left(f_\theta(x_{t_{n+1}}, t_{n+1}),\ f_{\theta^-}(\hat{x}_{t_n}, t_n)\right)\right]$$
+
+$\theta^-$는 $\theta$의 EMA. 경계 조건 $f_\theta(x_0, 0) = x_0$는 architecture로 강제된다.
+</Theorem>
+
+두 방법 모두 1-4 step 생성을 가능케 한다. Stable Diffusion 3는 Rectified Flow를 채택해 28 step으로 SDXL 대비 25%+ 인간 선호도 향상을 달성했다. LCM(Latent Consistency Model)은 SD를 2-4 step으로 압축했다.
+
+## EBM — 모든 생성 모델의 공통 언어
+
+Energy-Based Model은 생성 모델의 가장 일반적인 형식이다.
+
+$$p_\theta(x) = \frac{e^{-E_\theta(x)}}{Z(\theta)}, \quad Z(\theta) = \int e^{-E_\theta(x)}\, dx$$
+
+$E_\theta$가 임의 NN이므로 architectural 제약이 없다. 문제는 $Z$의 intractability다. 이를 우회하는 핵심 통찰이 **score**다.
+
+$$\nabla_x \log p = -\nabla_x E_\theta - \underbrace{\nabla_x \log Z}_{= 0} = -\nabla_x E_\theta$$
+
+$Z$가 $x$와 무관하므로 gradient가 0이다. Diffusion model이 학습하는 $s_\theta(x, t) \approx \nabla_x \log q_t$는 바로 이 score다. **Diffusion은 time-conditional EBM의 score를 학습하는 알고리즘이다.**
+
+JEM(Grathwohl 2020)은 이 통찰을 다른 방향으로 확장한다. 표준 classifier의 logit $f_\theta(x)[y]$에서 에너지를 유도한다.
+
+$$E_\theta(x) = -\log\sum_y \exp(f_\theta(x)[y]) = -\text{LogSumExp}_y(f_\theta(x)[y])$$
+
+Classifier가 암묵적으로 EBM을 정의하고 있다는 것이다. Joint training으로 생성 능력과 adversarial robustness를 동시에 얻는다 — 분류 정확도의 소폭 손실을 감수하고.
+
+## 프런티어 — 같은 철학, 다른 도메인
+
+Diffusion과 Flow Matching은 이제 이미지 생성을 넘어 다른 도메인으로 확산됐다.
+
+**Video**: Sora는 DiT(Diffusion Transformer)로 시공간 패치를 처리한다. U-Net의 convolutional inductive bias 대신 Transformer의 attention이 긴 시간 축의 coherence를 처리한다. DiT-XL/2는 ImageNet 256×256에서 FID 2.27을 기록해 U-Net 기반을 압도했다.
+
+**3D**: DreamFusion의 SDS(Score Distillation Sampling)는 2D diffusion의 score를 NeRF에 증류한다. 3D 데이터셋이 부족한 상황에서 풍부한 2D 지식을 활용하는 우회로다.
+
+$$\nabla_\theta \mathcal{L}_\text{SDS} = \mathbb{E}_{t, \epsilon, c}\left[w(t)(\epsilon_\phi(x_t; y, t) - \epsilon) \frac{\partial x}{\partial \theta}\right]$$
+
+**과학**: AlphaFold 3는 Flow Matching으로 단백질 원자 좌표 분포를 학습한다. SE(3) equivariance를 통해 회전-이동 불변성을 보존하면서, 단순 구조 예측을 넘어 단백질-리간드 복합체의 앙상블 생성으로 나아갔다. 단백질-단백질 인터페이스에서 AlphaFold 2 대비 50% 향상이 보고됐다.
+
+## 정리
+
+- 다섯 계보는 모두 $\min_\theta \text{KL}(p_d \| p_\theta)$의 다른 근사다. 선택은 항상 likelihood, 속도, 품질, 안정성 간의 타협이다.
+- Diffusion이 GAN을 대체한 것은 품질만의 문제가 아니다. Forward KL로 mode coverage를 보장하고, per-step supervised training으로 안정성을 확보하며, Transformer와 결합해 스케일이 작동한 결과다.
+- Consistency Model과 Rectified Flow는 Diffusion의 마지막 약점인 샘플링 속도를 1-4 step으로 압축했다. GAN 수준의 속도와 Diffusion 수준의 품질이 수렴 중이다.
+- EBM은 모든 생성 모델의 공통 언어다. Diffusion은 그것의 실용적 구현이고, JEM은 classifier와의 통합이며, Compositionality는 미래의 controllable generation 기반이다.
+
+생성 모델의 다음 질문은 "어떤 family가 최선인가"가 아니다. "각 도메인의 inductive bias와 compute 제약에 맞는 타협점을 어떻게 설계하는가"다.
+
+<Reference
+  title="Consistency Models"
+  authors="Song et al."
+  year={2023}
+  venue="ICML"
+  url="https://arxiv.org/abs/2303.01469"
+/>
+<Reference
+  title="Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow"
+  authors="Liu et al."
+  year={2022}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2209.03003"
+/>
+<Reference
+  title="Your classifier is secretly an energy based model and you should treat it like one"
+  authors="Grathwohl et al."
+  year={2020}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1912.03263"
+/>

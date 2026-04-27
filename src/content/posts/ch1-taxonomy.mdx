@@ -1,0 +1,138 @@
+---
+title: "생성 모델의 통합 프레임워크 — 무엇을 배우는가"
+description: "Discriminative와 Generative의 수학적 차이부터 KL 최소화 통합 관점, IS·FID·NLL 평가 지표까지, 생성 모델을 하나의 언어로 이해한다."
+pubDate: 2026-04-27
+category: ai
+tags: [generative-model, kl-divergence, likelihood, evaluation-metrics]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+AR, VAE, Flow, GAN, Diffusion — 다섯 family는 서로 완전히 다른 알고리즘처럼 보인다. 하지만 이들은 모두 하나의 질문에 대한 다른 대답이다. **"모델 분포 $p_\theta$를 데이터 분포 $p_\text{data}$에 가깝게 만드는 방법은 무엇인가?"** 그리고 "가깝다"는 기준이 무엇인지에 따라 모델의 구조와 훈련 방식이 달라진다.
+
+## 두 패러다임의 수학적 뿌리
+
+생성 모델을 이해하는 출발점은 discriminative와 generative의 차이를 정확히 아는 것이다.
+
+**Discriminative**는 $p_\theta(y \mid x)$만 학습한다. 결정 경계에 모델 용량을 집중하고, 데이터 분포 전체는 무시한다. **Generative**는 $p_\theta(x)$ 또는 $p_\theta(x, y)$를 학습한다. 데이터가 어떻게 생겼는지를 통째로 모델링해야 한다.
+
+Bayes 정리가 두 패러다임을 연결한다.
+
+$$p_\theta(y \mid x) = \frac{p_\theta(x \mid y)\, p_\theta(y)}{\sum_{y'} p_\theta(x \mid y')\, p_\theta(y')}$$
+
+라벨이 있는 generative 모델 $p_\theta(x, y)$가 있으면 Bayes로 discriminative 분류기를 자동으로 유도할 수 있다. 역방향은 불가능 — $p(y \mid x)$만으로 $p(x \mid y)$를 복원할 수 없다. 이 비대칭이 generative 모델의 근본적 우위다.
+
+<Aside label="왜 Generative를 연구하는가">
+분류만 잘 하면 된다면 discriminative로 충분하다. 하지만 $p(x)$를 알면 샘플 생성, likelihood 평가, latent 표현 학습, anomaly detection이 같은 모델 하나로 처리된다. Discriminative는 매 task마다 재훈련이 필요하다.
+</Aside>
+
+## Explicit vs Implicit — Likelihood를 계산할 수 있는가
+
+5개 family를 나누는 두 번째 축은 **likelihood의 계산 가능성**이다.
+
+- **Tractable Explicit** (AR, Flow): $\log p_\theta(x)$를 closed-form으로 계산 가능. MLE를 SGD로 직접 풀 수 있다.
+- **Bounded Explicit** (VAE, Diffusion): $\log p_\theta(x)$ 자체는 intractable하지만 lower bound $\mathcal{L}(\theta; x)$가 존재한다.
+
+$$\log p_\theta(x) \geq \mathcal{L}(\theta; x), \quad \forall x$$
+
+- **Implicit** (GAN, EBM): $\log p_\theta(x)$를 직접 평가할 수 없다. 샘플링 또는 unnormalized score만 제공한다.
+
+<Theorem kind="proposition" number="1" title="Tractable Likelihood의 Architecture 제약">
+$\log p_\theta(x)$가 closed-form으로 계산 가능하기 위해서는 모델이 (i) AR factorization, (ii) invertible transformation, 또는 (iii) latent 없는 closed-form density 형태여야 한다.
+</Theorem>
+
+<Proof>
+AR은 chain rule $\log p_\theta(x) = \sum_i \log p_\theta(x_i \mid x_{<i})$로 forward pass 1회에 평가 가능하다. Flow는 invertible $f_\theta$와 change of variables
+
+$$\log p_\theta(x) = \log p(f^{-1}(x)) + \log|\det J_{f^{-1}}(x)|$$
+
+로 exact 계산이 가능하다. 임의의 NN decoder와 continuous latent를 조합하면 marginal $\int p(x \mid z)\,p(z)\,dz$가 일반적으로 intractable하다. 이것이 VAE가 ELBO만 주는 이유다. GAN의 generator $x = G_\theta(z)$는 lower-dimensional manifold로의 push-forward이므로 ambient space에서 density 자체가 singular하다. $\square$
+</Proof>
+
+VAE의 ELBO gap은 $\text{KL}(q_\phi(z \mid x) \| p_\theta(z \mid x))$이다. Amortized inference $q_\phi$가 true posterior와 일치할 때만 ELBO = $\log p_\theta(x)$. 일반적인 NN으로는 이 gap이 항상 존재한다.
+
+## 모든 모델은 KL 최소화다
+
+세 번째이자 가장 강력한 통합이다. 5개 family의 서로 다른 objective는 사실 같은 목표의 다른 근사다.
+
+<Theorem kind="theorem" number="2" title="MLE ≡ Forward KL 최소화">
+데이터 $\{x_i\} \overset{\text{iid}}{\sim} p_\text{data}$에 대해, $n \to \infty$일 때
+
+$$\hat\theta_\text{MLE} = \arg\max_\theta \frac{1}{n}\sum_i \log p_\theta(x_i) \equiv \arg\min_\theta \text{KL}(p_\text{data} \| p_\theta)$$
+</Theorem>
+
+<Proof>
+큰 수의 법칙으로 $\frac{1}{n}\sum_i \log p_\theta(x_i) \xrightarrow{n \to \infty} \mathbb{E}_{p_\text{data}}[\log p_\theta(x)]$. 그리고
+
+$$\mathbb{E}_{p_\text{data}}[\log p_\theta(x)] = -H(p_\text{data}) - \text{KL}(p_\text{data} \| p_\theta)$$
+
+$H(p_\text{data})$는 $\theta$와 무관하므로, $\theta$에 대한 maximization은 $\text{KL}(p_\text{data} \| p_\theta)$ minimization과 동치다. $\square$
+</Proof>
+
+각 family가 어떤 divergence를 최소화하는지를 표로 정리하면 다음과 같다.
+
+| 모델 | 최소화 대상 | 방식 |
+|------|------------|------|
+| AR | Forward KL (exact) | 직접 NLL |
+| Flow | Forward KL (exact) | Change-of-variables |
+| VAE | Forward KL (하한) | ELBO 최대화 |
+| Diffusion | Weighted forward KL | Chain 분해, $L_\text{simple}$ |
+| GAN | JSD | Adversarial minimax |
+| WGAN | Wasserstein-1 | 1-Lipschitz constraint |
+
+Forward KL $\text{KL}(p_\text{data} \| p_\theta)$는 **mass-covering**이다. $p_\text{data} > 0$인 곳에 $p_\theta$가 없으면 발산하므로, 모든 mode를 cover해야 한다. 이것이 VAE 이미지가 blurry한 이유다.
+
+Reverse KL $\text{KL}(p_\theta \| p_\text{data})$는 **mode-seeking**이다. $p_\theta > 0$인 곳에 $p_\text{data}$가 있어야 하므로, $p_\theta$가 $p_\text{data}$의 일부 mode만 선택한다. GAN의 mode collapse가 reverse KL적 행동의 극단적 사례다.
+
+<Callout type="warning" title="JSD와 Disjoint Support">
+GAN의 훈련이 불안정한 수학적 이유가 여기 있다. Support가 겹치지 않는 $p$와 $q$에서 $\text{KL}(p \| q) = \infty$이지만, JSD는 $\log 2$로 **상수**다. Gradient가 0이 되어 훈련이 멈춘다. WGAN이 Wasserstein distance를 사용하는 동기다 — transport-based metric은 support가 겹치지 않아도 연속적이고 미분 가능하다.
+</Callout>
+
+Diffusion은 이 구분을 hybrid로 넘어선다. ELBO로 likelihood를 평가하면서 (bounded explicit), score matching으로 implicit-style 샘플을 생성한다. Chain을 따라 분해된 forward KL이 sharpness와 coverage를 동시에 유지하는 구조다. 이것이 2020년 이후 diffusion이 다른 모든 family를 압도한 이유다.
+
+## 평가: 무엇을 측정하는가
+
+좋은 생성 모델이란 무엇인가. 이 질문의 어려움이 평가 지표의 다양성을 만들었다.
+
+**IS** (Inception Score)는 mutual information $I(X; Y)$의 지수다. 각 샘플이 분류기에서 confident하고 (낮은 $H(Y \mid X)$), 전체적으로 다양한 클래스에 분포할 때 (높은 $H(Y)$) 크다. 단, within-class diversity를 무시한다.
+
+**FID**는 Inception feature space에서 두 분포를 Gaussian으로 가정하고 Fréchet distance를 측정한다.
+
+$$\text{FID} = \|\mu_r - \mu_g\|^2 + \text{tr}\!\left(\Sigma_r + \Sigma_g - 2(\Sigma_r \Sigma_g)^{1/2}\right)$$
+
+실제로는 Wasserstein-2 distance의 Gaussian 근사다. Gaussian 가정이 깨지면 FID가 misleading할 수 있다.
+
+**Precision/Recall**은 FID로 포착하지 못하는 quality vs diversity를 분해한다. Precision은 생성 샘플이 진짜 manifold 안에 있는 비율(품질), Recall은 진짜 샘플이 생성 manifold로 cover되는 비율(다양성)이다. GAN은 보통 high precision, low recall. VAE는 반대. Diffusion은 둘 다 높다.
+
+**NLL** (bits per dimension)은 정보론적으로 엄밀하지만 implicit 모델에는 적용할 수 없고, sample quality와 상관관계가 약하다 (Theis et al., 2016). 동일한 NLL을 가진 두 모델이 perceptual quality에서 극단적으로 다를 수 있다.
+
+<Callout type="note" title="트레이드오프">
+단일 metric으로 생성 모델을 평가하지 말아야 한다. NLL은 mode coverage에 민감하지만 per-sample sharpness에 둔감하다. FID는 반대다. Precision/Recall은 둘을 분해하지만 Inception 의존성이 있다. Text-to-image 시대에는 CLIP score가 alignment를 측정하는 표준이 됐다. 사용 사례에 따라 조합해야 한다.
+</Callout>
+
+## 정리
+
+- Generative는 discriminative를 포함한다 — Bayes로 $p_\theta(x, y)$에서 $p_\theta(y \mid x)$를 유도할 수 있지만, 역방향은 불가능하다.
+- Explicit/Implicit의 구분은 아키텍처 결정이다. Exact likelihood와 expressive latent는 양립하기 어렵고, 이것이 Flow vs VAE의 근본 trade-off다.
+- 모든 생성 모델은 divergence 최소화다. 어떤 divergence를 선택하느냐가 mass-covering/mode-seeking 성향과 훈련 안정성을 결정한다.
+- NLL과 FID는 서로 다른 차원을 측정한다. Diffusion이 SOTA인 이유는 두 metric을 동시에 잘 하기 때문이다.
+
+다음 챕터에서는 AR 모델이 chain rule factorization으로 exact likelihood를 구현하는 방법과, sequential 구조가 만드는 generation 속도 병목을 구체적으로 추적한다.
+
+<Reference
+  title="On Discriminative vs. Generative Classifiers: A comparison of logistic regression and naive Bayes"
+  authors="Ng, A. Y. and Jordan, M. I."
+  year={2002}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper_files/paper/2001/hash/7b7a53e239

@@ -1,0 +1,157 @@
+---
+title: "Normalizing Flow의 모든 설계 결정은 하나의 제약에서 나온다"
+description: "Change of variables 공식의 두 조건 — invertibility와 tractable Jacobian — 이 어떻게 Coupling, Autoregressive, Continuous Flow의 architecture를 각각 다르게 강제하는지 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [normalizing-flow, change-of-variables, jacobian, realnvp, neural-ode]
+difficulty: advanced
+series:
+  slug: generative-model-deep-dive
+  title: Generative Model Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Normalizing Flow는 VAE의 ELBO가 아니라 **정확한** $\log p(x)$를 계산한다. 이 사실 하나가 모든 것을 결정한다. Flow의 각 architecture는 서로 다른 설계처럼 보이지만, 사실 모두 같은 두 제약 — *invertibility*와 *tractable Jacobian determinant* — 을 각기 다른 방식으로 타협한 결과다. 왜 이 두 제약이 그토록 강력한 inductive bias가 되는가?
+
+## 출발점: 확률 질량 보존
+
+Change of variables 공식은 단순하다.
+
+$$
+p_X(x) = p_Z(f^{-1}(x)) \cdot |\det J_{f^{-1}}(x)| = \frac{p_Z(z)}{|\det J_f(z)|}
+$$
+
+직관은 더 단순하다. $f$가 공간을 늘리면 density는 반비례로 줄어야 전체 확률 질량이 1로 보존된다. $|\det J_f|$가 그 부피 변화율이다.
+
+체인 $f = f_L \circ \cdots \circ f_1$로 확장하면:
+
+$$
+\log p_X(x) = \log p_Z(z_0) - \sum_{l=1}^{L} \log |\det J_{f_l}(z_{l-1})|
+$$
+
+이 공식이 Flow에 주는 것은 세 가지다. **Exact likelihood** — 근사가 아니다. **Trivial sampling** — $p_Z$에서 샘플링 후 $f$ 적용. **Exact latent inference** — $z = f^{-1}(x)$가 결정론적.
+
+그런데 문제가 있다. $|\det J_f|$의 일반적 계산 비용은 $O(d^3)$다. $d = 1000$이면 매 forward pass마다 $10^9$ ops — 실용적이지 않다. 이것이 모든 Flow architecture를 만들어낸 문제다.
+
+## 첫 번째 해법: 삼각 Jacobian (RealNVP / Glow)
+
+<Theorem kind="proposition" number="1" title="Triangular Jacobian의 행렬식">
+$J \in \mathbb{R}^{d \times d}$가 하삼각 행렬이면 $\det J = \prod_{i=1}^d J_{ii}$이다. 계산 비용 $O(d)$.
+</Theorem>
+
+RealNVP의 affine coupling layer는 이 성질을 architecture에 직접 구워 넣는다.
+
+$$
+y_A = x_A, \quad y_B = x_B \odot \exp(s(x_A)) + t(x_A)
+$$
+
+$x_A$는 그대로 통과, $x_B$만 $x_A$에 의존하는 affine 변환. Jacobian의 블록 구조:
+
+$$
+J = \begin{pmatrix} I & 0 \\ * & \text{diag}(\exp(s(x_A))) \end{pmatrix}
+$$
+
+하삼각 블록 형태이므로 $\log |\det J| = \sum_i s_i(x_A)$ — $O(d)$ 계산. $s, t$는 임의의 NN이어도 된다. Invertibility는 architecture가 보장한다: $x_B = (y_B - t(y_A)) \odot \exp(-s(y_A))$.
+
+Glow는 여기에 **Invertible $1 \times 1$ Convolution**을 더한다. 채널 차원에 $W \in \mathbb{R}^{C \times C}$를 적용하면 $\log |\det J| = HW \cdot \log |\det W|$. $W = PL(U + \text{diag}(s))$로 분해하면 $\log |\det W| = \sum_i s_i$ — 다시 $O(C)$. 고정 alternating mask 대신 학습 가능한 channel mixing.
+
+<Callout type="note" title="트레이드오프">
+Coupling layer는 forward와 inverse 모두 병렬이라 양방향 효율이 좋다. 대신 **매 layer마다 절반의 입력이 변형되지 않는다** — information bottleneck. 이를 보상하려면 수십 개의 layer를 쌓아야 한다. 깊이가 expressive함을 결정한다.
+</Callout>
+
+## 두 번째 해법: 자기회귀 순서 (MAF / IAF)
+
+Coupling의 "절반은 그대로"라는 제약을 피하려면? 모든 차원을 변형하되, **자기회귀 순서**를 이용해 triangular Jacobian을 구성한다.
+
+MAF(Masked Autoregressive Flow):
+
+$$
+z_i = \frac{x_i - \mu_i(x_{<i})}{\sigma_i(x_{<i})}
+$$
+
+$\partial z_i / \partial x_j = 0$ for $j > i$ — 하삼각 구조. $\log |\det J| = -\sum_i \log \sigma_i(x_{<i})$.
+
+하지만 비대칭이 생긴다. **Density 계산 방향** ($x \to z$): $x$가 전부 알려져 있으므로 MADE masking으로 모든 $\mu_i, \sigma_i$를 한 번에 병렬 계산. **Sampling 방향** ($z \to x$): $x_i = \mu_i(x_{<i}) + \sigma_i(x_{<i}) z_i$에서 $x_1$을 먼저 구해야 $x_2$를 구할 수 있다 — $O(D)$ 순차.
+
+IAF(Inverse Autoregressive Flow)는 conditioning 변수를 뒤집는다:
+
+$$
+x_i = \mu_i(z_{<i}) + \sigma_i(z_{<i}) \cdot z_i
+$$
+
+$z$가 한 번에 샘플링되면 모든 $\mu_i, \sigma_i$를 병렬 계산 가능 — **sampling 병렬, density 순차**. 정반대의 효율 구조다.
+
+| | Density 계산 | Sampling |
+|:---|:---|:---|
+| **Coupling** | 병렬 | 병렬 |
+| **MAF** | 병렬 | $O(D)$ 순차 |
+| **IAF** | $O(D)$ 순차 | 병렬 |
+
+MAF는 density estimation(이상 탐지)에, IAF는 VAE의 expressive posterior나 Parallel WaveNet의 student model에 쓰인다. 같은 변환 family를 표현하지만 효율의 비대칭이 사용처를 결정한다.
+
+## 세 번째 해법: 연속 시간 ODE (CNF / FFJORD)
+
+Coupling도, autoregressive도, 아무 architectural restriction도 원하지 않는다면? ResNet block $h_{\ell+1} = h_\ell + \Delta t \cdot f_\theta(h_\ell)$의 $\Delta t \to 0$ 극한을 취한다.
+
+$$
+\frac{dz(t)}{dt} = f_\theta(z(t), t)
+$$
+
+이것이 Neural ODE다. $f_\theta$는 임의의 NN이어도 된다 — coupling pattern도, autoregressive mask도 필요 없다. Invertibility는 ODE를 역방향으로 적분하면 자동으로 얻어진다.
+
+Density의 시간 변화는 continuity equation으로 유도된다:
+
+$$
+\frac{d \log p(z(t))}{dt} = -\text{tr}\left(\frac{\partial f_\theta}{\partial z}\right)
+$$
+
+Discrete flow의 $\log |\det J|$가 continuous 버전에서 $\int \text{tr}(\partial f / \partial z) \, dt$가 된다.
+
+<Theorem kind="lemma" number="2" title="Hutchinson Trace Estimator">
+$\epsilon \sim \mathcal{N}(0, I)$이면 $\text{tr}(A) = \mathbb{E}_\epsilon[\epsilon^\top A \epsilon]$.
+</Theorem>
+
+<Proof>
+$\mathbb{E}[\epsilon^\top A \epsilon] = \sum_{ij} A_{ij} \mathbb{E}[\epsilon_i \epsilon_j] = \sum_{ij} A_{ij} \delta_{ij} = \sum_i A_{ii} = \text{tr}(A)$.
+</Proof>
+
+FFJORD은 이 추정량을 CNF에 적용한다. $\epsilon^\top (\partial f / \partial z) \epsilon$을 autograd의 JVP 한 번으로 계산 — $O(D)$ stochastic 추정. $O(D^3)$ determinant에서 $O(D)$로.
+
+<Callout type="warning" title="트레이드오프">
+CNF는 free-form NN으로 이론상 가장 expressive하다. 대가는 ODE solver 비용이다. Adaptive solver(Dopri5)의 NFE(Number of Function Evaluations)는 문제 난이도에 따라 20~1000회 NN forward pass를 요구한다. Discrete flow의 상수 $L$번과 달리 가변 비용이다. Hutchinson estimator의 분산도 학습 불안정성을 유발한다.
+</Callout>
+
+## Diffusion과의 통합
+
+CNF의 vector field가 score $\nabla \log p_t$와 연결된다는 사실은 이 framework의 범위를 드러낸다.
+
+Score-SDE의 forward process에 대한 **Probability Flow ODE**:
+
+$$
+\frac{dx}{dt} = f(x, t) - \frac{1}{2} g(t)^2 \nabla_x \log p_t(x)
+$$
+
+이 ODE의 marginal이 SDE와 동일하다. Diffusion의 **결정론적 sampling**은 CNF다. Score는 vector field의 특수한 parameterization이다.
+
+Diffusion이 CNF보다 실용적인 이유가 여기 있다. CNF는 vector field $f_\theta$를 직접 학습하면서 $\det J$ tracking 비용을 감수한다. Diffusion은 **denoising score matching**으로 Jacobian 계산을 우회한다 — 같은 ODE framework 안에서 더 효율적인 학습 신호.
+
+<Aside label="설계 철학">
+Normalizing Flow의 세 갈래 — Coupling, Autoregressive, Continuous — 는 모두 같은 질문의 다른 답이다. "triangular Jacobian을 어떻게 구성할 것인가?" Coupling은 구조를 반으로 자르고, Autoregressive는 순서를 이용하고, CNF는 시간 미분으로 국소화한다. 제약이 architecture를 만든다.
+</Aside>
+
+## 정리
+
+- Flow의 모든 설계 결정은 $|\det J_f|$를 $O(d^3)$에서 $O(d)$로 줄이는 방법의 차이다.
+- Coupling (RealNVP/Glow)은 양방향 병렬이지만 매 layer 절반이 변형되지 않는다.
+- MAF는 density 병렬, IAF는 sampling 병렬 — 같은 family의 비대칭 duality.
+- CNF는 제약이 없지만 ODE solver 비용과 stochastic trace 분산이 대가다.
+- Diffusion은 CNF와 같은 ODE framework 위에서 score-based 학습으로 Jacobian 추적을 우회해 현재의 SOTA를 점한다.
+
+"Exact likelihood"가 항상 "best generative model"을 의미하지는 않는다. Architecture의 inductive bias와 학습 신호의 질이 sample quality를 결정한다.
