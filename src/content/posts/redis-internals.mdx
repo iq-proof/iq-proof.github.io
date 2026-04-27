@@ -1,0 +1,118 @@
+---
+title: "Redis의 모든 설계 결정은 하나의 철학에서 나온다"
+description: "단일 스레드 이벤트 루프부터 jemalloc 메모리 관리, redisObject 인코딩, 키 만료 메커니즘, Threaded I/O까지 — Redis 내부 설계의 공통 원리를 추적한다."
+pubDate: 2026-04-27
+category: dev
+tags: [redis, event-loop, memory, internals, performance]
+difficulty: intermediate
+series:
+  slug: redis-internals
+  title: Redis Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Redis는 단일 스레드다. 메모리만 쓴다. 인코딩을 자동으로 바꾼다. 만료를 즉시 처리하지 않는다. 얼핏 보면 제각각인 이 결정들은 사실 하나의 질문에 대한 답이다 — **"어떻게 하면 예측 가능한 성능을 보장할 수 있는가?"**
+
+## 단일 스레드 이벤트 루프 — 복잡성 제거의 선택
+
+전통적인 멀티스레드 서버는 연결마다 스레드를 할당한다. 10,000 연결이면 10,000 스레드. 그 스레드들은 소켓 데이터를 기다리며 블록되고, OS는 이들을 끊임없이 전환한다.
+
+Redis는 정반대를 선택했다. 단일 스레드가 Linux의 `epoll`(macOS에서는 `kqueue`)로 수만 개의 소켓을 감시한다. `epoll_wait`는 "읽기/쓰기 준비된 소켓"이 생길 때까지 대기하다가, 준비된 fd만 반환한다. Redis는 그 목록만 순회해 핸들러를 호출한다.
+
+```bash
+# select: 매 호출마다 전체 fd 목록을 커널로 복사 — O(N) 스캔
+select(max_fd + 1, &readfds, NULL, NULL, &timeout);
+
+# epoll: 준비된 소켓만 반환 — O(이벤트 수)
+epoll_wait(epfd, events, MAX_EVENTS, -1);
+```
+
+10,000 연결 중 10개만 동시에 데이터가 있으면, `epoll`은 10개만 돌려준다. 나머지 9,990개를 스캔하는 비용은 0이다. 이 구조에서 Lock, Mutex, Deadlock은 원천적으로 존재하지 않는다. 단일 스레드이므로.
+
+<Callout type="warning" title="이벤트 루프 = 단일 차선 도로">
+한 번에 한 명령어만 통과한다. `KEYS *`가 100만 개 키를 순회하는 수백 ms 동안 다른 모든 요청은 큐에서 기다린다. `KEYS *` → `SCAN`, `SMEMBERS` → `SSCAN`으로 교체하면 이벤트 루프를 독점하지 않는다.
+</Callout>
+
+## jemalloc과 redisObject — 메모리 예측 가능성 확보
+
+Redis가 인메모리인 이유는 RAM 접근이 디스크보다 1,000~100,000배 빠르기 때문이다. 하지만 빠른 것만으로는 부족하다. 메모리가 단편화되어 예측 불가능하게 늘어나면 운영이 불가능해진다.
+
+Redis가 기본 `malloc` 대신 **jemalloc**을 선택한 이유가 여기 있다. jemalloc은 할당 요청을 8, 16, 32, 48, 64... 바이트 크기 클래스로 올림해 같은 크기끼리 같은 영역에서 관리한다. 단편화율이 일반 `malloc`의 10~30%에서 3~8%로 줄어든다.
+
+`redisObject` 구조체는 이 원칙을 값 수준으로 내린다.
+
+```c
+typedef struct redisObject {
+    unsigned type:4;      /* 외부 타입 (String/List/Hash...) */
+    unsigned encoding:4;  /* 내부 인코딩 (int/embstr/raw/listpack...) */
+    unsigned lru:24;      /* 마지막 접근 시각 또는 LFU 빈도 */
+    int refcount;
+    void *ptr;
+} robj;
+```
+
+같은 "string"이라도 정수면 `int`(ptr에 값 직접 저장, malloc 0회), 44바이트 이하 문자열이면 `embstr`(redisObject와 연속 메모리, malloc 1회), 그 이상이면 `raw`(별도 SDS, malloc 2회)다. 44바이트 경계는 jemalloc의 64바이트 슬롯에 redisObject(16B) + SDS 헤더(3B) + 문자열 + null이 정확히 들어가도록 맞춘 것이다.
+
+Hash도 필드 수 128개 이하, 값 크기 64바이트 이하면 `listpack`(연속 메모리, O(N) 탐색)으로 유지되다가 임계값을 넘는 순간 `hashtable`(O(1) 탐색, 메모리 4~10배)로 전환된다. 이 전환은 단방향이다 — 한 번 `hashtable`이 되면 돌아오지 않는다.
+
+<Aside label="설계 원칙">
+Redis의 인코딩 전략은 "작을 때는 메모리 효율 우선, 커지면 성능 우선"이다. 사용자는 API(HGET, HSET)를 그대로 쓰면서 Redis가 내부적으로 최적 인코딩을 선택한다.
+</Aside>
+
+## 키 만료 — 정확성보다 효율성
+
+`EXPIRE key 60`을 설정한다고 60초 후 즉시 메모리가 회수되지는 않는다. Redis의 만료는 두 경로로 처리된다.
+
+**Lazy 만료**: 클라이언트가 키에 접근할 때 `db->expires` dict에서 만료 시각을 확인하고, 지났으면 삭제 후 nil을 반환한다. CPU 오버헤드가 없지만 접근이 없는 키는 영원히 메모리에 남는다.
+
+**Active 만료**: `serverCron()`이 `hz` 설정에 따라 초당 10~100회 실행되며, expires dict에서 20개를 무작위 샘플링해 만료된 것을 삭제한다. 만료된 비율이 25% 이상이면 같은 DB에서 반복하고, 25% 미만이면 다음 DB로 넘어간다.
+
+```
+Lazy 만료:  접근 즉시 처리, CPU 비용 0, 접근 없는 콜드 키 처리 불가
+Active 만료: 주기적 처리, 콜드 키도 회수, 대량 만료 시 지연 가능
+```
+
+Replica에서는 독자적으로 만료를 실행하지 않는다. Master가 만료를 처리하고 `DEL` 명령을 전파할 때까지 기다린다. Redis 3.2 이후로는 Replica가 읽기 시 만료 여부를 자체 확인해 nil을 반환하지만, 실제 삭제는 Master의 전파 이후다.
+
+<Callout type="note" title="트레이드오프">
+TTL 만료는 "이 이후로는 읽히지 않음"을 보장하지, "정확히 이 시각에 메모리에서 삭제됨"을 보장하지 않는다. 대량 만료가 필요한 서비스에서 TTL에 랜덤 지터를 추가하지 않으면 Active 만료 부하가 한 시점에 집중된다.
+</Callout>
+
+## Threaded I/O — 단일 스레드 원칙을 지키면서 병목만 제거
+
+Redis 6.0의 Threaded I/O는 "모든 것을 빠르게"가 아니라 "I/O 병목만 제거"다.
+
+소켓 읽기(`recv` + RESP 파싱)와 소켓 쓰기(`send`)는 여러 I/O 스레드가 병렬로 처리한다. 그러나 명령어 실행은 여전히 메인 스레드 단일 순차 실행이다. I/O 스레드는 파싱된 명령어 객체를 메인 스레드의 실행 큐에 전달할 뿐이다.
+
+`MULTI/EXEC` 블록의 원자성이 Threaded I/O 환경에서도 유지되는 이유가 여기 있다. 데이터 구조에 접근하는 스레드는 언제나 메인 스레드 하나뿐이므로 Lock 없이도 안전하다.
+
+```
+io-threads가 효과적인 조건:
+  ✓ Value 크기 1KB 이상 (네트워크 전송이 병목)
+  ✓ 동시 연결 수 1,000개 이상
+  ✓ CPU 사용률 50~70% (CPU 병목이 아닌 경우)
+
+io-threads가 효과 없는 조건:
+  ✗ CPU 100% 포화 (복잡한 명령어, Lua 스크립트)
+  ✗ 소량 Value 단순 GET/SET (8~100 bytes)
+```
+
+CPU 병목이 실제 문제라면 `io-threads`가 아니라 Redis Cluster로 수평 확장하는 것이 올바른 선택이다.
+
+## 정리
+
+Redis의 설계 결정들은 결국 같은 방향을 가리킨다.
+
+- 단일 스레드 이벤트 루프: 동기화 오버헤드를 0으로 만들어 예측 가능성 확보
+- jemalloc + redisObject 인코딩: 메모리 단편화를 최소화하고 작은 데이터는 압축 표현 유지
+- Lazy + Active 만료: CPU 효율과 메모리 회수를 트레이드오프하며 양쪽을 보완
+- Threaded I/O: 단일 스레드의 원자성 보장은 그대로 두고 I/O 병목만 제거
+
+병목이 발생했을 때 `SLOWLOG GET 20`으로 느린 명령어를 먼저 확인하라. 인프라 업그레이드보다 O(N) 명령어 하나를 `SCAN`으로 교체하는 것이 먼저다.
+
+다음 글에서는 Redis의 데이터 구조 내부 — String과 SDS가 왜 C 표준 문자열이 아닌지, 그리고 이 선택이 어떤 성능 특성을 만들어내는지 추적한다.

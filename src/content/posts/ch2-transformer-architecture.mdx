@@ -1,0 +1,167 @@
+---
+title: "Transformer Block은 왜 이 네 요소의 조합인가"
+description: "Attention, FFN, LayerNorm, Residual이 하나의 block에 packed되는 이유부터 Pre-LN/Post-LN의 gradient dynamics, Encoder/Decoder 분기의 본질까지 Transformer 설계 철학을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [transformer, attention, layer-norm, residual, ffn]
+difficulty: advanced
+series:
+  slug: transformer-deep-dive
+  title: Transformer Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer block은 Attention, FFN, LayerNorm, Residual 네 요소로 구성된다. 이 조합은 임의적이지 않다 — 각 요소는 나머지 요소의 결함을 정확히 보완하도록 설계되어 있다. 그렇다면 이 네 요소 중 하나라도 제거하면 무엇이 무너지는가?
+
+## Block의 구조 — 역할 분담
+
+Transformer block은 두 개의 sub-layer를 residual connection으로 감싼 구조다.
+
+```
+x ──┬──→ [Attention] ──┐
+    │                   + ──→ x' ──┬──→ [FFN] ──┐
+    └───────────────────┘          │             + ──→ y
+                                   └─────────────┘
+```
+
+각 sub-layer의 역할 분담은 명확하다. Attention은 **token 간 정보 교환(mixing)** 을 담당하고, FFN은 **token별 비선형 변환(transformation)** 을 담당한다. Attention이 "어떤 정보를 어디서 가져올 것인가"를 결정한다면, FFN은 "가져온 정보를 어떻게 변환할 것인가"를 결정한다.
+
+이 분리는 MLP-Mixer(Tolstikhin 2021)에서 명시화됐다 — attention을 fixed token-mixing MLP로 대체해도 유사한 성능을 낸다는 사실은, 두 axis가 구조적으로 독립임을 보여준다.
+
+FFN의 역할은 흔히 과소평가된다. 한 block의 파라미터 약 2/3를 FFN이 차지한다. $W_1 \in \mathbb{R}^{d \times 4d}$, $W_2 \in \mathbb{R}^{4d \times d}$로 총 $8d^2$, attention의 $4d^2$에 비해 두 배다. Geva(2021)는 이 구조를 **soft key-value memory**로 해석했다:
+
+$$
+\text{FFN}(x) = \sum_{i=1}^{d_{\text{ff}}} \underbrace{\text{act}((W_1)_i x)}_{\text{matching score}} \cdot \underbrace{(W_2)_{:,i}}_{\text{value vector}}
+$$
+
+$W_1$의 각 행이 key(학습된 입력 패턴), $W_2$의 각 열이 value(해당 패턴 매칭 시 추가할 벡터)다. ReLU의 양수 필터링이 selective retrieval을 구현한다. LLaMA와 PaLM이 채택한 SwiGLU는 이 selectivity를 gating으로 강화한 변형이다:
+
+$$
+\text{SwiGLU}(x) = (x W_1) \odot \text{Swish}(x V_1) \cdot W_2
+$$
+
+## Residual — 표현력의 기반
+
+Residual connection $y = x + f(x)$는 단순해 보이지만 두 가지 결정적 역할을 한다.
+
+첫째, **gradient highway**다. Pre-LN block의 backward pass:
+
+$$
+\frac{\partial y}{\partial x} = I + \frac{\partial f}{\partial x}
+$$
+
+$I$ 항이 항상 존재하므로, sub-layer Jacobian $\partial f / \partial x$가 소실되어도 gradient가 흐른다. $L$개 layer를 쌓으면:
+
+$$
+\frac{\partial h^{(L)}}{\partial h^{(0)}} = \prod_{l=1}^L \left(I + J_l\right)
+$$
+
+각 항이 $I + \delta$ 형태이므로 product가 폭발하거나 소실하지 않는다.
+
+둘째, **identity 학습의 자유**다. $f(x) = 0$이면 block이 정확히 항등 함수가 된다. 이는 block을 추가해도 표현력이 절대로 감소하지 않음을 보장한다 — depth는 단조 이득이다.
+
+<Theorem kind="proposition" number="1" title="Residual block의 표현력 단조성">
+Residual block $y = x + f(x)$에서 $f \in \mathcal{F}$이면, block을 추가하는 것은 표현 가능한 함수 클래스를 확장(또는 동일하게) 유지한다.
+</Theorem>
+
+<Proof>
+$f \equiv 0$은 $\mathcal{F}$의 원소다. 따라서 identity function $x \mapsto x$는 임의의 $\mathcal{F}$에 대해 $\{x \mapsto x + f(x) : f \in \mathcal{F}\}$에 포함된다. Block 추가는 expressive class를 strict하게 확장하거나 같게 유지한다. $\square$
+</Proof>
+
+Residual을 제거하면 6+ layer부터 학습이 거의 불가능해진다 — ResNet(He 2015)의 동기와 정확히 같다.
+
+## Pre-LN vs Post-LN — LN 위치가 결정하는 것
+
+LayerNorm의 위치는 architectural detail이 아니라 훈련 안정성의 본질을 결정한다.
+
+$$
+\text{Pre-LN:} \quad x' = x + \text{Attn}(\text{LN}(x)), \quad y = x' + \text{FFN}(\text{LN}(x'))
+$$
+
+$$
+\text{Post-LN:} \quad x' = \text{LN}(x + \text{Attn}(x)), \quad y = \text{LN}(x' + \text{FFN}(x'))
+$$
+
+Pre-LN에서 residual path는 LN을 거치지 않는다. Gradient는 $I + J_f$ 형태로 직접 흐른다. Post-LN에서는 매 layer마다 LN-Jacobian이 곱해진다:
+
+$$
+\frac{\partial h^{(l)}}{\partial h^{(l-1)}} = J_{\text{LN}}^{(l)} \cdot (I + J_{f_l})
+$$
+
+Xiong(2020)의 핵심 결과는 이 차이를 정량화한다:
+
+$$
+\boxed{\text{Pre-LN: } \|\nabla\| = O(1), \quad \text{Post-LN: } \|\nabla\| = O(L)}
+$$
+
+Post-LN에서 input gradient norm이 layer 수에 선형 비례해 증가한다. 큰 learning rate를 쓰면 발산한다. 이것이 Post-LN이 warmup을 필수로 요구하는 이유다.
+
+<Callout type="note" title="트레이드오프">
+**Pre-LN**: gradient가 bounded, warmup 없이도 안정, 100+ layer stacking 가능. 단, output에 final LN을 별도로 추가해야 한다(GPT, LLaMA 모두 이 패턴). **Post-LN**: BERT 같은 초기 모델의 표준, 일부 연구에서 generation quality가 미세하게 우수하다는 주장이 있다. 그러나 warmup 필수, 깊이 ~24 layer가 실용적 한계. Modern LLM(GPT-3, LLaMA, PaLM)은 모두 Pre-LN을 채택했다 — 안정성이 품질의 미세한 차이를 압도한다.
+</Callout>
+
+Wang(2022)의 DeepNorm은 $y = \text{LN}(\alpha x + f(x))$로 residual path를 $\alpha > 1$배 scaling해 1000+ layer 학습을 가능하게 했다. 그러나 현실의 LLM은 width를 늘리는 방향을 택한다 — depth를 늘리면 sequential inference latency가 선형 증가하기 때문이다.
+
+## Encoder vs Decoder — mask 하나의 차이
+
+BERT와 GPT의 architectural 차이는 attention mask 하나다.
+
+```
+Bidirectional:    Causal:
+[1 1 1 1 1]      [1 0 0 0 0]
+[1 1 1 1 1]      [1 1 0 0 0]
+[1 1 1 1 1]      [1 1 1 0 0]
+[1 1 1 1 1]      [1 1 1 1 0]
+[1 1 1 1 1]      [1 1 1 1 1]
+```
+
+Causal mask의 수학적 정의:
+
+$$
+M^{\text{causal}}_{ij} = \begin{cases} 0 & i \geq j \\ -\infty & i < j \end{cases}
+$$
+
+이 mask는 autoregressive factorization $p(x_t | x_{<t})$을 정확히 구현한다 — $h^{(L)}_t$는 오직 $x_{1:t}$에만 의존한다는 것을 귀납법으로 증명할 수 있다. Causal mask 덕분에 한 번의 forward pass에서 sequence 전체 위치의 loss를 동시에 계산할 수 있다.
+
+Cross-attention은 이 분기를 연결하는 bridge다:
+
+$$
+\text{CrossAttn}(X, Z) = \text{softmax}\!\left(\frac{(XW_Q)(ZW_K)^\top}{\sqrt{d_k}}\right)(ZW_V)
+$$
+
+$Q$는 decoder에서, $K$와 $V$는 encoder에서 온다. T5의 translation에서 이 attention weight는 source-target alignment matrix가 된다 — Bahdanau(2014)의 additive attention을 scaled dot-product로 일반화한 것이다. Whisper의 audio-text alignment, BLIP-2의 image-text bridge가 모두 같은 메커니즘이다.
+
+GPT-3 이후 LLM은 decoder-only를 택했다. Cross-attention 없이 source와 target을 단일 sequence로 concat하고 causal LM으로 학습하면, scale이 충분할 때 cross-attention의 효과가 emergent하게 나타난다. Architecture의 단순함이 scaling의 이점을 압도한다.
+
+## 정리
+
+- Transformer block은 token-mixing(Attention)과 feature-mixing(FFN)을 명시적으로 분리한다. FFN은 block 파라미터의 2/3를 차지하며 soft key-value memory로 해석된다.
+- Residual connection은 gradient highway와 identity 학습의 자유를 동시에 제공한다. 이것 없이는 6+ layer 학습이 불가능하다.
+- Pre-LN은 gradient norm을 $O(1)$로 bound해 deep stacking을 가능하게 한다. Post-LN의 $O(L)$ 발산이 warmup을 필수로 만든다.
+- Encoder와 Decoder의 차이는 attention mask 하나다. 같은 코드베이스에서 `mask=None`이면 BERT, `mask=causal_mask`이면 GPT다.
+
+네 요소 중 하나를 빼면 무너진다 — 이것이 "packed design"의 의미다.
+
+<Reference
+  title="On Layer Normalization in the Transformer Architecture"
+  authors="Xiong et al."
+  year={2020}
+  venue="ICML"
+  url="https://arxiv.org/abs/2002.04745"
+/>
+
+<Reference
+  title="Transformer Feed-Forward Layers Are Key-Value Memories"
+  authors="Geva et al."
+  year={2021}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/2012.14913"
+/>

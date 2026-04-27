@@ -1,0 +1,126 @@
+---
+title: "BERT, GPT, T5, ViT, MoE — 다섯 아키텍처는 하나의 질문에 답한다"
+description: "Transformer 의 다섯 변형이 '맥락을 어떻게 쓸 것인가'라는 하나의 질문에 각자 다르게 답하는 방식부터, MoE 가 파라미터와 계산을 분리하는 원리까지, 아키텍처 설계 철학의 흐름을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [transformer, bert, gpt, vit, mixture-of-experts]
+difficulty: advanced
+series:
+  slug: transformer-deep-dive
+  title: Transformer Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+BERT, GPT, T5, ViT, MoE — 다섯 아키텍처는 모두 Transformer 블록을 쌓는다. 그런데 왜 이렇게 다르게 생겼는가? 각각의 설계 결정을 나란히 놓으면 하나의 질문이 드러난다. **"맥락(context)을 언제, 어떻게, 얼마나 쓸 것인가?"** 그리고 그 답이 달라질 때마다 trade-off 의 모양도 달라진다.
+
+## 맥락의 방향 — BERT vs GPT
+
+Transformer 의 attention 은 방향이 없다. 그러나 언어 모델을 만들 때 방향을 강제로 선택해야 하는 순간이 온다.
+
+BERT 의 선택은 양방향이다. Masked Language Modeling(MLM) 은 문장의 15% 토큰을 가리고 **양쪽 문맥 모두**를 이용해 예측한다.
+
+$$
+L_{\text{MLM}} = -\sum_{i \in M} \log p(x_i \mid \tilde{x})
+$$
+
+반면 GPT 의 선택은 단방향이다. 매 토큰에서 왼쪽만 본다.
+
+$$
+L_{\text{CLM}} = -\sum_{t=1}^{T} \log p(x_t \mid x_{<t})
+$$
+
+이 차이가 두 모델의 운명을 갈랐다. BERT 는 풍부한 표현을 얻는 대신 생성 능력을 잃었다. GPT 는 생성 능력을 얻는 대신 "미래를 보지 않는다"는 제약 안에서 이해 능력을 키워야 했다.
+
+<Callout type="note" title="Bitter Lesson 의 등장">
+GPT-3 (175B) 은 BERT-large (340M) 보다 NLU 에서도 더 잘한다. 아키텍처의 귀납 편향보다 스케일이 dominant 해지는 시점이 있다. Sutton 의 "Bitter Lesson" — 일반적 방법 + 규모 가 특수한 bias 를 압도한다.
+</Callout>
+
+## 맥락의 통합 방법 — T5 의 Encoder-Decoder
+
+BERT 는 인코더만, GPT 는 디코더만 쓴다. T5 는 둘을 모두 쓰고, 그 사이에 cross-attention 을 놓는다.
+
+```
+Encoder: "translate English to French: The cat is black."
+         ↓ (bidirectional attention)
+         z (contextualized representation)
+         ↓ (cross-attention in every decoder layer)
+Decoder: "Le chat est noir."
+```
+
+T5 의 또 다른 선택은 **Text-to-Text 프레임워크**다. 번역, 요약, 분류, QA — 모든 태스크를 "문자열 입력 → 문자열 출력"으로 통일한다. 이 통일이 가능한 이유는 cross-attention 이 encoder 의 표현을 decoder 에 직접 흘려보내기 때문이다.
+
+T5 는 또한 MLM 대신 **Span Corruption** 을 목적함수로 쓴다. 단일 토큰이 아니라 여러 토큰의 연속(span)을 하나의 sentinel 토큰으로 대체한 후 decoder 가 복원한다. Phrase-level 패턴을 더 효율적으로 학습할 수 있다.
+
+그러나 스케일이 10B 를 넘으면 decoder-only + in-context learning 이 encoder-decoder 의 explicit conditioning 을 대체하기 시작한다. T5 의 spirit 은 architecture 가 아니라 **instruction tuning** 이라는 paradigm 으로 흡수됐다.
+
+## 맥락의 공간 — ViT 의 이미지 토큰화
+
+언어 모델의 토큰은 자연스럽게 정의된다. 이미지는 다르다. ViT 의 핵심 발견은 이미지를 강제로 토큰 시퀀스로 만들면 표준 Transformer 가 그대로 작동한다는 것이다.
+
+224×224 이미지를 16×16 패치 196개로 쪼갠다. 각 패치를 선형 투영으로 $d_{\text{model}}$ 차원 벡터로 만들고, [CLS] 토큰을 앞에 붙여 197개 토큰 시퀀스를 만든다. 이 과정이 사실 Conv2D 한 번이다.
+
+$$
+\text{PatchEmbed}(I) = \text{Conv2D}(I,\; \text{kernel}=P,\; \text{stride}=P)
+$$
+
+<Theorem kind="proposition" number="1" title="ViT 의 inductive bias 부재">
+CNN 이 가진 translation equivariance 와 locality 가 ViT 에는 없다. 따라서 ViT 는 작은 데이터셋에서 CNN 보다 낮은 성능을 보이지만, 대규모 데이터(JFT-300M 수준)에서 역전된다.
+</Theorem>
+
+<Proof>
+CNN 의 convolution filter 는 동일한 가중치를 모든 위치에 공유한다(translation equivariance). ViT 의 attention 은 패치 인덱스만 다를 뿐 모든 패치 쌍을 동등하게 처리하며, 위치 정보는 학습된 PE 에만 의존한다. 따라서 학습 전 공간 구조에 대한 사전 지식이 없다. 충분한 데이터가 주어지면 attention 이 이 구조를 학습으로 복원하지만, 데이터가 적을 때는 CNN 의 강한 bias 가 sample efficiency 를 보장한다. Dosovitskiy 2021 에서 crossover 는 약 14M 이미지 시점이다. $\square$
+</Proof>
+
+ViT 의 중요성은 vision 에 그치지 않는다. 패치 토큰이 텍스트 토큰과 동일한 형식이기 때문에, GPT-4V 와 Gemini 같은 multimodal 모델의 vision encoder 가 모두 ViT 계열이다.
+
+## 맥락의 분기 — MoE 의 조건부 계산
+
+앞의 네 아키텍처는 모두 모든 토큰이 동일한 가중치를 거친다. MoE 는 이 가정을 깨뜨린다. 토큰마다 다른 FFN(expert)을 활성화한다.
+
+$$
+y = \sum_{e \in \text{TopK}(g(x))} \tilde{g}_e(x) \cdot \text{FFN}_e(x)
+$$
+
+결과는 극적이다. Expert 를 $E$ 배 늘려도 토큰당 계산량은 top-$k$ 개만큼만 증가한다. Mixtral 8x7B 는 47B 파라미터를 가지지만 토큰당 활성 파라미터는 13B 에 불과하다. LLaMA-2 13B 와 비슷한 추론 비용으로 LLaMA-2 70B 에 근접한 품질을 낸다.
+
+<Callout type="warning" title="Load Collapse 의 위험">
+Router 가 제약 없이 학습되면 특정 expert 에만 모든 토큰이 몰린다. Load balancing loss 가 이를 막는다.
+
+$$L_{\text{aux}} = \alpha \cdot E \sum_{e=1}^{E} f_e \cdot P_e$$
+
+$f_e$ 는 expert $e$ 에 실제로 라우팅된 토큰 비율, $P_e$ 는 router 의 평균 확률이다. 균등 분포일 때 최소화된다. 단, perfect balance 가 목표가 아니다 — collapse 방지가 목표다. $\alpha = 0.01$ 수준의 mild balancing 이 specialization 을 해치지 않으면서 collapse 를 막는다.
+</Callout>
+
+## 설계 철학의 수렴
+
+다섯 아키텍처를 나란히 놓으면 하나의 흐름이 보인다.
+
+```
+BERT   — 양방향 맥락, 인코더 전용, 분류/NLU 특화
+GPT    — 단방향 맥락, 디코더 전용, 생성 + 스케일
+T5     — 교차 맥락, 인코더-디코더, 태스크 통일
+ViT    — 공간 맥락, 이미지 토큰화, 시각 + 멀티모달
+MoE    — 조건부 맥락, sparse activation, 파라미터 효율
+```
+
+각 모델이 해결한 문제는 다르지만, 해결 방식의 논리는 같다. **맥락을 더 잘 활용하거나, 맥락 활용의 비용을 줄이거나.** BERT 는 전자, MoE 는 후자, ViT 는 맥락의 정의 자체를 이미지로 확장했다.
+
+<Aside label="수렴의 방향">
+2024년 이후 frontier 모델은 대부분 decoder-only + MoE 구조다. T5 의 text-to-text 아이디어는 instruction tuning 으로, ViT 는 multimodal encoder 로 흡수됐다. BERT 는 embedding 과 classification 의 특화 영역에 남았다. 아키텍처 전쟁의 승자는 단일 구조가 아니라 각 trade-off 의 명확한 이해다.
+</Aside>
+
+## 정리
+
+- BERT 의 MLM 은 양방향 맥락을 얻지만 생성을 포기한다. GPT 의 causal LM 은 생성을 얻고 스케일로 이해 능력을 만회한다.
+- T5 의 encoder-decoder 는 cross-attention 으로 입출력을 명시적으로 분리하지만, 10B 이상 스케일에서는 decoder-only 의 implicit conditioning 에 흡수된다.
+- ViT 는 이미지를 패치 시퀀스로 만들어 Transformer 를 그대로 적용한다. CNN 의 귀납 편향 부재는 대규모 데이터로 극복된다.
+- MoE 는 파라미터와 계산을 분리한다. 같은 FLOP 으로 훨씬 많은 파라미터를 수용할 수 있으며, 이는 현재 frontier LLM 의 표준 구조다.
+
+다음 글에서는 이 스케일의 논리를 수학적으로 기술하는 Scaling Laws — 모델 크기, 데이터, 연산량의 관계가 어떤 멱함수를 따르는지 추적한다.

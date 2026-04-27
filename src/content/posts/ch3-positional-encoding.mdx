@@ -1,0 +1,168 @@
+---
+title: "Positional Encoding은 어떻게 진화했나"
+description: "순서를 모르는 Self-Attention의 한계부터 Sinusoidal, Learned, Relative PE를 거쳐 RoPE와 ALiBi까지, 위치 정보 주입의 설계 진화를 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [transformer, positional-encoding, rope, alibi, attention]
+difficulty: advanced
+series:
+  slug: transformer-deep-dive
+  title: Transformer Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Self-Attention은 **permutation-equivariant**다. 입력 토큰의 순서를 바꿔도 출력의 순서만 바뀔 뿐, 각 토큰의 표현 자체는 변하지 않는다. "John loves Mary"와 "Mary loves John"이 같은 표현 집합으로 귀결된다는 뜻이다. 그렇다면 Transformer는 어떻게 순서를 이해하는가? 그리고 그 해답이 왜 단순한 sin/cos 함수에서 시작해 LLaMA의 RoPE까지 진화했는가?
+
+## 왜 Attention은 위치를 모르는가
+
+Self-Attention의 출력을 수식으로 쓰면 다음과 같다.
+
+$$
+\text{Attn}(X) = \text{softmax}\!\left(\frac{XW_Q (XW_K)^\top}{\sqrt{d_k}}\right) XW_V
+$$
+
+입력 행렬 $X$에 임의의 순열 행렬 $P$를 적용하면 $Q' = PQ$, $K' = PK$, $V' = PV$가 되고, 최종적으로 $\text{Attn}(PX) = P\,\text{Attn}(X)$가 성립한다. 출력의 행 순서만 바뀌고, 각 행의 내용은 동일하다. 이것이 permutation equivariance의 정확한 의미다.
+
+<Theorem kind="proposition" number="1" title="Self-Attention의 Permutation Equivariance">
+순열 행렬 $P \in \{0,1\}^{T \times T}$에 대해
+
+$$\text{SelfAttn}(PX) = P\,\text{SelfAttn}(X)$$
+</Theorem>
+
+<Proof>
+$Q' = PQ$, $K' = PK$, $V' = PV$.  
+$S' = Q'K'^\top/\sqrt{d_k} = PQK^\top P^\top/\sqrt{d_k} = PSP^\top$.  
+Row-wise softmax는 $P$와 commute하므로 $A' = PA P^\top$.  
+$\text{Attn}' = A'V' = PAP^\top PV = PAV = P\,\text{Attn}$. $\square$
+</Proof>
+
+이 성질이 "bag of words" 문제를 만든다. 위치 정보를 별도로 주입하지 않으면, Transformer는 토큰들의 집합만 알 뿐 그 순서를 알지 못한다.
+
+## Sinusoidal PE — 회전의 씨앗
+
+Vaswani 2017은 다음 식으로 위치 정보를 주입했다.
+
+$$
+\text{PE}_{(pos,\, 2i)} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad
+\text{PE}_{(pos,\, 2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)
+$$
+
+단순해 보이지만 이 식에는 중요한 수학적 성질이 숨어 있다.
+
+$$
+\text{PE}_{pos+k} = M_k\,\text{PE}_{pos}
+$$
+
+임의의 오프셋 $k$에 대해, 위치 $pos+k$의 PE는 위치 $pos$의 PE에 block-diagonal 회전 행렬 $M_k$를 적용한 결과다. 각 $(2i, 2i+1)$ 쌍이 frequency $\omega_i = 10000^{-2i/d}$로 독립적으로 회전한다. 낮은 dimension은 빠르게 변하는 고주파(인접 위치 구분), 높은 dimension은 느리게 변하는 저주파(먼 위치 구분)를 담당한다.
+
+두 PE의 내적 또한 위치 차이에만 의존한다.
+
+$$
+\langle \text{PE}_{pos},\, \text{PE}_{pos+k} \rangle = \sum_i \cos(\omega_i k)
+$$
+
+이 성질이 RoPE의 직접적인 동기가 된다. 그러나 sinusoidal PE는 token embedding과 **더하기**로 결합되기 때문에, attention score의 $W_Q W_K^\top$ 변환을 거치면 이 relative 성질이 보장되지 않는다.
+
+<Callout type="note" title="트레이드오프">
+Sinusoidal PE는 학습 파라미터가 없고 임의 위치를 수학적으로 정의할 수 있다. 하지만 실증적으로 학습 길이의 약 2배를 넘으면 성능이 급감한다. 이론적 extrapolation 가능성과 실증적 한계 사이의 간극이 learned PE와 modern PE 등장의 동기다.
+</Callout>
+
+## Learned PE — 데이터가 찾은 패턴
+
+BERT(512), GPT-2(1024)는 각 위치에 학습 가능한 벡터를 할당하는 방식을 택했다.
+
+$$
+\mathbf{P} \in \mathbb{R}^{T_{\max} \times d}, \quad \tilde{x}_t = x_t + \mathbf{P}_t
+$$
+
+이 방식은 데이터에서 직접 위치 패턴을 학습하므로 task-specific 최적화가 가능하다. 흥미롭게도 학습된 BERT의 PE를 분석하면 sinusoidal-like 주파수 구조가 자연스럽게 출현한다. 자연어 데이터의 통계적 성질—인접 토큰의 강한 의존성(고주파)과 문장/문단 단위 구조(저주파)—이 모델로 하여금 multi-scale frequency를 발견하게 만든다.
+
+그러나 $T_{\max}$라는 hard limit이 치명적이다. 학습하지 않은 위치는 정의 자체가 없다. 8K, 32K, 128K context 시대에 learned PE는 근본적으로 부적합하다.
+
+## Relative PE — Shaw에서 T5까지
+
+절대 위치 대신 두 토큰 사이의 거리 $i-j$만 인코딩하면 어떻게 될까? Shaw 2018은 attention score에 relative 항을 명시적으로 추가했다.
+
+$$
+e_{ij} = \frac{(x_i W_Q)(x_j W_K + a_{i-j}^K)^\top}{\sqrt{d_k}}
+$$
+
+추가 항 $q_i a_{i-j}^\top$가 거리 정보를 직접 주입한다. clip distance $k_{\max}$를 도입해 파라미터 수를 $2k_{\max}+1$개로 한정하고, 그 너머의 거리는 동일하게 처리한다.
+
+T5(Raffel 2020)는 이를 더 단순화했다. 벡터 대신 head별 scalar bias만 사용하고, 거리에 대수적 bucketing을 적용해 파라미터를 수십 개 수준으로 줄였다.
+
+$$
+e_{ij} = \frac{(x_i W_Q)(x_j W_K)^\top}{\sqrt{d_k}} + b^h_{\text{bucket}(i-j)}
+$$
+
+가까운 거리는 fine-grained, 먼 거리는 coarse—자연어 의존성의 통계적 분포와 자연스럽게 일치한다.
+
+## RoPE와 ALiBi — 현대 LLM의 표준
+
+Shaw의 아이디어를 더 elegant하게 구현하면 RoPE(Su 2021)가 된다. 추가 항을 붙이는 대신 Q, K에 직접 position-dependent 회전을 적용한다.
+
+$$
+\tilde{q}_i = R(i)\,q_i, \quad \tilde{k}_j = R(j)\,k_j
+$$
+
+$$
+\langle R(i)\,q,\, R(j)\,k \rangle = q^\top R(i)^\top R(j)\, k = q^\top R(j-i)\, k
+$$
+
+회전의 합성 법칙 $R(a)^\top R(b) = R(b-a)$ 덕분에 내적이 자동으로 거리 $j-i$에만 의존한다. sinusoidal PE가 embedding에 더하기로 주입하면서 잃어버렸던 relative 성질이, 회전을 attention의 메트릭 자체에 주입함으로써 architecture에 baked-in된다. 파라미터는 0개다.
+
+ALiBi(Press 2021)는 반대 방향에서 접근한다. 회전 없이, attention score에 단순한 거리 패널티를 더한다.
+
+$$
+S_{ij}^{(h)} = \frac{q_i^{(h)\top} k_j^{(h)}}{\sqrt{d_k}} - m_h |i-j|
+$$
+
+head별 slope $m_h = 2^{-8h/H}$는 각 head가 다른 거리 스케일에 특화되도록 만든다. 어떤 head는 local(큰 $m$), 어떤 head는 global(작은 $m$)에 집중한다.
+
+<Aside label="설계 철학의 차이">
+RoPE는 "attention 메트릭을 frequency-aware rotation으로 만들자"는 수학적 정교함을 추구한다. ALiBi는 "먼 토큰일수록 덜 attend하는 것이 자연스럽다"는 직관을 linear penalty로 구현한다. 전자는 LLaMA 계열, 후자는 BLOOM 계열의 선택이다.
+</Aside>
+
+RoPE의 extrapolation 한계는 NTK-aware scaling이나 YaRN 같은 기법으로 보완할 수 있다. 이것이 LLaMA-3가 128K context를 처리할 수 있는 이유다. ALiBi는 별도 기법 없이도 학습 길이의 4배까지 robust하다.
+
+## 정리
+
+- Self-Attention은 permutation-equivariant다. 위치 정보는 반드시 외부에서 주입해야 한다.
+- Sinusoidal PE의 linear shift 성질($\text{PE}_{pos+k} = M_k\,\text{PE}_{pos}$)은 RoPE의 직접적 선행자다.
+- Learned PE는 데이터에서 sinusoidal-like 구조를 자연스럽게 발견하지만, $T_{\max}$라는 hard limit이 long context 시대에 치명적이다.
+- RoPE는 sinusoidal의 회전 직관을 attention 메트릭 자체에 baked-in해 자동 relative encoding을 달성한다.
+- ALiBi는 linear distance penalty만으로 가장 강한 extrapolation 능력을 보인다.
+
+PE의 진화는 결국 하나의 질문을 반복해서 정제하는 과정이었다—"relative 정보를 architecture의 어느 곳에, 어떤 형태로 주입할 것인가?"
+
+<Reference
+  title="Attention Is All You Need"
+  authors="Vaswani et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
+/>
+
+<Reference
+  title="RoFormer: Enhanced Transformer with Rotary Position Embedding"
+  authors="Su et al."
+  year={2021}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2104.09864"
+/>
+
+<Reference
+  title="Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation"
+  authors="Press et al."
+  year={2021}
+  venue="ICLR 2022"
+  url="https://arxiv.org/abs/2108.12409"
+/>

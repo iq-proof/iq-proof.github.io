@@ -1,0 +1,135 @@
+---
+title: "Attention은 왜 그렇게 설계됐는가"
+description: "Scaled dot-product attention의 수학적 필연성부터 softmax 포화, 커널 해석, 멀티헤드의 표현력, 해석 가능성 논쟁까지 — Transformer의 핵심 설계 결정을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [transformer, attention, softmax, multi-head, interpretability]
+difficulty: advanced
+series:
+  slug: ch1-attention-decomposition
+  title: Transformer Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer의 모든 표현력은 단 한 줄의 식에서 출발한다.
+
+$$
+\text{Attn}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+이 식의 각 기호 — $Q$, $K$, $V$의 분리, 분모의 $\sqrt{d_k}$, row-wise softmax — 는 어떤 수학적 필연성에서 나왔는가? 그리고 이 설계가 만들어내는 $O(T^2)$ 병목은 왜 피할 수 없는가?
+
+## Q, K, V 분리: 비대칭이 표현력이다
+
+같은 입력 $X \in \mathbb{R}^{T \times d}$에서 세 개의 다른 projection을 만드는 이유가 있다.
+
+```
+Q = X W_Q  →  "내가 무엇을 찾는가"
+K = X W_K  →  "내가 무엇을 가지고 있는가"
+V = X W_V  →  "내가 실제로 전달하는 정보"
+```
+
+만약 $W_Q = W_K = W_V$라면 attention은 self-correlation으로 환원된다. 쿼리-키의 비대칭성이 "A가 B를 참조하지만 B는 A를 참조하지 않는" directional 관계를 가능하게 한다. 세 개의 독립 projection이 표현력의 핵심이다.
+
+<Theorem kind="proposition" number="1" title="Attention의 출력은 V의 convex combination">
+각 출력 $\text{Attn}_i = \sum_j A_{ij} v_j$는 $\{v_1, \ldots, v_T\}$의 convex combination이다 ($A_{ij} \geq 0$, $\sum_j A_{ij} = 1$).
+</Theorem>
+
+<Proof>
+Softmax의 정의에 의해 $A_{ij} = \exp(S_{ij}) / \sum_l \exp(S_{il}) > 0$이고 $\sum_j A_{ij} = 1$. 따라서 $\text{Attn}_i$는 $v_j$들의 convex combination. 결과적으로 $\|\text{Attn}_i\|_\infty \leq \max_j \|v_j\|_\infty$ — attention은 representation을 "확장"하지 못하고 "압축"만 한다. FFN의 비선형 확장이 표현력에 필수인 이유다. $\square$
+</Proof>
+
+Softmax의 row-wise 적용도 의도적이다. 각 query(행)가 모든 key에 대한 확률 분포를 형성해야 "이 query가 어디에 주목하는가"가 정의된다. column-wise였다면 각 key가 모든 query에 대한 분포가 되는데, 그것은 attention의 의미와 다르다.
+
+## $\sqrt{d_k}$: 분산을 1로 되돌리는 유일한 선택
+
+$\sqrt{d_k}$는 관행이 아니라 수학적 필연이다.
+
+$Q_{ij}, K_{ij}$가 평균 0, 분산 1의 i.i.d. 분포를 따를 때 (Xavier 초기화 + LayerNorm의 표준 가정), 내적 $(QK^\top)_{ij} = \sum_{l=1}^{d_k} Q_{il} K_{jl}$의 분산은:
+
+$$
+\text{Var}\!\left((QK^\top)_{ij}\right) = \sum_{l=1}^{d_k} \text{Var}(Q_{il} K_{jl}) = \sum_{l=1}^{d_k} 1 = d_k
+$$
+
+각 항이 독립이므로 분산이 합산된다. 표준편차는 $\sqrt{d_k}$다. $\sqrt{d_k}$로 나누면 분산이 정확히 1로 돌아온다. $d_k^\alpha$로 나눌 경우 $\alpha = 0.5$만 unit variance를 보장하며, 이보다 작으면 softmax 포화, 크면 uniform attention으로 정보가 손실된다.
+
+$d_k = 64$에서 scaling 없이 softmax에 들어가는 logit의 표준편차는 8이다. 극값 이론에 따르면 $T = 100$인 시퀀스에서 최대 logit의 기댓값은 $8 \times \sqrt{2\log 100} \approx 24$에 달하고, 이때 softmax 최댓값은 사실상 1.0 — one-hot으로 포화된다. scaling 후 표준편차 1에서 같은 최대 logit은 약 3.0이고, 최댓값은 0.17로 정상 범위다.
+
+<Callout type="warning" title="포화는 학습을 영구적으로 멈춘다">
+Softmax Jacobian은 $J = \text{diag}(\sigma) - \sigma\sigma^\top$이다. 포화 상태($\sigma_{\max} \approx 1-\epsilon$)에서 $\|J\|_F = O(\epsilon)$. Backprop의 chain rule에서 이 값이 0이 되면 $Q$에 대한 gradient가 0이 되고, 가중치가 업데이트되지 않아 포화가 영속된다. 한 번 빠지면 학습으로 탈출하기 어렵다.
+</Callout>
+
+## Attention은 학습 가능한 커널 추정이다
+
+Softmax attention을 다르게 쓰면 비모수 추정의 고전 기법이 나타난다.
+
+$$
+\text{Attn}(Q, K, V)_i = \frac{\sum_j \kappa_{\exp}(q_i, k_j) \, v_j}{\sum_j \kappa_{\exp}(q_i, k_j)}, \quad \kappa_{\exp}(q, k) = \exp\!\left(\frac{q^\top k}{\sqrt{d_k}}\right)
+$$
+
+이것은 Nadaraya-Watson estimator다. 각 데이터 포인트 $(k_j, v_j)$에 커널 유사도로 가중한 합 — 단, $k_j = X W_K$가 학습된다는 점이 다르다. Attention은 **표현 공간 자체를 학습하는 비모수 추정**이다.
+
+지수 내적 커널은 Taylor 전개를 통해 무한 차원 polynomial 커널의 가중합이며, $q, k$가 unit norm일 때 RBF 커널과 본질적으로 등가다. 이 해석이 Linear Attention과 Performer의 이론적 토대가 된다 — $\exp(q^\top k) \approx \phi(q)^\top \phi(k)$로 분해하면 행렬 곱의 결합 순서를 바꿔 $O(T^2) \to O(T)$가 가능하다.
+
+## Multi-Head: 공짜로 얻는 표현력
+
+$h$개 헤드, 헤드별 $d_k = d_{\text{model}}/h$의 MHA는 단일 헤드 $d_k = d_{\text{model}}$과 **같은 파라미터 수, 같은 FLOP**이다.
+
+$$
+h \cdot O(T^2 d_k) = h \cdot O\!\left(T^2 \frac{d_{\text{model}}}{h}\right) = O(T^2 d_{\text{model}})
+$$
+
+그러면서 더 많은 것을 얻는다. 각 헤드는 다른 $d_k$차원 subspace로 projection하므로 다른 종류의 유사도를 동시에 측정한다. 학습된 BERT의 헤드들이 syntactic 구조, coreference, positional 패턴을 각각 포착한다는 실증 결과(Voita 2019, Clark 2019)가 이를 뒷받침한다.
+
+<Aside label="Redundancy와 효율">
+Michel et al. (2019)는 inference 시 헤드의 30-50%를 제거해도 성능이 거의 유지됨을 보였다. 훈련 시 redundancy는 regularization 역할을 하고, inference 시는 제거 가능하다. Multi-Query Attention과 Grouped-Query Attention(LLaMA-2)이 KV 헤드만 줄이는 것은 이 비대칭 redundancy를 활용한 것이다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="Attention의 설계 결정과 그 대가">
+| 설계 | 얻는 것 | 잃는 것 |
+|------|---------|---------|
+| 3개 독립 projection | 방향성 있는 관계 표현 | 파라미터 3배 |
+| $\sqrt{d_k}$ scaling | 학습 안정성 | 없음 (unique optimal) |
+| Row-wise softmax | 해석 가능한 확률 분포 | 포화 위험, $O(T^2)$ FLOP |
+| Multi-head | 표현력 ↑, 공짜 | KV cache 부담 |
+| Permutation equivariance | 위치 독립 표현 | 위치 정보 없음 → PE 필수 |
+</Callout>
+
+$O(T^2)$ 복잡도는 피할 수 없는 구조적 병목이다. $T = 32{,}768$ (32K context)에서 attention matrix 하나가 FP32 기준 4GB를 차지한다. Flash Attention, Linear Attention, Sparse Attention 모두 이 한계를 우회하려는 시도다.
+
+해석 가능성 문제도 설계의 결과다. Jain & Wallace(2019)는 같은 출력을 만드는 다른 attention 분포가 존재함을 보여 attention이 유일한 설명이 될 수 없음을 주장했다. Wiegreffe & Pinter(2019)는 자연스럽게 학습된 분포는 informative하다고 반박했다. 둘 다 맞다. Attention map은 디버깅 도구로는 유용하지만 causal explanation으로 단순 사용하면 오류가 생긴다. Anthropic의 mechanistic interpretability는 이 질문을 "attention이 explanation인가"에서 "attention이 어떤 computation을 수행하는가"로 전환했다 — induction head처럼 특정 circuit은 투명하게 분석 가능하다.
+
+## 정리
+
+- $Q, K, V$의 비대칭 분리는 directional 관계 표현을 위한 필연적 선택이다.
+- $\sqrt{d_k}$ scaling은 내적 분산이 $d_k$에 비례한다는 사실에서 유도되는 유일한 정규화다.
+- Softmax attention은 학습 가능한 Nadaraya-Watson estimator이며, 이 해석이 효율화 기법들의 이론적 토대다.
+- Multi-head는 같은 비용으로 더 많은 표현력을 얻는 설계이고, redundancy는 훈련 시 regularization, inference 시 제거 자원이다.
+- $O(T^2)$ 병목과 해석 가능성의 한계는 버그가 아니라 이 설계의 구조적 귀결이다.
+
+attention 식 한 줄 안에는 분산 제어, 비모수 추정, subspace 분리라는 세 개의 독립적인 엔지니어링 결정이 압축되어 있다.
+
+<Reference
+  title="Attention Is All You Need"
+  authors="Vaswani et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
+/>
+<Reference
+  title="Are Sixteen Heads Really Better than One?"
+  authors="Michel et al."
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1905.10650"
+/>

@@ -1,0 +1,127 @@
+---
+title: "Transformer 훈련을 가능하게 하는 다섯 가지 설계 결정"
+description: "Warmup 스케줄의 이론적 정당성부터 AdamW의 분리된 weight decay, label smoothing의 calibration 효과, gradient accumulation의 선형 스케일링 법칙, BF16 mixed precision까지 — 현대 LLM 훈련 레시피의 공통 철학을 추적한다."
+pubDate: 2026-04-27
+category: ai
+tags: [transformer, training, optimizer, mixed-precision, learning-rate]
+difficulty: advanced
+series:
+  slug: transformer-deep-dive
+  title: Transformer Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+GPT-3, LLaMA, PaLM은 모두 다른 아키텍처처럼 보이지만 훈련 레시피는 놀랍도록 수렴해 있다. Linear warmup + cosine decay, AdamW, label smoothing, gradient accumulation, BF16 — 이 다섯 가지가 현대 Transformer 훈련의 사실상 표준이다. 왜 하필 이 다섯 가지인가?
+
+## 불안정한 출발점에서의 탈출 — Warmup
+
+Post-LN Transformer는 초기 gradient가 레이어 깊이 $L$에 따라 $O(L)$로 누적된다. 큰 learning rate에서 학습을 시작하면 첫 몇 스텝 안에 loss가 발산한다. Warmup은 이 문제를 직접 우회하는 장치다.
+
+$$
+\eta_t = \eta_{\max} \cdot \min(t / T_w, 1)
+$$
+
+작은 $\eta_t$에서 시작하면, gradient가 폭발해도 parameter update 크기인 $\eta_t \|g_t\|$가 작다. LayerNorm의 $\gamma, \beta$가 학습되면서 gradient가 안정되면 그때 full LR로 진입한다.
+
+Warmup 이후의 decay로는 cosine이 표준이다.
+
+$$
+\eta_t = \eta_{\min} + \frac{\eta_{\max} - \eta_{\min}}{2}\left(1 + \cos\!\left(\pi \frac{t - T_w}{T - T_w}\right)\right)
+$$
+
+Cosine은 학습 초반에 빠르게 감소하다 후반부 수렴 구간에서 천천히 줄어드는 형태로, linear decay보다 fine-tuning 효과가 좋다. LLaMA-2는 peak LR의 10%까지만 내려가는 partial decay를 채택해 continued pretraining 가능성을 남겨 둔다.
+
+<Callout type="note" title="Warmup ratio는 모델 규모와 함께 줄어든다">
+BERT는 warmup ratio 1%, GPT-3는 0.1%, LLaMA-2는 0.3%. 큰 모델일수록 전체 step 수 대비 warmup 비율이 작아진다. Token 기준으로는 10B tokens 내외를 warmup에 쓰는 방식이 현대 레시피의 경향이다.
+</Callout>
+
+## Weight Decay를 분리한 이유 — AdamW
+
+표준 Adam에 L2 regularization을 추가하면 $\lambda\theta$ 항이 gradient에 더해진다. 그런데 이 항도 second moment $v_t$에 들어간다.
+
+$$
+v_t = \beta_2 v_{t-1} + (1-\beta_2)(g_t + \lambda\theta_t)^2
+$$
+
+결과적으로 L2 penalty의 effective decay가 $\sqrt{v_t}$로 나뉘어 **dampening**된다. 파라미터 크기가 클수록 $v_t$가 커져 decay가 더 약해지는, 의도와 정반대의 효과다.
+
+AdamW(Loshchilov & Hutter 2019)는 weight decay를 update에 직접 분리한다.
+
+$$
+\theta_{t+1} = (1 - \eta_t \lambda)\,\theta_t - \eta_t \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+decay 항이 adaptive learning rate의 영향을 받지 않으므로 effective decay가 정확히 $\eta\lambda$다. GPT-3, LLaMA, BERT 모두 $\lambda = 0.1$ (bias와 LayerNorm 파라미터는 제외)을 쓴다.
+
+<Theorem kind="remark" number="1" title="β₂ 선택의 규모 의존성">
+BERT는 $\beta_2 = 0.999$를 쓰지만, LLaMA-2와 GPT-3는 $\beta_2 = 0.95$를 쓴다. 큰 모델에서 레이어별 gradient 분포가 빠르게 변하기 때문에 긴 averaging window가 오히려 stale estimate를 만든다. $\epsilon$도 함께 $10^{-5}$로 키워 small-$v$ 영역의 불안정을 방지한다.
+</Theorem>
+
+## 모델의 과신을 막는 장치 — Label Smoothing
+
+Hard one-hot label로 학습하면 모델은 정답 class의 logit을 무한히 키우려 한다. Cross-entropy loss를 0으로 만들기 위해 $p_y \to 1$이 되어야 하므로, logit 크기에 상한이 없다. 결과는 over-confidence와 poor calibration이다.
+
+Label smoothing은 정답 분포를 균등 분포 방향으로 섞는다.
+
+$$
+y_k^{\text{smooth}} = (1-\epsilon)\,y_k^{\text{onehot}} + \frac{\epsilon}{K}
+$$
+
+이 분포를 최소화하는 $p^*$는 $p_y^* = 1 - \epsilon + \epsilon/K$로 cap된다. $\epsilon = 0.1$, $K = 1000$이면 logit 차이의 상한이 $\log(9001) \approx 9.1$로 유한해진다.
+
+<Callout type="warning" title="Distillation teacher에는 사용하지 않는다">
+Müller 2019의 핵심 발견: smoothed teacher는 틀린 클래스들 간의 상대적 ranking — 이른바 "dark knowledge" — 을 손실한다. Student가 이 정보를 학습하지 못해 1-2% 정확도 손실이 생긴다. LLM pre-training에서 label smoothing을 쓰지 않는 또 다른 이유는 vocabulary가 50K+로 커 $\epsilon/K$의 영향이 미미하고, next token prediction의 정답이 본질적으로 ambiguous하기 때문이다.
+</Callout>
+
+## 메모리와 규모 사이 — Gradient Accumulation과 선형 스케일링
+
+GPU 한 장에 batch 32밖에 안 올라가도, 4 step을 accumulate하면 effective batch 128과 수학적으로 동일하다.
+
+$$
+g^{(\text{accum})} = \frac{1}{K}\sum_{k=1}^K \hat{g}(\theta;\, B_{\text{micro}}^{(k)}) = \frac{1}{B}\sum_{i=1}^B g_i
+$$
+
+각 micro-batch의 gradient 평균이 큰 batch의 gradient 평균과 같다는 동치 관계다. 여기서 Goyal 2017의 **Linear Scaling Rule**이 성립한다: batch $B \to kB$일 때 $\eta \to k\eta$로 같이 키우면 학습 곡선이 거의 일치한다.
+
+$$
+\theta_{t+k} \approx \theta_t - k\eta \cdot \mathbb{E}[\hat{g}(\theta_t; B)]
+$$
+
+직관: $k$번 작은 step을 밟은 것이 $k$ 배 큰 step 한 번과 같으려면, LR도 $k$배가 되어야 한다. 단, Adam에서는 $\sqrt{v}$ 분모가 자동으로 일부 scaling을 처리하므로, 매우 큰 batch에서는 $\sqrt{k}$ scaling이 더 안정적이다. GPT-3의 3.2M tokens effective batch는 이 framework 위에 있다.
+
+<Aside label="Sharp minima와의 화해">
+Keskar 2017은 large batch가 sharp minima로 수렴해 generalization을 해친다고 주장했다. 그러나 LLM pre-training은 사정이 다르다. 수백 billion tokens의 다양한 데이터가 inherent noise를 제공하고, token 단위로 보면 3.2M tokens batch도 sequence 단위로는 수천 개 수준이다. Warmup + Adam의 layer-wise normalization 효과가 sharp minima 위험을 완화한다.
+</Aside>
+
+## 속도와 정밀도의 균형 — BF16 Mixed Precision
+
+FP16은 exponent가 5 bit으로 dynamic range가 $\pm 65504$에 불과하다. LLM gradient의 tail은 $10^{-7}$ 아래로 내려가는데, 이 값들이 FP16에서 subnormal 또는 0으로 플러시된다. Loss scaling($\times S$, 전형적으로 $2^{16}$)이 이를 막지만 파이프라인을 복잡하게 만든다.
+
+BF16은 exponent를 FP32와 동일한 8 bit로 유지하고 mantissa만 7 bit으로 줄였다. Dynamic range가 $\pm 10^{38}$으로 확장되어 gradient underflow가 사라진다. Mantissa 7 bit의 정밀도($\approx 0.78\%$ 상대 오차)는 LLM의 weight update magnitude 수준에서 충분하다.
+
+| Format | Exponent | Mantissa | Range | Loss Scaling |
+|--------|----------|----------|-------|-------------|
+| FP16 | 5 bit | 10 bit | ±65504 | 필요 |
+| BF16 | 8 bit | 7 bit | ±10³⁸ | 불필요 |
+| FP32 | 8 bit | 23 bit | ±10³⁸ | — |
+
+Master weight은 FP32로 유지한다. Update 크기가 $\sim 10^{-7}$인데 weight이 $\sim 10^{-1}$이면, BF16의 mantissa 7 bit으로는 누적 업데이트가 소실된다. Forward는 BF16으로, 누적은 FP32로 — 속도와 정밀도를 분리한다. 2023년 이후 LLaMA, Mistral, PaLM 모두 BF16이 기본이다.
+
+## 정리
+
+다섯 가지 결정은 각자 독립된 기법이 아니라 하나의 공통 철학에서 나온다 — **불안정한 수치 환경에서 신호를 보존하라**.
+
+- Warmup은 초기 gradient 폭발을 작은 step으로 흡수한다.
+- AdamW는 weight decay가 adaptive LR에 의해 왜곡되는 것을 막는다.
+- Label smoothing은 무한히 커지려는 logit에 유한한 상한을 부여한다.
+- Linear scaling rule은 batch 크기와 LR의 일관성을 유지한다.
+- BF16은 gradient의 dynamic range를 보존하면서 Tensor Core 속도를 가져온다.
+
+이 다섯 가지를 함께 쓰면 수천억 파라미터의 모델도 안정적으로 수렴한다. 다음 챕터에서는 이렇게 훈련된 모델이 추론 시 마주치는 병목, quadratic attention complexity로 넘어간다.
