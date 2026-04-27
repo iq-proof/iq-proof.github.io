@@ -1,0 +1,108 @@
+---
+title: "Kernel은 왜 Positive Definite여야 하는가"
+description: "PD kernel의 정의부터 Mercer 분해, characteristic·universal 성질까지 — '함수를 내적으로 표현할 수 있다'는 보장이 SVM, GP, MMD 전체를 어떻게 떠받치는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [kernel-methods, positive-definite, mercer, rkhs, mmd]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kernel method의 모든 것은 한 가지 가정 위에 세워진다: "$k$가 positive definite(PD)이다." 이 조건이 단순한 기술적 요건처럼 보이지만, 실제로는 **feature map의 존재**, SVM dual QP의 볼록성, GP covariance의 Cholesky 분해 가능성을 모두 한꺼번에 보장한다. 그렇다면 왜 하필 이중합 $\sum_{i,j} \alpha_i \alpha_j k(x_i, x_j) \geq 0$이라는 조건이 그 모든 것의 열쇠가 되는가?
+
+## PD kernel의 정의 — 왜 이중합인가
+
+집합 $\mathcal{X}$ 위의 함수 $k : \mathcal{X} \times \mathcal{X} \to \mathbb{R}$가 **positive semi-definite kernel**이 되려면 두 가지를 만족해야 한다: 대칭성 $k(x, y) = k(y, x)$, 그리고 임의의 유한 부분집합 $\{x_1, \ldots, x_n\}$과 스칼라 $\{\alpha_i\}$에 대해
+
+$$\sum_{i=1}^n \sum_{j=1}^n \alpha_i \alpha_j k(x_i, x_j) \geq 0.$$
+
+이 조건이 나오는 이유는 간단하다. 만약 $k(x, y) = \langle \phi(x), \phi(y) \rangle_\mathcal{H}$로 표현된다면, 이중합은 곧 $\left\| \sum_i \alpha_i \phi(x_i) \right\|_\mathcal{H}^2$이고, norm 제곱은 항상 음이 아니다. 역으로 이 성질이 성립하면 feature map을 거꾸로 구성할 수 있다는 것이 Moore-Aronszajn 정리의 내용이다.
+
+그람 행렬 관점에서 보면 더 간결하다. $n$개 점의 그람 행렬 $K_{ij} := k(x_i, x_j)$를 정의하면 이중합은 이차형식 $\alpha^\top K \alpha$이다. 따라서:
+
+$$k \text{ is PD} \iff K \succeq 0 \text{ (모든 유한 샘플에서)}.$$
+
+<Theorem kind="proposition" number="1" title="Gram 양정치성과 PD kernel의 동치">
+대칭 함수 $k : \mathcal{X} \times \mathcal{X} \to \mathbb{R}$에 대해 다음은 동치이다: (1) $k$는 PD kernel이다. (2) 임의의 유한 부분집합에 대한 그람 행렬 $K$는 $K \succeq 0$이다.
+</Theorem>
+
+<Proof>
+$(1) \Rightarrow (2)$: 임의의 $\alpha \in \mathbb{R}^n$에 대해 $\alpha^\top K \alpha = \sum_{i,j} \alpha_i \alpha_j k(x_i, x_j) \geq 0$. 대칭성에 의해 $K = K^\top$이므로 $K \succeq 0$.
+
+$(2) \Rightarrow (1)$: $\alpha^\top K \alpha \geq 0$이 곧 PD 정의의 조건이다. $\square$
+</Proof>
+
+PD의 따름정리로 Cauchy-Schwarz 부등식 $k(x, y)^2 \leq k(x, x) \cdot k(y, y)$가 자동으로 성립한다. $n = 2$인 $2 \times 2$ 그람의 행렬식이 $\geq 0$이어야 하기 때문이다.
+
+## 대표 kernel의 PD 증명 전략
+
+실무에서 자주 쓰이는 kernel들이 실제로 PD인지는 세 가지 전략으로 증명한다.
+
+**전략 1 — Feature map 제시.** $k(x, y) = \langle \phi(x), \phi(y) \rangle$를 만족하는 $\phi$를 직접 보이는 방법이다. Linear kernel $k(x, y) = x^\top y$는 $\phi = \text{id}$로 즉각. Polynomial kernel $(x^\top y + c)^d$는 이항전개로 각 항 $(x^\top y)^j = \langle x^{\otimes j}, y^{\otimes j} \rangle$를 확인하면 된다.
+
+**전략 2 — PD-보존 연산.** 이미 PD인 kernel에 합·곱·지수함수를 적용해도 PD가 유지된다. 곱의 경우 핵심은 **Schur product theorem**: 두 PSD 행렬 $A, B$의 원소별 곱 $A \odot B$도 PSD다. 이로부터 $k_1 \cdot k_2$가 PD이고, $e^k = \sum_{j} k^j / j!$도 PD임이 따라온다. Gaussian RBF의 PD 증명이 바로 이 경로다:
+
+$$\exp\!\left(-\frac{\|x-y\|^2}{2\sigma^2}\right) = e^{-\|x\|^2/2\sigma^2} \cdot \exp\!\left(\frac{x^\top y}{\sigma^2}\right) \cdot e^{-\|y\|^2/2\sigma^2}.$$
+
+가운데 $\exp(x^\top y / \sigma^2)$는 Taylor 전개 후 양계수 무한합, 나머지는 scalar conjugate 변환이다. 세 단계 모두 PD를 보존한다.
+
+**전략 3 — Bochner 정리.** Shift-invariant kernel $k(x-y)$는 어떤 유한 음이 아닌 측도의 Fourier 변환일 때 정확히 PD다. Laplace kernel과 Matérn kernel은 각각 Cauchy-류, Whittle-류 spectral density를 가지며 이로써 PD가 따라온다.
+
+<Callout type="warning" title="Sigmoid kernel은 일반적으로 PD가 아니다">
+$k_{\text{sig}}(x, y) = \tanh(a x^\top y + c)$는 $(a, c)$의 일부 범위에서만 PD에 가깝다. 특정 $c > 0$ 설정에서는 그람 행렬의 최소 고유값이 음수가 되어 PD 조건을 위반한다. SVM에서 sigmoid kernel을 사용할 때 solver가 non-convex 문제에 빠지는 이유가 여기 있다.
+</Callout>
+
+## Mercer 정리 — 무한차원 feature의 기원
+
+"Gaussian RBF의 feature가 무한차원이다"라는 ML의 문구는 어디서 오는가? 답은 **Mercer 정리**에 있다.
+
+컴팩트 측도공간 $(\mathcal{X}, \mu)$ 위의 연속 PD kernel로부터 integral operator
+
+$$(T_k f)(x) := \int_\mathcal{X} k(x, y) f(y) \, d\mu(y)$$
+
+를 정의하면, $T_k$는 compact·self-adjoint·positive 작용소가 된다. 스펙트럴 정리에 의해 음이 아닌 고유값 $\lambda_1 \geq \lambda_2 \geq \cdots \geq 0$과 $L^2$에서 직교정규인 고유함수 $\{\phi_n\}$이 존재하고, kernel 자체가 이로부터 재조립된다:
+
+$$k(x, y) = \sum_{n=1}^\infty \lambda_n \phi_n(x) \phi_n(y) \quad \text{(일양 수렴)}.$$
+
+이를 $\phi(x) := (\sqrt{\lambda_n} \phi_n(x))_{n \geq 1} \in \ell^2$로 읽으면 $k(x, y) = \langle \phi(x), \phi(y) \rangle_{\ell^2}$이다. Gaussian RBF의 경우 고유값이 지수적으로 감쇠하므로 무한히 많은 Hermite 함수 모드가 필요하다 — 이것이 "implicit 무한차원 feature"의 정확한 의미다.
+
+<Aside label="고유값 감쇠와 함수의 매끄러움">
+Mercer 전개에서 고유값 감쇠 속도는 kernel의 매끄러움을 직접 반영한다. RBF는 $\lambda_n \asymp A^n$ (지수 감쇠), Laplace는 $\lambda_n \asymp n^{-2}$ (다항 감쇠), Matérn-$\nu$는 $\lambda_n \asymp n^{-(2\nu+1)}$. 감쇠가 빠를수록 소수의 모드로 kernel을 근사할 수 있고, GP 샘플 함수도 그만큼 매끄럽다.
+</Aside>
+
+일양 수렴 보장이 중요한 이유가 있다. 유한 부분합 $k_N(x, y) = \sum_{n=1}^N \lambda_n \phi_n(x) \phi_n(y)$가 실제 $k$를 균일하게 근사한다는 것이 Random Features 근사와 Nyström 방법의 이론적 근거이기 때문이다.
+
+## Characteristic과 Universal — 두 가지 강함의 척도
+
+PD kernel 중에서도 두 가지 중요한 성질이 추가로 구분된다.
+
+**Characteristic kernel**은 mean embedding $\mu_p := \mathbb{E}_{X \sim p}[k(\cdot, X)] \in \mathcal{H}_k$이 분포 $p$를 **단사적으로** 표현할 때 성립한다: $\mu_p = \mu_q \Rightarrow p = q$. 이 성질이 없으면 Maximum Mean Discrepancy가 의미를 잃는다. 서로 다른 두 분포인데도 $\text{MMD}(p, q) = 0$으로 오판하는 상황이 생긴다.
+
+**Universal kernel**은 RKHS $\mathcal{H}_k$가 컴팩트 $\mathcal{X}$ 위의 연속 함수 공간 $C(\mathcal{X})$에서 $\sup$-노름으로 dense할 때 성립한다. 이는 "임의의 연속 함수를 원하는 정밀도로 근사할 수 있다"와 같으며, SVM의 consistency가 이에 기댄다.
+
+두 성질의 관계는 비대칭적이다.
+
+<Theorem kind="theorem" number="2" title="Universal은 Characteristic을 함의한다">
+컴팩트 $\mathcal{X}$에서 universal kernel은 characteristic이다. 역은 일반적으로 성립하지 않는다.
+</Theorem>
+
+Gaussian RBF와 Laplace, Matérn-$\nu$는 둘 다 만족한다. 이유는 공통적이다: 이 kernel들의 spectral density가 $\mathbb{R}^d$ 전체에서 양수이기 때문이다. Shift-invariant kernel에서 characteristic 성질은 정확히 "spectral measure의 support가 $\mathbb{R}^d$ 전체"와 동치다.
+
+반면 Polynomial kernel $(x^\top y + c)^d$는 둘 다 아니다. RKHS가 차수 $\leq d$ 다항식의 유한 차원 공간이므로 universal이 불가능하고, mean embedding이 분포의 $d$차 모멘트까지만 포착하므로 같은 모멘트를 가진 서로 다른 분포를 구분하지 못한다.
+
+## 정리
+
+PD 조건은 단순한 수학적 형식이 아니다. 그 안에는 "feature map이 존재한다"는 기하적 보장, SVM dual의 볼록성, GP posterior의 수치 안정성이 전부 담겨 있다. kernel을 쓴다는 말은 곧 "내가 선택한 함수가 PD임을 알고 있다"는 뜻이다.
+
+- PD kernel $\iff$ 모든 유한 샘플에서 그람 행렬 $K \succeq 0$ $\iff$ $k(x,y) = \langle \phi(x), \phi(y) \rangle_\mathcal{H}$인 feature map 존재.
+- 합·곱·지수·composition 연

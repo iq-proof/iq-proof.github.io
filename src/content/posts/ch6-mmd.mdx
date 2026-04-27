@@ -1,0 +1,153 @@
+---
+title: "MMD는 어떻게 분포를 벡터로 만드는가"
+description: "Mean embedding으로 확률분포를 RKHS 벡터에 올리는 순간부터, Two-sample test·MMD-GAN·HSIC까지 하나의 철학이 관통하는 방식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [kernel-methods, mmd, rkhs, mean-embedding, hsic]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"두 분포가 같은가?"라는 질문에 답하려면 먼저 분포를 **비교 가능한 객체**로 만들어야 한다. KL divergence는 density를 알아야 하고, Kolmogorov-Smirnov는 1차원에만 쓸 수 있다. Maximum Mean Discrepancy(MMD)는 다른 길을 택한다 — 분포를 RKHS의 벡터 하나로 embedding한 뒤, 두 벡터의 거리를 잰다. 이 단순한 아이디어가 Two-sample test, 생성모델 학습, 독립성 검정을 하나의 언어로 묶어버리는 것은 왜인가?
+
+## 분포를 RKHS에 올리기 — Mean Embedding
+
+확률측도 $p$의 **mean embedding**은 다음과 같이 정의된다.
+
+$$
+\mu_p := \mathbb{E}_{X \sim p}[k(\cdot, X)] = \int k(\cdot, x)\, dp(x) \in \mathcal{H}_k.
+$$
+
+각 점 $x$에서 RKHS 원소 $k(\cdot, x)$를 뽑아 $p$에 대해 평균낸 것이다. RBF kernel을 쓰면 $\mu_p$의 $n$번째 Mercer 성분이 $p$의 $n$번째 kernel moment에 해당하므로, $\mu_p$ 하나가 **분포의 모든 모멘트 정보를 담은 벡터**가 된다.
+
+재생성질 $f(x) = \langle f, k(\cdot, x) \rangle_{\mathcal{H}_k}$과 Fubini 정리를 결합하면 즉각 다음을 얻는다.
+
+$$
+\mathbb{E}_{X \sim p}[f(X)] = \langle f, \mu_p \rangle_{\mathcal{H}_k}.
+$$
+
+"$p$에 대한 $f$의 기댓값"이 "RKHS에서 $f$와 $\mu_p$의 내적"으로 바뀐다. $\mu_p$는 기댓값 연산을 내적으로 대체하는 **대리자**다.
+
+## MMD — RKHS 거리로서의 분포 차이
+
+두 분포 $p$, $q$의 mean embedding 사이 RKHS 거리를 **Maximum Mean Discrepancy**라 한다.
+
+$$
+\text{MMD}^2(p, q) := \|\mu_p - \mu_q\|_{\mathcal{H}_k}^2.
+$$
+
+내적을 전개하면 샘플로 직접 계산할 수 있는 형태가 나온다.
+
+$$
+\text{MMD}^2(p, q) = \mathbb{E}_{X, X' \sim p}[k(X, X')] - 2\,\mathbb{E}_{X \sim p,\, Y \sim q}[k(X, Y)] + \mathbb{E}_{Y, Y' \sim q}[k(Y, Y')].
+$$
+
+세 항의 의미는 명확하다. $p$의 self-similarity, $q$의 self-similarity, 그리고 두 분포 사이의 cross-similarity. $p = q$이면 세 항이 정확히 상쇄되어 MMD = 0이 된다.
+
+<Theorem kind="theorem" number="1" title="Characteristic kernel과 MMD의 완전성">
+$k$가 characteristic kernel이면, $\text{MMD}(p, q) = 0 \iff p = q$.
+</Theorem>
+
+<Proof>
+$(\Leftarrow)$: $p = q$이면 $\mu_p = \mu_q$이므로 $\text{MMD} = 0$.
+
+$(\Rightarrow)$: $\text{MMD}(p, q) = 0$이면 $\mu_p = \mu_q$. Characteristic kernel의 정의에 의해 사상 $p \mapsto \mu_p$는 단사이므로 $p = q$. $\square$
+</Proof>
+
+이와 동치인 **IPM(Integral Probability Metric) 해석**이 있다.
+
+$$
+\text{MMD}(p, q) = \sup_{\|f\|_{\mathcal{H}_k} \leq 1} \bigl|\mathbb{E}_p[f] - \mathbb{E}_q[f]\bigr|.
+$$
+
+Cauchy-Schwarz 등호 조건 $f = (\mu_p - \mu_q) / \|\mu_p - \mu_q\|$에서 supremum이 달성된다. MMD는 "RKHS unit ball 안의 test function으로 두 분포를 가장 크게 구별할 수 있는 기댓값 차이"다. Total variation이 indicator function 전체를 허용하는 데 비해, MMD는 smooth function class만 허용하기 때문에 실용적이면서도 원칙적이다.
+
+## 샘플 추정량 — Biased vs Unbiased
+
+실무에서 MMD²은 샘플로 추정한다. 두 가지 추정량이 있다.
+
+**Biased 추정량**은 경험적 mean embedding의 RKHS 거리를 그대로 제곱한 것이다. $i = j$ 항, 즉 $k(x_i, x_i)$를 포함하기 때문에 $O(1/n)$ bias가 생긴다. Null($p = q$) 상황에서도 양수 값을 가지므로 가설검정에 그대로 쓰면 안 된다.
+
+**Unbiased 추정량(U-statistic)**은 $i \ne j$ 쌍만 사용한다.
+
+$$
+\widehat{\text{MMD}}_u^2 = \frac{1}{n(n-1)}\sum_{i \ne j} k(x_i, x_j) - \frac{2}{nm}\sum_{i,j} k(x_i, y_j) + \frac{1}{m(m-1)}\sum_{i \ne j} k(y_i, y_j).
+$$
+
+$\mathbb{E}[\widehat{\text{MMD}}_u^2] = \text{MMD}^2$이며, bounded kernel($k \leq K$) 하에서 Hoeffding 부등식으로 다음 집중 부등식을 얻는다.
+
+$$
+P\!\left(|\widehat{\text{MMD}}_u^2 - \text{MMD}^2| \geq t\right) \leq 2\exp\!\left(-\frac{nt^2}{4K^2}\right).
+$$
+
+수렴률은 $O(1/\sqrt{n})$이다. Polynomial kernel처럼 characteristic이 아닌 kernel을 쓰면 처음 $d$개 모멘트만 비교하게 되어, 평균·분산이 같지만 왜도가 다른 두 분포를 구분하지 못하는 false negative가 발생한다.
+
+<Callout type="note" title="추정량 선택 가이드">
+가설검정에는 unbiased 추정량을 써야 한다. Null 분포가 0에 중심을 두기 때문이다. MMD-GAN 학습 손실로는 biased 추정량도 무방하다. 상수 shift는 gradient에 영향을 주지 않고, 분산이 약간 더 작아 학습이 안정적이다.
+</Callout>
+
+## Two-Sample Test와 MMD-GAN — 같은 도구, 다른 목적
+
+**Two-sample test**는 $H_0: p = q$ vs $H_1: p \ne q$를 $\widehat{\text{MMD}}_u^2$를 검정통계량으로 삼아 수행한다. Critical value는 두 가지 방법으로 구한다.
+
+점근 분포를 쓰면 Null 하에서 $n\widehat{\text{MMD}}_u^2 \xrightarrow{d} \sum_l \lambda_l(z_l^2 - 1)$임을 Gretton et al.(2012)이 보였다. $\lambda_l$은 centered kernel의 적분 연산자 고유값이다. 이 분포는 직접 다루기 복잡하므로 실무에서는 **permutation test**가 더 많이 쓰인다. $p = q$ 하에서 $\{x_i\}$와 $\{y_j\}$는 exchangeable하므로, label을 random shuffle한 뒤 MMD²를 반복 계산하면 유한 샘플에서 exact한 null 분포를 얻는다. Type-I error가 $\alpha$ 이하임이 수학적으로 보장된다.
+
+**MMD-GAN**은 같은 MMD²를 generator의 손실함수로 삼는다.
+
+$$
+\mathcal{L}(\theta) = \mathbb{E}_{\tilde{x},\tilde{x}' \sim q_\theta}[k(\tilde{x},\tilde{x}')] - 2\,\mathbb{E}_{x \sim p,\,\tilde{x} \sim q_\theta}[k(x,\tilde{x})].
+$$
+
+Discriminator가 없다. Characteristic kernel 하에서 $\mathcal{L} = 0 \iff q_\theta = p$이므로 이론적으로 mode collapse의 "실패 모드"가 봉쇄된다. Gradient는 RBF kernel이 미분 가능하므로 backprop으로 직접 계산된다. 단일 목적함수이기 때문에 minimax 균형을 찾지 않아도 되어 학습이 안정적이다.
+
+Multi-scale RBF
+
+$$
+k = \sum_l \exp\!\left(-\frac{\|x-y\|^2}{2\sigma_l^2}\right)
+$$
+
+을 쓰면 coarse scale에서 fine scale까지 연속적인 gradient signal을 제공해 vanishing gradient를 완화한다. Raw pixel 위의 MMD는 고해상도 이미지에서 효과가 약하므로, Inception feature 위에서 Gaussian 근사로 Fréchet distance를 재는 **FID**는 사실상 deep feature space에서의 MMD에 해당한다.
+
+<Aside label="설계 철학">
+Two-sample test는 MMD²가 크면 "다르다"고 결론짓고, MMD-GAN은 MMD²가 작아지도록 generator를 훈련한다. 같은 도구를 "측정"과 "최적화" 두 방향으로 쓰는 것이다.
+</Aside>
+
+## HSIC와 조건부 Embedding — 같은 언어의 확장
+
+Mean embedding의 핵심 통찰 — "분포를 Hilbert 공간 객체로 다룬다" — 은 독립성 검정과 조건부 추론으로 곧장 확장된다.
+
+**HSIC(Hilbert-Schmidt Independence Criterion)**는 결합분포 $p_{XY}$의 mean embedding과 주변분포 곱 $p_X \otimes p_Y$의 mean embedding 사이의 거리다.
+
+$$
+\text{HSIC}(X, Y) = \|\mu_{XY} - \mu_X \otimes \mu_Y\|^2_{\mathcal{H}_X \otimes \mathcal{H}_Y}.
+$$
+
+Characteristic kernels $k_X$, $k_Y$ 하에서 $\text{HSIC} = 0 \iff X \perp Y$. 샘플로는
+
+$$
+\widehat{\text{HSIC}} = \frac{1}{(n-1)^2}\text{tr}(KHLH)
+$$
+
+으로 계산한다($H$는 centering matrix). Pearson correlation이 0인 $Y = X^2$ 같은 비선형 의존성도 HSIC는 감지한다.
+
+**조건부 mean embedding**은 $p(y \mid x)$ 전체를 RKHS 원소 $\mu_{Y|X=x} \in \mathcal{H}_{k_Y}$로 나타낸다. 추정은
+
+$$
+\hat{\mu}_{Y|X=x^*} = \sum_i \beta_i\, k_Y(\cdot, y_i), \quad \beta = (K_X + n\lambda I)^{-1}k_X(x^*)
+$$
+
+이며, 이것은 정확히 Kernel Ridge Regression의 예측 공식이다. KRR은 scalar output을 예측하고, 조건부 mean embedding은 분포 전체를 예측한다는 점만 다르다. Distribution regression(분포 자체를 input으로 삼는 회귀)도 같은 맥락에서, 각 분포의 mean embedding을 feature로 삼아 그 위에서 kernel 회귀를 수행한다.
+
+## 정리
+
+- Mean embedding $\mu_p = \int k(\cdot, x)\,dp(x)$는 분포를 RKHS 벡터로 바꾼다. Characteristic kernel 하에서 이 사상은 단사

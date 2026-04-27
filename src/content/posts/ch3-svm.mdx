@@ -1,0 +1,110 @@
+---
+title: "SVM은 왜 내적만으로 비선형이 되는가"
+description: "Margin 최대화의 기하학적 출발점부터 Lagrangian dual, Kernel Trick, Soft-margin, SMO까지 — SVM 전체 설계를 관통하는 하나의 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [svm, kernel-methods, lagrangian-dual, margin, optimization]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+SVM의 모든 설계 결정은 하나의 질문에서 출발한다 — "무수히 많은 분리선 중 어떤 것이 가장 좋은가?" 그리고 그 답이 연쇄적으로 Lagrangian dual을 요구하고, dual이 kernel trick을 자연스럽게 허용하고, kernel trick이 비선형 분류를 "치환 한 줄"로 가능하게 만든다. 왜 내적 하나를 바꾸는 것만으로 무한 차원 feature 공간에서의 분류가 가능한가?
+
+## Margin: "가장 안전한 분리"의 기하학
+
+데이터를 분리하는 초평면은 무수히 많다. SVM의 출발점은 그중 **양 클래스로부터 가장 먼 것**을 택하자는 원칙이다.
+
+초평면 $\{x : w^\top x + b = 0\}$과 점 $x_i$ 사이의 유클리드 거리는 $|w^\top x_i + b| / \|w\|$다. 스케일 모호성을 제거하기 위해 "가장 가까운 점에서 $|w^\top x_i + b| = 1$"이 되도록 정규화하면, 가장 가까운 점의 거리가 $1/\|w\|$이 되고 양 클래스 간 margin은 $2/\|w\|$가 된다.
+
+$$\text{margin} = \frac{2}{\|w\|} \quad \Rightarrow \quad \text{최대화} \Leftrightarrow \min \frac{1}{2}\|w\|^2$$
+
+제약조건 $y_i(w^\top x_i + b) \geq 1$의 "1"은 본질이 아니라 스케일링 선택이다. Objective가 strictly convex quadratic이고 제약이 affine이므로, 이 문제는 **유일한 전역 최솟값**을 갖는 볼록 이차 프로그램(QP)이 된다. 제약이 등호로 성립하는 점들 — margin 경계 위의 점들 — 이 **support vector**다. 이 점들만으로 분리선이 결정된다.
+
+<Aside label="Generalization과 Margin의 연결">
+Vapnik (1998)의 bound에 따르면 generalization error의 upper bound는 $\mathcal{O}(\sqrt{R^2/\gamma^2 + \log(1/\delta)}/n)$에 비례한다. 즉 margin을 최대화하는 것은 단순히 "여유롭게 분리"하는 것이 아니라 **test error의 upper bound를 직접 줄이는** 행위다.
+</Aside>
+
+## Lagrangian Dual: 왜 변환이 필요한가
+
+Hard-margin primal을 kernel 공간에 직접 적용하면 문제가 생긴다. RBF kernel의 feature space $\mathcal{H}$는 무한 차원이므로 $w \in \mathcal{H}$를 직접 최적화할 수 없다.
+
+Lagrangian을 구성하고 $(w, b)$에 대해 최소화하면 stationarity 조건이 나온다.
+
+$$\nabla_w L = 0 \Rightarrow w^* = \sum_{i=1}^n \alpha_i y_i x_i, \qquad \frac{\partial L}{\partial b} = 0 \Rightarrow \sum_i \alpha_i y_i = 0$$
+
+이것이 Representer 정리의 SVM 특수 사례다. $w^*$가 training 점들의 $\alpha_i y_i$-가중 합이 된다는 것은, 무한 차원 문제가 $n$개의 실수 $\alpha$로 축소됨을 의미한다. $w^*$를 Lagrangian에 대입하면 dual이 나온다.
+
+$$\max_\alpha \sum_i \alpha_i - \frac{1}{2} \sum_{i,j} \alpha_i \alpha_j y_i y_j \mathbf{x_i^\top x_j}, \quad \alpha_i \geq 0,\ \sum_i \alpha_i y_i = 0$$
+
+선형 분리 가능 데이터에서 Slater 조건이 성립하므로 **strong duality**가 보장된다 — primal 최적값과 dual 최적값이 정확히 일치한다.
+
+<Theorem kind="proposition" number="1" title="KKT와 Support Vector의 동치">
+최적해 $(w^*, b^*, \alpha^*)$에서, complementary slackness $\alpha_i^*[y_i(w^{*\top}x_i + b^*) - 1] = 0$에 의해 $\alpha_i^* > 0$인 점과 margin 경계 위의 점($y_i(\cdots) = 1$)이 정확히 일치한다.
+</Theorem>
+
+<Proof>
+$\alpha_i^* > 0$이면 $y_i(w^{*\top}x_i + b^*) - 1 = 0$이 강제된다. 반대로 $y_i(\cdots) > 1$이면 $\alpha_i^* = 0$이어야 한다. 따라서 dual에서 $\alpha_i^* > 0$인 집합과 primal에서 active constraint 집합이 동일하다.
+</Proof>
+
+예측은 $\hat{y}(x) = \text{sign}(\sum_i \alpha_i^* y_i x_i^\top x + b^*)$로, **$x$와 support vectors 사이의 내적만** 필요하다. 이 구조가 kernel trick의 문을 연다.
+
+## Kernel Trick: 내적을 바꾸면 공간이 바뀐다
+
+Dual의 $x_i^\top x_j$를 $k(x_i, x_j) = \langle \phi(x_i), \phi(x_j) \rangle_{\mathcal{H}}$로 치환하면:
+
+$$\max_\alpha \sum_i \alpha_i - \frac{1}{2} \sum_{i,j} \alpha_i \alpha_j y_i y_j k(x_i, x_j)$$
+
+이 치환이 수학적으로 정당한 이유는 feature 공간 $\mathcal{H}$에서 linear SVM의 dual을 그대로 전개하면 정확히 이 식이 나오기 때문이다. "원래 공간의 linear SVM을 feature 공간의 linear SVM으로 upgrade"하는 셈이다. $\phi$가 비선형 사상이면 원래 공간에서 decision boundary는 곡면이 된다.
+
+RBF kernel $k(x_i, x) = \exp(-\|x_i - x\|^2 / 2\sigma^2)$를 쓰면 예측 함수는 support vector 근방에서 큰 값을 갖는 "Gaussian bump들의 가중합"이 된다. $\sigma$가 작을수록 각 bump가 좁아지고, support vector 수가 늘어나며, 결정 경계가 복잡해진다. 극단적으로 $\sigma \to 0$이면 Gram matrix가 단위행렬로 수렴해 모든 점이 support vector가 된다 — 완벽한 training fit, 즉 overfit.
+
+## Soft-Margin과 Hinge Loss: 실용 SVM의 핵심
+
+Hard-margin SVM은 선형 분리 가능 데이터에만 작동한다. 실무의 대부분 데이터에는 soft-margin이 필요하다. Slack variable $\xi_i \geq 0$으로 margin 위반을 허용하되 페널티를 부과한다.
+
+$$\min_{w, b} \frac{1}{2}\|w\|^2 + C\sum_i \max(0, 1 - y_i(w^\top x_i + b))$$
+
+Optimal slack $\xi_i^* = \max(0, 1 - y_i f(x_i))$를 대입하면 **hinge loss**가 등장한다. 이 형태는 SVM을 "loss + regularization"이라는 일반 ML 프레임워크 안에 놓는다.
+
+<Callout type="note" title="트레이드오프: C의 역할">
+$C$가 크면 위반에 큰 벌을 주므로 margin이 작아지고 training 점에 밀착한다 (low bias, high variance). $C$가 작으면 margin이 넓어지고 일부 오분류를 허용한다 (high bias, low variance). Soft-margin dual에서 이것은 $\alpha_i \in [0, C]$의 box constraint로 나타난다 — hard-margin의 $\alpha_i \in [0, \infty)$ 대비 상한 $C$가 outlier 한 점이 해 전체를 지배하는 것을 막는다.
+</Callout>
+
+KKT 조건으로부터 점들이 세 범주로 분류된다: margin 바깥($\alpha_i = 0$), margin 경계 위의 free SV($0 < \alpha_i < C$), margin 내부의 bounded SV($\alpha_i = C$). Hinge loss의 핵심 성질은 correctly classified + margin 충분한 점($y_i f(x_i) > 1$)의 gradient가 0이라는 점이다 — 이것이 sparse solution의 수학적 기원이다.
+
+## SMO: 해석적 업데이트로 대규모 SVM을 푼다
+
+$n \geq 10^4$에서 일반 QP solver는 $O(n^3)$ 메모리와 시간을 요구해 실용성이 없다. SMO (Platt 1998)는 $\sum_i \alpha_i y_i = 0$ 제약 때문에 1-변수 업데이트가 불가능하다는 사실을 역으로 활용한다 — **두 변수씩 동시에 업데이트**하면 제약을 유지하면서 2차 sub-problem의 해석적 해를 얻을 수 있다.
+
+$$\alpha_j^{\text{new}} = \alpha_j^{\text{old}} + \frac{y_j(E_i - E_j)}{\eta}, \quad \eta = 2k(x_i, x_j) - k(x_i, x_i) - k(x_j, x_j) < 0$$
+
+$\eta < 0$은 $\|\phi(x_i) - \phi(x_j)\|^2 = -\eta > 0$에서 나온다 — 두 점이 feature 공간에서 구별 가능하면 항상 성립한다. 이 값이 음수이므로 sub-problem의 objective가 strictly concave가 되어 Newton step이 잘 정의된다.
+
+Working set 선택은 KKT 위반량을 기준으로 한다. KKT 조건을 가장 많이 깨뜨리는 pair를 선택하면 각 step에서 dual objective가 단조 증가하고, 수렴이 보장된다. 전체 복잡도는 $O(n^2) \sim O(n^{2.3})$, 메모리는 $O(n)$ (Gram을 on-the-fly로 계산하는 경우)으로 대규모 데이터에서도 실용적이다.
+
+## 정리
+
+- Margin 최대화는 단순한 기하학적 직관을 넘어 generalization error upper bound를 직접 제어한다.
+- Lagrangian dual 전환은 무한 차원 문제를 $n$개의 $\alpha$로 축소하고, 동시에 예측 함수에서 내적 $x_i^\top x_j$만을 남긴다.
+- Kernel trick은 이 내적을 $k(x_i, x_j)$로 교체하는 단 하나의 치환이다 — Representer 정리가 이 치환의 수학적 정당성을 보장한다.
+- Soft-margin의 box constraint $\alpha_i \in [0, C]$는 outlier 영향을 제한하고, hinge loss의 sparsity는 support vector 집합을 작게 유지한다.
+- SMO는 이 모든 구조를 $O(n^2)$ 수준의 실용적 알고리즘으로 구현한 것이다.
+
+SVM은 "분리선 하나를 고르는 문제"였지만, 그 고르는 원칙을 수학적으로 추구하자 dual, kernel, sparsity, 알고리즘이 모두 필연적으로 따라왔다.
+
+<Reference
+  title="A Training Algorithm for Optimal Margin Classifiers"
+  authors="Boser, Guyon, Vapnik"
+  year={1992}
+  venue

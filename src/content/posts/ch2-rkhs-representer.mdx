@@ -1,0 +1,116 @@
+---
+title: "Kernel Method의 통일 원리: PD Kernel에서 계산까지"
+description: "Moore-Aronszajn 정리로 RKHS가 존재함을 보이고, 재생성질·Representer 정리를 거쳐 SVM·KRR·GP가 같은 형태의 해를 갖는 이유까지, kernel method의 수학적 골격을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [kernel-methods, rkhs, representer-theorem, gaussian-process, functional-analysis]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kernel method의 핵심 공식들 — SVM의 dual, KRR의 closed-form, GP의 posterior mean — 은 표면적으로 제각각처럼 보인다. 그런데 이 모든 것이 "PD kernel 하나가 Hilbert 공간을 결정한다"는 단 하나의 정리에서 흘러나온다. 그 연쇄가 어떻게 전개되는가?
+
+## PD Kernel에서 Hilbert 공간으로: Moore-Aronszajn
+
+출발점은 **긍정정치(positive definite, PD) kernel** $k : \mathcal{X} \times \mathcal{X} \to \mathbb{R}$다. 각 점 $x \in \mathcal{X}$에 대해 함수 $k_x(\cdot) := k(\cdot, x)$를 정의하고, 이들의 유한 선형결합으로 pre-Hilbert 공간을 구성한다.
+
+$$\mathcal{H}_0 := \left\{ f = \sum_{i=1}^n \alpha_i k(\cdot, x_i) : n \in \mathbb{N},\, \alpha_i \in \mathbb{R},\, x_i \in \mathcal{X} \right\}$$
+
+이 공간에 내적을 $\langle k_x, k_y \rangle := k(x, y)$로 정의하면 well-definedness를 확인해야 한다. 핵심 관찰은 다음과 같다.
+
+$$\langle f, g \rangle_{\mathcal{H}_0} = \sum_{i,j} \alpha_i \beta_j k(x_i, y_j) = \sum_i \alpha_i g(x_i)$$
+
+우변은 $g$의 값만 참조하므로 $g$의 표현 방식과 무관하다. $\langle f, f \rangle \geq 0$은 $k$의 PD 성질에서 따르고, $\langle f, f \rangle = 0 \Rightarrow f \equiv 0$은 Cauchy-Schwarz를 $g = k_x$에 적용해 얻는다.
+
+$$|f(x)|^2 = |\langle f, k_x \rangle|^2 \leq \langle f, f \rangle \cdot k(x, x)$$
+
+$\langle f, f \rangle = 0$이면 $f(x) = 0$ for all $x$. 이것이 L² 공간과 다른 점이다 — RKHS에서는 "노름 0 = 함수 0"이 **pointwise** 성립한다.
+
+$\mathcal{H}_0$는 일반적으로 완비가 아니다. RBF kernel의 경우 Cauchy 수열의 극한이 유한 선형결합으로 표현되지 않을 수 있다. 완비화 과정에서 Cauchy 수열 $\{f_n\}$의 각 점 $x$에서의 수렴성을 위 부등식으로 보장하고, 그 pointwise 극한을 $\mathcal{H}_k$의 원소로 identify한다.
+
+<Theorem kind="theorem" number="1" title="Moore-Aronszajn">
+PD kernel $k$에 대해 재생성질 $f(x) = \langle f, k_x \rangle_{\mathcal{H}_k}$를 만족하는 Hilbert 공간 $\mathcal{H}_k$가 **유일하게** 존재한다.
+</Theorem>
+
+<Proof>
+$\mathcal{H}_0$의 내적이 well-defined임은 위 계산으로 확인된다. 완비화 $\mathcal{H}_k$의 원소를 pointwise 극한으로 identify할 수 있는 것은 $|f_n(x) - f_m(x)|^2 \leq \|f_n - f_m\|^2 \cdot k(x,x)$에서 Cauchy in $\mathcal{H}_0$ $\Rightarrow$ Cauchy in $\mathbb{R}$ at each $x$이기 때문이다. 유일성은 재생성질을 만족하는 두 공간이 공통 dense subset $\mathcal{H}_0$을 가지고 그 위에서 내적이 $k(x,y)$로 강제되기 때문이다.
+</Proof>
+
+## 재생성질: 점별 평가 = 내적
+
+Moore-Aronszajn의 핵심 산물은 **재생성질(reproducing property)**이다.
+
+$$f(x) = \langle f, k(\cdot, x) \rangle_{\mathcal{H}_k}$$
+
+이 한 줄이 kernel method 전체를 구동한다. 점 $x$에서 $f$의 값을 구하는 연산이 내적과 동치이므로, **점별 평가는 선형이고 연속인 연산**이 된다. 이를 평가범함수(evaluation functional) $\delta_x : f \mapsto f(x)$의 언어로 표현하면 $\delta_x$는 유계 선형 범함수이고 Riesz 표현 원소가 정확히 $k_x$다.
+
+$$\|\delta_x\|_{\text{op}} = \sqrt{k(x, x)}$$
+
+L² 공간에서 $\delta_x$는 유계 범함수조차 아니다 — L² 원소는 a.e. 정의된 함수라 특정 점에서의 값이 무의미하다. RKHS는 이 문제를 해결한다: 모든 $f \in \mathcal{H}_k$는 자연스러운 pointwise 정의를 가지며, 평가가 유계 연산이다.
+
+재생성질은 또한 RKHS norm의 의미를 드러낸다. Mercer 전개 $k(x,y) = \sum_n \lambda_n \phi_n(x) \phi_n(y)$에서 $f = \sum_n c_n \phi_n$이면
+
+$$\|f\|_{\mathcal{H}_k}^2 = \sum_n \frac{c_n^2}{\lambda_n}$$
+
+고유값 $\lambda_n$이 작은 모드(고주파 성분)에 큰 계수가 있으면 norm이 폭발한다. **RKHS norm은 함수의 매끄러움을 측정**한다.
+
+<Aside label="L²와의 대비">
+L²에서는 $\delta_x$가 정의되지 않는다. RKHS에서는 $\delta_x$가 유계 범함수이고 그 크기가 $\sqrt{k(x,x)}$로 정확히 표현된다. "함수를 점별로 다루는 ML 문제"의 자연스러운 무대가 RKHS인 이유가 여기에 있다.
+</Aside>
+
+## Representer 정리: 무한 차원에서 유한 차원으로
+
+Moore-Aronszajn이 RKHS의 **존재**를 보장한다면, Representer 정리는 **계산 가능성**을 보장한다.
+
+$$\min_{f \in \mathcal{H}_k} \Big( L(y_1, \ldots, y_n, f(x_1), \ldots, f(x_n)) + \Omega(\|f\|_{\mathcal{H}_k}) \Big)$$
+
+이 문제에서 $V := \text{span}\{k_{x_1}, \ldots, k_{x_n}\}$으로의 직교분해 $f = f_V + f_\perp$를 수행하면 두 가지 핵심 관찰이 따른다.
+
+**손실은 $f_V$에만 의존한다.** $k_{x_i} \in V$이고 $f_\perp \perp V$이므로 $\langle f_\perp, k_{x_i} \rangle = 0$. 재생성질에서 $f(x_i) = \langle f_V, k_{x_i} \rangle = f_V(x_i)$.
+
+**노름은 $f_\perp$를 포함한다.** Pythagoras에서 $\|f\|^2 = \|f_V\|^2 + \|f_\perp\|^2 \geq \|f_V\|^2$. $\Omega$가 엄격 증가이면 $f_\perp \ne 0$일 때 목적함수가 더 커진다.
+
+따라서 최적해는 반드시 $f^* \in V$, 즉
+
+$$f^*(\cdot) = \sum_{i=1}^n \alpha_i k(\cdot, x_i)$$
+
+$\mathcal{H}_k$가 무한 차원이어도 최적화는 $\alpha \in \mathbb{R}^n$ 위에서 이루어진다. Representer 정리는 $L$의 볼록성을 요구하지 않는다 — **임의의 엄격 증가 $\Omega$**와 **training 점에만 의존하는 임의의 $L$**에서 성립한다.
+
+## 통일 프레임워크: $k(x)^\top \alpha$
+
+Representer 정리 후 모든 kernel method의 예측이 같은 형태를 갖는다.
+
+$$\hat{f}(x) = \sum_{i=1}^n \alpha_i k(x, x_i) = k(x)^\top \alpha$$
+
+차이는 $\alpha$를 결정하는 방식뿐이다.
+
+| 방법 | $\alpha$ 결정 |
+|------|-------------|
+| KRR | $(K + \lambda I)\alpha = y$ |
+| SVM | dual QP: $\max \sum \alpha_i - \frac{1}{2}\alpha^\top (yy^\top \odot K)\alpha$ |
+| GP posterior | $(K + \sigma^2 I)\alpha = y$ |
+| KPCA | centered $K$의 eigendecomposition |
+| Kernel LogReg | IRLS 반복 |
+
+"어떤 kernel을 선택하는가"는 "어떤 함수 공간에서 학습하는가"와 동치다. Shift-invariant kernel에서 spectral density $\rho$를 통해 RKHS norm을 Fourier 도메인으로 쓰면 $\|f\|_{\mathcal{H}_k}^2 = \int |\hat{f}(\omega)|^2 / \rho(\omega) \, d\omega$. Matérn-$\nu$ kernel의 경우 이것이 Sobolev norm $H^{\nu + d/2}$와 isometric이 되므로, **kernel 선택 = smoothness 가정 선택**이다. RBF는 해석적 함수만 허용하고, Matérn-1/2(Laplace)는 $H^1$ 수준의 연속 함수까지 허용한다.
+
+<Callout type="note" title="트레이드오프: 표현력 vs 계산 복잡도">
+Representer 정리는 $O(n^3)$ 병목을 수반한다. $n = 10^4$까지는 Cholesky로 직접 풀 수 있지만, $n = 10^5$ 이상에서는 **Random Features**(kernel을 유한 차원 $\mathbb{R}^D$로 근사, $O(nD^2)$), **Nyström**(inducing point $m \ll n$개로 $K \approx K_{nm}K_{mm}^{-1}K_{mn}$, $O(nm^2)$), **Conjugate Gradient**($O(n^2)$ per iteration)가 필요하다. 이 근사들은 모두 Gram 행렬을 저계수(low-rank)로 대체하는 전략이다. 큰 RKHS(작은 length-scale)일수록 표현력은 높아지나 over-fitting 위험과 계산 비용이 동시에 커진다.
+</Callout>
+
+## 정리
+
+- PD kernel 하나가 RKHS를 유일하게 결정한다 (Moore-Aronszajn). 컴팩트성·측도 가정 없이 성립한다.
+- 재생성질 $f(x) = \langle f, k_x \rangle$은 점별 평가를 내적으로 바꿔치기하는 도구다. L²와 달리 RKHS에서는 평가범함수가 유계이고, 노름 수렴이 pointwise 수렴을 함의한다.
+- Representer 정리는 $f_\perp \perp V$가 손실에 기여하지 않으면서 노름만 키운다는 관찰에서 무한 차원 최적화를 $n$차원 $\alpha$ 문제로 환원한다.
+- SVM·KRR·GP·KPCA는 모두 $\hat{f}(x) = k(x)^\top \alpha$ 형태의 해

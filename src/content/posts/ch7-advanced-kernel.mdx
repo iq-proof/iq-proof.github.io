@@ -1,0 +1,143 @@
+---
+title: "Kernel Method는 어디서 Neural Network와 만나는가"
+description: "MKL의 볼록 결합부터 Random Features의 Fourier 근사, Deep Kernel Learning의 공동 학습, NTK의 무한폭 동치까지 — kernel theory가 deep learning으로 수렴하는 경로를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [kernel-methods, neural-tangent-kernel, random-features, gaussian-process, deep-learning]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Kernel method는 오랫동안 deep learning과 별개의 세계로 여겨졌다. 하나는 볼록 최적화와 RKHS 이론에, 다른 하나는 확률적 경사법과 표현 학습에 뿌리를 두고 있다. 그런데 이 시리즈의 네 챕터 — MKL, Random Features, Deep Kernel Learning, NTK — 를 나란히 놓으면 하나의 흐름이 보인다. kernel이 점점 데이터로부터 학습되고, 마침내 무한폭 NN과 정확히 동치가 된다. 이 수렴은 우연인가, 아니면 같은 원리의 다른 표현인가?
+
+## Kernel 선택을 데이터에 맡기다 — MKL
+
+Multiple Kernel Learning (MKL)의 출발점은 단순하다. 후보 kernel $\{k_1, \ldots, k_L\}$이 각각 PD이면, 볼록 결합
+
+$$k_\beta(x, y) = \sum_{l=1}^L \beta_l k_l(x, y), \quad \beta_l \geq 0, \sum_l \beta_l = 1$$
+
+도 PD다. $\beta$를 데이터로부터 학습하면 "어떤 kernel을 써야 하는가"라는 질문이 최적화 문제로 바뀐다.
+
+<Theorem kind="proposition" number="1" title="MKL-SVM의 볼록성">
+MKL-SVM의 joint optimization은 $(\beta, f)$의 적절한 reparametrization에서 볼록(convex)하다.
+</Theorem>
+
+<Proof>
+Lagrangian 분해로 $\beta$에 대한 dual objective $J(\beta) = \max_\alpha \{\text{SVM dual with } k_\beta\}$가 $\beta$에서 볼록임을 보일 수 있다 (Rakotomamonjy 2008, Bach 2008). 볼록 함수의 최댓값은 볼록이며, $\beta$-simplex 위의 최소화는 전역 최적해를 보장한다.
+</Proof>
+
+실용적 알고리즘인 **SimpleMKL**은 이 구조를 활용한다. $\beta$ 고정 → 표준 SVM 풀기 → dual objective의 $\beta$-gradient로 simplex 위 투영 → 수렴까지 반복. 복잡도는 $O(n^2 L T)$로 원래 SDP formulation의 $O(n^6)$보다 실용적이다.
+
+$\ell_p$-norm 변형 ($\sum \beta_l^p = 1$)은 sparsity를 제어한다. $p=1$이면 Lasso처럼 irrelevant kernel을 0으로 밀어내고, $p=2$이면 모든 kernel을 고르게 사용한다.
+
+<Callout type="note" title="트레이드오프">
+MKL은 "좋은 후보 kernel이 있다"는 가정 위에 선다. bad kernel만 제공하면 MKL도 나쁜 결과를 낸다. 또한 $L$이 커지면 메모리($O(Ln^2)$)와 반복 비용이 선형으로 증가한다.
+</Callout>
+
+## $O(n^3)$를 피하는 Fourier 우회로 — Random Features
+
+Kernel method의 근본 병목은 $n \times n$ gram matrix다. $n = 10^6$이면 $O(n^3)$은 불가능하다. Rahimi & Recht (2007)의 Random Features는 이 병목을 Bochner 정리로 우회한다.
+
+shift-invariant kernel $\kappa(z) = \kappa(x - y)$가 PD이면, Bochner 정리에 의해
+
+$$\kappa(z) = \int_{\mathbb{R}^d} e^{i\omega^\top z} \, d\mu(\omega)$$
+
+를 만족하는 양의 유한 측도 $\mu$가 존재한다. 이것은 $\kappa(x-y) = \mathbb{E}_{\omega \sim \mu}[e^{i\omega^\top x} e^{-i\omega^\top y}]$를 의미하므로, Monte Carlo 근사가 가능하다.
+
+$$\phi_{\text{RFF}}(x) = \sqrt{2/D}\,(\cos(\omega_j^\top x + b_j))_{j=1}^D, \quad \omega_j \sim \tilde{\mu},\; b_j \sim U[0, 2\pi]$$
+
+<Theorem kind="theorem" number="2" title="RFF의 불편성과 집중">
+$\mathbb{E}[\phi_{\text{RFF}}(x)^\top \phi_{\text{RFF}}(y)] = \kappa(x-y)$이며, 고정 $(x, y)$에 대해
+
+$$P\bigl(|\hat{k}(x,y) - k(x,y)| > \epsilon\bigr) \leq 2\exp\!\left(-\frac{D\epsilon^2}{8\kappa(0)^2}\right).$$
+</Theorem>
+
+<Proof>
+불편성은 product-to-sum ($\cos A \cos B = \frac{1}{2}[\cos(A-B)+\cos(A+B)]$)과 $b \sim U[0,2\pi]$에 의한 위상 평균화로 얻는다. 집중 부등식은 각 성분이 $\sqrt{2\kappa(0)/D}$로 유계이므로 Hoeffding 부등식을 직접 적용하면 된다.
+</Proof>
+
+실용적 함의는 명확하다. $\Phi = [\phi(x_1); \ldots; \phi(x_n)] \in \mathbb{R}^{n \times D}$를 구성하면 KRR은 $O(nD^2 + D^3)$으로 풀린다. $D = 1000$, $n = 10^6$에서 $O(n^3) = 10^{18}$이 $O(nD^2) = 10^{12}$로 줄어든다. RBF kernel의 경우 $\omega_j \sim \mathcal{N}(0, I/\sigma^2)$로 샘플링하면 된다.
+
+<Aside label="Performer로의 연결">
+Choromanski et al. (2020)의 Performer는 이 아이디어를 Transformer attention에 적용한다. $\exp(qk^\top)$를 RFF로 근사하면 attention이 $O(n^2) \to O(nD)$로 선형화된다. 2007년 이론이 2020년 Transformer scaling에서 재발견된 셈이다.
+</Aside>
+
+## GP의 불확실성 + NN의 표현 학습 — Deep Kernel Learning
+
+MKL은 fixed candidate kernel들을 결합한다. Random Features는 무한 차원 feature space를 Monte Carlo로 근사한다. Deep Kernel Learning (Wilson et al. 2016)은 다른 방향을 택한다. NN이 feature를 직접 학습하게 하고, 그 위에 GP를 얹는다.
+
+$$k_\theta(x, y) := k_0(\phi_\theta(x), \phi_\theta(y))$$
+
+composition $k_\theta$는 $\phi_\theta$가 임의의 NN이어도 PD다 (composition 정리). 학습 목표는 marginal likelihood의 최대화다.
+
+$$\mathcal{L}(\theta, \ell, \sigma_n) = -\frac{1}{2} y^\top (K_\theta + \sigma_n^2 I)^{-1} y - \frac{1}{2} \log|K_\theta + \sigma_n^2 I| - \frac{n}{2}\log 2\pi$$
+
+$\theta$ (NN weights), $\ell$ (base kernel length-scale), $\sigma_n$ (noise)를 backprop으로 공동 학습한다. 핵심은 **자동 정규화**다. NN이 overfit하려 하면 feature들이 너무 독특해져 $\log|K_\theta|$가 커지고 objective가 떨어진다. "데이터를 설명하는 가장 단순한 feature"가 Bayesian Occam's razor로 선택된다.
+
+대규모 데이터에서는 SVDKL이 필요하다. feature space의 inducing point $Z \in \mathbb{R}^{m \times D}$와 VFE ELBO로 mini-batch stochastic gradient를 가능하게 하면 복잡도가 $O(Bm^2)$로 줄어 $n = 10^6$ 이상으로 scaling된다.
+
+## 무한폭에서 NN = Kernel Method — NTK
+
+Deep Kernel Learning은 "NN을 kernel에 사용"하는 방향이었다. NTK는 역방향을 증명한다. "NN 자체가 kernel method다".
+
+$$\Theta_\theta(x, y) := \nabla_\theta f_\theta(x)^\top \nabla_\theta f_\theta(y)$$
+
+이 **Neural Tangent Kernel**은 feature map $\phi_\theta(x) = \nabla_\theta f_\theta(x)$의 내적이므로 자동으로 PD다.
+
+<Theorem kind="theorem" number="3" title="Jacot 2018 — 무한폭 수렴">
+적절한 initialization으로 width $\to \infty$일 때, $\Theta_{\theta_0}(x, y)$는 deterministic kernel $\Theta(x, y)$로 수렴하며 training 동안 거의 불변이다 (lazy regime). MSE loss, gradient flow에서 $t \to \infty$ 해는
+
+$$f_\infty(x_*) = \Theta_*^\top \Theta^{-1} y$$
+
+— 정확히 NTK kernel regression이다.
+</Theorem>
+
+<Proof>
+초기화 시 각 neuron의 activation은 독립 확률변수의 합이므로 LLN으로 $\Theta_{\theta_0}$가 deterministic limit $\Theta$에 수렴한다. Training 중 parameter 이동이 $O(1/\sqrt{\text{width}})$이므로 $\Theta_{\theta(t)} \approx \Theta$ (lazy regime). Gradient flow ODE
+
+$$\frac{df_t}{dt} = -\Theta(f_t - y)$$
+
+는 선형이며, 영 초기화에서 $t \to \infty$로 보내면 $f_\infty = \Theta_*^\top \Theta^{-1} y$를 얻는다.
+</Proof>
+
+NTK의 eigendecomposition은 학습 동력학을 직접 설명한다. 큰 고유값 방향(smooth function)은 training 초기에 빠르게 fit되고, 작은 고유값 방향(high-frequency)은 느리게 혹은 전혀 fit되지 않는다. Early stopping은 이 관점에서 자연스러운 정규화다.
+
+<Callout type="warning" title="NTK의 한계">
+NTK는 infinite width, gradient flow, MSE loss라는 세 조건 모두에서만 정확하다. 실제 유한 폭 NN에서는 feature learning이 일어나 $\Theta_{\theta(t)} \ne \Theta$가 된다. NTK는 "lazy NN"의 precise theory이지, 실제 deep network의 완전한 설명이 아니다.
+</Callout>
+
+## 정리
+
+네 챕터를 관통하는 흐름은 하나다 — **"kernel을 고정에서 학습으로"**.
+
+- MKL: fixed candidate kernel들의 **볼록 결합**을 학습한다. global optimum 보장, $O(n^2 L T)$.
+- Random Features: shift-invariant kernel의 **Fourier 구조**를 Monte Carlo로 근사해 $O(n^3) \to O(nD^2)$로 scaling한다.
+- Deep Kernel Learning: NN feature를 **marginal likelihood로 공동 학습**해 GP의 불확실성과 NN의 표현력을 통합한다.
+- NTK: 무한폭 NN gradient flow가 **kernel regression과 정확히 동치**임을 증명한다.
+
+kernel theory와 deep learning은 서로 다른 언어로 같은 문제를 말하고 있었다.
+
+<Reference
+  title="Random Features for Large-Scale Kernel Machines"
+  authors="Rahimi, A. and Recht, B."
+  year={2007}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html"
+/>
+
+<Reference
+  title="Neural Tangent Kernel: Convergence and Generalization in Neural Networks"
+  authors="Jacot, A., Gabriel, F., and Hongler, C."
+  year={2018}
+  venue

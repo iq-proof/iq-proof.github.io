@@ -1,0 +1,137 @@
+---
+title: "GP는 왜 '함수에 대한 Bayesian prior'인가"
+description: "Gaussian Process의 정의부터 Sparse GP까지, 공분산 함수 선택이 prior 함수 공간을 결정하고 closed-form posterior가 불확실성을 정량화하는 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gaussian-process, kernel-methods, bayesian-inference, sparse-gp, uncertainty]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Gaussian Process는 "함수에 대한 확률분포"다. 이 말은 추상적으로 들리지만, 구조는 단순하다 — 임의의 유한 점들에서 평가한 함수값이 항상 다변수 정규분포를 따른다는 가정 하나다. 그렇다면 왜 이 하나의 가정이 예측과 불확실성 정량화를 동시에 closed-form으로 풀어내는가?
+
+## 공분산 함수 = prior 함수 공간의 선택
+
+GP는 두 함수로 완전히 결정된다: mean function $m(x)$와 covariance function $k(x, y)$.
+
+$$
+f \sim \mathcal{GP}(m, k) \iff \forall \{x_i\}: (f(x_1), \ldots, f(x_n)) \sim \mathcal{N}(\mu, K)
+$$
+
+여기서 $\mu_i = m(x_i)$, $K_{ij} = k(x_i, x_j)$다. Kolmogorov 확장 정리가 이 finite-dimensional consistency로부터 process의 존재를 보장한다 — PD kernel $k$가 주어지면 그것을 covariance로 갖는 GP가 항상 존재한다.
+
+핵심은 $k$의 선택이 "어떤 함수를 prior로 기대하는가"를 결정한다는 점이다.
+
+- **RBF** $k(x,y) = \sigma_f^2 \exp(-\|x-y\|^2/2\ell^2)$: 가까운 점이 강하게 상관 → 매끄러운 함수 prior. Sample path는 거의 확실히 $C^\infty$.
+- **Matérn-$\nu$**: Sample path가 $C^{\lceil\nu\rceil - 1}$ 번 미분가능. $\nu = 5/2$는 두 번, $\nu = 1/2$ (Laplace)는 연속이지만 미분 불가능.
+- **Linear** $k(x,y) = x^\top y$: 선형 함수만 prior에 담긴다. Sample path는 $f(x) = w^\top x$, $w \sim \mathcal{N}(0, I)$.
+- **Periodic**: 주기 $p$로 반복하는 함수.
+
+"Covariance 함수 선택 = prior 함수 공간 선택"이라는 등식이 성립한다.
+
+## Posterior는 Joint Gaussian의 조건부다
+
+Prior $f \sim \mathcal{GP}(0, k)$와 관측 $y_i = f(x_i) + \epsilon_i$, $\epsilon_i \sim \mathcal{N}(0, \sigma^2)$가 주어지면, test 점 $f_* = f(x_*)$와 $y$의 joint distribution은 다음과 같다.
+
+$$
+\begin{pmatrix} f_* \\ y \end{pmatrix} \sim \mathcal{N}\left(0, \begin{pmatrix} k_{**} & k_*^\top \\ k_* & K + \sigma^2 I \end{pmatrix}\right)
+$$
+
+Joint Gaussian의 conditional 공식을 적용하면 posterior가 closed-form으로 나온다.
+
+$$
+\boxed{m_*(x_*) = k_*^\top (K + \sigma^2 I)^{-1} y}
+$$
+
+$$
+\boxed{\sigma_*^2(x_*) = k_{**} - k_*^\top (K + \sigma^2 I)^{-1} k_*}
+$$
+
+**Posterior mean** $m_*$는 $x_*$와 training 점들 사이의 kernel 유사도로 가중 평균한 예측이다. **Posterior variance** $\sigma_*^2$는 prior variance에서 "training 데이터로부터 얻은 정보"를 뺀 것이다. 주목할 점은 variance가 target $y$값에 **무관**하다는 것 — training 점 위치 $X$만 알면 variance를 미리 계산할 수 있다. 이것이 active learning에서 GP가 강력한 이유다.
+
+<Aside label="GP = KRR">
+GP posterior mean은 Kernel Ridge Regression의 해와 정확히 일치한다 ($\lambda = \sigma^2$일 때). $f_{\text{KRR}}(x_*) = k_*^\top (K + \lambda I)^{-1} y = m_*(x_*)$. 같은 계산, 다른 해석 — KRR은 point prediction만, GP는 여기에 posterior variance와 marginal likelihood를 추가로 제공한다.
+</Aside>
+
+## Non-Gaussian Likelihood에서의 Laplace 근사
+
+Binary classification에서는 Bernoulli likelihood $p(y_i \mid f(x_i)) = \sigma(y_i f(x_i))$가 필요하다. 이는 non-Gaussian이라 exact posterior가 intractable하다.
+
+Laplace approximation은 posterior mode $\hat{f}$를 찾고, 그 주변에서 2차 Taylor 전개로 Gaussian을 근사한다.
+
+$$
+p(f \mid y) \approx \mathcal{N}(\hat{f},\, (K^{-1} + W)^{-1}), \quad W_{ii} = \sigma(\hat{f}_i)(1 - \sigma(\hat{f}_i))
+$$
+
+Logistic likelihood가 log-concave이므로 log-posterior도 log-concave — mode가 unique하고 Newton-Raphson이 수렴을 보장한다. 예측 class 확률은 probit 근사로 closed-form을 얻는다.
+
+$$
+p(y_* = +1 \mid y) \approx \sigma\!\left(\frac{\mu_*}{\sqrt{1 + \pi \sigma_*^2 / 8}}\right)
+$$
+
+## Marginal Likelihood의 자동 Occam's Razor
+
+Hyperparameter $\theta = (\sigma_f, \ell, \sigma_n)$를 어떻게 정하는가? GP는 marginal likelihood를 최대화한다.
+
+$$
+\log p(y \mid \theta) = \underbrace{-\frac{1}{2} y^\top (K_\theta + \sigma_n^2 I)^{-1} y}_{\text{data fit}} \underbrace{- \frac{1}{2}\log|K_\theta + \sigma_n^2 I|}_{\text{complexity penalty}} - \frac{n}{2}\log 2\pi
+$$
+
+세 항의 구조가 중요하다. **Data fit 항**은 데이터가 prior와 얼마나 compatible한지 측정한다. **Complexity penalty 항** $-\frac{1}{2}\log|K|$은 kernel의 eigenvalue 합의 로그 — 유연한 모델일수록 큰 패널티를 받는다.
+
+<Callout type="note" title="자동 Occam's Razor">
+length-scale $\ell$을 줄이면 data fit이 좋아지지만 complexity 패널티가 커진다. $\ell$을 늘리면 반대다. Marginal likelihood는 "데이터를 설명하는 가장 단순한 모델"을 자동으로 선택한다. Cross-validation과 달리 모든 데이터를 사용하고, gradient $\frac{\partial \log p}{\partial \theta} = \frac{1}{2}\text{tr}((\alpha\alpha^\top - K^{-1})\partial K/\partial \theta)$가 closed-form이라 L-BFGS로 효율적으로 최적화된다.
+</Callout>
+
+ARD (Automatic Relevance Determination) kernel에서 각 축별 length-scale $\ell_d$를 학습하면, 무관한 feature의 $\ell_d \to \infty$가 되어 자동 feature selection이 이루어진다.
+
+## Sparse GP — $O(n^3)$을 $O(nm^2)$으로
+
+풀 GP는 $n > 10^4$에서 실용적이지 않다. Titsias (2009)의 VFE (Variational Free Energy)는 $m \ll n$개의 **inducing points** $Z$를 통한 정보 bottleneck으로 이를 해결한다.
+
+$$
+\mathcal{L}_{\text{VFE}} = \log \mathcal{N}(y;\, 0,\, Q_{nn} + \sigma^2 I) - \frac{1}{2\sigma^2}\text{tr}(K_{nn} - Q_{nn})
+$$
+
+여기서 $Q_{nn} = K_{nm}K_{mm}^{-1}K_{mn}$은 Nyström 근사다. Trace term $\text{tr}(K_{nn} - Q_{nn})$은 각 training 점에서 inducing points로 설명되지 않는 variance의 합 — inducing points가 데이터를 잘 커버할수록 작아진다.
+
+VFE ELBO는 marginal likelihood의 true lower bound다. $m$을 늘리면 ELBO가 단조 증가해 full GP로 수렴하고, $Z$도 gradient-based로 학습할 수 있다. FITC (Fully Independent Training Conditional)는 diagonal correction을 추가하지만 biased estimator라는 이론적 약점이 있다. VFE가 GPflow·GPyTorch의 기본인 이유다.
+
+계산 복잡도는 $O(nm^2 + m^3)$으로 줄어든다. $n = 10^5$, $m = 100$ 수준에서 full GP 대비 $10^6$배 속도 향상이 가능하다.
+
+## 정리
+
+- GP의 모든 것은 공분산 함수 $k$에서 출발한다. $k$의 선택 = prior 함수 공간의 선택 = sample path의 smoothness 결정.
+- Joint Gaussian의 conditional 공식 하나가 closed-form posterior를 만들어낸다. Posterior variance는 target과 무관해 active learning에 즉시 활용된다.
+- GP posterior mean은 KRR과 정확히 일치하며 ($\lambda = \sigma^2$), GP는 여기에 uncertainty와 marginal likelihood를 추가로 제공한다.
+- Marginal likelihood는 data fit과 complexity penalty의 trade-off를 통해 hyperparameter를 자동으로 학습하고, overfitting을 Bayesian Occam's razor로 방지한다.
+- Sparse GP (VFE)는 inducing points를 통해 $O(n^3) \to O(nm^2)$으로 scaling하며, ELBO의 lower bound 보장이 FITC 대비 이론적 우위를 준다.
+
+GP의 우아함은 "Bayesian inference를 함수 공간에서 정확히 수행할 수 있는 드문 경우"라는 데 있다. 그 계산 비용과 scaling 한계는 Sparse GP와 Deep Kernel Learning이 이어받는 문제다.
+
+<Reference
+  title="Gaussian Processes for Machine Learning"
+  authors="Rasmussen, C. E. and Williams, C. K. I."
+  year={2006}
+  venue="MIT Press"
+  url="https://gaussianprocess.org/gpml/"
+/>
+
+<Reference
+  title="Variational Learning of Inducing Variables in Sparse Gaussian Processes"
+  authors="Titsias, M. K."
+  year={2009}
+  venue="AISTATS"
+  url="http://proceedings.mlr.press/v5/titsias09a.html"
+/>

@@ -1,0 +1,130 @@
+---
+title: "커널 클러스터링은 왜 비구형 군집을 찾을 수 있는가"
+description: "Kernel Ridge Regression의 closed-form 유도부터 Kernel PCA, Spectral Clustering, Kernel k-means까지, 커널 방법이 비선형 구조를 포착하는 통일된 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [kernel-methods, clustering, spectral-clustering, rkhs, dimensionality-reduction]
+difficulty: advanced
+series:
+  slug: kernel-methods-deep-dive
+  title: Kernel Methods Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+K-means는 원형 군집만 찾고, 선형 PCA는 평평한 분산만 포착하고, Ridge Regression은 직선만 적합한다. 커널 방법은 이 세 가지 한계를 동일한 수학적 장치 하나로 돌파한다. 그 장치는 무엇이고, 왜 작동하는가?
+
+## Kernel Ridge Regression — 닫힌 형태가 존재하는 이유
+
+Ridge Regression의 dual form을 먼저 이해하면 나머지가 전부 같은 패턴임을 알 수 있다.
+
+선형 Ridge Regression은 $\min_w \|y - Xw\|^2 + \lambda\|w\|^2$를 풀고 $w^* = (X^\top X + \lambda I)^{-1} X^\top y$를 얻는다. $n < d$ (고차원) 상황에서 이 primal form 대신 dual form으로 바꾸면
+
+$$\alpha = (XX^\top + \lambda I)^{-1} y, \quad f(x) = x^\top X^\top \alpha$$
+
+이 되고, 내적 $x^\top x_i$를 커널 $k(x, x_i)$로 교체하면 바로 **Kernel Ridge Regression (KRR)**이 된다.
+
+$$\alpha = (K + \lambda I)^{-1} y, \quad f^*(x) = \sum_i \alpha_i k(x_i, x)$$
+
+Representer 정리가 이 교체를 정당화한다. RKHS $\mathcal{H}_k$ 위에서 최적해는 항상 $f^* = \sum_i \alpha_i k(\cdot, x_i)$ 형태이므로, 무한 차원 함수 공간에서의 최적화가 $n \times n$ 선형 시스템으로 환원된다.
+
+$\lambda$의 역할은 $(K + \lambda I)^{-1}$의 고유값 구조로 읽힌다. 커널 행렬 $K$의 작은 고유값 $\mu_i$는 고주파(진동) 성분에 해당하고, $\mu_i + \lambda$ 분모에서 $\lambda$가 지배적일 때 그 성분을 강하게 억제한다. 즉 $\lambda$는 "얼마나 smooth한 해를 허용하는가"의 직접적인 제어 변수다.
+
+<Theorem kind="proposition" number="1" title="극한 거동">
+$\lambda \to 0^+$이면 $\alpha \to K^{-1}y$이고 모든 훈련 점에서 $f^*(x_i) = y_i$ (interpolation). $\lambda \to \infty$이면 $\alpha \to 0$이고 $f^* \to 0$ (prior mean).
+</Theorem>
+
+<Proof>
+$(K + \lambda I)^{-1} \to K^{-1}$ as $\lambda \to 0$이면 $\alpha \to K^{-1}y$, 따라서 $(K\alpha)_i = y_i$. $\lambda \to \infty$이면 $(K + \lambda I)^{-1} \approx \lambda^{-1} I \to 0$이므로 $\alpha \to 0$. $\square$
+</Proof>
+
+## Kernel PCA — 명시적 특성 없이 비선형 주성분
+
+표준 PCA는 공분산 $C = \frac{1}{n} X^\top X$를 고유분해해 선형 방향을 찾는다. Kernel PCA는 이 과정을 특성 공간 $\mathcal{H}$에서 수행하되 $\phi$를 명시적으로 계산하지 않는다.
+
+핵심 관찰은 KRR과 동일하다. 공분산 $C_\phi = \frac{1}{n}\sum_i \phi(x_i)\phi(x_i)^\top$의 고유벡터 $v_k$는 Representer 정리에 의해 $v_k = \sum_i \alpha_k^i \phi(x_i)$ 형태여야 한다. 이를 대입하면 고유값 문제가
+
+$$\tilde{K} \alpha_k = n\mu_k \alpha_k$$
+
+로 환원된다. $\tilde{K}$는 centering된 Gram 행렬이다.
+
+$$\tilde{K} = (I - \mathbf{1}/n)\, K\, (I - \mathbf{1}/n)$$
+
+Centering이 필요한 이유는 PCA가 평균 제거된 데이터에서 작동하기 때문이다. 특성 공간의 평균 $\bar{\phi} = \frac{1}{n}\sum_i \phi(x_i)$를 빼면 Gram 행렬에 이 이중 centering이 자동으로 유도된다.
+
+새 점 $x$의 $k$번째 주성분 score는
+
+$$y_k(x) = \frac{1}{\sqrt{\lambda_k}} \sum_i \alpha_k^i \tilde{k}(x_i, x)$$
+
+로 계산된다. RBF 커널을 사용하면 동심원 같은 비선형 매니폴드를 선형 분리 가능한 공간으로 펼칠 수 있다.
+
+<Callout type="warning" title="pre-image 문제">
+Kernel PCA는 특성 공간으로의 projection은 가능하지만, 재구성된 특성 벡터를 원래 공간의 점으로 되돌리는 역변환은 일반적으로 ill-posed다. $\phi : \mathcal{X} \to \mathcal{H}$가 전사(onto)가 아닐 수 있으므로 정확한 pre-image가 존재하지 않을 수 있다.
+</Callout>
+
+## Spectral Clustering — 그래프 라플라시안과 커널의 연결
+
+Kernel PCA에서 "커널 = normalized similarity matrix"로 특수화하면 Spectral Clustering이 나온다.
+
+유사도 $w_{ij} = k(x_i, x_j)$로 에지 가중치를 정의하고, 차수 행렬 $D = \text{diag}(\sum_j w_{ij})$을 구성하면 **Graph Laplacian**은
+
+$$L = D - W, \quad f^\top L f = \frac{1}{2}\sum_{i,j} w_{ij}(f_i - f_j)^2$$
+
+이다. Rayleigh quotient 해석이 핵심이다. $f^\top Lf$가 작다는 것은 유사한 점들(큰 $w_{ij}$)에서 $f$ 값이 비슷하다는 뜻이다. 군집 내부에서 일정하고 군집 사이에서만 변하는 함수가 바로 $L$의 작은 고유값에 대응하는 고유벡터다.
+
+완전히 분리된 $K$개 군집이라면 $L$의 0 고유값이 정확히 $K$중으로 겹치고, 대응 고유벡터가 군집 지표 함수 $\mathbf{1}_{C_k}$가 된다. Normalized Laplacian $L_\text{sym} = I - D^{-1/2}WD^{-1/2}$의 상위 $k$개 고유벡터로 임베딩 후 k-means를 돌리는 것이 Ng-Jordan-Weiss 알고리즘의 본질이다.
+
+Normalized Cut (Shi & Malik 1997)과의 연결도 이 구조에서 나온다. 분할 $A, \bar{A}$의 $\text{NCut}(A, \bar{A})$ 최소화는 NP-hard 조합 최적화지만, 지표 벡터를 실수값으로 완화하면 $L_\text{rw} = D^{-1}L$의 두 번째 작은 고유벡터(Fiedler vector)를 구하는 문제로 떨어진다.
+
+## Kernel k-Means — 이터레이티브 방법으로 eigendecomp 우회
+
+Spectral Clustering의 $O(n^3)$ 고유분해가 부담스러울 때 Kernel k-means가 대안이다.
+
+특성 공간에서의 군집 중심 $\mu_j = \frac{1}{|C_j|}\sum_{i \in C_j} \phi(x_i)$까지의 거리는 $\phi$를 명시하지 않고도 계산된다.
+
+$$d_{ij}^2 = K_{ii} - \frac{2}{|C_j|}\sum_{l \in C_j} K_{il} + \frac{1}{|C_j|^2}\sum_{l,m \in C_j} K_{lm}$$
+
+이 공식이 있으면 k-means의 할당-갱신 루프를 Gram 행렬만으로 돌릴 수 있다. 복잡도는 반복당 $O(n^2)$으로, Spectral Clustering 대비 대규모 데이터에서 유리하다.
+
+Dhillon et al. (2004)의 핵심 결과는 이 둘의 동치성이다.
+
+<Theorem kind="theorem" number="2" title="Weighted Kernel k-Means ⟺ Normalized Cut">
+유사도 행렬 $K = W$, 가중치 $w_i = d_i$ (차수)로 설정한 Weighted Kernel k-means는 Normalized Cut의 목적함수와 동치다.
+</Theorem>
+
+즉 Spectral Clustering과 Kernel k-means는 같은 목적함수를 서로 다른 방법(스펙트럼 vs. 이터레이티브)으로 최적화한다. 고유분해가 전역 relaxation을 제공하고, k-means가 더 빠른 근사를 제공한다.
+
+<Aside label="통일된 패턴">
+KRR, Kernel PCA, Spectral Clustering, Kernel k-means — 네 가지 모두 동일한 구조를 공유한다. "특성 공간에서의 연산 → Representer 정리로 유한 차원 환원 → Gram 행렬의 선형대수". $\phi$를 명시하지 않고도 비선형 구조를 포착할 수 있는 이유가 여기에 있다.
+</Aside>
+
+## 트레이드오프
+
+커널 방법의 공통 대가는 $O(n^2)$ 메모리와 $O(n^3)$ 연산이다. $n \geq 10^4$이면 Nyström 근사나 Lanczos 반복법 없이는 실용적이지 않다.
+
+| 방법 | 복잡도 | 고유분해 | 비구형 군집 |
+|------|--------|---------|------------|
+| KRR | $O(n^3)$ (1회) | 필요 | — |
+| Kernel PCA | $O(n^3)$ | 필요 | 가능 |
+| Spectral Clustering | $O(n^3)$ | 필요 | 가능 |
+| Kernel k-means | $O(n^2 T)$ | 불필요 | 가능 |
+
+커널 선택도 결과를 크게 좌우한다. RBF 커널의 length-scale이 너무 작으면 모든 점이 고립되고, 너무 크면 모든 점이 동일한 군집으로 묶인다. 교차 검증이나 GP marginal likelihood로 자동화하는 것이 실무 표준이다.
+
+<Callout type="note" title="트레이드오프 요약">
+커널 방법은 명시적 특성 없이 비선형 구조를 포착하는 대신, **$O(n^2)$ 메모리**와 **커널 선택의 민감성**이라는 두 가지 대가를 요구한다. Nyström 근사가 전자를, 교차 검증이 후자를 완화한다.
+</Callout>
+
+## 정리
+
+- 커널 방법의 공통 원리는 "특성 공간에서의 연산 → Gram 행렬로 환원"이다. $\phi$를 명시하지 않아도 된다.
+- KRR의 $\lambda$는 Gram 행렬 고유값의 shift로 작용해 해의 smoothness를 직접 제어한다.
+- Kernel PCA는 centered Gram 행렬의 고유분해로, Spectral Clustering은 Graph Laplacian의 고유분해로, 각각 비선형 차원 축소와 군집을 수행한다.
+- Kernel k-means는 Gram 행렬만으로 이터레이티브하게 Normalized Cut을 근사한다. Spectral Clustering
