@@ -1,0 +1,140 @@
+---
+title: "RNN은 왜 긴 기억을 갖지 못하는가"
+description: "Vanilla RNN의 BPTT부터 vanishing gradient의 수학적 원인, LSTM의 Constant Error Carousel, 그리고 Echo State Network까지 — 순환 구조의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [rnn, lstm, bptt, vanishing-gradient, reservoir-computing]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RNN 계열 아키텍처의 역사는 사실 하나의 질문을 중심으로 수렴한다. 순환 구조가 시간 축에서 정보를 기억한다면, 왜 멀리 있는 과거는 학습하지 못하는가? BPTT의 연쇄 곱, 스펙트럼 반지름, LSTM의 덧셈 업데이트, 그리고 Reservoir Computing이 선택한 포기까지 — 이 챕터들은 모두 같은 문제의 다른 해법이다.
+
+## 시간을 펼치면 보이는 것
+
+Vanilla RNN의 forward pass는 단순하다.
+
+$$
+h_t = \tanh(W_{hh} h_{t-1} + W_{xh} x_t + b_h)
+$$
+
+가중치 $W_{hh}$는 모든 시간 단계에서 공유된다. 역전파할 때는 이 시간 축을 펼쳐서(unroll) 깊은 네트워크처럼 연쇄법칙을 적용한다. 손실 $L = \sum_t L_t$에 대해 $W_{hh}$의 기울기는 다음과 같다.
+
+$$
+\frac{\partial L}{\partial W_{hh}} = \sum_{t=1}^T \sum_{k=1}^t \left(\prod_{j=k+1}^t \frac{\partial h_j}{\partial h_{j-1}}\right) \frac{\partial h_k}{\partial W_{hh}}
+$$
+
+각 시점의 기여도가 합산된다는 점이 CNN 역전파와 다른 점이다. 같은 가중치에 도달하는 경로가 $T$개 이상 존재하기 때문이다.
+
+여기서 핵심 항은 $\prod_{j=k+1}^t \frac{\partial h_j}{\partial h_{j-1}}$이다. 이 곱이 시퀀스 길이에 따라 어떻게 거동하는가가 모든 것을 결정한다.
+
+## 스펙트럼 반지름이 기울기를 지배한다
+
+각 Jacobian 항을 계산하면 $\frac{\partial h_t}{\partial h_{t-1}} = \text{diag}(\sigma'(z_t)) \cdot W_{hh}$가 된다. 노름의 상한을 구하면 다음 정리가 나온다.
+
+<Theorem kind="theorem" number="1" title="Vanishing/Exploding Gradient (Pascanu et al., 2013)">
+Vanilla RNN에서 시간 0에서 $t$로의 기울기 노름은 다음 상한을 갖는다.
+
+$$
+\left\|\frac{\partial h_t}{\partial h_0}\right\|_2 \leq \left(\rho(W_{hh}) \cdot \max_z |\sigma'(z)|\right)^t
+$$
+
+따라서, $\gamma = \rho(W_{hh}) \cdot \max |\sigma'| < 1$이면 기울기가 지수적으로 **소실**하고, $\gamma > 1$이면 지수적으로 **폭발**한다.
+</Theorem>
+
+<Proof>
+$\|AB\|_2 \leq \|A\|_2 \|B\|_2$를 반복 적용한다.
+
+$$
+\left\|\frac{\partial h_t}{\partial h_0}\right\|_2 \leq \prod_{k=1}^t \left\|\text{diag}(\sigma'(z_k))\right\|_2 \cdot \|W_{hh}\|_2 \leq \left(\rho(W_{hh}) \cdot \max_z |\sigma'(z)|\right)^t \quad \square
+$$
+</Proof>
+
+Tanh의 최대 도함수는 1이므로 임계값은 $\rho(W_{hh}) = 1$이다. Sigmoid는 최대 도함수가 0.25이므로 $\rho(W_{hh}) = 4$가 임계값이 된다. 이 분석이 가르쳐주는 것은 명확하다. $W_{hh}$의 스펙트럼 반지름 하나가 기울기 전파의 운명을 결정한다.
+
+<Callout type="warning" title="트레이드오프">
+$\rho(W_{hh}) < 1$로 설정하면 학습이 안정되지만 장거리 의존성을 학습할 수 없다. $\rho(W_{hh}) \approx 1$로 높이면 기억 용량은 늘어나지만 학습이 불안정해진다. Gradient Clipping은 폭발을 막지만 소실을 해결하지는 못한다. 이 딜레마가 LSTM 설계의 직접적인 동기다.
+</Callout>
+
+## LSTM의 답: 곱하기 대신 더하기
+
+LSTM은 이 문제를 구조로 해결한다. 핵심은 Cell State의 업데이트 방식이다.
+
+$$
+c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t
+$$
+
+Vanilla RNN이 $h_t$를 완전히 덮어쓰는 것과 달리, LSTM은 이전 cell state의 일부를 **더한다**. 이 덧셈이 기울기 흐름을 바꾼다.
+
+$$
+\frac{\partial c_t}{\partial c_{t-1}} = f_t + \text{(부수 항들)}
+$$
+
+Forget gate $f_t \in [0,1]$가 중요한 정보를 유지하도록 학습되면 ($f_t \approx 1$), 역전파에서 $\prod_k f_k \approx 1$이 유지된다. Hochreiter & Schmidhuber(1997)가 이를 **Constant Error Carousel (CEC)**라고 불렀다.
+
+Vanilla RNN과 결정적으로 다른 점은 이것이 **고정된 $W_{hh}$의 스펙트럼 반지름이 아니라 학습된 forget gate 값**으로 기울기 흐름이 제어된다는 것이다. 각 시간 단계마다, 각 차원마다 다른 값을 가질 수 있다. 선택적 기억이 가능해진다.
+
+GRU는 cell state와 hidden state를 통합하고 gate를 2개로 줄인다.
+
+$$
+h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t
+$$
+
+Update gate $z_t$가 interpolation weight 역할을 한다. 경험적으로 LSTM과 성능이 유사하면서 파라미터가 25% 적다. 태스크의 복잡도에 따라 선택하면 된다.
+
+<Aside label="설계 철학">
+LSTM의 Gate 메커니즘은 이후 Attention 메커니즘의 개념적 선구자다. 둘 다 본질적으로 "어떤 정보를 얼마나 통과시킬 것인가"라는 선택 문제를 학습 가능한 파라미터로 해결한다.
+</Aside>
+
+## 다른 해법: 학습 자체를 포기한다
+
+LSTM이 구조를 바꿔서 문제를 해결했다면, Echo State Network(ESN)는 전혀 다른 질문을 던진다. 반드시 순환 가중치를 학습해야 하는가?
+
+ESN의 구조는 단순하다. 순환 부분 $W_{hh}$은 **초기화 후 고정**하고, 출력 가중치 $W_{hy}$만 Ridge Regression으로 학습한다.
+
+$$
+h_t = \tanh(W_{hh} h_{t-1} + W_{xh} x_t), \quad y_t = W_{hy} h_t
+$$
+
+이것이 가능한 이유는 Echo State Property(ESP) 때문이다. $\rho(W_{hh}) < 1$이면, 초기 조건과 무관하게 모든 궤적이 같은 attractor로 수렴한다. 즉, $h_t$는 오직 현재와 최근 입력의 함수가 된다. Random network도 충분히 풍부한 비선형 특징을 생성하고, 나머지는 선형 조합으로 해결된다는 것이다.
+
+학습 복잡도는 $O(T \cdot d_h^2 + d_h^3)$으로, BPTT의 반복 계산과 비교해 epoch 수만큼 빠르다. 대신 표현력은 제한된다. 선형 readout은 reservoir가 생성한 특징 공간 안에서만 해를 찾을 수 있다.
+
+<Callout type="note" title="ESP와 스펙트럼 반지름의 트레이드오프">
+$\rho(W_{hh})$를 낮추면 ESP 수렴이 빠르지만 과거 정보를 빨리 망각한다. 높이면 기억 용량이 증가하지만 1을 초과하면 ESP가 보장되지 않는다. 경험적으로 $\rho(W_{hh}) \approx 0.9$가 많은 시계열 태스크에서 최적점이다.
+</Callout>
+
+## 정리
+
+- BPTT의 기울기는 $\prod_k \frac{\partial h_k}{\partial h_{k-1}}$의 연쇄 곱이다. 이 곱의 크기가 $\rho(W_{hh})$에 의해 지수적으로 증폭되거나 소멸한다.
+- LSTM은 덧셈 기반 Cell State 업데이트로 기울기 경로를 보존한다. 학습된 forget gate가 고정된 스펙트럼 반지름을 대체한다.
+- GRU는 LSTM의 단순화 버전이다. 2개 gate로 유사한 효과를 낸다.
+- Echo State Network은 순환 가중치 학습을 포기하고 Ridge Regression으로 대체한다. ESP 조건 하에서 학습이 $O(d_h^3)$ 한 번으로 끝난다.
+
+이 네 개의 아이디어는 하나의 스펙트럼 위에 있다 — 기울기 소실이라는 근본 문제에 대해 구조적 해법, 점진적 단순화, 그리고 학습 포기라는 세 가지 응답이다.
+
+<Reference
+  title="Long Short-Term Memory"
+  authors="Hochreiter, S. and Schmidhuber, J."
+  year={1997}
+  venue="Neural Computation"
+  url="https://www.bioinf.jku.at/publications/older/2604.pdf"
+/>
+<Reference
+  title="On the difficulty of training recurrent neural networks"
+  authors="Pascanu, R., Mikolov, T., and Bengio, Y."
+  year={2013}
+  venue="ICML"
+  url="https://arxiv.org/abs/1211.5063"
+/>

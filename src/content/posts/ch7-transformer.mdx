@@ -1,0 +1,144 @@
+---
+title: "Transformer는 왜 작동하는가 — 설계 결정들의 공통 뿌리"
+description: "√d_k 스케일링부터 Residual Connection까지, Transformer의 핵심 설계 결정들이 하나의 원칙 — '신호가 사라지지 않게 하라' — 에서 비롯됨을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [transformer, attention, positional-encoding, residual-connection, gradient-flow]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer의 설계를 들여다보면 겉보기에 무관한 결정들이 반복된다. 내적을 $\sqrt{d_k}$로 나누고, 위치 인코딩을 별도로 주입하고, 모든 서브레이어마다 잔차 연결을 단다. 왜 하필 이것들인가? 이 결정들은 각각 독립적인 공학적 선택처럼 보이지만, 실제로는 하나의 공통 원칙에서 나온다 — **신호가 깊이 방향으로 사라지지 않게 하라**.
+
+## 문제의 시작: 신호 분산의 폭발
+
+Self-Attention의 핵심 수식은 다음과 같다.
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+$$
+
+왜 $\sqrt{d_k}$로 나누는가? 각 원소 $Q_{il}, K_{jl} \sim \mathcal{N}(0,1)$이라 가정하면, 내적 $(QK^\top)_{ij} = \sum_{l=1}^{d_k} Q_{il} K_{jl}$의 분산은 다음과 같다.
+
+$$
+\text{Var}\left(\sum_{l=1}^{d_k} Q_{il} K_{jl}\right) = d_k
+$$
+
+중심극한정리에 의해 이 합은 근사적으로 $\mathcal{N}(0, d_k)$를 따른다. $d_k = 64$이면 표준편차가 8이고, $d_k = 512$이면 표준편차가 약 22다. Softmax에 큰 값이 들어오면 특정 위치에 거의 모든 가중치가 쏠리는 **포화(saturation)** 상태가 된다. 포화된 Softmax의 그래디언트는 거의 0이다.
+
+<Theorem kind="lemma" number="1" title="Softmax 포화와 그래디언트 소실">
+$z_1 \gg z_2, z_3, \ldots$ 일 때, $\partial\,\text{softmax}(z)_i / \partial z_j \approx 0$ for $i \neq 1$ or $j \neq 1$.
+</Theorem>
+
+<Proof>
+$\text{softmax}(z)_i (\delta_{ij} - \text{softmax}(z)_j)$ 에서, $z_1$이 극단적으로 크면 $\text{softmax}(z) \approx (1, 0, \ldots, 0)$이 된다. 따라서 $i \neq 1$ 또는 $j \neq 1$인 모든 편미분이 0에 수렴한다.
+</Proof>
+
+$\sqrt{d_k}$로 나누면 분산이 $d_k / d_k = 1$로 정규화된다. Softmax 입력이 $O(1)$ 스케일로 유지되고, 엔트로피가 높은 "부드러운" 분포가 만들어져 그래디언트가 전달된다. 이 한 줄의 나눗셈이 대규모 모델 훈련의 기반이다.
+
+## 순서라는 정보를 어텐션에 주입하기
+
+Self-Attention은 **순열 동변(permutation-equivariant)** 이다. 입력 순열행렬 $P$에 대해 $\text{Attention}(PX) = P \cdot \text{Attention}(X)$가 성립하기 때문에, 순서를 바꿔도 어텐션 가중치 패턴은 그대로 바뀐다. "개가 고양이를 쫓았다"와 "고양이가 개를 쫓았다"를 구분할 수 없다.
+
+위치 인코딩은 이 대칭성을 깬다. Sinusoidal 방식(Vaswani et al., 2017)은 각 위치 $p$, 차원 $i$에 대해
+
+$$
+\text{PE}(p, 2i) = \sin\!\left(\frac{p}{10000^{2i/d}}\right), \quad
+\text{PE}(p, 2i+1) = \cos\!\left(\frac{p}{10000^{2i/d}}\right)
+$$
+
+를 입력에 더한다. 삼각함수 덧셈 공식에 의해 위치 $p$와 $p+k$ 사이의 관계는 고정된 회전 행렬로 표현되며, 이는 네트워크가 상대 위치를 선형 변환으로 학습할 수 있음을 의미한다.
+
+최근 대규모 모델들은 RoPE(Su et al., 2021)나 ALiBi(Press et al., 2022)를 선호한다. RoPE는 쿼리와 키에 위치 의존 회전을 직접 적용해 내적 자체에 상대 위치가 인코딩되도록 만들고, ALiBi는 어텐션 점수에 거리 기반 선형 바이어스를 더해 훈련 길이를 초과하는 시퀀스에서도 잘 작동한다.
+
+<Callout type="note" title="트레이드오프">
+Sinusoidal: 별도 파라미터 없음, 안정적. Learned: 유연하지만 훈련 길이 외 외삽 불가. RoPE: 외삽 우수, 구현 복잡. ALiBi: 극단적으로 단순, 의미론적 방향성 부재. 시퀀스 길이와 외삽 요구사항이 선택 기준이다.
+</Callout>
+
+## 표현력을 높이는 방법: 헤드를 여러 개
+
+단일 Self-Attention은 $n \times n$ 어텐션 행렬 하나로 모든 관계를 표현해야 한다. Multi-Head Attention은 이 문제를 병렬 부분공간으로 분산한다.
+
+$$
+\text{MultiHead}(Q,K,V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)W^O
+$$
+
+파라미터 수는 단일 헤드와 동일하다($4d^2$). 각 헤드의 $d_k = d/h$로 줄어들기 때문이다. 그러나 헤드마다 독립적인 $W_Q^{(i)}, W_K^{(i)}, W_V^{(i)}$를 학습하므로, 한 헤드는 문법 관계를, 다른 헤드는 의미 관계를, 또 다른 헤드는 위치 관계를 포착할 수 있다. Michel et al.(2019)의 헤드 프루닝 실험은 훈련 수렴 후 일부 헤드를 제거해도 성능 손실이 작다는 것을 보였지만, **훈련 과정 자체에서는 헤드 다양성이 필수적**이다.
+
+## 깊이를 가능하게 하는 구조: Residual Connection
+
+2015년 이전까지 50층 이상의 네트워크는 훈련이 사실상 불가능했다. 역전파 시 그래디언트가 층을 거듭할수록 곱해지기 때문이다.
+
+$$
+\frac{\partial L}{\partial h_0} = \frac{\partial L}{\partial h_L} \prod_{l=1}^L \frac{\partial F_l}{\partial h_{l-1}}
+$$
+
+각 항의 최대 고유값이 $\rho < 1$이면 그래디언트는 $\rho^L$로 지수 감쇠한다. He et al.(2015)의 해결책은 단순하다.
+
+$$
+h_{l+1} = h_l + F_l(h_l)
+$$
+
+역전파 시 $\partial L / \partial h_l = (\partial L / \partial h_{l+1})(I + \partial F_l / \partial h_l)$이 된다. $I$ 항이 그래디언트를 직접 전달하는 **"그래디언트 고속도로"**를 만든다. $F_l$의 가중치가 아무리 작아도 그래디언트는 소실되지 않는다. Transformer의 모든 서브레이어(Self-Attention, FFN)가 잔차 연결을 사용하는 이유가 여기 있다.
+
+<Aside label="공통 원칙">
+√d_k 스케일링은 Softmax 입력의 분산을 1로 유지한다. 위치 인코딩은 순서 정보 손실을 막는다. Multi-Head는 표현력을 분산시켜 특정 패턴에 과도하게 쏠리는 것을 막는다. Residual Connection은 그래디언트 신호가 깊이 방향으로 사라지지 않게 한다. 네 가지 모두 "신호 보존"이라는 하나의 목표를 다른 축에서 구현한다.
+</Aside>
+
+## Transformer가 범용 근사자인 이유
+
+Yun et al.(2020)은 적절한 깊이와 너비를 가진 Transformer가 compact set 위의 모든 연속 시퀀스-투-시퀀스 함수를 균일하게 근사할 수 있음을 증명했다. 증명의 핵심은 세 가지다: Attention이 "소프트 선택"으로 임의의 선형 조합을 만들고, FFN이 위치별 비선형 변환을 적용하며, 층을 쌓는 것이 복합 함수를 만든다. 단, 포지셔널 인코딩이 없으면 순열 동변 함수만 표현 가능하다 — 순서가 중요한 언어 문제에서는 사실상 쓸모가 없다.
+
+이 정리의 실전 함의는 다소 냉정하다. "충분히 크면 된다"는 이론적 보장은 있지만, 필요한 파라미터 수와 샘플 복잡도는 보장하지 않는다. 성능이 부족할 때 원인은 모델 구조가 아니라 데이터, 훈련, 하이퍼파라미터일 가능성이 높다.
+
+## 정리
+
+- $\sqrt{d_k}$ 정규화는 Softmax 포화를 막아 그래디언트 소실을 방지한다. 분산을 $d_k$에서 1로 돌리는 것이 전부다.
+- 위치 인코딩은 순열 동변인 Self-Attention에 순서 정보를 주입한다. RoPE와 ALiBi는 외삽 능력이 필요한 대규모 모델의 선택지다.
+- Multi-Head는 같은 파라미터로 다양한 관계 패턴을 병렬 학습한다. 파라미터 효율성과 표현력의 교환이다.
+- Residual Connection은 그래디언트 고속도로를 만들어 100층 이상 훈련을 가능하게 한다. Transformer의 모든 서브레이어가 이 구조를 따른다.
+
+이 네 가지가 하나의 철학을 공유한다는 것을 알면, 새로운 아키텍처 변형을 보았을 때 "이 결정은 어떤 신호를 보존하려는 것인가"라는 질문을 먼저 던질 수 있다.
+
+<Reference
+  title="Attention Is All You Need"
+  authors="Vaswani et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
+/>
+
+<Reference
+  title="Are Sixteen Heads Really Better than One?"
+  authors="Michel et al."
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1905.10650"
+/>
+
+<Reference
+  title="Are Transformers Effective for Time Series Forecasting?"
+  authors="Yun et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2009.14794"
+/>
+
+<Reference
+  title="Deep Residual Learning for Image Recognition"
+  authors="He et al."
+  year={2015}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1512.03385"
+/>

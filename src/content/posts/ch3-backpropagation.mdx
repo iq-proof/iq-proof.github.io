@@ -1,0 +1,139 @@
+---
+title: "역전파는 왜 단 한 번의 backward pass로 충분한가"
+description: "Jacobian과 연쇄법칙의 행렬 버전부터 softmax + cross-entropy의 기적적인 gradient까지, 역전파 알고리즘의 수학적 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [backpropagation, jacobian, automatic-differentiation, neural-network]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-3는 1,750억 개의 파라미터를 가진다. 그 파라미터 전부에 대한 gradient를 계산하는 데 필요한 backward pass는 단 **한 번**이다. forward pass 횟수가 아니라 파라미터 개수에 비례해야 할 것 같은데, 왜 한 번으로 충분한가? 그 답이 역전파(backpropagation)의 수학 안에 있다.
+
+## 문제의 뿌리: Jacobian과 연쇄법칙
+
+신경망의 각 계층은 벡터를 벡터로 매핑하는 함수다. 스칼라 미분 $\frac{df}{dx}$는 입출력이 모두 1차원일 때만 정의되고, 벡터 함수에는 **Jacobian**이 필요하다.
+
+함수 $\mathbf{f}: \mathbb{R}^n \to \mathbb{R}^m$의 Jacobian은 다음과 같이 정의된다.
+
+$$
+J_{\mathbf{f}}(x) = \begin{pmatrix}
+\frac{\partial f_1}{\partial x_1} & \cdots & \frac{\partial f_1}{\partial x_n} \\
+\vdots & \ddots & \vdots \\
+\frac{\partial f_m}{\partial x_1} & \cdots & \frac{\partial f_m}{\partial x_n}
+\end{pmatrix} \in \mathbb{R}^{m \times n}
+$$
+
+$(J_{\mathbf{f}})_{ij} = \frac{\partial f_i}{\partial x_j}$로, 행 하나는 "한 출력이 모든 입력에 얼마나 민감한가"를 기록한다.
+
+연쇄법칙은 이 Jacobian들의 **행렬 곱셈**으로 표현된다. $\mathbf{f}: \mathbb{R}^n \to \mathbb{R}^p$, $\mathbf{g}: \mathbb{R}^p \to \mathbb{R}^m$의 합성 $\mathbf{h} = \mathbf{g} \circ \mathbf{f}$에 대해,
+
+$$
+J_{\mathbf{h}}(x) = J_{\mathbf{g}}(\mathbf{f}(x)) \cdot J_{\mathbf{f}}(x)
+$$
+
+차원을 확인하면 $[m \times p] \cdot [p \times n] = [m \times n]$으로 일치한다. 이것이 역전파가 행렬 곱셈으로 구현되는 이유다.
+
+<Theorem kind="theorem" number="1" title="가중치 미분의 행렬 형식">
+선형 변환 $\mathbf{y} = W\mathbf{x} + \mathbf{b}$와 스칼라 손실 $L(\mathbf{y})$에 대해,
+
+$$\frac{\partial L}{\partial W} = \frac{\partial L}{\partial \mathbf{y}} \mathbf{x}^T \in \mathbb{R}^{m \times n}$$
+</Theorem>
+
+<Proof>
+$y_i = \sum_j W_{ij} x_j + b_i$이므로 $\frac{\partial y_i}{\partial W_{kl}} = \delta_{ik} x_l$. 연쇄법칙을 적용하면 $\frac{\partial L}{\partial W_{kl}} = \sum_i \frac{\partial L}{\partial y_i} \frac{\partial y_i}{\partial W_{kl}} = \frac{\partial L}{\partial y_k} x_l$이다. 행렬 표기로 쓰면 $\frac{\partial L}{\partial W} = \frac{\partial L}{\partial \mathbf{y}} \mathbf{x}^T$. 차원 확인: $[m \times 1] \cdot [1 \times n] = [m \times n]$. $\square$
+</Proof>
+
+## Forward-Mode vs Reverse-Mode: 왜 $10^6$배 차이가 나는가
+
+자동 미분(AD)에는 두 가지 모드가 있다.
+
+**Forward-mode AD**는 입력에서 출력으로 미분을 전파한다. Dual number $x + \dot{x}\epsilon$($\epsilon^2 = 0$)을 도입해 연산을 수행하면, 결과의 비표준 부분에서 특정 입력 방향의 미분을 얻는다. $n$차원 입력에 대한 Jacobian을 완성하려면 $n$번의 forward pass가 필요하다.
+
+**Reverse-mode AD**는 출력에서 입력으로 미분을 전파한다. 각 변수 $x_k$에 대해 adjoint $\bar{x}_k := \frac{\partial L}{\partial x_k}$를 정의하고, 역방향으로 VJP(Vector-Jacobian Product)를 누적한다.
+
+$$\bar{x}_l = J_{f_{l+1}}(x_l)^T \bar{x}_{l+1}$$
+
+손실 $L$은 스칼라($m = 1$)이므로 backward pass 한 번으로 **모든 파라미터의 gradient**를 동시에 얻는다.
+
+<Callout type="note" title="복잡도 비교">
+파라미터 $n \sim 10^6$, 손실 $m = 1$인 신경망에서:
+- Forward-mode: $O(n \times T)$ — 입력마다 한 번씩, $10^6$번
+- Reverse-mode: $O(T)$ — 손실이 스칼라이므로 단 한 번
+
+역전파가 $10^6$배 빠른 이유는 이것이다.
+</Callout>
+
+## MLP 역전파 공식의 완전한 유도
+
+$L$-계층 MLP에서 각 계층은 $z^{(l)} = W^{(l)} a^{(l-1)} + b^{(l)}$, $a^{(l)} = \sigma(z^{(l)})$로 정의된다. **error signal** $\delta^{(l)} := \frac{\partial L}{\partial z^{(l)}}$을 도입하면 역전파가 간결해진다.
+
+출력층:
+
+$$\delta^{(L)} = \nabla_{a^{(L)}} L \odot \sigma'(z^{(L)})$$
+
+중간 계층 $(l < L)$:
+
+$$\delta^{(l)} = \left((W^{(l+1)})^T \delta^{(l+1)}\right) \odot \sigma'(z^{(l)})$$
+
+가중치와 편향의 미분:
+
+$$\frac{\partial L}{\partial W^{(l)}} = \delta^{(l)} (a^{(l-1)})^T, \quad \frac{\partial L}{\partial b^{(l)}} = \delta^{(l)}$$
+
+<Aside label="Vanishing Gradient의 수학">
+깊은 네트워크에서 $\delta^{(1)}$은 행렬 $(W^{(2)})^T, \ldots, (W^{(L)})^T$와 $\sigma'(z^{(l)})$의 곱을 타고 전달된다. Sigmoid의 경우 $\sigma'(z) \leq 0.25$이므로, 층이 깊어질수록 $\|\delta^{(1)}\| \sim (0.25 \cdot \lambda_{\max})^{L-1} \|\delta^{(L)}\|$로 지수적으로 감소한다.
+</Aside>
+
+## Softmax + Cross-Entropy의 기적
+
+분류 문제에서 softmax의 Jacobian은 비대각 항을 포함해 복잡하다.
+
+$$\frac{\partial \hat{y}_i}{\partial z_j} = \hat{y}_i(\delta_{ij} - \hat{y}_j)$$
+
+행렬 형태로 $J = \text{diag}(\hat{\mathbf{y}}) - \hat{\mathbf{y}}\hat{\mathbf{y}}^T$.
+
+cross-entropy loss $L = -\sum_i y_i \log \hat{y}_i$와 연쇄법칙을 결합하면:
+
+$$\frac{\partial L}{\partial z_j} = \sum_i \frac{\partial L}{\partial \hat{y}_i} \frac{\partial \hat{y}_i}{\partial z_j} = \sum_i \left(-\frac{y_i}{\hat{y}_i}\right) \hat{y}_i(\delta_{ij} - \hat{y}_j)$$
+
+one-hot 조건 $\sum_i y_i = 1$을 이용해 정리하면:
+
+$$\boxed{\frac{\partial L}{\partial z_j} = \hat{y}_j - y_j}$$
+
+복잡한 Jacobian이 상쇄되어 **예측과 정답의 차이**만 남는다. 이 간단한 형태 덕분에 수치 안정성이 높고 구현이 명확하다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프: 메모리 vs 계산">
+Reverse-mode AD는 backward pass에서 forward pass의 모든 활성값(activation)이 필요하다. 깊이 100, 배치 크기 1000인 네트워크는 수 GB 메모리를 요구할 수 있다.
+
+**Gradient checkpointing**은 이 트레이드오프를 조절한다. 선택된 계층의 활성값만 저장하고, 필요할 때 해당 구간을 다시 계산한다. 메모리는 $O(\sqrt{L})$로 줄지만 계산 시간이 2-3배 증가한다. 배치 처리에서 행렬 연산($\partial L / \partial W = \Delta^T X$)은 GPU의 GEMM 최적화를 그대로 활용하므로, 순차 처리보다 실제 실행 시간이 수십 배 빠르다.
+</Callout>
+
+## 정리
+
+- Jacobian은 벡터 함수의 미분을 행렬로 표현하고, 연쇄법칙은 그 행렬들의 곱이다.
+- Reverse-mode AD는 손실이 스칼라임을 이용해 단 한 번의 backward pass로 모든 gradient를 계산한다 — forward-mode 대비 파라미터 수만큼 빠르다.
+- MLP 역전파의 핵심은 error signal $\delta^{(l)}$의 재귀 전파이며, 가중치 미분은 항상 $\delta^{(l)} (a^{(l-1)})^T$ 형태다.
+- Softmax + cross-entropy의 gradient $\hat{y} - y$는 우연이 아니라 두 함수의 Jacobian이 정확히 상쇄되는 수학적 결과다.
+
+역전파는 단순한 "gradient 계산 알고리즘"이 아니다. 손실의 스칼라 구조를 exploit해 계산 복잡도를 극적으로 줄인 설계 결정이다.
+
+<Reference
+  title="Learning Representations by Back-propagating Errors"
+  authors="Rumelhart, Hinton, Williams"
+  year={1986}
+  venue="Nature"
+  url="https://www.nature.com/articles/323533a0"
+/>

@@ -1,0 +1,168 @@
+---
+title: "CNN의 설계 철학 — 왜 Convolution인가"
+description: "Translation equivariance의 수학적 근거부터 VC 이론의 파라미터 효율, pooling의 invariance, 그리고 LeNet에서 EfficientNet까지 아키텍처 진화의 공통 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [cnn, convolution, equivariance, vc-theory, architecture]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+CNN은 왜 이미지에 잘 맞는가? "그냥 실험적으로 잘 됐다"는 답은 틀렸다. Convolution이라는 연산 자체가 이미지 데이터의 통계적 구조 — **위치와 무관하게 같은 특징이 반복된다** — 를 수학적으로 반영한다. 이 단순한 사실이 파라미터 효율, 일반화 이론, 그리고 20년간의 아키텍처 진화를 모두 설명한다.
+
+## Translation Equivariance — 설계의 출발점
+
+Convolution 연산의 핵심 성질은 **translation equivariance**다.
+
+$$
+\phi(T_s x) = T_s \phi(x) \quad \forall s
+$$
+
+입력을 평행이동한 후 연산한 결과가, 연산한 후 평행이동한 결과와 같다. 이미지에서 강아지가 왼쪽 위에 있든 오른쪽 아래에 있든, 같은 필터가 같은 방식으로 반응한다는 뜻이다.
+
+<Theorem kind="proposition" number="1" title="Convolution Layer의 Translation Equivariance">
+$\phi(x) = x * k$ 로 정의되는 convolution 층에 대해, 임의의 shift $s$에 대해 $\phi(T_s x) = T_s \phi(x)$ 가 성립한다.
+</Theorem>
+
+<Proof>
+$m' = m - s$ 치환을 이용한다.
+
+$$
+\phi(T_s x)[n] = \sum_m x[m-s]\, k[n-m] = \sum_{m'} x[m']\, k[(n-s)-m'] = (x*k)[n-s] = T_s \phi(x)[n]
+$$
+
+따라서 $\phi(T_s x) = T_s \phi(x)$. $\square$
+</Proof>
+
+이 성질은 $L$개 층을 쌓아도 보존된다. 각 층 $\phi_i$가 equivariant이면, 합성 $\phi_L \circ \cdots \circ \phi_1$도 equivariant이다. CNN 전체가 위치 불변 특징 검출기가 되는 근거가 여기에 있다.
+
+중요한 구분이 하나 있다. ML 프레임워크가 "convolution"이라 부르는 것은 사실 **cross-correlation**이다.
+
+$$
+\text{Conv}: \sum_m f[m]\,g[n-m], \quad \text{Cross-corr}: \sum_m f[m]\,g[n+m]
+$$
+
+수학적 convolution은 커널을 뒤집지만, cross-correlation은 뒤집지 않는다. 커널을 학습하는 ML에서는 뒤집기 여부가 무의미하다 — 어차피 학습이 수렴 방향을 결정하기 때문이다. 이 구분은 이론적으로는 의미있지만 실무에서는 무시해도 된다.
+
+## 파라미터 공유와 VC 이론
+
+Equivariance는 "같은 커널을 전체 이미지에 적용한다"는 **파라미터 공유**로 구현된다. 이 단순한 원칙이 완전연결층 대비 극적인 파라미터 절감을 만든다.
+
+$224 \times 224$ RGB 이미지의 첫 번째 층을 비교하면:
+
+$$
+\text{FC}: D_\text{in} \cdot D_\text{out} = (224 \times 224 \times 3) \times 64 \approx 9.6\text{M}
+$$
+
+$$
+\text{CNN}\ (3{\times}3): k^2 \cdot C_\text{in} \cdot C_\text{out} = 9 \times 3 \times 64 = 1{,}728
+$$
+
+약 5500배 차이. 공간 차원 $H, W$가 파라미터 수식에서 사라진다는 것이 핵심이다.
+
+이 차이는 **VC 이론**으로 일반화 성능과 직결된다. Vapnik-Chervonenkis 부등식에 따르면:
+
+$$
+L_\text{true} \leq L_\text{emp} + O\!\left(\sqrt{\frac{d_\text{VC}}{n}}\right)
+$$
+
+FC의 VC 차원은 $\propto H \cdot W \cdot C_\text{in} \cdot C_\text{out}$이고, CNN은 $\propto k^2 \cdot C_\text{in} \cdot C_\text{out} \cdot L$이다. 같은 학습 데이터 $n$개에서 CNN의 일반화 오차 상한이 $(k/H)^2$배 낮다. 더 적은 파라미터로 더 나은 일반화를 달성하는 이유가 과적합 방지에 관한 직관이 아니라 이 이론에 있다.
+
+<Callout type="note" title="Sample Complexity">
+일반화 오차를 $\epsilon$ 이내로 유지하는 데 필요한 샘플 수는 $n \gtrsim d_\text{VC}/\epsilon^2$에 비례한다. 수치 예시에서 FC는 CNN보다 약 2000배 많은 데이터가 필요하다. CNN이 적은 데이터로도 학습되는 이유다.
+</Callout>
+
+깊이를 쌓으면 **receptive field**가 선형으로 확장된다.
+
+$$
+\text{RF}_L = (k-1) \cdot L + 1
+$$
+
+$3 \times 3$ 커널 7층이 $13 \times 13$ 수용야를 만들고, 13층이 $25 \times 25$를 만든다. 파라미터는 깊이에 선형으로 증가하지만 receptive field는 각 층 추가로 커널 크기만큼 확장된다.
+
+## Pooling — Equivariance를 Invariance로
+
+Equivariance는 강력하지만 때로는 과도하다. 1픽셀 shift된 이미지가 shift된 출력을 만드는 것은 분류 작업에서 불필요한 민감도다. Pooling이 이를 완화한다.
+
+$$
+\text{MaxPool}_k(X)[i,j] = \max_{(m,n) \in \mathcal{N}(i,j)} X[m,n]
+$$
+
+$2 \times 2$ 윈도우 안에서 최댓값만 추출하면, 특징이 윈도우 내에서 한 칸 이동해도 같은 값이 통과한다. 이것이 **local translation invariance** — strict가 아닌 soft한 불변성이다.
+
+Max pooling은 두 가지 역할을 동시에 한다. 작은 shift에 대한 robustness를 제공하면서, 공간 해상도를 절반으로 줄여 다음 층의 계산량을 줄인다. Stride 2 convolution도 공간을 절반으로 줄이지만, pooling은 영역 내 최댓값을 선택하므로 "어디서 가장 반응했는지"라는 정보를 보존한다.
+
+<Callout type="warning" title="트레이드오프">
+Max pooling은 정보를 명시적으로 버린다. 최댓값이 아닌 위치의 gradient는 역전파에서 0이 된다. Stride 2 conv 대신 pooling을 선택하는 것은 "학습 가능한 다운샘플링" vs "결정론적 최댓값 선택"의 트레이드오프다. ResNet처럼 깊은 네트워크는 후반부에 stride conv를 선호한다 — 이미 충분한 특징이 추출된 시점에서 pooling의 정보 손실이 더 크기 때문이다.
+</Callout>
+
+Global Average Pooling은 이 원리의 극단이다. $H \times W \times C$ 특성맵을 $C$차원 벡터로 압축하면, 공간 정보는 사라지고 "이 채널이 얼마나 활성화됐는가"만 남는다. FC 층의 $H \cdot W \cdot C \times \text{num\_classes}$ 파라미터를 $C \times \text{num\_classes}$로 줄이고, Class Activation Map 같은 해석 가능성 기법의 기반이 된다.
+
+## 아키텍처 진화의 공통 원리
+
+LeNet(1998)부터 EfficientNet(2019)까지, 아키텍처 진화는 세 축 — 깊이, 너비, 해상도 — 의 탐색이었다.
+
+```
+LeNet-5 (1998): 5층, 62K 파라미터, 95.3% (MNIST)
+AlexNet (2012): 8층, 60M,  63.3% (ImageNet top-1)
+VGG-16  (2014): 16층, 138M, 71.3%
+ResNet-50(2016): 50층, 25M,  77.7%
+DenseNet-121(2017): 121층, 7M, 77.2%
+EfficientNet-B7(2019): 66M, 85.0%
+```
+
+VGG의 핵심 통찰은 "$3 \times 3$ 두 개가 $5 \times 5$ 하나보다 낫다"는 것이다. 수용야는 같지만 비선형성이 두 배이고, 파라미터는 $2 \times 9 < 25$로 적다. ResNet의 혁신은 skip connection이다:
+
+$$
+y = F(x) + x
+$$
+
+역전파 시 $\partial L / \partial x = \partial L / \partial y \cdot (\partial F/\partial x + \mathbb{I})$로, $F$의 gradient가 소실되어도 항등항이 gradient를 통과시킨다. 100층이 넘는 네트워크 학습이 가능해진 수학적 이유다.
+
+EfficientNet은 이 세 축의 최적 비율을 공식화했다:
+
+$$
+d = \alpha^\phi,\quad w = \beta^\phi,\quad r = \gamma^\phi, \quad \alpha \cdot \beta^2 \cdot \gamma^2 \approx 2
+$$
+
+$\phi$를 늘릴수록 연산량이 약 2배 증가하도록 제약하면서, 깊이/너비/해상도를 동시에 균형있게 키운다.
+
+<Aside label="설계 철학">
+ResNet이 VGG보다 파라미터가 1/5인데 정확도는 더 높은 이유는 단순히 "더 깊어서"가 아니다. Skip connection이 loss landscape를 평탄하게 만들어 최적화를 쉽게 한다. 더 적은 파라미터 + 더 나은 최적화 가능성이 결합된 결과다.
+</Aside>
+
+## 정리
+
+- Convolution은 이미지의 translation equivariance 구조를 수학적으로 반영한다. 이것은 관찰이 아니라 $\phi(T_s x) = T_s \phi(x)$의 증명 가능한 성질이다.
+- 파라미터 공유는 FC 대비 VC 차원을 수천 배 낮추고, 같은 데이터로 훨씬 작은 일반화 오차를 보장한다.
+- Max pooling은 equivariance를 soft invariance로 변환한다. 정보 손실과 robustness의 교환이다.
+- LeNet에서 EfficientNet까지의 진화는 "equivariant + parameter efficient + 깊이 확장 가능"이라는 세 요구를 점진적으로 해결한 역사다.
+
+다음 장에서는 CNN이 다루기 어려운 long-range dependency를 RNN이 어떻게 다루는지, 그리고 BPTT(Backpropagation Through Time)의 수학으로 넘어간다.
+
+<Reference
+  title="ImageNet Classification with Deep Convolutional Neural Networks"
+  authors="Krizhevsky, Sutskever, Hinton"
+  year={2012}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/2012/hash/c399862d3b9d6b76c8436e924a68c45b-Abstract.html"
+/>
+
+<Reference
+  title="Deep Residual Learning for Image Recognition"
+  authors="He, Zhang, Ren, Sun"
+  year={2016}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1512.03385"
+/>

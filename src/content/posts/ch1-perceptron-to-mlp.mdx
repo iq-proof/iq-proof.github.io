@@ -1,0 +1,154 @@
+---
+title: "신경망 이론의 네 가지 뿌리 — 퍼셉트론부터 활성화 함수까지"
+description: "Novikoff 수렴 정리의 (R/γ)² bound부터 XOR의 선형 분리 불가능성, MLP의 합성함수 구조, 활성화 함수별 gradient 안정성까지, 현대 딥러닝 이론의 기반을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [neural-network, perceptron, mlp, activation-function, gradient]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+현대 딥러닝의 모든 구성 요소는 하나의 질문으로 수렴한다 — **"왜 이 설계 결정인가?"** 단일 퍼셉트론이 수렴하는 이유, XOR을 풀 수 없는 이유, 비선형 활성화가 필수인 이유, ReLU가 Sigmoid를 대체한 이유. 이 네 가지 질문은 각각 독립적인 것처럼 보이지만, 실제로는 **"gradient가 어떻게 흐르는가"라는 단일 주제의 다른 표현**이다. 왜 이 연결이 중요한가?
+
+## 수렴의 기하학 — Novikoff 정리
+
+Rosenblatt의 퍼셉트론 알고리즘은 단순하다. mistake가 발생하면 가중치를 업데이트한다:
+
+$$w_{k+1} \leftarrow w_k + y_i x_i$$
+
+이 알고리즘이 유한 스텝 안에 반드시 멈춘다는 것을 Novikoff(1962)가 증명했다.
+
+<Theorem kind="theorem" number="1" title="Novikoff 수렴 bound">
+데이터가 선형 분리 가능하고, 단위 분리자 $w^*$에 대해 $y_i(w^* \cdot \tilde{x}_i) \geq \gamma > 0$, $\|\tilde{x}_i\| \leq R$이면, 퍼셉트론 알고리즘의 총 mistake 횟수 $k$는
+
+$$k \leq \left(\frac{R}{\gamma}\right)^2$$
+
+를 만족한다.
+</Theorem>
+
+<Proof>
+증명은 두 축을 동시에 추적한다.
+
+**하한**: $w_k \cdot w^*$의 증가. 매 mistake에서 $y^{(k)}(w^* \cdot x^{(k)}) \geq \gamma$이므로:
+
+$$w_k \cdot w^* \geq k\gamma \tag{A}$$
+
+**상한**: $\|w_k\|^2$의 증가. mistake 시에만 업데이트되고 $y^{(k)}(w_{k-1} \cdot x^{(k)}) \leq 0$이므로:
+
+$$\|w_k\|^2 \leq kR^2 \tag{B}$$
+
+Cauchy-Schwarz로 조인다. $\|w^*\| = 1$이므로:
+
+$$k\gamma \overset{(A)}{\leq} w_k \cdot w^* \leq \|w_k\| \overset{(B)}{\leq} \sqrt{k}R$$
+
+양변을 제곱하면 $k \leq (R/\gamma)^2$. $\square$
+</Proof>
+
+이 bound에서 핵심은 **입력 차원 $d$가 등장하지 않는다**는 점이다. 수렴 속도는 데이터의 기하학적 성질 — margin $\gamma$(분리 경계와 데이터 사이의 여유)와 반지름 $R$(데이터의 범위) — 만으로 결정된다. 이것이 이후 SVM의 margin bound와 kernel methods로 이어지는 이유이다.
+
+<Aside label="Cauchy-Schwarz 조임">
+증명의 핵심 기법은 같은 양 $w_k \cdot w^*$에 대해 하한과 상한을 독립적으로 구한 뒤 합쳐서 $k$를 고립시키는 것이다. 이 전략은 이후 온라인 학습의 regret bound 증명에서 그대로 재활용된다.
+</Aside>
+
+## 선형 분리 불가능성 — XOR의 증명
+
+퍼셉트론 수렴 정리는 "데이터가 선형 분리 가능할 때"라는 가정을 달고 있다. Minsky와 Papert(1969)는 이 가정이 얼마나 강한지를 XOR로 보였다.
+
+단일 퍼셉트론이 XOR을 표현하려면 $w_1, w_2, b$가 다음 연립 부등식을 **동시에** 만족해야 한다:
+
+$$\begin{cases} b \leq 0 & (0,0) \to 0 \\ w_2 + b > 0 & (0,1) \to 1 \\ w_1 + b > 0 & (1,0) \to 1 \\ w_1 + w_2 + b \leq 0 & (1,1) \to 0 \end{cases}$$
+
+첫 번째 조건에서 $b \leq 0$, 두 번째와 세 번째에서 $w_1, w_2 > -b \geq 0$. 따라서 $w_1 + w_2 > 0$. 그런데 네 번째 조건은 $w_1 + w_2 \leq -b$를 요구한다. 모순이다.
+
+<Callout type="warning" title="XOR의 기하학적 이유">
+$(0,0)$과 $(1,1)$이 한 클래스, $(0,1)$과 $(1,0)$이 다른 클래스다. 이 체커보드 패턴은 **어떤 방향의 직선으로도 분리할 수 없다**. Novikoff 정리에서 말하는 $\gamma$가 존재하지 않는다 — 따라서 수렴 보장도 없다.
+</Callout>
+
+해결책은 hidden layer 하나를 추가하는 것이다. hidden unit 하나는 OR, 다른 하나는 NAND를 계산하도록 가중치를 설정하면, 출력층은 이 둘의 AND로 XOR을 구성한다. 단층의 한계는 **"비선형 데이터를 선형 분리 가능한 공간으로 변환할 layer가 없다"**는 구조적 문제였다.
+
+## MLP — 합성함수로서의 공간 변환
+
+Hidden layer를 추가하는 것의 수학적 의미는 명확하다. Depth $L$인 MLP는:
+
+$$f(x) = \sigma_L(W_L \cdots \sigma_1(W_1 x + b_1) \cdots + b_L)$$
+
+각 층 $f_l = \sigma_l \circ A_l$은 affine 변환과 비선형 활성화의 합성이다. 핵심 사실이 하나 있다:
+
+<Theorem kind="proposition" number="2" title="비선형성의 필수성">
+모든 층의 activation이 항등함수인 MLP는 단층 선형 변환과 동등하다. 즉, 깊이가 표현력을 증가시키려면 **반드시 비선형 activation이 필요하다**.
+</Theorem>
+
+<Proof>
+$f(x) = W_L(W_{L-1}(\cdots(W_1 x + b_1)\cdots + b_{L-1}) + b_L) = \tilde{W}x + \tilde{b}$. 중괄호를 전개하면 모든 $W_l$의 곱이 단일 행렬 $\tilde{W}$로 합쳐진다. $\square$
+</Proof>
+
+역전파에서 gradient는 Jacobian chain rule로 역방향 전파된다:
+
+$$\frac{\partial \ell}{\partial W_1} = \frac{\partial \ell}{\partial A_L} \cdot \frac{\partial A_L}{\partial Z_L} \cdots \frac{\partial A_2}{\partial Z_2} \cdot \frac{\partial Z_2}{\partial W_1}$$
+
+이것이 여러 activation 도함수의 곱이라는 사실이 다음 섹션의 출발점이다.
+
+## 활성화 함수 — gradient 안정성의 핵심
+
+Sigmoid $\sigma(z) = 1/(1+e^{-z})$의 도함수는 $\sigma'(z) = \sigma(z)(1-\sigma(z))$이고, 최대값은 $z=0$에서 $0.25$이다. Depth $L$에서:
+
+$$\prod_{l=1}^{L} \sigma'(z_l) \leq (0.25)^L$$
+
+$L=20$이면 이 값은 $9 \times 10^{-13}$에 불과하다. 입력 근처의 가중치는 사실상 업데이트되지 않는다.
+
+ReLU $\max(0, z)$는 정반대다. $z > 0$인 모든 경로에서 도함수가 정확히 1이므로:
+
+$$\prod_{l: z_l > 0} \text{ReLU}'(z_l) = 1$$
+
+깊이에 무관하게 gradient 크기가 유지된다. 2012년 AlexNet이 Sigmoid 대비 학습 시간을 6배 단축한 것은 이 차이에서 비롯됐다.
+
+<Callout type="note" title="트레이드오프">
+ReLU의 대가는 **Dying ReLU**다. 뉴런이 음수 입력을 계속 받으면 gradient가 0이 되어 영구히 비활성화된다. Leaky ReLU($\alpha z$ for $z < 0$)는 $\alpha \neq 0$으로 이를 완화하고, GELU는 smooth한 비단조 함수로 Transformer 계열의 표준이 됐다. 아키텍처 선택이 activation 선택을 결정한다.
+</Callout>
+
+현대 선택의 기준은 단순하다:
+
+| 함수 | 도함수 최대 | 깊은 망 | 주 사용처 |
+|------|----------|--------|---------|
+| Sigmoid | 0.25 | 나쁨 | 이진 출력층 |
+| ReLU | 1.0 | 좋음 | ResNet 계열 |
+| GELU | ~1.7 | 매우 좋음 | Transformer |
+| Swish | ~1.8 | 매우 좋음 | 현대 비전 |
+
+## 정리
+
+네 챕터를 관통하는 주제는 **"gradient가 얼마나 깨끗하게 흐르는가"**다.
+
+- Novikoff bound $(R/\gamma)^2$는 학습 난이도가 데이터의 기하학으로만 결정됨을 보인다.
+- XOR의 선형 분리 불가능성은 비선형 공간 변환, 즉 hidden layer의 필요성을 강제한다.
+- MLP의 합성함수 구조에서 비선형 activation이 없으면 깊이는 표현력을 주지 못한다.
+- 활성화 함수의 도함수 크기가 gradient flow를 결정하며, ReLU → GELU로의 진화는 이 문제의 점진적 해결이다.
+
+다음 글에서는 Cybenko(1989)의 Universal Approximation Theorem을 통해 "MLP는 어떤 함수도 근사할 수 있는가, 그리고 그 비용은 얼마인가"를 추적한다.
+
+<Reference
+  title="Perceptrons: An Introduction to Computational Geometry"
+  authors="Minsky, M. and Papert, S."
+  year={1969}
+  venue="MIT Press"
+  url="https://mitpress.mit.edu/9780262130431/perceptrons/"
+/>
+
+<Reference
+  title="Rectified Linear Units Improve Restricted Boltzmann Machines"
+  authors="Nair, V. and Hinton, G."
+  year={2010}
+  venue="ICML"
+  url="https://icml.cc/Conferences/2010/papers/432.pdf"
+/>

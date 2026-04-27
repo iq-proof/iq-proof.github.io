@@ -1,0 +1,124 @@
+---
+title: "신경망은 왜 어떤 함수든 근사할 수 있는가"
+description: "Cybenko의 sigmoid 보편성 증명부터 Hornik의 일반화, ReLU의 구성적 증명, 깊이 분리, Barron의 차원 무관 수렴율까지 — Universal Approximation Theorem의 수학적 계보를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [neural-network, universal-approximation, relu, depth-separation, barron]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망은 왜 작동하는가? 이 질문에 대한 가장 근본적인 답은 함수 근사 이론에 있다. 1989년부터 1990년대 중반까지, 수학자들은 신경망이 단순한 경험적 도구가 아니라 **함수공간에서 보편적 근사자(universal approximator)**임을 차례로 증명했다. 그 계보를 따라가면, 오늘날 ReLU가 표준이 된 이유와 깊이가 너비보다 효율적인 이유까지 하나의 흐름으로 이해된다.
+
+## 출발점: Cybenko가 세운 수학적 기초
+
+1989년 Cybenko는 처음으로 신경망의 보편성을 엄밀히 증명했다.
+
+<Theorem kind="theorem" number="1" title="Cybenko's Universal Approximation Theorem (1989)">
+$\sigma$가 sigmoidal 함수이고 $K \subset \mathbb{R}^n$이 컴팩트일 때, 1층 신경망 함수들의 집합
+
+$$S = \left\{ \sum_{i=1}^{N} \alpha_i \sigma(w_i \cdot x + b_i) : N \in \mathbb{N},\, \alpha_i \in \mathbb{R},\, w_i \in \mathbb{R}^n,\, b_i \in \mathbb{R} \right\}$$
+
+는 $C(K)$ (컴팩트 $K$ 위의 연속함수 공간)에서 uniform dense이다.
+</Theorem>
+
+<Proof>
+귀류법으로 $S$가 dense가 아니라고 가정하면, Hahn-Banach 정리에 의해 모든 $g \in S$에 대해 $L(g) = 0$이지만 어떤 $f^* \in C(K)$에 대해 $L(f^*) \neq 0$인 nontrivial 선형범함수 $L$이 존재한다. Riesz 표현 정리에 의해 $L(f) = \int_K f \, d\mu$로 표현되는 유한 부호측도 $\mu$가 존재하고, sigmoidal 함수의 경계성(boundedness)과 단조성을 활용하면 모든 hyperplane에서 $\mu$가 0 측도를 가져야 함이 따라온다. 따라서 $\mu \equiv 0$, 즉 $L \equiv 0$이 되어 모순이다. $\square$
+</Proof>
+
+직관적으로는 이렇다. sigmoid 한 개는 하이퍼플레인 하나를 기준으로 0에서 1로 전환하는 함수다. 여러 sigmoid를 선형결합하면 복잡한 경계를 표현할 수 있고, 무한히 쌓으면 어떤 연속함수도 임의의 정확도로 흉내 낼 수 있다.
+
+단, 이 정리는 **존재성**만을 말한다. 어떤 가중치를 써야 하는지, 뉴런이 몇 개 필요한지는 알려주지 않는다. 그리고 sigmoid에만 적용된다.
+
+## Hornik의 일반화: 활성화 함수의 특수성을 제거하다
+
+1991년 Hornik은 질문을 바꿨다. sigmoid의 어떤 성질이 본질적인가?
+
+<Theorem kind="theorem" number="2" title="Hornik (1991)">
+$\sigma: \mathbb{R} \to \mathbb{R}$이 비상수(non-constant), 유계(bounded), 연속이면, $K \subset \mathbb{R}^n$이 컴팩트일 때 1층 신경망 함수들의 집합은 $C(K)$에서 uniform dense이다.
+</Theorem>
+
+증명 경로가 달라진다. Cybenko는 sigmoidal의 특수한 성질(경계성과 단조성)을 직접 활용했다. Hornik은 Stone-Weierstrass 정리를 쓴다. 핵심은 신경망으로 생성되는 함수들의 집합 $A$가 (1) 상수 함수를 포함하고, (2) 서로 다른 두 점을 구분할 수 있으면(separating), 그 폐포(closure)가 $C(K)$ 전체라는 것이다.
+
+이 결과가 중요한 이유는 명확하다. tanh, swish, softplus — 어떤 비상수 유계 연속 함수를 활성화로 써도 보편성이 보장된다. 단 한 가지 예외가 있다.
+
+<Callout type="warning" title="다항식 활성화는 UAT를 만족하지 않는다">
+$\sigma(z) = z^2$를 쓰면 1층 신경망 함수는 항상 2차 다항식 $\sum_i \alpha_i (w_i \cdot x + b_i)^2$의 형태다. 유한 층을 쌓아도 차수만 높아지므로, 함수공간의 유한 부분공간만 표현 가능하다. 차원이 무한한 $C(K)$를 조밀하게 덮을 수 없다.
+</Callout>
+
+## ReLU의 구성적 증명: "어떻게"를 처음으로 보이다
+
+Cybenko와 Hornik은 "존재한다"고 말했다. 1993년 Leshno et al.은 ReLU에 대해 처음으로 **구성적 증명**을 제시했다.
+
+핵심 아이디어는 bump 함수다. ReLU 3개를 적절히 조합하면 특정 구간에서만 값을 가지는 tent 함수를 만들 수 있다.
+
+```
+ReLU(x - a) - 2·ReLU(x - (a+b)/2) + ReLU(x - b)
+= tent function on [a, b]
+```
+
+증명의 흐름은 다음과 같다.
+
+1. 임의의 연속함수 $f \in C(K)$는 조각적 선형(piecewise linear) 함수로 uniform 근사 가능하다 (Weierstrass의 확장).
+2. 조각적 선형 함수는 ReLU의 선형결합으로 **정확히** 표현 가능하다.
+3. 따라서 ReLU로 임의의 연속함수를 임의의 정확도로 근사할 수 있다.
+
+ReLU는 비유계다. Hornik의 정리에서 "유계" 조건이 필요했는데, Leshno는 "비다항식(non-polynomial)"이면 충분하다는 더 일반적인 결과를 증명했다. 이것이 현대 딥러닝의 표준 활성화가 ReLU인 이유 중 하나다. 이론적 정당성과 실무적 효율성(경사 소실 없음)이 함께 보장된다.
+
+## 깊이의 이유: Telgarsky의 지수적 분리
+
+UAT는 "충분히 많은 뉴런이 있으면"이라는 전제가 붙는다. 그렇다면 깊은 네트워크와 얕은 네트워크는 같은 표현력을 가지는가?
+
+2016년 Telgarsky는 **아니다**라고 증명했다.
+
+<Theorem kind="theorem" number="3" title="Telgarsky의 깊이 분리 (2016)">
+깊이 $L$의 ReLU 신경망으로 표현되는 sawtooth 함수 $f_L$을 깊이 $O(L^{1/3})$의 ReLU 신경망으로 $\epsilon$-근사하려면, 너비가 최소 $\Omega(2^L / \text{poly}(L))$이어야 한다.
+</Theorem>
+
+sawtooth 함수 $f_L$은 $[0, 1]$ 위에서 정확히 $2^L$개의 진동(oscillation)을 가진다. 깊이 $L$의 네트워크는 $O(L)$ 너비만으로 이를 표현한다. 반면 얕은 네트워크는 동일한 표현력을 얻기 위해 너비가 **지수적으로** 증가해야 한다.
+
+<Callout type="note" title="트레이드오프: 깊이와 너비">
+깊이 8, 너비 2와 깊이 1, 너비 256은 비슷한 파라미터 수를 가진다. 하지만 깊은 네트워크가 기하급수적으로 많은 breakpoint를 표현할 수 있다. ResNet, BERT, GPT가 "넓고 얕은" 구조 대신 "좁고 깊은" 구조를 선택한 이유가 여기 있다. 단, 실무에서 깊이를 무한정 늘리면 그래디언트 소실 문제가 발생한다 — 이것이 skip connection과 normalization이 필요한 이유다.
+</Callout>
+
+## Barron의 수렴율: 차원의 저주를 피하는 방법
+
+UAT와 깊이 분리는 "무엇을 표현할 수 있는가"를 다룬다. 1993년 Barron은 "얼마나 빨리 수렴하는가"를 정량화했다.
+
+다항식 근사(Sobolev space $W^{s,2}$)의 수렴율은 $O(n^{-s/d})$다. 차원 $d$가 커지면 필요한 항의 수 $n$이 지수적으로 증가한다. 차원의 저주다.
+
+Barron은 신경망이 다른 세계에서 동작함을 보였다. 함수 $f$의 Fourier 변환 $\hat{f}$에 대해 Barron norm을 다음과 같이 정의한다.
+
+$$C_f = \int_{\mathbb{R}^d} \|\omega\| \left| \hat{f}(\omega) \right| d\omega$$
+
+<Theorem kind="theorem" number="4" title="Barron (1993)">
+$C_f < \infty$인 함수 $f$에 대해, $n$개의 뉴런을 가진 1층 sigmoid 신경망 $f_n$이 존재하여
+
+$$\mathbb{E}\left[ \|f - f_n\|_{L^2}^2 \right] = O\left( \frac{C_f^2}{n} \right)$$
+
+이 수렴율은 차원 $d$에 무관하다.
+</Theorem>
+
+왜 차원에 무관한가? 증명의 핵심은 Monte Carlo 샘플링이다. $(\omega_j, b_j)$를 무작위로 샘플링하면 Fourier 적분을 차원에 무관한 방식으로 근사할 수 있다. 오직 Barron norm — 즉 고주파 에너지의 총량 — 만이 수렴 속도를 결정한다.
+
+<Aside label="왜 자연 신호에서 잘 작동하는가">
+자연 이미지, 음성, 언어 임베딩은 대부분 저주파 에너지에 집중되어 있다. 인접 픽셀은 비슷한 강도를 가지고, 발화는 연속적으로 변한다. 이는 낮은 Barron norm에 해당한다. 딥러닝이 고차원 자연 데이터에서 잘 작동하는 이유는, 그 데이터가 Barron 공간의 함수에 가깝기 때문이다.
+</Aside>
+
+## 정리
+
+- **Cybenko (1989)**: sigmoid 1층 신경망은 컴팩트 도메인의 모든 연속함수를 uniform 근사한다. 증명 도구: Hahn-Banach + Riesz 표현.
+- **Hornik (1991)**: "유계 비상수 연속"이면 충분하다. Stone-Weierstrass로 일반화. 다항식만 제외.
+- **Leshno (1993)**: ReLU는 비유계이지만 UAT를 만족한다. bump 함수 구성으로 "어떻게"를 처음으로 보임.
+- **Telgarsky (2016)**: 깊이 $L$의 표현력을 얕은 네트워크로 모방하려면 너비가 $\Omega(2^L)$이 필요하

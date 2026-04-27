@@ -1,0 +1,147 @@
+---
+title: "신경망 초기화는 왜 이렇게 복잡해졌는가"
+description: "대칭성 깨기부터 Fixup까지, 분산 보존이라는 하나의 원칙이 Xavier, He, LSUV, Orthogonal 초기화를 어떻게 파생시켰는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [initialization, variance-preservation, deep-learning, xavier, he-kaiming]
+difficulty: advanced
+series:
+  slug: neural-network-theory-deep-dive
+  title: Neural Network Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망을 처음 만든다면 가중치를 전부 0으로 놓는 게 자연스러워 보인다. 그런데 그렇게 하면 네트워크는 영원히 학습하지 못한다. 왜일까? 그리고 그 답을 쫓다 보면, 현대 딥러닝의 모든 초기화 전략이 결국 **하나의 질문**으로 수렴한다는 것을 알게 된다 — 신호가 층을 통과할 때 분산을 어떻게 보존할 것인가?
+
+## 대칭성: 가장 먼저 깨야 할 것
+
+$W = 0$으로 초기화하면 모든 hidden unit이 동일한 값을 출력한다. forward pass에서 $h_1 = h_2 = \cdots = h_m$이고, backward pass에서 gradient도 동일하다. 결과적으로 모든 가중치가 같은 방향으로 업데이트되어, 업데이트 이후에도 여전히 동일하다.
+
+<Theorem kind="proposition" number="1" title="대칭성 고착 (Symmetry Fixation)">
+$\ell$번째 층의 모든 가중치 행이 동일하면, 역전파 후에도 모든 행이 동일하게 유지된다. 따라서 네트워크의 effective width는 1이다.
+</Theorem>
+
+<Proof>
+모든 행이 동일한 $W^{(\ell)}$에서 forward pass를 수행하면 $h_i^{(\ell)} = h^{(\ell)}$ (상수)이다. Loss가 $h$들에 대해 대칭적으로 의존하므로 $\delta_i^{(\ell)} = \delta^{(\ell)}$ (상수). 가중치 gradient는 $\partial L / \partial w_{ij}^{(\ell)} = \delta^{(\ell)} a_j^{(\ell-1)}$이고, 모든 행에서 동일하므로 업데이트 후에도 행들이 동일하다. $\square$
+</Proof>
+
+해결책은 $W_{ij} \sim \mathcal{N}(0, \sigma_w^2)$로 무작위 초기화하는 것이다. 그런데 $\sigma_w$가 너무 작으면 gradient가 사라지고, 너무 크면 활성화가 포화된다. "Goldilocks zone"을 찾는 것이 초기화 이론의 출발점이다.
+
+## Xavier: 선형 네트워크의 타협
+
+활성화가 선형(identity)이라고 가정하자. 입력 $x \in \mathbb{R}^{n_\text{in}}$이 한 층을 통과할 때:
+
+$$
+\text{Var}(y_j) = n_\text{in} \cdot \sigma_w^2 \cdot \text{Var}(x)
+$$
+
+분산을 보존하려면 $\sigma_w^2 = 1/n_\text{in}$이어야 한다. 그런데 역전파에서는 gradient 분산을 보존하기 위해 $\sigma_w^2 = 1/n_\text{out}$이 필요하다. 두 조건을 동시에 만족할 수 없으므로 Glorot & Bengio (2010)는 기하 평균을 택했다:
+
+$$
+\sigma_w^2 = \frac{2}{n_\text{in} + n_\text{out}}
+$$
+
+이것이 Xavier 초기화다. Uniform 버전으로는 $W_{ij} \sim \text{Uniform}\!\left(-\sqrt{6/(n_\text{in}+n_\text{out})},\, \sqrt{6/(n_\text{in}+n_\text{out})}\right)$이다.
+
+<Callout type="note" title="Xavier의 한계">
+Xavier는 **선형 활성화를 가정**한다. ReLU가 등장하면 이 타협이 무너진다.
+</Callout>
+
+## He: ReLU가 분산을 절반으로 죽인다
+
+$z \sim \mathcal{N}(0, \sigma_z^2)$에 ReLU를 적용하면 음수 절반이 0이 된다. 대칭성에 의해:
+
+$$
+\mathbb{E}[\text{ReLU}(z)^2] = \int_0^\infty z^2\, p(z)\, dz = \frac{1}{2}\int_{-\infty}^\infty z^2\, p(z)\, dz = \frac{1}{2}\sigma_z^2
+$$
+
+ReLU 한 번에 분산이 절반으로 줄어든다. 30층 ReLU 네트워크에서 Xavier를 쓰면 활성화 분산이 $\approx (0.5)^{30} \approx 10^{-9}$으로 소멸한다. He et al. (2015)는 이 손실을 사전에 보정했다:
+
+$$
+\sigma_w^2 = \frac{2}{n_\text{in}}
+$$
+
+Leaky ReLU ($a = \max(\alpha x, x)$)로 일반화하면 $\sigma_w^2 = 2/((1+\alpha^2)n_\text{in})$이다. PyTorch에서 `nn.init.kaiming_normal_`이 이 공식을 구현한다.
+
+## LSUV와 Orthogonal: 이론이 현실과 어긋날 때
+
+Xavier와 He는 이론적 기댓값에 기반한다. 그런데 실제 데이터 분포가 가정을 벗어나거나 네트워크가 100층을 넘어서면 이론과 현실의 괴리가 누적된다.
+
+**Orthogonal 초기화**는 다른 각도로 접근한다. $W^T W = I$이면:
+
+$$
+\|Wx\|_2 = \|x\|_2 \quad \forall x
+$$
+
+spectral norm이 정확히 1이므로 forward 신호와 backward gradient가 층을 지나도 크기가 변하지 않는다 — **dynamic isometry**. 선형 네트워크에서 100층을 쌓아도 gradient norm이 1로 유지된다.
+
+**LSUV** (Mishkin & Matas 2015)는 데이터를 직접 활용한다. 먼저 orthogonal로 rough 초기화를 하고, 미니배치를 forward pass하여 각 층의 실제 activation std를 측정한 뒤, 층마다 $W \leftarrow W / \text{std}(a)$로 조정한다. 이 과정을 $|\sigma_l - 1| < \epsilon$이 될 때까지 반복한다. 일반적으로 5~10회로 수렴하며, 200층 이상에서도 unit variance를 달성한다.
+
+<Aside label="세 방법의 위계">
+Xavier/He는 빠르고 이론적이다 (~50층). Orthogonal은 spectral norm을 수학적으로 보장한다 (~100층, RNN). LSUV는 데이터 기반으로 가장 정확하다 (~200층). 깊이가 깊어질수록 더 강한 보장이 필요하다.
+</Aside>
+
+## Fixup: 초기화만으로 Batch Normalization을 대체하다
+
+Batch Normalization은 깊은 네트워크의 분산 문제를 런타임에 해결한다. 그런데 BN은 미니배치 크기에 의존하고, edge device 배포가 어렵고, training-test gap을 만든다.
+
+Zhang et al. (2019)의 **Fixup**은 초기화 하나로 BN을 대체한다. 핵심 아이디어는 residual branch의 마지막 conv를 0으로 초기화하는 것이다:
+
+$$
+x_{l+1}\big|_{t=0} = x_l + 0 = x_l
+$$
+
+초기 forward pass가 identity function처럼 작동하므로 분산이 그대로 보존된다. 동시에 첫 번째 conv의 초기화 스케일을 residual block 수 $L$에 맞게 조정한다:
+
+$$
+\sigma_w = L^{-1/(2m-2)}
+$$
+
+여기서 $m$은 각 block 내 conv 수다. 결과적으로 마지막 conv가 0 → 1로 성장하는 속도가 $L$의 깊이와 균형을 맞춘다. ResNet-152 ImageNet 실험에서 BN 있는 모델이 76.3% top-1을 기록할 때, Fixup은 75.8%를 달성했다.
+
+<Callout type="note" title="트레이드오프">
+Fixup은 BN 없이 동작하지만 **첫 conv 스케일 공식의 정밀도**와 **residual 구조 의존성**이 전제다. 순수 sequential 네트워크나 Attention과의 조합에서는 추가 조정이 필요하다. BN이 학습률을 암묵적으로 안정화하던 역할도 사라지므로 학습률 민감도가 높아진다.
+</Callout>
+
+## 정리
+
+- 모든 초기화 전략의 공통 목표는 하나다 — **층을 통과해도 분산이 보존되어야 한다**.
+- Xavier는 선형 활성화에서 forward/backward 분산을 기하 평균으로 타협한다.
+- He는 ReLU가 분산을 절반으로 죽이는 것을 사전에 $\sigma_w^2 = 2/n_\text{in}$으로 보정한다.
+- Orthogonal은 spectral norm을 1로 고정해 수학적으로 gradient norm을 보장한다.
+- LSUV는 실제 데이터로 각 층을 측정하고 조정해 이론-현실 괴리를 제거한다.
+- Fixup은 residual branch를 0에서 시작해 BN 없이도 1000층 학습을 가능하게 한다.
+
+분산 보존이라는 단순한 원칙이 네트워크가 깊어질수록 점점 더 정교한 방법을 요구한다. 다음 글에서는 이 초기화 전략들이 실제로 어떤 활성화 함수와 만날 때 어떻게 조합되는지 — GELU, Swish, SiLU 각각의 분산 특성을 추적한다.
+
+<Reference
+  title="Understanding the difficulty of training deep feedforward neural networks"
+  authors="Glorot, X. and Bengio, Y."
+  year={2010}
+  venue="AISTATS"
+  url="https://proceedings.mlr.press/v9/glorot10a.html"
+/>
+
+<Reference
+  title="Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification"
+  authors="He, K. et al."
+  year={2015}
+  venue="ICCV"
+  url="https://arxiv.org/abs/1502.01852"
+/>
+
+<Reference
+  title="Fixup Initialization: Residual Learning Without Normalization"
+  authors="Zhang, H. et al."
+  year={2019}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1901.09321"
+/>
