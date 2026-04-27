@@ -1,0 +1,112 @@
+---
+title: "Redis는 왜 같은 데이터를 다르게 저장하는가"
+description: "String의 SDS부터 Sorted Set의 skiplist까지, Redis 7가지 자료구조의 인코딩 전략과 listpack 경계가 메모리를 10배 바꾸는 원리를 추적한다."
+pubDate: 2026-04-27
+category: dev
+tags: [redis, data-structures, encoding, listpack, memory]
+difficulty: intermediate
+series:
+  slug: redis-deep-dive
+  title: Redis Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Redis는 같은 "문자열"이라도 값이 정수냐, 44 bytes 이하냐, 그 이상이냐에 따라 전혀 다른 방식으로 메모리에 저장한다. 이 결정 하나가 수백만 키에서 수십 GB 차이를 만든다. Redis는 왜 하나의 타입에 여러 인코딩을 두는가?
+
+## 모든 인코딩 결정의 공통 논리
+
+Redis의 인코딩 전략에는 일관된 패턴이 있다. **데이터가 작을 때는 연속 메모리(compact)로, 커지면 포인터 기반(indexed)으로** 전환한다. 이 경계를 `listpack`이 담당한다.
+
+String의 세 인코딩이 이 패턴을 압축적으로 보여준다.
+
+```
+int:    ptr 필드에 정수값 직접 저장 → malloc 0회
+embstr: redisObject + SDS를 하나의 64B 블록에 연속 할당 → malloc 1회
+raw:    redisObject와 SDS를 별도 할당 → malloc 2회
+```
+
+`embstr`의 경계가 44 bytes인 이유도 계산에서 나온다. `16(redisObject) + 3(sdshdr8 헤더) + 44(buf) + 1(\0) = 64 bytes` — jemalloc의 64 bytes 슬롯에 정확히 맞는다. 45 bytes가 되는 순간 65 bytes가 필요하고, 128 bytes 슬롯으로 넘어간다.
+
+## SDS — C 문자열이 버린 것들
+
+Redis가 C의 `char*` 대신 SDS(Simple Dynamic String)를 직접 구현한 이유는 세 가지 결함 때문이다. `strlen`의 O(N), 버퍼 오버플로우 위험, 이진 비안전성(null byte에서 종료).
+
+SDS는 `len`, `alloc`, `flags`, `buf[]` 네 필드로 이 셋을 모두 해결한다. `len` 필드로 길이를 O(1)에 조회하고, `alloc - len`으로 여유 공간을 즉시 계산한다. `APPEND`가 반복될 때 재할당 횟수를 줄이는 사전 할당 전략도 여기서 나온다.
+
+```c
+// 새 크기 < 1MB → 2배 할당
+// 새 크기 ≥ 1MB → +1MB 할당
+```
+
+100번 `APPEND`하면 재할당이 100번이 아니라 O(log N)회로 줄어든다.
+
+<Callout type="warning" title="embstr는 수정 불가">
+`APPEND`, `SETRANGE` 등 수정 명령은 `embstr`를 즉시 `raw`로 전환한다. 한 번 `raw`가 되면 값이 짧아져도 `embstr`로 돌아가지 않는다. 다시 최적 인코딩을 얻으려면 `SET`으로 새로 저장해야 한다.
+</Callout>
+
+## listpack 경계가 메모리를 결정한다
+
+Hash, List, Set, Sorted Set 모두 동일한 패턴을 따른다. 원소 수와 값 크기가 임계값 이하면 `listpack`(연속 메모리), 초과하면 포인터 기반 구조로 전환된다.
+
+```
+Hash:       fields ≤ 128, value ≤ 64B  → listpack
+            초과                        → hashtable
+
+Set (정수):  원소 ≤ 512               → intset (이진 탐색 O(log N))
+Set (문자열): 원소 ≤ 128              → listpack
+            초과 또는 문자열 추가       → hashtable
+
+Sorted Set: 원소 ≤ 128, member ≤ 64B → listpack
+            초과                       → skiplist + hashtable
+```
+
+전환 전후의 메모리 차이는 예상보다 크다. Hash 127개 필드(listpack)에서 128번째 필드를 추가하는 순간 `hashtable`로 전환되고, `dictEntry`(24 bytes) × 필드 수 + 버킷 배열이 추가된다. 실측하면 3~5배 증가가 일반적이다.
+
+<Aside label="intset의 특수성">
+정수 Set에 문자열 하나를 추가하면 `intset`이 즉시 `hashtable`로 전환된다. 문자열을 다시 제거해도 되돌아가지 않는다. 권한 ID를 정수로 관리한다면 철저하게 정수만 유지해야 한다.
+</Aside>
+
+## Sorted Set이 두 자료구조를 동시에 유지하는 이유
+
+Sorted Set은 `skiplist + hashtable` 두 구조를 항상 함께 유지한다. 이유는 두 가지 쿼리 패턴이 각각 다른 자료구조를 요구하기 때문이다.
+
+- `ZRANGEBYSCORE` — 스코어 기준 범위 탐색 → skiplist 필요
+- `ZSCORE` — 멤버 이름으로 O(1) 스코어 조회 → hashtable 필요
+
+skiplist는 확률적 레이어(P=0.25)로 O(log N)을 보장한다. 각 노드의 `span` 필드가 "이 포인터가 건너뛰는 Level 0 노드 수"를 기록하기 때문에, `ZRANK`는 HEAD에서 목표 노드까지 span을 누산하는 것만으로 순위를 O(log N)에 계산한다. AVL Tree 대신 skiplist를 선택한 이유는 구현 단순성과 범위 쿼리에서의 연결 순회 효율 때문이다.
+
+```
+ZSCORE: O(1)      — hashtable 직접 조회
+ZRANK:  O(log N)  — skiplist span 누산
+ZADD:   O(log N)  — skiplist 삽입 + hashtable 갱신
+ZRANGEBYSCORE: O(log N + K)  — K = 반환 원소 수
+```
+
+## 특수 자료구조의 "싸게 푸는" 철학
+
+Bitmap, HyperLogLog, Geo는 별도 타입처럼 보이지만 내부는 각각 String과 Sorted Set 위에 구축된다.
+
+Bitmap은 String의 `buf[]`를 비트 단위로 조작한다. `TYPE dau:bitmap → "string"`. 1억 유저의 접속 여부를 `ceil(1억/8) = 12.5 MB`로 추적한다. 단, 유저 ID가 순차 정수일 때만 효율적이다. 희소한 ID(예: 오프셋 10억)라면 125 MB 낭비다.
+
+HyperLogLog는 16,384개 레지스터 × 6 bits = 12 KB로 수십억 개의 고유값 수를 추정한다. 오차율 `1.04 / sqrt(16384) ≈ 0.81%`. 멤버십 확인은 불가능하고 카운트만 된다.
+
+Geo는 위도/경도를 52비트 Geohash 정수로 변환해 Sorted Set 스코어로 저장한다. `GEOSEARCH`는 Geohash 범위로 후보를 빠르게 추린 뒤 하버사인 공식으로 정밀 거리를 계산하는 2단계 구조다.
+
+<Callout type="note" title="트레이드오프">
+listpack 유지(메모리 최소)는 선형 탐색을 감수한다. Hash `HGET`이 O(128)이고, `intset SISMEMBER`가 O(log N)이다. 초당 수십만 회 조회하는 Hot Key에서는 hashtable의 O(1)이 필요하다. 임계값을 올리기 전에 반드시 `SLOWLOG`로 실측하라.
+</Callout>
+
+## 정리
+
+- String의 인코딩은 `int → embstr → raw` 순으로 메모리 비용이 증가한다. `embstr` 경계는 jemalloc 64 bytes 슬롯에서 나온다.
+- Hash, List, Set, Sorted Set 모두 원소가 임계값 이하면 `listpack`(연속 메모리)을 사용한다. 이 경계를 넘는 순간 포인터 기반 구조로 전환되며 메모리가 3~5배 증가한다.
+- Sorted Set은 `skiplist`(범위 쿼리)와 `hashtable`(스코어 조회)을 동시에 유지한다. `ZSCORE`는 O(1), `ZRANK`는 O(log N)인 이유다.
+- Bitmap, HyperLogLog, Geo는 각각 String, Sorted Set 위에 구축된 확장이다. 메모리 효율과 기능 제약 사이의 명확한 트레이드오프가 있다.
+- 최적화의 시작은 `OBJECT ENCODING`으로 현재 인코딩을 확인하고, `MEMORY USAGE`로 실제 바이트를 측정하는 것이다. 측정 없는 최적화는 오히려 악화시킨다.
+
+다음 글에서는 Redis가 이 자료구조들을 디스크에 저장하는 두 방식 — RDB 스냅샷과 AOF 로그 — 의 내부 구조와 실제 복구 시나리오를 추적한다.

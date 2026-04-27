@@ -1,0 +1,106 @@
+---
+title: "Redis의 모든 선택은 하나의 질문에서 나온다"
+description: "캐싱 전략 선택부터 분산 락 논쟁까지, Redis를 올바르게 쓰기 위해 반드시 답해야 할 트레이드오프 질문들을 추적한다."
+pubDate: 2026-04-27
+category: dev
+tags: [redis, caching, distributed-systems, event-loop, pub-sub]
+difficulty: intermediate
+series:
+  slug: redis-deep-dive
+  title: Redis Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Redis를 "빠른 DB 앞단"으로만 이해하면, 언젠가 반드시 그것이 틀렸다는 사실을 장애로 배우게 된다. Cache-Aside와 Write-Back의 차이, Pub/Sub과 Stream의 차이, 단순 락과 Redlock의 차이 — 이 선택들은 모두 같은 질문의 다른 표현이다. **"지금 이 데이터에서 일관성과 성능 중 무엇을 더 잃을 수 있는가?"**
+
+## 캐시 전략: 쓰기 시 SET이 아니라 DELETE
+
+Redis 캐싱의 가장 흔한 실수는 쓰기 시 캐시를 업데이트(SET)하는 것이다. 직관적으로는 맞아 보이지만, 동시 요청 두 개가 DB 업데이트 순서와 캐시 SET 순서가 뒤바뀌는 순간 구버전 값이 캐시에 영구적으로 박힌다. 올바른 패턴은 쓰기 시 캐시를 무효화(DELETE)하는 것이다. 삭제는 멱등적이다. 여러 프로세스가 같은 키를 동시에 삭제해도 결과는 "없음"으로 동일하다.
+
+전략별 적합한 상황은 데이터의 쓰기 빈도와 유실 허용 여부로 결정된다.
+
+- **Cache-Aside**: 읽기 위주 데이터. miss → DB 조회 → 캐시 저장. 쓰기 시 DELETE.
+- **Write-Through**: 쓰기 직후 즉시 일관성이 필요한 경우. 캐시 + DB 동시 업데이트. 쓰기 지연 증가.
+- **Write-Back**: 조회수, 좋아요처럼 쓰기가 폭발적이고 약간의 유실을 허용하는 경우. Redis에만 쓰고 주기적으로 DB에 플러시.
+
+Spring에서는 `@Cacheable`이 Cache-Aside 읽기, `@CacheEvict`가 명시적 무효화, `@CachePut`이 Write-Through에 대응한다. `@Cacheable`은 쓰기 시 자동 무효화를 하지 않는다는 점을 반드시 기억해야 한다.
+
+## Cache Stampede: 동시 만료 순간의 폭발
+
+TTL이 만료되는 순간, 수천 개의 요청이 동시에 DB로 쏟아진다. DB가 이 폭발을 감당하지 못하면 타임아웃이 발생하고, 더 많은 재요청이 생겨 장애가 연쇄된다. 5분마다 주기적으로 DB CPU가 스파이크한다면 Stampede를 먼저 의심해야 한다. DB 인스턴스 업그레이드는 근본 해결이 아니다.
+
+가장 단순한 방어는 **TTL 지터**다. `TTL = 300 ± random(30)`처럼 만료 시점을 분산시키면 동시 만료 자체가 사라진다. 비용이 거의 없어 항상 적용해야 한다.
+
+더 강한 보장이 필요하다면 **Mutex Lock**이나 **PER(Probabilistic Early Recomputation)**을 사용한다. Mutex Lock은 단 하나의 프로세스만 DB를 조회하고 나머지는 대기하게 한다. PER은 만료 전에 확률적으로 미리 갱신해 만료 순간의 miss 자체를 없앤다.
+
+$$
+\text{갱신 조건: } t_{now} - \delta \cdot \beta \cdot \log(\text{random}()) \geq t_{expiry}
+$$
+
+잔여 TTL이 클 때 갱신 확률은 사실상 0이고, 만료에 근접할수록 급격히 증가한다. `beta`를 키우면 더 일찍, 더 공격적으로 갱신한다.
+
+<Callout type="note" title="트레이드오프">
+TTL 지터는 비용 없이 Stampede를 약화시키지만 완전히 제거하지는 못한다. Mutex Lock은 DB 조회를 1회로 제한하지만 락 대기 지연이 생긴다. PER은 대기 없이 miss를 없애지만 구현이 복잡하다. 실무 권장: 항상 TTL 지터 + 중요 데이터에 Mutex Lock 추가.
+</Callout>
+
+## Hot Key: Cluster도 해결 못하는 병목
+
+Redis Cluster는 데이터를 노드에 분산하지만, 단일 키에 트래픽이 집중되면 그 키를 담당하는 노드 하나만 병목이 된다. Cluster 구성은 Hot Key 문제를 해결하지 않는다.
+
+읽기 Hot Key에 가장 효과적인 해결책은 **이중 레이어 캐시**다. JVM Caffeine 같은 로컬 캐시를 Redis 앞에 두면, 서버 100대 × 초당 1,000 요청 = 초당 100,000 Redis 요청이, 서버당 10초마다 1회 Redis 조회 = 초당 10회로 줄어든다. 10,000배 감소다.
+
+쓰기 Hot Key는 **카운터 샤딩**으로 푼다. `INCR likes:article:1:shard:{0~9}`처럼 N개 샤드에 분산 쓰고, 읽기 시 파이프라인으로 합산한다. 각 INCR이 원자적이므로 샤드별 카운트는 정확하고, 합산도 정확하다.
+
+## 분산 락: 올바른 구현의 두 가지 핵심
+
+분산 락의 두 가지 필수 원칙이 있다.
+
+첫째, `SETNX`와 `EXPIRE`를 분리하면 안 된다. 두 명령어 사이에서 프로세스가 죽으면 TTL 없는 영구 잠금이 생긴다. `SET key token NX EX 30`처럼 단일 원자 명령으로 써야 한다.
+
+둘째, 락 해제 시 소유 확인 없이 DELETE하면 다른 프로세스의 락을 실수로 해제한다. UUID 토큰을 값으로 저장하고, 해제 시 Lua 스크립트로 GET과 DEL을 원자적으로 실행해야 한다.
+
+```lua
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+```
+
+**Redlock**은 5개 독립 노드에서 과반수(≥3) 획득 시 락이 성립한다. 단일 노드 장애에도 락을 보장하기 위한 설계다. 그러나 Martin Kleppmann은 GC Pause나 시계 오차로 락 유효 시간 판단이 틀릴 수 있다고 비판했고, Redis 창시자 Antirez는 실용적으로 충분히 안전하다고 반론했다. 이 논쟁은 아직 결론이 없다. 실무에서는 Redisson 같은 검증된 라이브러리를 사용하고, 비즈니스 로직에서 멱등성을 별도로 보장하는 것이 현실적이다.
+
+## Pub/Sub vs Stream: "보내고 잊는 것"과 "반드시 처리하는 것"
+
+Pub/Sub은 Fire-and-Forget이다. 구독자가 없는 순간 발행된 메시지는 영원히 사라진다. ACK가 없어 처리 보장도 없다. 결제, 주문, 재고 변경처럼 반드시 처리돼야 하는 이벤트에 Pub/Sub을 쓰면 서버 재배포 30초 동안 발생한 이벤트가 전부 소실된다.
+
+Stream은 메시지를 영구 저장하고, Consumer Group을 통해 각 메시지를 정확히 하나의 Consumer에게만 전달한다. PEL(Pending Entry List)이 미ACK 메시지를 추적해 Consumer 크래시 후 `XAUTOCLAIM`으로 재처리할 수 있다.
+
+올바른 Stream Consumer 패턴은 재시작 시 `0-0`으로 자신의 pending 메시지를 먼저 처리하고, 이후 `>`로 새 메시지를 처리하는 것이다. **`XACK`를 빠뜨리면 PEL이 계속 쌓이고, 같은 메시지가 반복 재전달된다.**
+
+## Pipeline과 MULTI/EXEC: 원자성의 범위를 정확히 알자
+
+10개 명령어를 순차 실행하면 10번의 TCP 왕복이 발생한다. Pipeline은 이를 1번으로 줄인다. 그러나 Pipeline은 원자적이지 않다. 명령어 사이에 다른 클라이언트가 끼어들 수 있다.
+
+MULTI/EXEC는 블록 안의 명령어들이 끊김 없이 순서대로 실행됨을 보장한다. 하지만 **롤백이 없다**. 실행 시점에 타입 오류가 나도 나머지 명령어는 계속 실행된다. 이것은 버그가 아니라 Redis의 의도적 설계다.
+
+조건부 실행이나 Read-Modify-Write가 필요하면 Lua 스크립트를 써야 한다. Lua 스크립트는 이벤트 루프를 독점하므로 짧아야 한다. O(N) 루프가 있는 Lua 스크립트는 그 시간만큼 Redis 전체가 멈춘다.
+
+<Aside label="설계 철학">
+Redis의 선택들은 일관된 방향을 가리킨다 — 복잡성을 사용자에게 위임하고, 코어는 단순하고 빠르게. 롤백 없는 트랜잭션, ACK 없는 Pub/Sub, GC Pause를 가정하지 않는 Redlock은 모두 그 철학의 표현이다. Redis를 올바르게 쓴다는 것은 그 위임된 복잡성을 사용자가 직접 책임진다는 뜻이다.
+</Aside>
+
+## 정리
+
+- 캐시 쓰기 시 SET 대신 DELETE. 삭제는 멱등적이고 Race Condition을 회피한다.
+- Stampede 방지는 TTL 지터로 시작하고, 중요 데이터에 Mutex Lock 또는 PER을 더한다.
+- Hot Key는 Cluster로 해결되지 않는다. 읽기는 로컬 캐시, 쓰기는 카운터 샤딩으로 분산한다.
+- 분산 락 해제는 반드시 Lua 스크립트로 소유 확인 후 삭제한다. Redlock은 멱등성과 함께 써야 한다.
+- Pub/Sub은 손실 허용 알림, Stream은 처리 보장 이벤트. 둘은 교체재가 아니다.
+- Pipeline은 RTT 최적화, MULTI/EXEC는 순서 보장, Lua는 조건부 원자 실행. 세 가지는 서로 다른 문제를 푼다.
+
+다음 글에서는 Redis 운영 중 실제로 병목이 어디서 발생하는지, `SLOWLOG`와 `INFO` 명령어로 어떻게 진단하는지 추적한다.
