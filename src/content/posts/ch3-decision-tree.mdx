@@ -1,0 +1,103 @@
+---
+title: "결정트리의 모든 분할 기준은 하나의 질문에서 나온다"
+description: "엔트로피 기반 정보이득부터 Gini impurity, MSE 분할, Cost-Complexity Pruning, 축정렬 편향까지 — 결정트리의 설계 원리를 관통하는 단일 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [decision-tree, information-gain, gini, cart, ensemble]
+difficulty: advanced
+series:
+  slug: ml-fundamentals-deep-dive
+  title: Ml Fundamentals Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+결정트리는 단순해 보인다. 데이터를 조건으로 쪼개고, 각 그룹에 예측값을 할당한다. 그런데 "어떻게 쪼갤 것인가"라는 질문 하나가 정보이론, 분산 분해, 정규화, 앙상블까지 이어지는 깊은 구조를 품고 있다. ID3의 엔트로피, CART의 Gini, 회귀 트리의 MSE, Cost-Complexity Pruning의 $\alpha$ — 이 모든 선택이 사실 **같은 하나의 원칙**에서 파생되었다는 것을 아는가?
+
+## 분할이란 무엇인가: 엔트로피와 정보이득
+
+분할 기준의 시작은 정보이론이다. 레이블 $Y$의 엔트로피는
+
+$$H(Y) = -\sum_k p_k \log p_k$$
+
+로 정의되고, "현재 데이터가 얼마나 섞여 있는가"를 잰다. 순수하면 0, 균등하면 최대. **Information Gain**은 feature $A$로 분할한 뒤 엔트로피가 얼마나 줄었는지다.
+
+$$IG(S, A) = H(S) - \sum_v \frac{|S_v|}{|S|} H(S_v)$$
+
+이 수식은 생김새부터 Mutual Information $I(Y; A) = H(Y) - H(Y|A)$와 동일하다. ID3의 탐욕적 분할은 곧 "feature와 레이블 사이의 상호정보량을 매 단계 최대화한다"는 뜻이다. 정보이론의 표준 도구가 ML에 그대로 흘러온 셈이다.
+
+<Callout type="note" title="High-Cardinality 편향">
+IG는 유니크 값이 많은 feature를 부당하게 선호한다. ID가 $n$개이면 각 bucket에 1개 샘플 → $H(S_v) = 0$ → $IG = H(S)$ 최대. C4.5의 **Gain Ratio** $GR = IG / H(A)$는 분할 자체의 엔트로피로 나눠 이 편향을 페널티한다.
+</Callout>
+
+## Gini는 엔트로피의 다른 이름인가
+
+CART는 엔트로피 대신 Gini impurity를 쓴다.
+
+$$G(S) = 1 - \sum_k p_k^2 = \sum_k p_k(1 - p_k)$$
+
+직관은 두 가지다. 첫째, "두 샘플을 뽑았을 때 클래스가 다를 확률" — 확률적 해석. 둘째, 클래스 indicator의 **평균 분산** — 통계적 해석. 두 번째 해석이 중요하다. Gini는 분류 문제에서 분산 감소를 재는 도구다.
+
+binary entropy $h(p)$와 binary Gini $g(p) = 2p(1-p)$를 $p = 1/2$ 주변에서 Taylor 전개하면 두 함수가 공통된 2차 항을 가진다.
+
+$$h(p) = \ln 2 - 2(p - 1/2)^2 + \cdots, \quad g(p) = \frac{1}{2} - 2(p - 1/2)^2$$
+
+**같은 곡률**이다. 어떤 feature가 더 좋은 split인지 순위를 매길 때 두 기준은 거의 항상 같은 결론을 낸다. Iris 데이터로 실험하면 IG와 $\Delta G$ 점수의 상관계수는 0.997이다. sklearn에서 `criterion='gini'`와 `criterion='entropy'`가 같은 트리를 만드는 이유가 여기 있다. CART가 Gini를 택한 실질적 이유는 $\log$가 없어 약간 빠르고, $p \to 0$ 근처에서 수치 안정성이 높기 때문이다.
+
+## 회귀로 넘어가면: MSE 분할과 분산의 통일
+
+분류에서 Gini가 "indicator의 분산"이라면, 회귀 트리에서 MSE 분할은 **연속 $y$의 분산**을 직접 다룬다.
+
+Leaf $v$ 내에서 상수 $c$를 예측할 때 MSE를 최소화하는 $c^*$는 leaf 내 평균 $\bar{y}_v$다. Split의 gain은
+
+$$\text{Gain}(R, j, t) = \frac{|R_L||R_R|}{|R|}(\bar{y}_L - \bar{y}_R)^2$$
+
+두 leaf의 평균이 얼마나 다른가 — 이것이 분할 품질의 척도다. 분류의 Gini와 회귀의 MSE는 형태가 동일하다. CART가 분류와 회귀를 **같은 알고리즘으로 통합**한 이유가 여기 있다. 연속 feature의 최적 split 탐색은 정렬 후 running prefix sum으로 $O(n)$에 가능하고, 전체 복잡도는 $O(pn \log n)$이다.
+
+<Aside label="분류와 회귀의 공통 정신">
+Gini (분류), MSE (회귀) — 이름은 다르지만 둘 다 "분할 후 각 그룹의 이질성이 줄었는가"를 측정한다. 이질성을 분산으로 정의하면 같은 프레임이다.
+</Aside>
+
+## 트리가 너무 자라면: Cost-Complexity Pruning
+
+완전히 자란 트리는 train error = 0이지만 test에서 무너진다. 가지치기는 이 trade-off를 명시적으로 제어한다.
+
+$$R_\alpha(T) = R(T) + \alpha |T|$$
+
+$\alpha = 0$이면 full tree, $\alpha \to \infty$이면 root 하나. Breiman의 **Weakest Link Pruning**은 각 internal node $t$에 대해
+
+$$g(t) = \frac{R(\{t\}) - R(T_t)}{|T_t| - 1}$$
+
+을 계산해 $g(t)$가 가장 작은 노드부터 잘라낸다. "단위 leaf 감소당 error 증가가 가장 작은 가지"가 weakest link다. 이를 반복하면 유한한 $\alpha$ 시퀀스 $0 = \alpha_0 < \alpha_1 < \cdots < \alpha_M$와 nested 트리 $T_0 \supset T_1 \supset \cdots \supset T_M$이 나온다. 어떤 $\alpha$에 대해서도 최적 트리는 이 시퀀스 안에 있다 — 모든 $\alpha$를 연속 탐색하지 않아도 된다.
+
+<Callout type="note" title="트레이드오프">
+$\alpha$가 작으면 복잡한 트리 (낮은 bias, 높은 variance), 크면 단순한 트리 (높은 bias, 낮은 variance). sklearn의 `ccp_alpha`는 이 $\alpha$ 그대로다. Cross-validation으로 최적 $\alpha$를 선택하고, 더 보수적 선택이 필요하면 **1-SE rule** — CV 최솟값 + 1 standard error 이내에서 가장 단순한 트리를 고른다. Breast Cancer 데이터에서 `ccp_alpha=0.01`은 leaf 33개 → 8개로 줄이면서 test accuracy를 0.918 → 0.947로 올린다.
+</Callout>
+
+## 결정트리의 구조적 한계 — 왜 앙상블이 불가피한가
+
+분할 기준을 아무리 정교하게 만들어도 결정트리에는 두 가지 구조적 약점이 있다.
+
+**첫째, 불안정성.** 탐욕 알고리즘은 argmax를 사용한다. 두 feature의 IG가 비슷할 때 데이터 1개만 바뀌어도 argmax가 반전되고, 그 이후 subtree 전체가 달라진다. 200개 샘플 데이터에서 1점을 제거하는 실험을 20회 반복하면 트리 구조가 8/20번 바뀐다. 이것은 **chaotic behavior** — 작은 input 변화가 큰 output 변화를 만든다.
+
+**둘째, 축-정렬 편향.** CART의 모든 분할은 $X_j \leq t$ 형태다. 실제 decision boundary가 $X_1 + X_2 = 0$인 대각선이라면, 이를 stair-step으로 근사하려면 $\Omega(1/\epsilon)$개의 leaf가 필요하다. $\epsilon = 0.01$ 정확도면 depth ≥ 7, $\epsilon = 0.001$이면 depth ≥ 10이다. leaf가 많아질수록 variance도 폭발한다.
+
+이 두 약점이 앙상블의 동기다. Bagging은 $B$개 트리를 평균해 variance를 $O(1/B)$로 줄인다. Random Forest는 feature subsampling으로 트리 간 correlation $\rho$를 낮춰 분산을 $\rho\sigma^2$까지 감소시킨다. 대각선 경계에서 각 트리의 stair-step들을 평균하면 부드러운 근사가 나온다.
+
+## 정리
+
+결정트리의 다섯 챕터는 하나의 질문을 여러 각도에서 바라본다 — "분할은 무엇을 최소화하는가?"
+
+- 엔트로피 기반 IG는 레이블과 feature의 **상호정보량**을 최대화한다.
+- Gini는 IG의 다항식 근사 — 분류에서 **indicator의 분산**을 최소화한다.
+- MSE 분할은 회귀에서 **연속 $y$의 분산**을 최소화한다. Gini와 같은 형태다.
+- Cost-Complexity Pruning은 error + complexity penalty를 최소화하는 **모델 선택 문제**다.
+- 불안정성과 축정렬 편향은 단일 트리의 구조적 한계 — **앙상블의 필연성**이다.
+
+"분산을 줄여라"는 명령이 분류, 회귀, 정규화, 앙상블까지 일관되게 흐른다. 다음 글에서는 이 트리들을 Bootstrap으로 묶었을 때 OOB error가 어떻게 CV의 대안이 되는지 추적한다.

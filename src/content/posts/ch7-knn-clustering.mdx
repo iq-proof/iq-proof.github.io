@@ -1,0 +1,123 @@
+---
+title: "비지도 학습의 세 가지 질문: 모양, 계층, 밀도"
+description: "K-Means의 GMM 극한부터 DBSCAN의 밀도 연결, PCA·t-SNE·UMAP의 구조 보존 철학까지, 클러스터링과 차원축소의 근본 원리를 하나의 시각으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [clustering, dimensionality-reduction, k-means, dbscan, pca]
+difficulty: advanced
+series:
+  slug: ml-fundamentals-deep-dive
+  title: Ml Fundamentals Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+비지도 학습 알고리즘들은 표면적으로 제각각이다. KNN은 이웃을 세고, K-Means는 중심을 이동하고, DBSCAN은 밀도를 추적하고, PCA는 분산을 최대화한다. 그런데 이 알고리즘들은 하나의 공통 질문을 서로 다른 방식으로 묻고 있다 — **데이터의 "가까움"이란 무엇이고, 그 가까움은 고차원에서도 유효한가?** KNN의 Cover-Hart 정리에서 UMAP의 위상학적 가정까지, 각 알고리즘의 설계 결정은 이 질문에 대한 다른 대답이다.
+
+## 단순함의 점근적 보장 — KNN과 Cover-Hart
+
+KNN은 학습이 없다. 새 점이 오면 가장 가까운 $k$개를 찾아 다수결을 낸다. 이렇게 단순한 알고리즘이 점근적으로 얼마나 강력할 수 있을까?
+
+Cover와 Hart(1967)의 답은 놀랍다.
+
+<Theorem kind="theorem" number="1" title="Cover-Hart (1967)">
+$n \to \infty$일 때 1-NN 분류기의 오차는 다음을 만족한다.
+
+$$\lim_{n \to \infty} R_{\text{1-NN}} \leq 2R^*(1 - R^*) \leq 2R^*$$
+
+여기서 $R^*$는 Bayes error다.
+</Theorem>
+
+<Proof>
+$n \to \infty$이면 임의의 테스트 점 $x_0$의 1-NN $x_{(1)}$이 $x_0$로 수렴한다. 따라서 $y_{(1)}$의 분포가 $P(y \mid x_0)$로 수렴한다. 이진 분류에서 1-NN의 오차는 $y_0$와 $y_{(1)}$이 독립적으로 $P(y \mid x_0)$를 따를 때의 불일치 확률이므로
+
+$$P(y_0 \neq y_{(1)} \mid x_0) = 1 - \sum_y p_y(x_0)^2.$$
+
+$K = 2$일 때 이는 $2\min(p)(1 - \min(p)) \leq 2(1 - \max(p))$로 pointwise bounded되고, 기댓값을 취하면 $R_{\text{1-NN}}^\infty \leq 2R^*$를 얻는다. $\square$
+</Proof>
+
+더 나아가 $k \to \infty$, $k/n \to 0$이면 $R_{k\text{-NN}} \to R^*$다. 즉 k-NN은 점근적으로 Bayes optimal이다. 어떤 알고리즘도 이를 능가할 수 없다 — 단지 수렴 속도만 다를 뿐.
+
+## 차원의 저주와 거리의 무의미 — 알고리즘들의 공통 취약점
+
+그런데 "가까운 이웃"이 의미 있으려면 거리가 판별력을 가져야 한다. 고차원에서 이 전제가 무너진다.
+
+$$\frac{D_p^{(\max)} - D_p^{(\min)}}{D_p^{(\min)}} \xrightarrow{p \to \infty} 0$$
+
+Beyer(1999)의 이 결과는 충격적이다. 차원이 커질수록 가장 가까운 점과 가장 먼 점의 거리가 거의 같아진다. "가장 가까운 $k$개"가 사실상 랜덤 부분집합과 같다.
+
+<Callout type="warning" title="거리 집중 현상">
+$p \approx 20$차원부터 KNN·kernel method·DBSCAN 등 모든 거리 기반 알고리즘의 효과가 감소하기 시작한다. 해결책은 두 가지뿐이다 — 차원을 줄이거나, 데이터가 저차원 manifold 위에 있다고 가정하거나.
+</Callout>
+
+K-Means가 이 한계를 회피하는 방식은 흥미롭다. 클러스터 중심이라는 개념이 raw distance보다 더 안정적인 참조점을 제공하기 때문이다. 그러나 K-Means에는 다른 취약점이 있다.
+
+## K-Means = GMM의 극한, Lloyd = 단조 수렴
+
+K-Means는 단순한 휴리스틱이 아니다. 공분산 $\Sigma_k = \sigma^2 I$로 고정된 GMM에서 $\sigma \to 0$으로 보내면 posterior가 가장 가까운 컴포넌트에 모든 mass를 집중시킨다 — K-Means의 hard assignment가 정확히 이 극한이다.
+
+Lloyd 알고리즘의 각 step은 목적함수 $J = \sum_i \|x_i - \mu_{z_i}\|^2$를 단조감소시킨다. Assign step은 각 점을 가장 가까운 중심에 배정해 $J$를 줄이고, Update step은 각 중심을 클러스터 평균으로 이동해 $J$를 다시 줄인다. 배정 $z \in \{1, \ldots, K\}^n$의 가짓수가 유한하므로 알고리즘은 반드시 수렴한다.
+
+<Callout type="note" title="트레이드오프">
+Lloyd는 **local minimum으로 수렴을 보장하지만 global minimum은 보장하지 않는다**. $J(\mu)$가 비볼록이기 때문이다. K-Means++(Arthur & Vassilvitskii 2007)는 $O(\log k)$-approximation을 기댓값으로 보장하는 초기화 전략이다 — random init의 worst case $\Theta(k)$-bad와 대비된다.
+</Callout>
+
+## 모양의 자유 — DBSCAN과 밀도 연결
+
+K-Means와 hierarchical clustering은 모두 "컴팩트한 구형 클러스터"를 가정한다. 두 반달(moons), 동심원(circles) 같은 비볼록 데이터에서 이 가정은 틀린다.
+
+DBSCAN은 클러스터를 **"밀도가 높은 지역의 연결된 구간"**으로 정의한다. 핵심점은 $\epsilon$ 이웃 안에 MinPts 이상의 점이 있는 점이고, 클러스터는 핵심점들의 transitive closure다.
+
+이 정의에서 두 가지 귀결이 나온다. 첫째, 클러스터가 임의 모양을 가질 수 있다 — 핵심점들의 chain이 어느 방향으로도 뻗을 수 있기 때문이다. 둘째, 어떤 클러스터에도 속하지 않는 점이 자동으로 noise로 분류된다 — K-Means가 모든 점을 어딘가에 강제 배정하는 것과 다르다.
+
+그러나 단일 $\epsilon$ 값은 **밀도가 다른 클러스터를 동시에 처리할 수 없다**. 작은 $\epsilon$은 sparse 클러스터를 noise로, 큰 $\epsilon$은 두 클러스터를 합쳐버린다. OPTICS는 reachability distance를 기반으로 이 한계를 완화한다.
+
+## 선형·국소·위상 — 차원축소의 세 철학
+
+차원의 저주를 직접 공략하는 방법이 차원축소다. PCA, t-SNE, UMAP은 세 가지 다른 "보존할 것"을 선택한다.
+
+**PCA**는 분산을 최대화하는 선형 projection이다. 공분산 행렬 $\Sigma$의 top $k$ eigenvector가 최적 방향을 준다. Eckart-Young 정리에 의해 이는 Frobenius norm 의미에서 최적 rank-$k$ 근사이기도 하다. 전역 구조를 잘 보존하지만 비선형 manifold를 포착하지 못한다.
+
+**t-SNE**는 고차원의 Gaussian 유사도와 저차원의 Student-t 유사도 사이의 KL divergence를 최소화한다.
+
+$$\text{Attention}(Q, K, V) \leftarrow \text{Loss} = \text{KL}(P \| Q) = \sum_{i \neq j} p_{ij} \log \frac{p_{ij}}{q_{ij}}$$
+
+Student-t의 heavy tail이 핵심이다. 저차원에서도 멀리 있는 점들을 실제로 멀리 배치할 수 있어 crowding 문제를 회피한다. 대신 전역 거리를 distort하고 $O(n^2)$ 비용이 든다.
+
+**UMAP**은 데이터를 fuzzy simplicial set — $k$-NN 그래프 위의 edge weight 구조 — 으로 모델링한 뒤 저차원에서 같은 위상 구조를 재현한다. 국소 구조와 전역 구조 사이의 균형이 t-SNE보다 낫고, 계산 비용은 사실상 $O(n \log n)$이다.
+
+<Aside label="선택 기준">
+전처리나 noise 제거가 목적이면 PCA, 클러스터 시각화가 목적이면 t-SNE, 대규모 데이터 embedding 시각화나 downstream task 보존이 목적이면 UMAP. 셋을 조합하는 패턴 — NN representation → UMAP 시각화 — 이 현대 ML 파이프라인의 표준이다.
+</Aside>
+
+## 정리
+
+- Cover-Hart 정리는 가장 단순한 알고리즘(1-NN)도 무한 데이터에서 Bayes error의 2배 이내임을 보장한다. 단순함에는 점근적 근거가 있다.
+- 차원의 저주는 모든 거리 기반 알고리즘의 공통 취약점이다. 해결책은 차원축소 또는 manifold 가정이다.
+- K-Means는 GMM의 hard-EM 극한이고 Lloyd는 단조 수렴을 보장하지만, K-Means++가 없으면 초기화에 크게 의존한다.
+- DBSCAN은 임의 모양 클러스터와 outlier 자동 탐지를 제공하는 대신 단일 밀도 가정에 묶인다.
+- PCA·t-SNE·UMAP은 각각 전역 선형, 국소 확률, 위상학적 보존이라는 다른 철학을 구현한다.
+
+다음 글에서는 이 알고리즘들이 NN representation 위에서 어떻게 재탄생하는지 — contrastive learning과 clustering의 연결 — 을 추적한다.
+
+<Reference
+  title="Nearest neighbor pattern classification"
+  authors="Cover, T. and Hart, P."
+  year={1967}
+  venue="IEEE Transactions on Information Theory"
+  url="https://ieeexplore.ieee.org/document/1053964"
+/>
+<Reference
+  title="A density-based algorithm for discovering clusters in large spatial databases with noise"
+  authors="Ester, M., Kriegel, H.-P., Sander, J., and Xu, X."
+  year={1996}
+  venue="KDD"
+  url="https://www.aaai.org/Library/KDD/1996/kdd96-037.php"
+/>

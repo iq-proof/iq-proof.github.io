@@ -1,0 +1,123 @@
+---
+title: "Logistic Regression의 통일 철학 — MLE가 모든 것을 설명한다"
+description: "왜 sigmoid인가, 왜 cross-entropy인가, 왜 softmax인가. Bernoulli MLE 한 줄 유도부터 분리 문제·Firth 보정까지, 분류 알고리즘의 공통 뿌리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [logistic-regression, mle, cross-entropy, glm, softmax]
+difficulty: advanced
+series:
+  slug: ml-fundamentals-deep-dive
+  title: Ml Fundamentals Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Logistic Regression을 "분류 알고리즘 하나"로 보면 작게 보인다. 하지만 MLE 한 줄 유도를 따라가면 sigmoid의 출처, cross-entropy의 정체, softmax의 일반화, 그리고 왜 weight decay가 필수인지까지 모두 같은 뿌리에서 나온다는 것을 알게 된다. 이 챕터들이 공유하는 질문은 하나다 — **"MLE가 분류 문제에 적용될 때 무슨 일이 일어나는가?"**
+
+## Bernoulli MLE가 sigmoid를 만드는 방법
+
+$y \in \{0, 1\}$에 선형 모델 $y = x^\top \beta$를 직접 쓰면 두 가지가 어긋난다. 출력이 $(0, 1)$ 범위를 벗어나고, 이산 레이블에 연속 회귀를 강제한다. Bernoulli 분포의 자연 모수는 $p \in (0, 1)$이고, 선형 출력을 이 범위로 매핑할 함수가 필요하다.
+
+Logit $\log\frac{p}{1-p}$는 $p \in (0,1)$을 $\mathbb{R}$ 전체로 보내는 자연스러운 변환이다. 이를 뒤집으면 sigmoid가 나온다.
+
+$$P(y = 1 \mid x) = \sigma(x^\top \beta) = \frac{1}{1 + e^{-x^\top \beta}}$$
+
+여기서 **sigmoid는 선택이 아니라 Bernoulli 분포의 canonical link의 역함수**다. 그리고 Bernoulli likelihood $\prod p_i^{y_i}(1-p_i)^{1-y_i}$에 log를 취하면
+
+$$\ell(\beta) = \sum_{i=1}^n \bigl[y_i \log p_i + (1-y_i)\log(1-p_i)\bigr]$$
+
+이 나온다. 이것이 binary cross-entropy의 음수다. **MLE = cross-entropy 최소화**는 유도의 결과이지 정의가 아니다.
+
+## Concavity — 왜 LR은 항상 같은 답을 주는가
+
+log-likelihood의 Hessian을 계산하면 구조가 드러난다.
+
+$$\nabla^2_\beta \ell(\beta) = -X^\top W X, \qquad W = \operatorname{diag}(p_i(1-p_i))$$
+
+$p_i \in (0,1)$이면 $p_i(1-p_i) > 0$이므로 $W \succ 0$, 따라서 $X^\top W X \succeq 0$ (PSD), $-X^\top W X \preceq 0$ (NSD). log-likelihood는 **concave**다.
+
+<Theorem kind="theorem" number="1" title="MLE의 일의성">
+$X$가 full column rank이고 데이터가 linear separation이 아니면, $\hat{\beta}_{\text{MLE}} = \arg\max \ell(\beta)$가 유일하게 존재한다.
+</Theorem>
+
+<Proof>
+strictly concave + separation 없을 때 sublevel set이 compact → 유일 global max. 어떤 초기값에서 gradient descent나 Newton-Raphson을 돌려도 같은 답에 수렴한다. 심층 신경망과 달리 local minimum에 갇히지 않는다.
+</Proof>
+
+이 concavity는 **IRLS(Iteratively Reweighted Least Squares)**의 기반이기도 하다. Newton-Raphson update를 정리하면
+
+$$\beta^{(t+1)} = (X^\top W^{(t)} X)^{-1} X^\top W^{(t)} z^{(t)}, \qquad z^{(t)} = X\beta^{(t)} + (W^{(t)})^{-1}(y - p^{(t)})$$
+
+가 되는데, 이는 working response $z$를 타겟으로 한 **가중 최소제곱** 문제의 해다. Newton 한 step이 WLS 한 번과 정확히 같다. 수렴 속도는 quadratic — gradient descent의 linear 수렴보다 훨씬 빠르다 (실험에서 7 iteration vs 623 iteration).
+
+## GLM — 분포가 바뀌어도 공식은 그대로
+
+Logistic Regression이 Bernoulli + logit link인 GLM의 특수 사례라는 관점은 강력하다. Exponential Family의 통일 형태
+
+$$p(y; \theta) = h(y) \exp\bigl(\theta^\top T(y) - A(\theta)\bigr)$$
+
+에서 canonical link $g = (A')^{-1}$를 쓰면 **분포에 무관하게** score equation이 $X^\top(y - \mu) = 0$, Hessian이 $-X^\top W X$로 나온다.
+
+<Callout type="note" title="분포별 W 행렬">
+| 분포 | $W = \operatorname{diag}(\cdot)$ | Canonical link |
+|------|----------------------------------|---------------|
+| Normal | $I$ (상수) | identity |
+| Bernoulli | $p_i(1-p_i)$ | logit |
+| Poisson | $\mu_i$ | log |
+| Gamma | $\mu_i^2 / k$ | inverse |
+
+공식은 같고 $W$만 바뀐다. IRLS 한 줄이 모든 GLM에 통한다.
+</Callout>
+
+Gaussian에서 $W = I$이므로 IRLS가 1 iteration에 수렴한다 — 이것이 OLS다. Poisson에서 working response는 $z = \log\mu + (y-\mu)/\mu$가 되어 log-scale 회귀로 환원된다. **canonical link의 마법은 분류 문제를 회귀 문제로 반복적으로 환원하는 것**이다.
+
+## Softmax와 Identifiability
+
+K-class 일반화에서 softmax
+
+$$P(y = k \mid x) = \frac{e^{w_k^\top x}}{\sum_{j=1}^K e^{w_j^\top x}}$$
+
+는 sigmoid의 자연스러운 확장이다. cross-entropy loss가 categorical MLE의 negative log-likelihood라는 것도 같은 유도로 나온다. $K = 2$이면 sigmoid로 돌아온다.
+
+한 가지 주의할 점이 있다. $w_k \to w_k + c$ (모든 클래스에 같은 벡터를 더함)로 분자·분모에서 $e^{c^\top x}$가 약분되어 $p_k$가 변하지 않는다. **해의 비유일성** — identifiability 문제다. 해결책은 $w_K = 0$으로 reference class를 고정하거나 L2 regularization을 추가하는 것이다. sklearn `LogisticRegression`의 기본값 `C=1.0`이 사실 이 문제의 보호 장치다.
+
+PyTorch `CrossEntropyLoss`는 `LogSoftmax + NLLLoss`로 multinomial LR의 negative log-likelihood와 정확히 같다. **모든 NN 분류기의 출력층이 LR**이다.
+
+## 분리 문제 — MLE가 존재하지 않을 때
+
+두 클래스가 hyperplane으로 완전히 분리되면 $t\beta_0$에서 $t \to \infty$로 보낼 때 $p_i \to 1$ (양성) 또는 $0$ (음성)이 되어 $\ell \to 0$으로 올라간다. 그러나 어떤 유한 $t$에서도 도달하지 않는다.
+
+수치적으로는 Newton 업데이트가 발산한다 — $\|\beta\|$가 iteration마다 폭발적으로 증가한다. Hessian이 $W \to 0$으로 degenerate해지면서 업데이트가 무한히 커진다.
+
+**Firth의 penalized likelihood**는 이를 해결한다.
+
+$$\ell^*(\beta) = \ell(\beta) + \frac{1}{2}\log|X^\top W X|$$
+
+분리 방향에서 $W \to 0$이면 $|X^\top W X| \to 0$이고 $\log|X^\top W X| \to -\infty$다. likelihood가 0으로 올라가는 속도보다 페널티가 $-\infty$로 떨어지는 속도가 빠르다 — 균형점이 유한한 곳에 생긴다.
+
+<Aside label="Bayesian 정당화">
+Firth 보정은 Jeffreys prior $\pi_J(\beta) \propto |I(\beta)|^{1/2}$의 MAP와 정확히 같다. ad hoc 페널티가 아니라 reparameterization-invariant한 noninformative prior의 귀결이다. 큰 $n$에서는 MLE와 점근적으로 같아지면서 small-sample의 first-order bias를 제거한다.
+</Aside>
+
+<Callout type="note" title="트레이드오프 — Ridge vs Firth">
+Ridge ($\lambda\|\beta\|^2$)는 계산이 빠르고 tuning이 필요하지만 coordinate-invariant하지 않고 systematic shrinkage bias가 있다. Firth는 tuning-free이고 coordinate-invariant하며 first-order bias를 제거하지만 매 iteration마다 $O(p^3)$ 행렬식 계산이 필요하다. 드문 사건(rare events)이나 high-dim regime ($p \approx n$)에서는 Firth가 더 신뢰할 만하다.
+</Callout>
+
+Modern NN이 항상 weight decay를 쓰는 이유도 같은 뿌리에서 나온다. 깊은 네트워크는 train set에서 두 클래스를 분리하는 representation을 쉽게 만들어낸다. 그 순간 마지막 layer의 weight가 분리 방향으로 발산한다. Weight decay는 그 발산을 막는 Ridge LR이다. Label smoothing은 one-hot target을 부드럽게 만들어 MLE 발산 자체를 불가능하게 한다.
+
+## 정리
+
+- **sigmoid**: Bernoulli canonical link의 역함수. MLE를 계산하면 나온다.
+- **cross-entropy**: Bernoulli negative log-likelihood. 선택이 아니라 유도의 결과다.
+- **IRLS**: Newton = 가중 최소제곱. Concavity가 quadratic 수렴을 보장한다.
+- **GLM 통일**: 분포만 바뀌고 score $X^\top(y-\mu)$, Hessian $-X^\top WX$, IRLS 공식은 그대로다.
+- **분리 문제**: MLE가 존재하지 않는 가장 극적인 사례. Ridge와 Firth, 그리고 NN의 weight decay가 모두 같은 문제에 대한 답이다.
+
+MLE 한 줄 유도가 "왜 sigmoid인가"부터 "왜 weight decay인가"까지 설명한다. 이것이 LR을 마스터하는 것이 분류 알고리즘 절반을 마스터하는 것과 같은 이유다.

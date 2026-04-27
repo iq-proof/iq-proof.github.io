@@ -1,0 +1,146 @@
+---
+title: "Random Forest는 왜 트리를 많이 추가할수록 좋아지는가"
+description: "Bootstrap의 63.2% 법칙부터 Bagging의 분산 감소 공식, RF의 ρ 감소 전략, 수렴 보장, Feature Importance의 함정까지 — 앙상블 이론의 통일된 공식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [random-forest, bagging, ensemble, feature-importance, variance-reduction]
+difficulty: advanced
+series:
+  slug: ml-fundamentals-deep-dive
+  title: Ml Fundamentals Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Random Forest의 모든 설계 결정은 하나의 공식에서 나온다.
+
+$$
+\text{Var}(\bar{f}_B) = \rho \sigma^2 + \frac{1 - \rho}{B}\sigma^2
+$$
+
+트리를 늘리면 두 번째 항이 줄고, 각 split에서 feature를 무작위로 고르면 첫 번째 항이 줄고, 그 수렴이 보장되기 때문에 트리를 추가해도 절대 나빠지지 않는다. Bootstrap부터 Feature Importance까지 — RF의 다섯 챕터는 이 공식의 다른 각도다.
+
+## Bootstrap의 63.2% — 공짜 Validation의 기원
+
+크기 $n$의 데이터에서 복원 추출로 $n$번 뽑으면, 한 샘플 $i$가 한 번도 선택되지 않을 확률은 $(1 - 1/n)^n$이다.
+
+$$
+\lim_{n \to \infty} \left(1 - \frac{1}{n}\right)^n = e^{-1} \approx 0.368
+$$
+
+따라서 Bootstrap 샘플에 **포함될 확률은 $1 - 1/e \approx 63.2\%$**, 나머지 36.8%가 OOB(Out-of-Bag) 샘플이 된다. $n = 100$에서 이미 약 63.4%로 수렴하므로 실무적으로 이 비율은 상수로 다뤄도 된다.
+
+OOB의 의미는 구체적이다. $B = 100$개 트리를 학습하면 각 샘플은 평균 $B/e \approx 36.8$개 트리에서 OOB로 남는다. 이 트리들은 해당 샘플을 학습에 사용하지 않았으므로, 이들의 예측 평균이 곧 hold-out 없이 얻는 validation 추정치다.
+
+$$
+\hat{f}^{\text{oob}}(x_i) := \text{avg}\bigl\{f_b(x_i) : i \notin \mathcal{D}^{(b)}\bigr\}
+$$
+
+OOB error는 small $n$에서 약간 pessimistic 편향이 있다 — 전체 $n$개 대신 약 $0.632n$개로 학습한 앙상블을 추정하기 때문이다. 그러나 $n > 500$ 이상에서는 5-fold CV와 거의 차이가 없다. 계산 비용은 0이다.
+
+## Bagging의 핵심 공식 — 왜 평균이 분산을 줄이는가
+
+$B$개 모델이 **완전 독립**이라면 분산은 $\sigma^2/B$로 소멸한다. 그러나 Bootstrap 샘플들은 원 데이터의 63.2%를 공유하므로 모델 간 예측이 상관된다. 동일한 pairwise correlation $\rho$, 개별 분산 $\sigma^2$를 가정하면 정확한 공식은 다음과 같다.
+
+<Theorem kind="theorem" number="1" title="Bagging 분산 공식">
+$B$개 equivariant 모델 — $\text{Var}(f_b) = \sigma^2$, $\text{Cov}(f_b, f_{b'}) = \rho\sigma^2$ ($b \neq b'$) — 의 평균 분산:
+
+$$
+\text{Var}(\bar{f}_B) = \rho \sigma^2 + \frac{1 - \rho}{B}\sigma^2
+$$
+</Theorem>
+
+<Proof>
+$$
+\text{Var}\!\left(\frac{1}{B}\sum_b f_b\right) = \frac{1}{B^2}\bigl[B\sigma^2 + B(B-1)\rho\sigma^2\bigr] = \frac{\sigma^2}{B} + \rho\sigma^2 \cdot \frac{B-1}{B}
+$$
+
+전개하면 $\rho\sigma^2 + \frac{(1-\rho)\sigma^2}{B}$. $B \to \infty$에서 두 번째 항 소멸. $\square$
+</Proof>
+
+이 공식에서 두 가지 사실이 동시에 나온다. 첫째, **기댓값의 선형성**에 의해 $\mathbb{E}[\bar{f}_B] = \mathbb{E}[f_b]$ — Bagging은 bias를 바꾸지 않는다. 따라서 high-variance/low-bias learner(깊은 tree)에게만 효과적이다. 둘째, $B \to \infty$에서 분산의 하한은 $\rho\sigma^2$다 — 아무리 많은 트리를 써도 이 이하로는 내려가지 않는다.
+
+레버는 두 개다. $B$를 늘리는 것과 $\rho$를 줄이는 것. Bagging은 첫 번째 레버만 쓴다.
+
+## Random Forest — $\rho$를 인위적으로 낮추는 전략
+
+Bagging 트리들이 높은 $\rho$를 갖는 이유는 단순하다 — 같은 greedy 알고리즘으로 학습하면 대부분 같은 feature로 첫 번째 분할을 선택한다. 트리 구조가 비슷해지고 $\rho \approx 0.78$까지 치솟는다.
+
+Random Forest는 각 split에서 $p$개 전체 feature가 아니라 **random $m$개 subset만** 후보로 고려한다. 실험에서 도출된 권장값은 다음과 같다.
+
+| 문제 유형 | 권장 $m$ | sklearn 기본값 |
+|:---|:---|:---|
+| Classification | $\sqrt{p}$ | `max_features='sqrt'` |
+| Regression | $p/3$ | `max_features=1.0` |
+
+<Callout type="note" title="트레이드오프">
+$m$을 줄이면 $\rho$가 내려가 앙상블 분산이 줄지만($\rho\sigma^2 \downarrow$), 동시에 개별 트리의 $\sigma^2$가 커진다 — 최적 feature를 못 보는 경우가 늘기 때문이다. $\sqrt{p}$와 $p/3$은 이 두 효과가 균형을 이루는 경험적 sweet spot이다. Breast Cancer 데이터에서 Bagging $\rho \approx 0.78$, RF $\rho \approx 0.41$로 실측된다.
+</Callout>
+
+RF의 일반화 오차 bound는 Breiman(2001)의 정리로 공식화된다.
+
+$$
+P(\text{error}) \leq \frac{\bar{\rho}(1 - s^2)}{s^2}
+$$
+
+여기서 $s$는 평균 margin(정확도), $\bar{\rho}$는 평균 tree correlation이다. 각 트리가 강하고($s$ 큼) 동시에 다양해야($\bar{\rho}$ 작음) 한다는 RF의 설계 철학이 한 부등식에 들어 있다.
+
+## 수렴 보장 — 트리를 더 추가해도 절대 나빠지지 않는다
+
+각 트리 $f_b$는 독립 랜덤 파라미터 $\Theta_b$(bootstrap + feature subset)에 의존한다. $\{f(x; \Theta_b)\}$는 i.i.d. 확률변수 수열이고, 유한 분산 가정 하에 **강한 큰 수의 법칙(SLLN)**이 적용된다.
+
+$$
+\hat{f}_B(x) = \frac{1}{B}\sum_{b=1}^B f(x; \Theta_b) \xrightarrow{a.s.} \mathbb{E}_\Theta[f(x; \Theta)] =: f_\infty(x)
+$$
+
+Dominated Convergence를 더하면 generalization error도 $f_\infty$의 error로 단조수렴한다. 따라서 **$B$를 늘리는 것은 절대 test error를 악화시키지 않는다**.
+
+이것이 Boosting과의 결정적 차이다. Boosting은 $F_t$가 $F_{t-1}$에 순차 의존하므로 train noise까지 fit하면 overfit이 발생하고 early stopping이 필수다. RF는 각 트리가 독립이므로 $B$는 hyperparameter가 아니라 "충분히 크면 되는" 안전한 축이다.
+
+실무 수렴 지점은 $B = 100$에서 최종 성능의 80~90%에 도달하고, $B = 500$ 이후는 marginal하다.
+
+<Aside label="한계">
+수렴이 보장되는 것은 estimator variance(랜덤 tree parameter의 변동)다. 수렴 한계 $f_\infty$ 자체가 갖는 bias, 데이터 의존 분산, irreducible noise는 $B \to \infty$로 사라지지 않는다.
+</Aside>
+
+## Feature Importance — MDI의 함정과 Permutation의 교정
+
+RF 학습 후 `feature_importances_`가 자동으로 나오지만, 이것이 **MDI(Mean Decrease in Impurity)**임을 알아야 한다.
+
+$$
+\text{MDI}(j) = \frac{1}{B}\sum_b \sum_{t: A(t)=j} \frac{|S_t|}{|S|} \Delta I(t)
+$$
+
+MDI는 high-cardinality feature에 구조적으로 편향된다. 카테고리가 많은 feature일수록 더 세밀한 split이 가능하고 Gini 감소 누적이 커지기 때문이다. 랜덤 ID feature가 진짜 informative feature보다 MDI가 두 배 높게 나오는 상황이 실험에서 관찰된다.
+
+**Permutation Importance**는 이 편향을 교정한다 — test set에서 feature $j$를 random shuffle한 뒤 정확도 감소를 측정한다. 일반화 안 되는 feature는 shuffle 전후 정확도 차이가 없으므로 자동으로 0에 가깝게 나온다.
+
+$$
+\text{PI}(j) := \text{Acc}(\text{original}) - \text{Acc}(\text{permuted } X_j)
+$$
+
+단, 상관된 feature 쌍에서 한 feature만 permute하면 학습 분포 밖 영역을 평가하는 문제가 생긴다 — Strobl(2008)의 conditional permutation이나 SHAP이 이를 해결한다. SHAP의 Shapley value는 feature subset에 대한 coalition 평균으로 attribution을 정의하며, local accuracy·missingness·consistency 세 axiom을 만족하는 유일한 attribution임이 증명되어 있다.
+
+## 정리
+
+- Bootstrap의 63.2%는 극한 $1 - 1/e$에서 나온다. 이 나머지 36.8%가 OOB validation을 "공짜"로 만든다.
+- Bagging의 효과는 $\rho\sigma^2 + (1-\rho)\sigma^2/B$로 정확히 분해된다. bias는 변하지 않으며, 레버는 $B$와 $\rho$ 두 개다.
+- RF는 각 split의 random feature subset으로 $\rho$를 낮춘다. $m = \sqrt{p}$는 다양성과 개별 정확성의 경험적 균형점이다.
+- SLLN이 $\hat{f}_B \xrightarrow{a.s.} f_\infty$를 보장하므로, 트리 수는 hyperparameter가 아니라 안전한 축이다.
+- `feature_importances_`(MDI)는 high-cardinality feature에 편향된다. 중요 결정에는 반드시 `permutation_importance`나 SHAP을 함께 확인해야 한다.
+
+다음 글에서는 이 공식의 반대편 — bias를 직접 줄이는 Boosting의 sequential 구조가 어떻게 AdaBoost의 exponential loss 유도로 이어지는지 추적한다.
+
+<Reference
+  title="Random Forests"
+  authors="Breiman, L."
+  year={2001}
+  venue="Machine Learning"
+  url="https://link.springer.com/article/10.1023/A:1010933404324"
