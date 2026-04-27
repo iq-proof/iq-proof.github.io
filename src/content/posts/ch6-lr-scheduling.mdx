@@ -1,0 +1,109 @@
+---
+title: "LR 스케줄링의 통일 원리 — 왜 하나의 철학으로 수렴하는가"
+description: "고정 LR의 O(1/T) 보장부터 warmup의 curvature 안정화, cosine+warm restart의 local minimum 탐색, One-Cycle의 super-convergence까지, 현대 LR 스케줄링 전체를 관통하는 설계 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [learning-rate, optimization, sgd, scheduler, convergence]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Learning rate scheduling은 딥러닝 실전에서 가장 자주 건드리는 하이퍼파라미터이면서, 이론과 실전의 간극이 가장 큰 영역이기도 하다. 고정 LR, warmup, cosine annealing, One-Cycle — 표면적으로 다른 기법들이지만, 각각의 설계 결정을 수렴 이론과 loss landscape 동역학의 언어로 읽으면 하나의 공통 질문에 수렴한다. **"어느 시점에 얼마나 큰 step을 밟아야 하는가?"**
+
+## 고정 LR이 이미 답하는 것
+
+Convex smooth 함수에서 $\eta = 1/L$ 고정이면 GD는 $O(1/T)$로 수렴한다.
+
+$$f(x_T) - f^* \leq \frac{L\|x_0 - x^*\|^2}{2T}$$
+
+분자 $L\|x_0 - x^*\|^2$는 초기값에만 의존하는 고정 상수다. 분모는 $T$에 선형으로 성장한다. 이 말은 초반 500 스텝과 후반 500 스텝이 같은 크기의 step으로 error를 줄이는 효율이 다르다는 뜻이다 — 후반으로 갈수록 같은 step으로 줄일 수 있는 여지가 작아진다.
+
+strongly convex 설정에서는 상황이 달라진다. $\mu$-strongly convex이면 $\eta_t = 2/(\mu t + L)$의 감소 LR로 SGD의 $O(1/T)$ 수렴을 보장할 수 있다.
+
+<Theorem kind="theorem" number="1" title="Strongly Convex SGD 감소 LR 수렴">
+$f$가 $\mu$-strongly convex, $L$-smooth이고 stochastic gradient의 분산이 $\sigma^2$으로 유계일 때, $\eta_t = 2/(\mu t + L)$로 설정하면
+
+$$\mathbb{E}\|x_T - x^*\|^2 \leq \frac{C\sigma^2}{\mu T} = O(1/T)$$
+
+가 성립한다.
+</Theorem>
+
+<Proof>
+$\mu$-strong convexity로부터 $\nabla f(x_t)^\top(x_t - x^*) \geq \mu\|x_t - x^*\|^2$가 따라나온다. Descent lemma와 결합하면
+
+$$\mathbb{E}[f(x_{t+1}) - f(x^*)] \leq (1 - \eta_t\mu)\mathbb{E}[f(x_t) - f^*] + \frac{L\eta_t^2\sigma^2}{2}$$
+
+$\eta_t = c/t$ 형태에서 첫 항의 $(1 - c\mu/t)$ 곱이 telescoping되고 두 번째 항이 누적되는 균형을 맞출 때, $\eta_t = 2/(\mu t + L)$이 그 균형점이다. $\square$
+</Proof>
+
+strongly convex 조건 없이 convex만 성립하면 $\eta_t = D/(G\sqrt{t})$ 형태로 감소해야 $O(1/\sqrt{T})$ 수렴이 가능하다 — $O(1/T)$가 아닌 제곱근 감소가 이론적 하한이 된다. LR의 감소 속도가 수렴 보장의 형태 자체를 결정한다.
+
+| 설정 | 최적 LR | 수렴률 |
+|---|---|---|
+| Convex GD | $\eta = 1/L$ (고정) | $O(1/T)$ |
+| Strongly Convex SGD | $\eta_t = 2/(\mu t + L)$ (감소) | $O(1/T)$ |
+| Convex SGD | $\eta_t = D/(G\sqrt{t})$ (제곱근 감소) | $O(1/\sqrt{T})$ |
+| Non-convex (실전) | step decay, cosine, One-Cycle | 이론 없음 → 실증 |
+
+## Warmup — 이론이 아니라 메커니즘
+
+신경망은 strongly convex도 아니고 convex도 아니다. 그럼에도 LR scheduling이 효과를 발휘하는 이유는 수렴 보장 때문이 아니라, 초기 loss landscape의 기하학 때문이다.
+
+Gilmer et al. 2022의 핵심 관찰: 훈련 초기 몇 스텝에서 loss의 sharpness $\mathcal{S}(t) := \|\nabla^2 f(x_t)\|_2$가 급격히 증가한다.
+
+$$\mathcal{S}(t) \propto t^\alpha, \quad \alpha \approx 0.5 \sim 1.0$$
+
+GD의 안정성 조건은 $\eta < 2/\lambda_{\max}(H)$다. sharpness가 증가하는 동안 $\eta$가 고정되어 있으면, 어느 순간 이 조건이 위반된다. ImageNet을 batch size 8192로 훈련할 때 warmup 없이는 발산하는 이유가 여기 있다.
+
+<Callout type="warning" title="sharpness 급등과 고정 LR">
+초기에 sharpness가 수배로 증가하는 동안 $\eta$가 고정되면, $\eta > 2/\mathcal{S}(t)$ 조건이 위반되어 학습이 발산할 수 있다. Warmup은 이 위험 구간을 작은 LR로 통과하는 전략이다.
+</Callout>
+
+Linear warmup $\eta_t = \eta_{\max} \cdot t/T_{\text{warm}}$은 sharpness가 안정화될 때까지 step 크기를 억제한다. Transformer pre-LN vs post-LN의 차이도 이 프레임에서 읽힌다. Post-LN은 깊이가 증가할수록 초기 gradient scale이 누적되어 $\lambda_{\max}(H)$가 높아지지만, pre-LN은 각 sublayer 입력이 정규화되어 Hessian의 상한이 낮다 — 따라서 pre-LN이 warmup 없이도 상대적으로 안정적이다.
+
+Goyal et al. 2017의 linear scaling rule도 같은 원리에서 나온다. batch size $B$를 키우면 gradient 노이즈는 줄지만 true Hessian이 더 잘 드러나 $\lambda_{\max}$가 높아지므로, warmup period를 함께 늘려야 한다.
+
+## Cosine + Warm Restart — 탐색을 구조화하다
+
+Warmup이 "초기를 어떻게 통과하느냐"의 문제였다면, cosine annealing과 SGDR은 "같은 epoch 예산으로 더 좋은 minimum을 찾을 수 있는가"의 문제다.
+
+$$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\left(\frac{\pi t}{T}\right)\right)$$
+
+cosine 형태의 이점은 수렴 보장에 있는 것이 아니라 부드러움에 있다. Step decay에서 $t = T_i$는 LR이 불연속적으로 감소하는 점이다. cosine은 $t \in (0, T)$에서 $d\eta_t/dt$가 연속이다 — SGD trajectory가 LR 변화 자체로 인한 충격을 받지 않는다.
+
+SGDR의 warm restart는 더 근본적인 아이디어다. 각 cosine phase가 끝날 때 $\eta_t \approx \eta_{\min}$ 근처에서 모델이 어떤 local minimum에 수렴한다. 그 직전에 weight를 저장(snapshot)하고, LR을 다시 $\eta_{\max}$로 올리면 기존 minimum에서 탈출해 인근의 다른 minimum을 탐색하게 된다.
+
+Garipov et al. 2018이 보인 mode connectivity — 서로 다른 초기화로 훈련한 두 해 $\theta_A, \theta_B$ 사이에 저손실 경로가 존재한다는 사실 — 은 이 탐색이 왜 의미 있는지 설명한다. snapshot들의 diversity가 클수록 ensemble variance가 줄어든다. Loshchilov & Hutter 2017의 실험에서 SGDR + snapshot ensemble은 단일 모델 대비 CIFAR-10 accuracy를 약 1%p 이상 향상시켰다.
+
+<Aside label="free lunch?">
+Snapshot ensemble은 추가 훈련 없이 성능을 올린다는 점에서 free lunch처럼 보인다. 실제로는 SGDR의 warm restart가 diversity를 만들어내는 비용을 치른 셈이다. 단순 cosine으로 훈련한 마지막 weight만 저장해서는 같은 효과가 없다.
+</Aside>
+
+## One-Cycle — 두 시간 스케일의 교대
+
+Cosine annealing이 "감소"라는 방향성을 유지했다면, Smith 2018의 One-Cycle Policy는 LR을 먼저 올렸다가 내린다.
+
+$$\eta_t = \begin{cases} \eta_{\min} + \dfrac{t}{p_1 T}(\eta_{\max} - \eta_{\min}) & t < p_1 T \\[6pt] \eta_{\max} - \dfrac{t - p_1 T}{(1-p_1)T}(\eta_{\max} - \eta_{\min}) & t \geq p_1 T \end{cases}$$
+
+여기에 momentum을 역방향으로 결합한다. LR이 높아지는 구간에서는 momentum을 낮추고($\beta_{\max} \to \beta_{\min}$), LR이 낮아지는 구간에서는 높인다($\beta_{\min} \to \beta_{\max}$). 높은 LR로 탐색할 때 관성을 줄여 발산을 제어하고, 낮은 LR로 수렴할 때 관성을 높여 fine-tuning 속도를 올리는 상보적 설계다.
+
+CIFAR-10 ResNet-56에서 200 epoch 표준 훈련과 50 epoch One-Cycle이 비슷한 accuracy에 도달한다는 결과는 "super-convergence"라 불렸다. 이론적 설명은 아직 미완이지만 메커니즘은 두 시간 스케일의 교대다. 높은 LR 구간은 global landscape를 빠르게 탐색하고, 낮은 LR 구간은 local structure에 수렴한다. One-Cycle의 $\eta_{\max}$는 LR range test — 훈련 초기에 LR을 $10^{-4}$에서 천천히 올리면서 loss를 추적하고 loss가 급격히 증가하기 직전 값을 채택 — 로 결정한다. 이는 empirical하게 $2/\lambda_{\max}(H)$의 근사값을 찾는 과정이다.
+
+<Callout type="note" title="트레이드오프">
+One-Cycle은 hyperparameter($\eta_{\max}$, $p_1$, $\beta_{\min}$)에 민감하다. LR range test로 $\eta_{\max}$를 잘 찾으면 빠른 수렴을 얻지만, 잘못 설정하면 표준 cosine보다 나쁠 수 있다. SGDR은 상대적으로 robust하지만 총 epoch 예산을 더 요구한다. strongly convex 이론이 보장하는 $O(1/T)$는 실전 신경망에 직접 적용되지 않으므로, 어느 스케줄이든 이론 보장이 아닌 실증에 의존한다.
+</Callout>
+
+## 정리
+
+- 수렴 이론은 LR 감소의 방향과 속도를 처방한다. strongly convex이면 $\eta_t \propto 1/t$로 $O(1/T)$, convex only이면 $\eta_t \propto 1/\sqrt{t}$로 $O(1/\sqrt{T})$가 하한이다.
+- Warmup은 이론이 아니라 초기 sharpness 급등이라는

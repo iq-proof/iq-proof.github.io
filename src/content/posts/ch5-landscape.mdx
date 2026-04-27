@@ -1,0 +1,146 @@
+---
+title: "Loss Landscape는 어떻게 생겼는가"
+description: "고차원 saddle point의 통계적 희귀성부터 NTK의 lazy regime까지, 딥러닝 loss landscape의 기하학을 하나의 프레임으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [loss-landscape, saddle-point, ntk, flat-minima, mode-connectivity]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+SGD는 왜 saddle point에 갇히지 않고 계속 진행하는가? flat minima가 sharp minima보다 정말 더 일반화가 좋은가? 두 개의 독립적으로 훈련된 모델 사이에는 무엇이 있는가? 이 질문들은 서로 무관해 보이지만, 하나의 공통 프레임에서 답할 수 있다 — **고차원 loss landscape의 기하학**이다.
+
+## 고차원에서 saddle point는 얼마나 흔한가
+
+직관부터 거스르자. 우리는 흔히 "saddle point에 갇히면 어떻게 탈출하나"를 고민하지만, Dauphin et al. (2014)의 답은 의외다: 고차원에서 local minimum은 지수적으로 희귀하고, critical point의 거의 전부가 saddle이다.
+
+Random smooth function의 critical point에서 Hessian을 떠올리자. Wigner 반원 법칙에 따르면, 대칭 random matrix의 eigenvalue 분포는 반원을 따르며 그 절반이 음수다.
+
+$$
+\rho(\lambda) = \frac{1}{2\pi} \sqrt{4 - \lambda^2}, \quad \lambda \in [-2, 2]
+$$
+
+이를 바탕으로 Dauphin이 유도한 핵심 결과:
+
+$$
+\Pr[\text{local min} \mid \text{critical}] \approx e^{-cp}
+$$
+
+$p = 100$차원이면 이 확률은 $\approx 10^{-45}$다. **Local minimum은 거의 없다.** 반면 saddle은 거의 모두 escape 방향(negative eigenvalue의 eigenvector)을 가지므로, gradient noise만으로도 탈출이 자연스럽게 일어난다.
+
+<Aside label="고차원성의 역설">
+차원이 높을수록 최적화가 더 어렵다고 직관하기 쉽다. 하지만 Dauphin의 결과는 정반대를 말한다 — 고차원성 자체가 saddle point 탈출을 쉽게 만든다. Local minimum이 지수적으로 사라지기 때문이다.
+</Aside>
+
+## Flat vs Sharp: 논쟁의 핵심
+
+Saddle point 탈출보다 훨씬 논쟁적인 질문이 있다 — **어디에 수렴하느냐**가 일반화에 영향을 주는가?
+
+Hochreiter–Schmidhuber (1997)의 직관은 이렇다: flat minimum은 주변 perturbation에 loss가 크게 변하지 않으므로, test data에서도 robust하다. Keskar et al. (2017)은 이를 실험으로 뒷받침했다 — large-batch 훈련은 Hessian trace가 높은 sharp minimum으로 수렴하고, 실제로 일반화가 더 나쁘다.
+
+<Callout type="warning" title="Dinh의 반론">
+ReLU network에서 layer $l$의 weight를 $W_l \to \sigma W_l$, $W_{l+1} \to W_{l+1}/\sigma$로 rescale하면 network 함수는 불변이지만 Hessian eigenvalue는 $\sigma^2$배로 변한다. **Sharpness는 parameterization에 의존하므로 그 자체로는 의미 있는 척도가 아닐 수 있다.**
+</Callout>
+
+Dinh et al. (2017)의 이 반론은 개념의 정의 자체를 흔들었다. 대응책은 reparameterization-invariant 척도다 — PAC-Bayes margin:
+
+$$
+\gamma(x^*) := \sup\{r : \forall x \in B(x^*, r),\ L(x) \leq L(x^*) + \epsilon\}
+$$
+
+이 margin이 크다는 것은 "큰 ball 안에서 loss가 낮다"는 뜻이며, 이는 model complexity를 실질적으로 제한해 generalization bound를 tight하게 만든다. SAM(Sharpness Aware Minimization) 같은 실전 기법들이 표방하는 "landscape 정규화"는 정확히 이 margin을 키우는 행위다.
+
+## Loss Landscape를 실제로 보면
+
+Li et al. (2018)은 고차원 landscape를 2D로 시각화하는 방법을 제시했다. 핵심 아이디어는 두 방향을 선택하는 것이다:
+
+$$
+L_{\text{2D}}(\alpha, \beta) := L\!\left(\theta^* + \alpha\, d_1 + \beta\, d_2\right)
+$$
+
+$d_1$은 초기화에서 최종 weight로의 방향(SGD 실제 이동 경로), $d_2$는 $d_1$에 직교하는 random 방향. 이 선택이 중요한 이유는 visualization이 **training dynamics와 정렬**되어야 interpretable하기 때문이다.
+
+여기서 filter normalization이 필요하다. ReLU network는 weight를 $\sigma$배 rescale해도 함수가 불변이므로, step을 layer별 weight norm으로 정규화하지 않으면 architecture마다 landscape 스케일이 달라진다.
+
+<Theorem kind="theorem" number="1" title="ResNet의 Landscape Smoothing (Li et al. 2018)">
+동일 크기의 Vanilla CNN과 ResNet을 ImageNet에서 훈련한 후 filter normalization된 2D visualization을 비교하면, ResNet은 더 넓은 valley와 낮은 Hessian sharpness를 보인다. Skip connection이 landscape를 민주화한다.
+</Theorem>
+
+이와 함께 BatchNorm의 효과도 정량화된다 — Santurkar et al. (2018)에 따르면 BatchNorm은 Hessian의 condition number $\kappa(H) = \lambda_{\max}/\lambda_{\min}$를 낮춰 gradient descent가 더 큰 step을 안정적으로 밟을 수 있게 한다.
+
+## Mode Connectivity: 해들은 연결되어 있다
+
+두 개의 독립적으로 훈련된 모델 $\theta_A$, $\theta_B$를 linear interpolation하면 중간에 loss spike가 생긴다. 하지만 Garipov et al. (2018)은 놀라운 사실을 보였다 — 제어점을 최적화한 Bezier 곡선으로 이동하면 barrier 없이 연결된다.
+
+$$
+\gamma_B(t) = (1-t)^3 \theta_A + 3(1-t)^2 t\, \mathbf{c}_1 + 3(1-t)t^2\, \mathbf{c}_2 + t^3 \theta_B
+$$
+
+제어점 $(\mathbf{c}_1^*, \mathbf{c}_2^*)$를 $\max_t L(\gamma_B(t))$를 최소화하도록 학습하면, CIFAR-10 ResNet 기준으로 linear interpolation의 0.3+ barrier가 0.06 수준으로 줄어든다.
+
+이 현상은 Ch5-01의 이론적 귀결이기도 하다. 고차원에서 saddle point가 드물고 해들이 넓게 퍼져 있다면, 그 사이를 저비용 경로로 연결할 수 있다는 것은 **landscape의 approximate quasi-convexity**를 시사한다. Lottery ticket hypothesis와도 연결된다 — sparse subnetwork가 full network와 mode-connected되어 있다면, 그것들은 같은 "solution manifold"의 다른 표현이다.
+
+## NTK와 Lazy Regime: 또 다른 극한
+
+Jacot et al. (2018)의 Neural Tangent Kernel은 이 논의에 전혀 다른 각도를 제공한다. 무한폭 극한에서 network는 lazy regime에 진입한다 — weight가 초기화 근처에서 거의 움직이지 않고, 함수는 parameter에 대해 선형처럼 행동한다.
+
+$$
+f(x;\, \theta_t) \approx f(x;\, \theta_0) + \underbrace{\frac{\partial f(x;\, \theta_0)}{\partial \theta}}_{\text{Jacobian}} (\theta_t - \theta_0), \quad \|\theta_t - \theta_0\|_\infty = O\!\left(\tfrac{1}{\sqrt{n}}\right)
+$$
+
+이 근사 하에서 training dynamics는 kernel gradient descent와 동일해지고, loss는 NTK matrix의 최소 eigenvalue에 의해 지수적으로 감소한다:
+
+$$
+L(t) \lesssim \exp(-\eta\, \lambda_{\min}(K_n)\cdot t)
+$$
+
+<Callout type="note" title="트레이드오프">
+Lazy regime은 이론적으로 아름답지만, 실전에서는 두 가지 대가가 있다. 첫째, lazy하게 유지되려면 width가 $O(n^2)$ 이상이어야 한다 — 대부분의 실제 네트워크는 그렇지 않다. 둘째, lazy regime은 feature learning을 포기한다. Weight가 움직이지 않으면 데이터에 맞는 new representation을 학습할 수 없다. 실전 훈련은 초기 NTK phase와 중기 feature learning phase를 모두 거친다.
+</Callout>
+
+Saddle point가 드물다는 Dauphin의 결과와 weight가 거의 움직이지 않는다는 NTK 결과는 상충처럼 보인다. 하지만 두 결과는 서로 다른 regime을 기술한다 — 전자는 loss landscape의 전체적 기하학, 후자는 초기화 근처의 local behavior다.
+
+## 정리
+
+- 고차원에서 local minimum은 $e^{-cp}$의 확률로 희귀하다. Critical point의 거의 전부가 saddle이며, escape 방향이 존재한다.
+- Flat minima가 좋다는 직관은 옳지만, Hessian-based sharpness는 reparameterization에 의존한다. Scale-invariant margin이 올바른 척도다.
+- Skip connection과 BatchNorm은 landscape를 구조적으로 smooth하게 만들며, 이는 시각화와 Hessian analysis로 정량화된다.
+- 독립적으로 훈련된 두 모델은 low-loss Bezier path로 연결된다 — landscape는 approximate quasi-convex 구조를 가진다.
+- NTK의 lazy regime은 무한폭 근사에서 성립한다. 실전은 lazy와 feature learning의 전환이다.
+
+Loss landscape를 기하학으로 이해한다는 것은 "왜 SGD가 작동하는가"에 대한 사후 설명이 아니다. 어떤 아키텍처 선택이 landscape를 어떻게 바꾸는지, 어떤 optimizer가 어떤 regime에서 이점을 갖는지 예측하는 언어다.
+
+<Reference
+  title="Identifying and attacking the saddle point problem in high-dimensional non-convex optimization"
+  authors="Dauphin et al."
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1406.2572"
+/>
+
+<Reference
+  title="Visualizing the Loss Landscape of Neural Nets"
+  authors="Li et al."
+  year={2018}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1712.09913"
+/>
+
+<Reference
+  title="Neural Tangent Kernel: Convergence and Generalization in Neural Networks"
+  authors="Jacot et al."
+  year={2018}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1806.07572"
+/>

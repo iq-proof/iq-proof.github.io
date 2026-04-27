@@ -1,0 +1,141 @@
+---
+title: "Gradient Descent의 수렴 보장은 어디까지인가"
+description: "Steepest descent의 기하학적 유도부터 convex/strongly convex/non-convex 수렴 속도 비교, proximal gradient까지 — GD 계열 알고리즘의 이론적 한계를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gradient-descent, convex-optimization, convergence, proximal-gradient]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+딥러닝 코드에서 `optimizer.step()`을 호출할 때, 내부에서는 gradient descent의 변형이 실행된다. 그런데 이 알고리즘은 어떤 조건에서 수렴하고, 얼마나 빠른가? 그리고 신경망처럼 non-convex한 함수에서는 무엇을 보장할 수 있는가?
+
+## GD는 왜 gradient 방향인가
+
+Gradient descent의 업데이트 규칙 $x_{t+1} = x_t - \eta \nabla f(x_t)$는 직관적으로 "내리막 방향"이지만, 이것이 수학적으로 **steepest descent**임을 유도할 수 있다.
+
+현재 위치 $x$에서 거리 제약 $\|s\| \leq \eta$ 하에 $f$를 가장 빠르게 감소시키는 방향을 구하면, 1차 Taylor 근사에서 다음 문제가 된다.
+
+$$\min_{\|s\| \leq \eta} \nabla f(x)^\top s$$
+
+Cauchy–Schwarz 부등식에 의해 $\nabla f^\top s = \|\nabla f\| \|s\| \cos\theta$이고, 이는 $\theta = \pi$일 때 최소다. 따라서 최적 방향은 정확히 $-\nabla f(x) / \|\nabla f(x)\|$다.
+
+<Theorem kind="proposition" number="1" title="Steepest Descent 특성화">
+$\nabla f(x) \neq 0$일 때, 단위 벡터 $\|u\| = 1$ 제약 하에서 방향도함수 $\nabla_u f(x) = \nabla f(x)^\top u$를 최소화하는 방향은
+
+$$\arg\min_{\|u\|=1} \nabla f(x)^\top u = -\frac{\nabla f(x)}{\|\nabla f(x)\|}$$
+</Theorem>
+
+<Proof>
+Cauchy–Schwarz에 의해 $\nabla f(x)^\top u \geq -\|\nabla f(x)\| \|u\| = -\|\nabla f(x)\|$. 등호는 $u = -\nabla f(x) / \|\nabla f(x)\|$일 때만 성립한다. $\square$
+</Proof>
+
+Discrete GD는 연속시간 ODE인 **gradient flow** $\dot{x}(t) = -\nabla f(x(t))$의 Euler 전진 근사다. 스텝 크기 $\eta$를 시간 간격으로 해석하면 $x_t \approx x(t\eta)$이고, 오차는 $O(\eta^2)$다.
+
+## Convex Smooth: O(1/T) 수렴의 조건
+
+$f$가 $L$-Lipschitz smooth이면, 임의의 $x, y$에 대해 다음 **Descent Lemma**가 성립한다.
+
+$$f(y) \leq f(x) + \nabla f(x)^\top(y-x) + \frac{L}{2}\|y-x\|^2$$
+
+이를 $y = x_t - \eta \nabla f(x_t)$에 적용하면 한 스텝의 감소량이 결정된다.
+
+$$f(x_{t+1}) \leq f(x_t) - \eta\left(1 - \frac{L\eta}{2}\right)\|\nabla f(x_t)\|^2$$
+
+계수 $\eta(1 - L\eta/2)$가 양수이려면 $\eta < 2/L$이 필요하다. $\eta = 1/L$에서 이 계수가 최대화되며, 이것이 **최적 학습률**이다.
+
+<Theorem kind="theorem" number="2" title="Convex Smooth GD의 수렴">
+$f$가 convex이고 $L$-smooth이며 $\eta = 1/L$이면,
+
+$$f(x_T) - f^* \leq \frac{\|x_0 - x^*\|^2}{2T}$$
+</Theorem>
+
+수렴 속도는 $O(1/T)$다. 직관적으로 각 스텝마다 gradient norm의 제곱만큼 감소하고, 이를 $T$번 누적하면 평균적으로 $O(1/T)$의 suboptimality가 남는다.
+
+## Strongly Convex: 지수 수렴과 조건수
+
+$f$가 $\mu$-strongly convex이면 Hessian의 최소 eigenvalue가 $\mu > 0$으로 bounded below다. 이는 함수 바닥이 포물선 형태임을 보장하고, gradient flow가 지수적으로 수렴한다.
+
+<Theorem kind="theorem" number="3" title="Strongly Convex + Smooth GD의 수렴">
+$f$가 $\mu$-strongly convex이고 $L$-smooth이며 $\eta = 1/L$이면,
+
+$$\|x_T - x^*\|^2 \leq \left(1 - \frac{\mu}{L}\right)^T \|x_0 - x^*\|^2$$
+</Theorem>
+
+$O(1/T)$에서 **지수적 감소**로 속도가 향상된다. 이 수렴을 지배하는 것은 **조건수** $\kappa = L/\mu$다. $\epsilon$ 정밀도에 도달하는 데 필요한 반복 횟수는 대략 $T \approx \kappa \log(1/\epsilon)$이다.
+
+<Callout type="warning" title="조건수의 대가">
+$\kappa = 10^6$이면 $\epsilon = 10^{-6}$ 정밀도에 약 $1.4 \times 10^7$ 스텝이 필요하다. Ridge regression에서 정규화 계수 $\lambda$를 키우면 Hessian 최소 eigenvalue가 $2\lambda$로 상향되어 $\kappa$가 감소한다 — 수렴 속도와 bias 사이의 트레이드오프다.
+</Callout>
+
+## Non-Convex: Stationary Point로의 수렴
+
+신경망 훈련은 non-convex 문제다. Convexity 없이도 Descent Lemma는 성립하므로, 다음 결과를 유도할 수 있다.
+
+<Theorem kind="theorem" number="4" title="Non-Convex Smooth GD의 수렴">
+$f$가 $L$-smooth이고 bounded below이며 $\eta = 1/L$이면,
+
+$$\min_{t \leq T} \|\nabla f(x_t)\|^2 \leq \frac{2L(f(x_0) - f^*)}{T}$$
+</Theorem>
+
+<Proof>
+Descent Lemma에서 $f(x_t) - f(x_{t+1}) \geq \frac{1}{2L}\|\nabla f(x_t)\|^2$. $t=0$부터 $T-1$까지 합산하면
+
+$$\sum_{t=0}^{T-1} \|\nabla f(x_t)\|^2 \leq 2L(f(x_0) - f^*)$$
+
+$T$개 항의 합이 bounded이면 최소항은 평균 이하이므로 결과가 성립한다. $\square$
+</Proof>
+
+보장하는 것은 **global minimum이 아니라 stationary point**다. 즉 $\|\nabla f\| = 0$인 점 근방 도달만 보장하며, 그 점이 local min인지 saddle인지는 알 수 없다.
+
+고차원에서 random Hessian의 최소 eigenvalue가 음수일 확률은 차원이 커질수록 1에 가까워진다. 즉 고차원 non-convex 문제에서는 대부분의 stationary point가 **strict saddle**이다. Strict saddle ($\lambda_{\min}(H) < 0$)에서는 negative curvature 방향으로 작은 perturbation을 가하면 GD가 탈출한다. Perturbed GD는 $\text{poly}(d)/\epsilon^2$ 스텝 내에 $\epsilon$-approximate local minimum에 도달한다 (Ge et al. 2015).
+
+<Aside label="SGD와 saddle">
+SGD의 미니배치 노이즈는 자연스러운 perturbation으로 작동한다. Negative eigenvector 방향으로 성분이 생기면 saddle에서 자동으로 벗어나는데, 이것이 plain GD보다 SGD가 non-convex landscape에서 더 잘 작동하는 이유 중 하나다.
+</Aside>
+
+## Proximal Gradient: Non-Smooth 항의 분리
+
+Lasso처럼 $f(x) + g(x)$ 형태의 목적함수에서 $f$는 smooth하고 $g$는 non-smooth한 경우 (예: $\|x\|_1$), **proximal gradient**가 표준 도구다.
+
+$$\text{prox}_\lambda g(x) := \arg\min_z \left\{g(z) + \frac{1}{2\lambda}\|z-x\|^2\right\}$$
+
+업데이트 규칙은 "forward step(gradient) + backward step(proximal)"의 분리다.
+
+$$x_{t+1} = \text{prox}_{\eta g}(x_t - \eta \nabla f(x_t))$$
+
+$g(x) = \|x\|_1$의 경우 closed-form이 존재한다.
+
+$$\text{prox}_\lambda \|\cdot\|_1(x) = \text{sign}(x) \odot \max(|x| - \lambda,\ 0)$$
+
+이것이 **soft thresholding**이며, Lasso의 ISTA 알고리즘의 핵심이다. Nesterov acceleration을 추가한 FISTA는 $O(1/T^2)$ 수렴을 달성한다.
+
+<Callout type="note" title="트레이드오프">
+| 설정 | 수렴 속도 | 조건 |
+|:---|:---|:---|
+| Convex smooth | $O(1/T)$ | Lipschitz smooth |
+| Strongly convex smooth | $O((1-\mu/L)^T)$ | Hessian 최소 eigenvalue $\mu > 0$ |
+| Non-convex smooth | $O(1/\sqrt{T})$ — gradient norm | Lipschitz smooth, bounded below |
+| Proximal (convex) | $O(1/T)$ 또는 $O(1/T^2)$ | Smooth + non-smooth 분리 |
+
+조건이 강할수록 보장이 강하다. 신경망 훈련은 non-convex이므로 stationary point 수렴만 이론적으로 보장된다.
+</Callout>
+
+## 정리
+
+- GD의 $-\nabla f$ 방향은 Cauchy–Schwarz에 의한 steepest descent이며, gradient flow의 Euler 이산화다.
+- Convex smooth에서는 $O(1/T)$, strongly convex smooth에서는 지수 수렴이 보장된다. 수렴 속도는 조건수 $\kappa = L/\mu$에 반비례한다.
+- Non-convex smooth에서 GD는 global minimum을 보장하지 않는다. $O(1/\sqrt{T})$ 속도로 gradient norm이 작아질 뿐이며, strict saddle에서는 perturbation으로 탈출 가능하다.
+- Proximal gradient는 non-smooth 항을 명시적으로 처리해 Lasso 같은 문제를 $O(1/T)$, 가속 시 $O(1/T^2)$로 해결한다.
+
+"왜 Adam이 필요한가"라는 질문의 답은 이 챕터에 있다 — 고정된 $\eta$로는 조건수와 non-convexity를 동시에 다루기 어렵기 때문이다.

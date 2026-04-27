@@ -1,0 +1,154 @@
+---
+title: "SGD는 왜 수렴하는가 — Robbins–Monro부터 Implicit Regularization까지"
+description: "학습률 스케줄의 수학적 근거인 Robbins–Monro 조건부터 SGD noise가 flat minima를 선호하는 이유까지, 딥러닝 최적화의 이론적 토대를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [sgd, optimization, convergence, implicit-regularization, learning-rate]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+SGD는 현대 딥러닝의 기본 최적화 알고리즘이다. 그런데 "왜" 작동하는지 물으면 대부분 막힌다. 학습률 스케줄은 왜 그런 형태인지, 상수 학습률은 왜 수렴을 보장하지 않는지, 그리고 같은 목적함수를 최적화하는데 왜 SGD가 GD보다 일반화가 잘 되는지 — 이 질문들에는 하나의 공통된 답이 있다. SGD의 **noise 구조**가 수렴 조건과 해의 기하학을 동시에 결정한다.
+
+## 출발점: Robbins–Monro 조건
+
+1951년 Robbins와 Monro는 확률적 근사(stochastic approximation)의 수렴 조건을 확립했다. SGD의 update는 다음과 같다.
+
+$$
+x_{t+1} = x_t - \eta_t g_t, \quad \mathbb{E}[g_t \mid \mathcal{F}_t] = \nabla f(x_t)
+$$
+
+$g_t$는 unbiased gradient estimator이고 $\xi_t = g_t - \nabla f(x_t)$는 noise다. 이 noise가 장기적으로 어떻게 행동하는지가 수렴의 핵심이다.
+
+<Theorem kind="definition" number="1" title="Robbins–Monro 조건">
+학습률 수열 $\{\eta_t\}$가 다음 두 조건을 만족할 때 Robbins–Monro 조건을 만족한다.
+
+$$
+\sum_{t=0}^\infty \eta_t = \infty, \quad \sum_{t=0}^\infty \eta_t^2 < \infty
+$$
+</Theorem>
+
+두 조건의 직관은 명확하다. 첫 번째 조건 $\sum \eta_t = \infty$는 "충분한 진전"을 보장한다 — 학습률이 너무 빨리 0으로 가면 최적점에 도달하기 전에 이동이 멈춘다. 두 번째 조건 $\sum \eta_t^2 < \infty$는 "noise 억제"를 담당한다 — 학습률이 충분히 빨리 감소해야 누적 random 편차가 유한하게 수렴한다.
+
+$\eta_t = 1/t$는 두 조건을 모두 만족한다. $\eta_t = c$ (상수)는 $\sum c^2 = \infty$이므로 두 번째 조건을 위반한다. 상수 학습률로 훈련한 모델이 특정 noise floor 아래로 내려가지 않는 이유가 여기에 있다.
+
+## 수렴 속도의 계층
+
+수렴 조건이 확립되면 자연스러운 질문이 따라온다 — 얼마나 빠른가? 함수의 기하학적 성질에 따라 rate가 달라진다.
+
+**Convex 함수**에서 Polyak–Ruppert averaging을 적용하면 다음이 성립한다.
+
+$$
+\mathbb{E}[f(\bar{x}_T) - f^*] \leq \frac{2DG}{\sqrt{T}}
+$$
+
+여기서 $\bar{x}_T = \frac{1}{T}\sum_{t=0}^{T-1} x_t$는 iterate 평균이다. Nemirovski의 하한(1983)은 단일 gradient query만 사용하는 어떤 알고리즘도 이보다 빠를 수 없음을 보인다 — $O(1/\sqrt{T})$는 optimal이다.
+
+**$\mu$-strongly convex 함수**에서는 상황이 다르다. $\eta_t = 1/(\mu(t+1))$로 설정하면
+
+$$
+\mathbb{E}[\|x_t - x^*\|^2] \leq \left(1 - \frac{\mu}{L}\right)^t \|x_0 - x^*\|^2 + \frac{\sigma^2}{\mu^2 t}
+$$
+
+초기항은 condition number $\kappa = L/\mu$에 의존하는 지수 감소다. 최종항은 noise로 인한 $O(1/t)$ floor다. Averaging을 적용하면 이 floor가 점근 최적값 $\sigma^2/(2\mu^2 t)$으로 감소한다.
+
+**Non-convex 함수** — 실제 신경망의 세계 — 에서는 최적점이 아니라 임계점으로만 수렴을 보장할 수 있다.
+
+<Theorem kind="theorem" number="2" title="Ghadimi–Lan 2013">
+$f$가 $L$-smooth이고 gradient variance가 $\sigma^2$로 유계일 때,
+
+$$
+\min_{t \in [T]} \mathbb{E}[\|\nabla f(x_t)\|^2] = O\left(\frac{\sigma}{\sqrt{T}} + \frac{L}{T}\right)
+$$
+</Theorem>
+
+<Proof>
+$L$-smoothness의 descent 부등식 $f(x_{t+1}) \leq f(x_t) - \eta_t \|\nabla f(x_t)\|^2 + \frac{\eta_t^2 L}{2}\|g_t\|^2$에서 기댓값을 취하고, $\eta_t = 1/(2L)$로 고정하면 각 step에서 $\frac{1}{4L}\mathbb{E}[\|\nabla f(x_t)\|^2]$만큼 loss가 감소한다. $T$ steps에 걸쳐 합산하면 어떤 $t^*$에서 gradient norm이 $O(1/T)$ 수준이 되거나, noise 항이 지배하면 $O(\sigma/\sqrt{T})$가 된다. $\square$
+</Proof>
+
+Rate 자체는 convex case와 같지만 의미가 다르다. Convex에서 "gradient zero = 최적점"이지만, non-convex에서 "gradient zero = 임계점"이며 saddle point를 포함한다.
+
+## Saddle Point 탈출
+
+Non-convex landscape에는 saddle point가 무수히 많다. 함수 $f(x, y) = x^2 - y^2$의 원점처럼, Hessian이 양과 음의 고유값을 동시에 가지는 지점이다.
+
+<Callout type="warning" title="Saddle Point의 위험">
+순수한 gradient descent는 saddle point 근처에서 gradient가 작아지면 탈출이 매우 느려질 수 있다. 최악의 경우 탈출에 지수 시간이 걸린다.
+</Callout>
+
+SGD는 이 문제를 noise로 해결한다. 각 step의 stochastic noise $\xi_t$가 음의 곡률 방향(음의 고유벡터 방향)으로 우연히 aligned되면 자연스럽게 탈출이 일어난다. 고차원에서는 이 확률이 충분히 높아서 실제로는 큰 문제가 되지 않는다.
+
+Jin et al. (2017)의 perturbed SGD는 이를 명시적으로 만든다 — gradient norm이 작아지면 perturbation을 추가해 SOSP(second-order stationary point)를 polynomial time에 달성한다.
+
+## Mini-batch와 Linear Scaling Rule
+
+배치 크기 $B$의 mini-batch gradient 분산은 다음과 같이 감소한다.
+
+$$
+\sigma_B^2 = \frac{\sigma_1^2}{B}
+$$
+
+이 분산 감소가 convergence rate에 그대로 반영된다.
+
+$$
+\mathbb{E}[f(\bar{x}_T) - f^*] = O\left(\frac{\sigma_1}{\sqrt{BT}}\right)
+$$
+
+배치를 $k$배로 늘리면 같은 정확도에 도달하는 데 $k$배 적은 iteration이 필요하다. 각 iteration의 계산은 $k$배이므로 총 flops는 불변이지만, 병렬화로 wall-clock time은 단축된다.
+
+이때 학습률도 함께 조정해야 한다. Noise scale $\eta \sigma^2 / B$를 일정하게 유지하려면
+
+$$
+\eta_{\text{new}} = \sqrt{k} \cdot \eta_{\text{old}}
+$$
+
+Goyal et al. (2017)의 Linear Scaling Rule이다. 실제 구현에서는 훈련 초기에 warmup phase를 두어 gradient scale에 네트워크가 적응하는 시간을 준다.
+
+<Aside label="Critical Batch Size">
+배치를 무한정 늘릴 수는 없다. Smith & Le (2018)는 critical batch size $B^* \approx \text{tr}(\Sigma) / \|\nabla f\|^2$ 이상으로 배치를 늘리면 generalization이 악화됨을 보였다. Noise가 너무 작아지면 implicit regularization이 약해지기 때문이다.
+</Aside>
+
+## Implicit Regularization — Noise가 조종하는 기하학
+
+가장 흥미로운 질문이 여기서 나온다. 왜 SGD는 같은 목적함수를 최적화하는 GD보다 일반화가 잘 되는가?
+
+학습률 $\eta \to 0$ 극한에서 SGD는 다음 SDE로 근사된다.
+
+$$
+dx_t = -\nabla f(x_t) \, dt + \sqrt{\frac{\eta \Sigma(x_t)}{B}} \, dW_t
+$$
+
+이 SDE의 정상분포(stationary distribution)는 Fokker–Planck 방정식으로부터 유도된다.
+
+$$
+\pi(x) \propto \exp\left(-\frac{2B}{\eta \Sigma} f(x)\right)
+$$
+
+이것이 핵심이다. Loss가 낮을수록, 그리고 gradient noise $\Sigma$가 클수록 (즉 loss landscape가 넓고 평평할수록) $\pi(x)$가 높다. SGD는 자동으로 **flat minima**에 stationary mass를 더 많이 할당한다.
+
+<Theorem kind="theorem" number="3" title="Batch Size와 Sharpness (Keskar et al. 2017)">
+동일 조건에서 large-batch SGD는 sharper minima에, small-batch SGD는 flatter minima에 수렴하는 경향을 보인다. Effective noise temperature $T = \eta \Sigma / (2B)$가 클수록 flat minima 선호가 강해진다.
+</Theorem>
+
+Flat minima는 파라미터의 작은 perturbation에도 loss가 크게 변하지 않는다 — 즉 train-test distribution shift에 robust하다. 이것이 SGD의 implicit regularization의 실체다. 명시적 L2 regularization을 추가하지 않아도, noise intensity $\eta\Sigma/B$를 적절히 조정하면 effective temperature를 통해 해의 기하학을 제어할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+Implicit regularization은 moderate-size network에서 강하게 작동한다. 초대형 모델(LLM)에서는 거의 모든 임계점이 낮은 loss를 가지므로 flat/sharp 구분이 약해지고, double descent 등 다른 mechanism이 지배한다. Noise temperature를 높이면 flat minima를 선호하지만 수렴이 느려진다 — generalization과 speed 사이의 tradeoff가 $\eta/B$ 하나에 농축되어 있다.
+</Callout>
+
+## 정리
+
+- Robbins–Monro 조건 $\sum \eta_t = \infty$, $\sum \eta_t^2 < \infty$는 "충분한 진전"과 "noise 억제"의 수학적 표현이다. 상수 학습률은 이 조건을 위반해 noise floor에서 수렴이 멈춘다.
+- 수렴 rate는 함수 기하학에 따라 계층을 이룬다. Convex $O(1/\sqrt{T})$, strongly convex $O(1/T)$, non-convex는 gradient norm에 $O(1/\sqrt{T})$.
+- Mini-batch의 분산 감소 $\sigma_B^2 = \sigma_1^2/B$가 Linear Scaling Rule의 수학적 기초다. 배치 $k$배 증가 시 학습률을 $\sqrt{k}$배 증가시켜야 동등한 수렴이 보장된다.
+- SGD의 implicit regularization은 noise-driven SDE의 stat

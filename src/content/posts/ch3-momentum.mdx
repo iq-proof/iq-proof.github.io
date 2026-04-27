@@ -1,0 +1,143 @@
+---
+title: "Momentum은 왜 빠른가 — 관성에서 진동까지"
+description: "Polyak Heavy Ball의 √κ 가속 유도부터 NAG의 O(1/T²) 최적성, ODE 해석, 진동 조건, SGD 노이즈 누적까지 — Momentum optimizer의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [momentum, optimizer, nesterov, convergence, sgd]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`torch.optim.SGD(momentum=0.9)`를 호출할 때, 대부분은 "기울기의 지수평균을 누적한다"는 정도만 알고 있다. 하지만 이 한 줄 뒤에는 물리학의 관성 방정식, Chebyshev 다항식 최적화, 정보이론적 하한, 시변 마찰 ODE가 숨어 있다. Momentum optimizer의 모든 설계 결정은 하나의 질문에서 출발한다 — **gradient descent의 수렴을 이론적으로 가속할 수 있는 최대치는 얼마이고, 그 대가는 무엇인가?**
+
+## 관성에서 알고리즘으로 — Heavy Ball의 탄생
+
+Polyak 1964의 출발점은 뉴턴 방정식이다. 점성 매질 속에 잠긴 질량 1의 공:
+
+$$m\ddot{x} + c\dot{x} + \nabla f(x) = 0$$
+
+$m=1, c = 1 - \beta$로 정규화하고 Euler 이산화하면 정확히 다음이 나온다:
+
+$$x_{t+1} = x_t - \eta\nabla f(x_t) + \beta(x_t - x_{t-1})$$
+
+이것이 **Heavy Ball Method**다. "새 위치 = 기울기 방향 + 이전 모멘텀"이라는 직관은 물리학에서 직접 왔다.
+
+Quadratic $f(x) = \frac{1}{2}x^\top Ax$에서는 정확한 수렴 분석이 가능하다. 각 고유값 방향이 독립적인 2차 점화식이 되고, 그 특성방정식의 근의 크기가 수렴 속도를 결정한다. Chebyshev 다항식의 미니맥스 성질을 이용해 **모든 고유값 방향에서 균일하게 최적인** 파라미터를 구하면:
+
+$$\eta^* = \frac{4}{(\sqrt{L} + \sqrt{\mu})^2}, \quad \beta^* = \left(\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}\right)^2$$
+
+이 하에서 수렴율은 $\rho_{\text{HB}} = 1 - 2/\sqrt{\kappa}$, 반면 GD의 최적 수렴율은 $\rho_{\text{GD}} = 1 - 1/\kappa$. 큰 $\kappa$에서:
+
+$$\frac{T_{\text{GD}}}{T_{\text{HB}}} \sim \frac{1/\kappa}{2/\sqrt{\kappa}} = \frac{\sqrt{\kappa}}{2}$$
+
+**GD는 $O(\kappa)$ 반복, Heavy Ball은 $O(\sqrt{\kappa})$ 반복 — $\sqrt{\kappa}$ 배 가속**이다.
+
+## NAG — 미리 보기와 정보이론적 최적성
+
+Heavy Ball은 *현재 위치*에서 기울기를 계산한다. Nesterov 1983의 핵심 아이디어는 **momentum이 향할 미래 위치에서** 기울기를 계산하는 것이다:
+
+$$y_t = x_t + \beta(x_t - x_{t-1}), \quad x_{t+1} = y_t - \eta\nabla f(y_t)$$
+
+이 "lookahead"가 수렴 속도 등급을 바꾼다.
+
+<Theorem kind="theorem" number="1" title="NAG 수렴율 (Nesterov 1983)">
+$f$가 $L$-smooth convex이고 $\eta = 1/L$일 때:
+
+$$f(x_T) - f^* \leq \frac{2L\|x_0 - x^*\|^2}{(T+1)^2}$$
+</Theorem>
+
+GD는 $O(1/T)$, Heavy Ball은 convex에서 $O(1/T)$인데, NAG는 $O(1/T^2)$다. 그리고 이것이 **달성 가능한 최대치**다.
+
+<Theorem kind="theorem" number="2" title="Lower Bound (Nemirovski–Yudin 1983)">
+1차 방법(first-order oracle을 가진 결정론적 알고리즘)에 대해, 최악의 $L$-smooth convex 함수에서:
+
+$$f(x_T) - f^* \geq \Omega\left(\frac{L\|x_0 - x^*\|^2}{T^2}\right)$$
+</Theorem>
+
+NAG의 $O(1/T^2)$은 이 하한과 일치한다. NAG는 단순히 좋은 알고리즘이 아니라 **정보이론적으로 최적**이다.
+
+증명의 핵심 도구는 estimate sequence다. 보조 수열 $\phi_k$를 $f(x_k) \leq \phi_k^*$를 유지하도록 구성하고, $\phi_k^* - f^* \leq \lambda_k(\phi_0 - f^*)$로 기하급수 수렴을 보인다. $\alpha_k = 2/(k+2)$ 스케줄 하에서 $\lambda_k \sim 2/k^2$가 되어 $O(1/T^2)$이 자연스럽게 도출된다.
+
+## 연속 시간 ODE — $3/t$ 마찰이 숨긴 것
+
+NAG의 이산 업데이트에서 step size $h \to 0$ 극한을 취하면 ODE가 나온다 (Su–Boyd–Candes 2014):
+
+$$\ddot{X}(t) + \frac{3}{t}\dot{X}(t) + \nabla f(X(t)) = 0$$
+
+왜 정확히 $3/t$인가? 마찰 계수를 $\alpha/t$로 일반화하면:
+
+$$f(X(t)) - f^* = \begin{cases} O(1/t^2) & \text{if } \alpha \geq 3 \\ \text{slower} & \text{if } \alpha < 3 \end{cases}$$
+
+$\alpha = 3$이 **임계값**이다. 마찰이 클수록(초기) 안정화되고, 마찰이 작을수록(말기) momentum이 지속된다 — 이 **시변 감쇠**가 $O(1/t^2)$ 가속의 본질이다.
+
+<Aside label="설계 철학">
+현대 딥러닝의 "warm-up & decay" learning rate schedule은 이 ODE 직관에서 직접 온다. 초기에 큰 마찰(작은 LR)로 안정화하고, 이후 마찰을 줄여(LR 증가 후 감소) momentum의 이득을 누리는 것이다.
+</Aside>
+
+## 진동 — 가속의 대가
+
+모든 이득에는 대가가 있다. Heavy Ball의 특성방정식 $r^2 - (1+\beta-\eta\lambda)r + \beta = 0$으로 돌아가면, 판별식이 음수일 때 복소근이 나온다:
+
+$$\beta > \left(\frac{1 - \sqrt{\eta\lambda}}{1 + \sqrt{\eta\lambda}}\right)^2 \implies \text{복소 고유값} \implies \text{진동}$$
+
+복소근의 크기는 $|r| = \sqrt{\beta}$, 위상은 $\cos\theta = (1+\beta-\eta\lambda)/(2\sqrt{\beta})$. 수렴 궤적은:
+
+$$x_t \propto \beta^{t/2} \cos(t\theta + \phi)$$
+
+$\beta = 0.99$라면 100 step 후에도 진폭의 약 60%가 남는다. 이것이 large-batch training에서 높은 momentum을 쓸 때 loss가 "울렁거리는" 근본 이유다.
+
+<Callout type="warning" title="트레이드오프">
+**$\beta$ 크게**: $\sqrt{\kappa}$ 가속 극대화, 그러나 복소 고유값으로 진동 발생, noise 누적 심화.
+
+**$\beta$ 작게**: 진동 억제, noise 안정적, 그러나 가속 이득 감소. PyTorch 기본값 `momentum=0.9`는 이 둘 사이의 경험적 균형점이다.
+
+**QHM (Gitman 2019)**: 추가 파라미터 $a$로 lookahead 가중치를 제어해 진동을 줄이면서 가속을 유지하는 방향.
+</Callout>
+
+## SGD에서 Momentum — 노이즈가 이득을 상쇄한다
+
+Deterministic 이론은 아름답지만, 현실의 신경망은 SGD다. Stochastic gradient $\tilde{g}_t = \nabla f(x_t) + \xi_t$를 momentum 항에 넣으면:
+
+$$v_t = \beta v_{t-1} + \tilde{g}_t$$
+
+과거 noise $\xi_{t-k}$가 $\beta^k$로 감쇠하며 누적된다. $\beta = 0.9$라면 약 20~25 step 이전의 noise까지 유의미하게 남는다.
+
+Non-convex smooth에서 Yan 2018은 다음을 증명한다:
+
+$$\mathbb{E}\left[\|\nabla f(\bar{x}_T)\|^2\right] \leq O\left(\frac{1}{\sqrt{T}}\right)$$
+
+수렴 속도 등급은 GD와 같다. $\sqrt{\kappa}$ 가속은 **noise가 없을 때(배치 무한대)** 의 이득이고, SGD에서는 noise 때문에 hidden constant가 달라진다. 완전한 $\sqrt{\kappa}$ 가속을 누리려면 SVRG 같은 variance reduction이 필요하고, 실전에서는 batch size를 키우는 것이 더 쉬운 대안이다.
+
+## 정리
+
+- Heavy Ball은 Quadratic에서 $\beta^* = ((\sqrt{\kappa}-1)/(\sqrt{\kappa}+1))^2$으로 GD 대비 $\sqrt{\kappa}$ 배 가속을 달성한다.
+- NAG의 lookahead는 convex에서 $O(1/T^2)$를 달성하고, 이는 1차 방법의 정보이론적 상한이다.
+- ODE 해석에서 시변 마찰 $3/t$가 가속의 핵심임이 드러난다 — 현대 LR schedule의 원형이다.
+- $\beta$가 크면 복소 고유값으로 진동이 발생하고, SGD에서 노이즈가 momentum 항에 누적되어 이론적 이득을 상쇄한다.
+
+Momentum의 설계는 결국 하나의 tradeoff를 다른 언어로 반복해서 표현한다 — **관성을 키우면 빠르지만 흔들린다**.
+
+<Reference
+  title="Some methods of speeding up the convergence of iteration methods"
+  authors="Polyak, B.T."
+  year={1964}
+  venue="USSR Computational Mathematics and Mathematical Physics"
+  url="https://www.sciencedirect.com/science/article/pii/0041555364901375"
+/>
+<Reference
+  title="A differential equation for modeling Nesterov's accelerated gradient method"
+  authors="Su, W., Boyd, S., Candes, E.J."
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1503.01243"
+/>

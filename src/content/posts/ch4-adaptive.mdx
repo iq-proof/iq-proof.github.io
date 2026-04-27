@@ -1,0 +1,135 @@
+---
+title: "Adam은 왜 수렴을 보장하지 못하는가"
+description: "AdaGrad의 누적 분산에서 출발해 RMSProp의 이동평균, Adam의 편향 보정, 수렴 반례, 그리고 AMSGrad·AdamW·Lion까지 — adaptive optimizer 계보의 설계 결정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [optimization, adam, adaptive-optimizer, convergence]
+difficulty: advanced
+series:
+  slug: optimization-theory-deep-dive
+  title: Optimization Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+현대 딥러닝의 기본 optimizer는 Adam이다. 그런데 Adam에는 수렴 반례가 존재한다. 2018년 Reddi et al.이 단순한 1D 온라인 convex 문제에서 Adam이 발산함을 증명했다. 그렇다면 왜 실전에서는 잘 작동하는가? 그리고 AdaGrad부터 Lion까지 이어지는 계보에서 각 설계 결정은 무엇을 해결하려 했는가?
+
+## 출발점: AdaGrad와 좌표별 학습률
+
+모든 adaptive optimizer의 출발은 하나의 아이디어다 — **자주 업데이트되는 좌표는 학습률을 낮추고, 드문 좌표는 유지하라**.
+
+AdaGrad (Duchi et al. 2011)의 수식은 이 아이디어의 직접적 구현이다.
+
+$$x_{t+1} = x_t - \eta \frac{g_t}{\sqrt{G_t + \epsilon}}, \quad G_t = \sum_{s=1}^t g_s \odot g_s$$
+
+$G_t$는 모든 과거 gradient의 제곱합이다. NLP의 word embedding처럼 sparse한 문제에서는 드문 단어의 $G_{ii}$가 작으므로 학습률이 유지되고, 빈번한 단어는 $G_{ii}$가 빠르게 커져 step이 줄어든다. Online convex regret도 $O(\sqrt{\sum_i G_{T,ii}})$로 이론적으로 보증된다.
+
+치명적 약점은 $G_t$가 단조증가한다는 것이다. 다중 epoch 훈련에서는 $G_t \sim O(T)$로 커져 결국 학습률이 0으로 수렴한다. **AdaGrad는 한 번만 데이터를 보는 온라인 설정을 위해 설계된 것이다.**
+
+## RMSProp: 과거를 지수적으로 잊기
+
+RMSProp (Hinton, 2012)의 핵심 아이디어는 단순하다 — $G_t$를 무한정 누적하지 말고, 지수이동평균으로 제한하라.
+
+$$v_t = \beta v_{t-1} + (1-\beta) g_t \odot g_t, \quad x_{t+1} = x_t - \eta \frac{g_t}{\sqrt{v_t + \epsilon}}$$
+
+$v_0 = 0$에서 시작하면 $\mathbb{E}[v_t] = \sigma^2(1 - \beta^t)$로 수렴한다. $t \to \infty$에서 $v_t$는 true gradient second moment $\sigma^2$ 근방에 머문다. AdaGrad처럼 $O(T)$로 발산하지 않으므로 다중 epoch 훈련이 가능해진다.
+
+$\beta$의 역할은 **effective window size**를 결정한다. 반감기 $\tau_{1/2} = \log 2 / (-\log \beta)$로, $\beta = 0.9$이면 약 7 step, $\beta = 0.99$이면 약 69 step의 gradient를 기억한다.
+
+<Callout type="note" title="트레이드오프">
+AdaGrad는 sparse gradient에 이론적으로 강하지만 다중 epoch에서 step → 0. RMSProp은 다중 epoch을 지원하지만 이론적 수렴 보증이 약하다. 비공식 발표(Hinton Coursera)로 알려진 것도 이 실용적 발견의 성격을 반영한다.
+</Callout>
+
+## Adam: Momentum과 Adaptive LR의 결합
+
+Adam (Kingma & Ba, 2014)은 RMSProp의 second moment에 momentum(first moment)을 추가한다.
+
+$$m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t, \quad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2$$
+
+$$x_{t+1} = x_t - \eta \frac{m_t / (1-\beta_1^t)}{\sqrt{v_t / (1-\beta_2^t)} + \epsilon}$$
+
+분모의 $(1-\beta_1^t)$와 $(1-\beta_2^t)$는 **편향 보정(bias correction)**이다. $m_0 = v_0 = 0$에서 시작하면 초기 $t$에서 $v_t \approx (1-\beta_2)g_1^2$으로 매우 작다. $\beta_2 = 0.999$이면 $t=10$에서 보정 계수 $1/(1-0.999^{10}) \approx 100$이 적용된다. 보정 없이는 초기 step size가 비정상적으로 커진다.
+
+기본값 $\beta_1 = 0.9, \beta_2 = 0.999, \eta = 10^{-3}$은 first moment는 약 10 step, second moment는 약 1000 step을 기억하도록 설계됐다. 이 비대칭성이 "방향은 빠르게, 크기 추정은 안정적으로"라는 균형을 만든다.
+
+## 수렴 반례: $v_t$의 비단조성
+
+Reddi et al. (2018)의 반례는 다음 gradient 패턴을 사용한다.
+
+- Round $3k+1$: $g = 1010$ (드물고 큰 gradient)
+- Round $3k+2, 3k+3$: $g = -1$ (자주, 작은 gradient)
+
+평균 gradient는 $(1010 - 1 - 1)/3 = 336$이므로 최적해는 $x \to -\infty$ 방향이다. 그런데 $\beta_1 = 0.1, \beta_2 = 0.9, \eta = 100$으로 Adam을 실행하면 $x_t \to +\infty$로 발산한다.
+
+<Theorem kind="theorem" number="1" title="Adam 수렴 반례 (Reddi et al. 2018)">
+온라인 convex 함수 수열이 존재하여 Adam이 발산한다.
+</Theorem>
+
+<Proof>
+큰 gradient $g = 1010$이 한 번 나타나면 $v_1 = 0.1 \times 1010^2 \approx 10^5$. 이후 $g = -1$이 두 번 나타나도 $v_2 \approx 0.9 \times 10^5$, $v_3 \approx 0.81 \times 10^5$로 exponential decay하지만 여전히 크다.
+
+따라서 드문 작은 gradient $g = -1$에 의한 step은 $\eta \cdot m / \sqrt{v}$에서 분모가 과도하게 커 step이 억제된다. 반면 큰 gradient 이후에는 $m$이 양수로 편향되어 있어, 정작 이동해야 할 방향(-1 방향)으로 충분히 움직이지 못한다.
+
+$v_t$가 단조증가가 아니라 — 큰 gradient 후에 decay하다가 다시 증가하는 — **비단조적 패턴**을 보이므로, denominator의 통제가 불가능해진다. $\square$
+</Proof>
+
+문제의 본질은 "과거의 큰 gradient 하나가 이후 수십 step의 denominator를 지배한다"는 것이다.
+
+## AMSGrad와 AdamW: 두 방향의 수정
+
+반례를 받아들인 Reddi et al.은 같은 논문에서 AMSGrad를 제안한다. 핵심 수정은 단 하나 — $v_t$를 단조증가하도록 강제한다.
+
+$$\hat{v}_t = \max(\hat{v}_{t-1},\, v_t / (1-\beta_2^t))$$
+
+$\hat{v}_{t-1} \leq \hat{v}_t$가 항상 성립하므로 denominator가 단조증가하고, 이를 통해 $O(\sqrt{T})$ regret bound를 증명할 수 있다. 그러나 실전에서는 max operation의 보수성 때문에 초기 step이 작아져 Adam과 수렴 속도가 비슷하거나 느린 경우가 많다.
+
+AdamW (Loshchilov & Hutter, 2019)는 다른 문제를 해결한다 — L2 정규화와 weight decay의 구분.
+
+```python
+# Adam + L2: gradient에 λx가 포함 → adaptive LR에 의해 distort됨
+loss = f(x) + (lambda_/2) * (x**2)   # λx가 분자에 들어감
+adam_update(grad_loss(x))
+
+# AdamW: weight decay를 gradient와 분리
+adam_update(grad_f(x))               # adaptive step
+x *= (1 - lambda_ * eta)             # 별도의 uniform decay
+```
+
+Adam+L2에서는 큰 좌표에 $v_t$도 크므로 L2 penalty도 $\lambda x / \sqrt{v_t}$로 약화된다. AdamW는 decay를 별도 적용하므로 모든 좌표에 균일하게 작용한다. 최신 Transformer 훈련에서 AdamW가 표준인 이유다.
+
+## Lion과 Sophia: 다음 세대의 선택
+
+2023년 등장한 두 optimizer는 서로 다른 방향을 택한다.
+
+**Lion** (Chen et al.)은 momentum의 크기를 버린다.
+
+$$x_{t+1} = x_t - \eta \cdot \text{sign}(m_t)$$
+
+step size는 항상 $\pm\eta$로 고정이다. $v_t$가 없으므로 메모리는 Adam의 약 절반이다. 왜 작동하는가? Momentum $m_t = \beta m_{t-1} + (1-\beta) g_t$가 이미 gradient oscillation을 평활화했으므로, magnitude 정보($v_t$)가 없어도 방향 품질이 충분하다는 것이다.
+
+**Sophia** (Liu et al.)는 반대 방향 — second moment 대신 Hessian 대각을 사용한다.
+
+$$x_{t+1} = x_t - \eta \frac{g_t}{\text{diag}(H_t) + \epsilon}$$
+
+Hessian 대각은 Hutchinson trace estimator $\mathbb{E}[z \odot (Hz)] = \text{diag}(H)$로 추정한다 ($z$는 Rademacher 확률벡터). $v_t = \mathbb{E}[g_t^2]$은 gradient 분산이지만 $\text{diag}(H)$는 실제 곡률이다 — 평탄한 방향은 크게, 가파른 방향은 작게 이동한다는 Newton method의 철학을 부분적으로 가져온다.
+
+<Aside label="계보의 패턴">
+AdaGrad → RMSProp → Adam으로 이어지는 흐름의 공통 주제는 "좌표별로 얼마나 최근 정보만 볼 것인가"다. Lion은 크기 자체를 포기하고, Sophia는 크기의 정보원을 gradient 분산에서 곡률로 교체한다. 두 방향 모두 Adam의 $v_t$가 "gradient 분산의 근사"라는 한계를 다르게 돌파한다.
+</Aside>
+
+## 정리
+
+- AdaGrad는 좌표별 누적 분산으로 학습률을 조정한다. Sparse 문제에 강하지만 다중 epoch에서 step → 0.
+- RMSProp은 지수이동평균으로 $v_t$를 유계로 만든다. 이론 보증보다 실용성이 먼저였다.
+- Adam은 momentum과 adaptive LR을 결합하고 편향 보정을 추가해 대부분의 hyperparameter에 둔감한 기본값을 제공한다.
+- 수렴 반례의 원인은 $v_t$의 비단조성 — 과거의 큰 gradient 하나가 이후 step을 억제한다. AMSGrad는 max로 단조성을 복구하고, AdamW는 weight decay를 gradient와 분리한다.
+- Lion과 Sophia는 "무엇이 좌표별 step size를 결정해야 하는가"라는 질문에 다른 답을 제시한다.
+
+수렴이 보장되지 않는 optimizer가 10년간 기
