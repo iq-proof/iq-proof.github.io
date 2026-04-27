@@ -6,9 +6,9 @@ category: ai
 tags: [momentum, optimizer, nesterov, convergence, sgd]
 difficulty: advanced
 series:
-  slug: optimization-theory-deep-dive
-  title: Optimization Theory Deep Dive
-  order: 3
+slug: optimization-theory-deep-dive
+title: Optimization Theory Deep Dive
+order: 3
 draft: false
 featured: false
 ---
@@ -17,6 +17,7 @@ import Callout from '@/components/mdx/Callout.astro';
 import Theorem from '@/components/mdx/Theorem.astro';
 import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
 
 `torch.optim.SGD(momentum=0.9)`를 호출할 때, 대부분은 "기울기의 지수평균을 누적한다"는 정도만 알고 있다. 하지만 이 한 줄 뒤에는 물리학의 관성 방정식, Chebyshev 다항식 최적화, 정보이론적 하한, 시변 마찰 ODE가 숨어 있다. Momentum optimizer의 모든 설계 결정은 하나의 질문에서 출발한다 — **gradient descent의 수렴을 이론적으로 가속할 수 있는 최대치는 얼마이고, 그 대가는 무엇인가?**
 
@@ -51,17 +52,17 @@ $$y_t = x_t + \beta(x_t - x_{t-1}), \quad x_{t+1} = y_t - \eta\nabla f(y_t)$$
 이 "lookahead"가 수렴 속도 등급을 바꾼다.
 
 <Theorem kind="theorem" number="1" title="NAG 수렴율 (Nesterov 1983)">
-$f$가 $L$-smooth convex이고 $\eta = 1/L$일 때:
+  $f$가 $L$-smooth convex이고 $\eta = 1/L$일 때:
 
-$$f(x_T) - f^* \leq \frac{2L\|x_0 - x^*\|^2}{(T+1)^2}$$
+  $$f(x_T) - f^* \leq \frac{2L\|x_0 - x^*\|^2}{(T+1)^2}$$
 </Theorem>
 
 GD는 $O(1/T)$, Heavy Ball은 convex에서 $O(1/T)$인데, NAG는 $O(1/T^2)$다. 그리고 이것이 **달성 가능한 최대치**다.
 
 <Theorem kind="theorem" number="2" title="Lower Bound (Nemirovski–Yudin 1983)">
-1차 방법(first-order oracle을 가진 결정론적 알고리즘)에 대해, 최악의 $L$-smooth convex 함수에서:
+  1차 방법(first-order oracle을 가진 결정론적 알고리즘)에 대해, 최악의 $L$-smooth convex 함수에서:
 
-$$f(x_T) - f^* \geq \Omega\left(\frac{L\|x_0 - x^*\|^2}{T^2}\right)$$
+  $$f(x_T) - f^* \geq \Omega\left(\frac{L\|x_0 - x^*\|^2}{T^2}\right)$$
 </Theorem>
 
 NAG의 $O(1/T^2)$은 이 하한과 일치한다. NAG는 단순히 좋은 알고리즘이 아니라 **정보이론적으로 최적**이다.
@@ -81,7 +82,7 @@ $$f(X(t)) - f^* = \begin{cases} O(1/t^2) & \text{if } \alpha \geq 3 \\ \text{slo
 $\alpha = 3$이 **임계값**이다. 마찰이 클수록(초기) 안정화되고, 마찰이 작을수록(말기) momentum이 지속된다 — 이 **시변 감쇠**가 $O(1/t^2)$ 가속의 본질이다.
 
 <Aside label="설계 철학">
-현대 딥러닝의 "warm-up & decay" learning rate schedule은 이 ODE 직관에서 직접 온다. 초기에 큰 마찰(작은 LR)로 안정화하고, 이후 마찰을 줄여(LR 증가 후 감소) momentum의 이득을 누리는 것이다.
+  현대 딥러닝의 "warm-up & decay" learning rate schedule은 이 ODE 직관에서 직접 온다. 초기에 큰 마찰(작은 LR)로 안정화하고, 이후 마찰을 줄여(LR 증가 후 감소) momentum의 이득을 누리는 것이다.
 </Aside>
 
 ## 진동 — 가속의 대가
@@ -97,11 +98,11 @@ $$x_t \propto \beta^{t/2} \cos(t\theta + \phi)$$
 $\beta = 0.99$라면 100 step 후에도 진폭의 약 60%가 남는다. 이것이 large-batch training에서 높은 momentum을 쓸 때 loss가 "울렁거리는" 근본 이유다.
 
 <Callout type="warning" title="트레이드오프">
-**$\beta$ 크게**: $\sqrt{\kappa}$ 가속 극대화, 그러나 복소 고유값으로 진동 발생, noise 누적 심화.
+  **$\beta$ 크게**: $\sqrt{\kappa}$ 가속 극대화, 그러나 복소 고유값으로 진동 발생, noise 누적 심화.
 
-**$\beta$ 작게**: 진동 억제, noise 안정적, 그러나 가속 이득 감소. PyTorch 기본값 `momentum=0.9`는 이 둘 사이의 경험적 균형점이다.
+  **$\beta$ 작게**: 진동 억제, noise 안정적, 그러나 가속 이득 감소. PyTorch 기본값 `momentum=0.9`는 이 둘 사이의 경험적 균형점이다.
 
-**QHM (Gitman 2019)**: 추가 파라미터 $a$로 lookahead 가중치를 제어해 진동을 줄이면서 가속을 유지하는 방향.
+  **QHM (Gitman 2019)**: 추가 파라미터 $a$로 lookahead 가중치를 제어해 진동을 줄이면서 가속을 유지하는 방향.
 </Callout>
 
 ## SGD에서 Momentum — 노이즈가 이득을 상쇄한다
@@ -128,16 +129,16 @@ $$\mathbb{E}\left[\|\nabla f(\bar{x}_T)\|^2\right] \leq O\left(\frac{1}{\sqrt{T}
 Momentum의 설계는 결국 하나의 tradeoff를 다른 언어로 반복해서 표현한다 — **관성을 키우면 빠르지만 흔들린다**.
 
 <Reference
-  title="Some methods of speeding up the convergence of iteration methods"
-  authors="Polyak, B.T."
-  year={1964}
-  venue="USSR Computational Mathematics and Mathematical Physics"
-  url="https://www.sciencedirect.com/science/article/pii/0041555364901375"
+    title="Some methods of speeding up the convergence of iteration methods"
+    authors="Polyak, B.T."
+    year={1964}
+    venue="USSR Computational Mathematics and Mathematical Physics"
+    url="https://www.sciencedirect.com/science/article/pii/0041555364901375"
 />
 <Reference
-  title="A differential equation for modeling Nesterov's accelerated gradient method"
-  authors="Su, W., Boyd, S., Candes, E.J."
-  year={2014}
-  venue="NeurIPS"
-  url="https://arxiv.org/abs/1503.01243"
+    title="A differential equation for modeling Nesterov's accelerated gradient method"
+    authors="Su, W., Boyd, S., Candes, E.J."
+    year={2014}
+    venue="NeurIPS"
+    url="https://arxiv.org/abs/1503.01243"
 />
