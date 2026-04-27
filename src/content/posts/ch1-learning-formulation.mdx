@@ -1,0 +1,130 @@
+---
+title: "학습이란 무엇인가 — 통계적 학습 이론의 기초 언어"
+description: "진짜 위험과 경험 위험의 차이부터 No Free Lunch 정리와 iid 가정이 깨지는 경우까지, 통계적 학습 이론의 핵심 정식화를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [statistical-learning-theory, erm, generalization, bayes-optimal, iid]
+difficulty: advanced
+series:
+  slug: statistical-learning-theory-deep-dive
+  title: Statistical Learning Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"테스트 오차가 왜 훈련 오차보다 높은가?" 이 질문에 정확히 답하려면 **두 개의 risk**를 구분하는 언어가 먼저 필요하다. 통계적 학습 이론(SLT)은 그 언어를 제공한다. 우리가 계산할 수 있는 것과 우리가 정말 알고 싶은 것 — 이 간극을 어떻게 수학적으로 좁히는가?
+
+## 두 개의 위험
+
+학습 문제는 4-튜플 $(\mathcal{X}, \mathcal{Y}, \mathcal{D}, \ell)$로 정의된다. 여기서 $\mathcal{D}$는 우리가 **결코 직접 볼 수 없는** 데이터 생성 분포다. 우리가 관찰하는 것은 오직 그 분포에서 iid로 뽑힌 유한 샘플 $S = \{(x_1, y_1), \ldots, (x_n, y_n)\}$뿐이다.
+
+이 비대칭에서 두 개의 risk가 탄생한다.
+
+$$
+L_\mathcal{D}(h) := \mathbb{E}_{(X,Y) \sim \mathcal{D}}[\ell(h(X), Y)]
+$$
+
+$$
+L_S(h) := \frac{1}{n} \sum_{i=1}^n \ell(h(x_i), y_i)
+$$
+
+$L_\mathcal{D}(h)$는 우리가 **알고 싶은 것**이지만 계산할 수 없고, $L_S(h)$는 **계산할 수 있는 것**이지만 우리가 원하는 게 아니다. SLT의 모든 정리는 이 둘의 차이, 즉 generalization gap $L_\mathcal{D}(h) - L_S(h)$를 확률적으로 bound하는 일이다.
+
+<Theorem kind="theorem" number="1" title="경험 위험의 비편향성">
+고정된 $h \in \mathcal{H}$와 iid 샘플 $S \sim \mathcal{D}^n$에 대해, $\mathbb{E}_S[L_S(h)] = L_\mathcal{D}(h)$.
+</Theorem>
+
+<Proof>
+기대값의 선형성과 $(X_i, Y_i) \sim \mathcal{D}$의 동일분포성에 의해,
+
+$$
+\mathbb{E}_S[L_S(h)] = \frac{1}{n} \sum_{i=1}^n \mathbb{E}[\ell(h(X_i), Y_i)] = L_\mathcal{D}(h). \qquad \square
+$$
+
+단, 이는 **고정된** $h$에서만 성립한다. 데이터에 의존하는 $\hat{h} = A(S)$에서는 $\mathbb{E}_S[L_S(\hat{h})]$가 $\mathbb{E}_S[L_\mathcal{D}(\hat{h})]$보다 **작을 수 있다** — 이것이 과적합의 수학적 뿌리다.
+</Proof>
+
+## 손실함수가 "정답"을 결정한다
+
+손실함수 $\ell: \mathcal{Y} \times \mathcal{Y} \to \mathbb{R}_+$의 선택은 단순한 계산 편의가 아니다. 어떤 loss를 쓰느냐가 **어떤 "정답 예측기"를 지향하는가**를 결정한다.
+
+만약 분포 $\mathcal{D}$를 완전히 안다면 달성 가능한 최소 위험이 존재한다. 이를 **Bayes risk** $L^* := \inf_h L_\mathcal{D}(h)$라 하고, 이를 달성하는 $h^*$를 Bayes 최적 예측기라 한다. Bayes 예측기의 구체적 형태는 손실에 따라 달라진다.
+
+| 손실 $\ell$ | Bayes 최적 $h^*(x)$ |
+|:---|:---|
+| Squared loss $(\hat{y}-y)^2$ | $\mathbb{E}[Y \| X=x]$ — 조건부 **평균** |
+| Absolute loss $\|\hat{y}-y\|$ | $\text{median}(Y \| X=x)$ — 조건부 **중앙값** |
+| 0-1 loss $\mathbb{1}[\hat{y} \neq y]$ | $\arg\max_y \mathbb{P}(Y=y \| X=x)$ — 조건부 **mode** |
+| Cross-entropy | 조건부 분포 $p(\cdot \| x)$ 자체 |
+
+<Aside label="직관">
+학습 알고리즘의 선택은 "어떤 통계량을 추정하고 싶은가"의 선언이다. MSE를 쓰는 회귀는 평균을, 로지스틱 회귀는 조건부 확률을 추정하도록 설계되어 있다. 손실함수를 바꾸면 최적화 대상이 바뀐다.
+</Aside>
+
+## ERM과 Excess Risk의 3분해
+
+거의 모든 지도학습 알고리즘은 **ERM(Empirical Risk Minimization)**이다.
+
+$$
+\hat{h} \in \arg\min_{h \in \mathcal{H}} L_S(h)
+$$
+
+ERM이 SLT의 중심인 이유는 이 원리가 excess risk를 **세 가지 독립된 원천**으로 분해하기 때문이다.
+
+$$
+\underbrace{L_\mathcal{D}(\hat{h}) - L^*}_{\text{excess risk}} = \underbrace{L_\mathcal{D}(h^*_\mathcal{H}) - L^*}_{\text{approximation}} + \underbrace{L_\mathcal{D}(\hat{h}^*_S) - L_\mathcal{D}(h^*_\mathcal{H})}_{\text{estimation}} + \underbrace{L_\mathcal{D}(\hat{h}) - L_\mathcal{D}(\hat{h}^*_S)}_{\text{optimization}}
+$$
+
+각 항이 무엇을 바꿔서 줄어드는지가 명확히 분리된다. **approximation**은 모델 아키텍처의 문제, **estimation**은 데이터 양의 문제, **optimization**은 수렴 알고리즘의 문제다.
+
+estimation error에 대해 핵심 보조정리가 성립한다.
+
+$$
+L_\mathcal{D}(\hat{h}^*_S) - L_\mathcal{D}(h^*_\mathcal{H}) \leq 2 \sup_{h \in \mathcal{H}} |L_\mathcal{D}(h) - L_S(h)|
+$$
+
+이것이 **uniform convergence**가 estimation error를 통제한다는 SLT의 핵심 관찰이다. 유한 가설공간 $|\mathcal{H}| < \infty$에서 Hoeffding + Union Bound를 적용하면, 확률 $\geq 1-\delta$로 다음이 성립한다.
+
+$$
+\text{estimation error} \leq 2\sqrt{\frac{\log(2|\mathcal{H}|/\delta)}{2n}}
+$$
+
+<Callout type="warning" title="트레이드오프">
+$\mathcal{H}$를 키우면 approximation error는 감소하지만 estimation error는 증가한다. 이 tension이 "데이터가 적으면 단순 모델, 많으면 복잡 모델"이라는 실무 규칙의 이론적 근거다. 고전적 U-shape 일반화 곡선이 이 3분해의 직접적인 시각화다.
+</Callout>
+
+## No Free Lunch와 과적합의 정체
+
+과적합을 "train acc 높고 test acc 낮다"로 정의하면 충분한가? SLT는 세 가지 관점을 분리한다.
+
+- **Gap 관점**: $L_\mathcal{D}(\hat{h}) - L_S(\hat{h})$가 크다.
+- **Excess risk 관점**: estimation error가 approximation error를 지배한다.
+- **Training dynamics 관점**: validation loss가 어느 시점 이후 상승한다.
+
+세 관점은 같은 현상을 다른 각도에서 본다. "generalization gap이 작다"는 것과 "excess risk가 작다"는 것은 독립이다. 상수 예측기 "항상 0.5 출력"은 gap이 0이지만 excess risk는 클 수 있다. **진짜 학습의 목표는 excess risk 최소화**다.
+
+$\mathcal{H}$를 모든 가측함수로 놓고 ERM을 하면 어떻게 되는가? ERM은 "훈련 라벨 기억(memorization)"이 되어 $L_\mathcal{D}(\hat{h})$는 $L^*$로 수렴하지 않는다. 이것이 **No Free Lunch 정리**의 핵심이다. $|\mathcal{X}| = 2n$인 유한 입력 공간에서, 임의의 학습 알고리즘 $A$에 대해 어떤 분포 $\mathcal{D}$가 존재해 realizable임에도 $\mathbb{P}[L_\mathcal{D}(A(S)) \geq 1/8] \geq 1/7$이 성립한다. 관측되지 않은 점에서 알고리즘은 라벨 정보가 없으므로, 가능한 모든 라벨링에 대해 평균을 내면 오차 기대값이 $1/4$ 이상이고 Pigeonhole + Markov로 확률 하한이 따라온다. SLT의 모든 주장은 본질적으로 **"$\mathcal{H}$가 VC 유한" 같은 제약 하에서**의 주장이다.
+
+## iid 가정과 분포 이동
+
+Ch2~Ch7의 모든 정리는 "iid 샘플 $S \sim \mathcal{D}^n$"으로 시작한다. iid는 두 개의 독립된 가정이다 — **독립(Independence)**과 **동일분포(Identically distributed)**. 둘은 각각 다른 방식으로 깨지고, 대응 방식도 다르다.
+
+| 위반 유형 | 무엇이 깨지는가 | 수학적 대응 |
+|:---|:---|:---|
+| 시계열 의존성 | Hoeffding의 $\prod \mathbb{E}[e^{\lambda X_i}]$ 분해 | $\beta$-mixing, effective $n$ |
+| Covariate shift ($p(X)$ 변화) | $\mathbb{E}_\mathcal{D}$ 계산 | Importance weighting |
+| Concept drift ($p(Y\|X)$ 변화) | 고정 $\mathcal{D}$ 가정 자체 | Online learning |
+
+$\beta$-mixing sequence에서는 effective sample size $n_\text{eff} \approx n/(1 + \tau)$로 대체하면 많은 SLT bound이 생존한다. iid 위반은 "완전한 붕괴"가 아니라 **rate 감소**로 나타난다. Covariate shift에서는 importance-weighted ERM이 통계적으로 올바른 대응이지만, 가중치 분산 $\mathbb{E}[(p^\text{te}/p^\text{tr})^2]$이 발산하면 추정이 불안정해진다. Concept drift — $p(Y|X)$ 자체가 변하는 경우 — 는 고정 $\mathcal{D}$ 가정이 근본적으로 무너지므로 online learning이나 지속 학습으로만 대응 가능하다.
+
+## 정리
+
+- **두 risk**: $L_\mathcal{D}(h)$는 알고 싶지만 볼 수 없고, $L_S(h)$는 계산할 수 있지만 우리가 원하는 게 아니다. SLT 전체는 이 gap을 bound하는 일이다.
+- **손실함수**: 어떤 loss를 쓰느냐가 Bayes 최적 예측기의 형태를 결정한다. MSE는 조건부 평균, 0-1은 조건부 mode, cross-entropy는 조건부 분포 자체를 지향한다.
+- **ERM 3분해**: excess risk = approximation + estimation + optimization. 각 항은 모델

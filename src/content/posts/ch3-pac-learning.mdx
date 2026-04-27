@@ -1,0 +1,146 @@
+---
+title: "PAC Learning이란 무엇인가 — 학습 가능성의 수학적 정의"
+description: "Valiant의 PAC learnability 정의부터 Fundamental Theorem까지, '얼마나 많은 데이터가 있으면 학습이 보장되는가'를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [pac-learning, statistical-learning-theory, vc-dimension, generalization]
+difficulty: advanced
+series:
+  slug: statistical-learning-theory-deep-dive
+  title: Statistical Learning Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+"내 모델이 충분한 데이터로 학습되면 잘 일반화할까?" 이 질문에 "아마도"가 아닌 정량적 답을 제시하는 것이 통계적 학습 이론(SLT)의 전체 목표다. 그 핵심에 **PAC learnability**가 있다. 얼마나 많은 샘플이 있어야 학습이 보장되는가?
+
+## 점근 수렴을 버리다
+
+1970년대까지의 통계 학습 이론은 "$L_S \to L_\mathcal{D}$ as $n \to \infty$"만 보였다 — **점근** 수렴. 하지만 실무자는 "지금 10,000개 샘플로 무엇을 할 수 있나?"를 묻는다.
+
+Valiant(1984)는 학습 가능성을 **유한 샘플에서의 확률적 성공 보장**으로 재정의했다. 형식적으로:
+
+$$\exists\, m:(0,1)^2 \to \mathbb{N},\quad \forall \mathcal{D},\quad \forall \epsilon, \delta \in (0,1),$$
+
+$$n \geq m(\epsilon, \delta) \Rightarrow \mathbb{P}_{S \sim \mathcal{D}^n}\!\left[L_\mathcal{D}(A(S)) \leq \inf_{h \in \mathcal{H}} L_\mathcal{D}(h) + \epsilon\right] \geq 1 - \delta.$$
+
+세 항을 분리해서 읽으면:
+
+- **"Approximately Correct"** ($\epsilon$): 출력 가설의 진짜 위험이 $\mathcal{H}$ 내 최선 + $\epsilon$ 이하.
+- **"Probably"** ($1-\delta$): 이 조건이 확률 $1-\delta$ 이상으로 성립. $\delta$는 허용하는 실패 확률.
+- **Sample complexity** $m(\epsilon, \delta)$: 이 둘을 동시에 보장하기 위한 최소 샘플 수.
+
+이것이 PAC다. "충분히 많은 데이터가 필요하다"는 모호한 주장을 **정량화**한 것이 Valiant의 혁신이다.
+
+## Realizable의 빠른 수렴
+
+가설공간 $\mathcal{H}$에 오차 0인 완벽한 가설 $h^*$가 존재하는 **realizable case**는 분석이 단순하면서도 날카롭다.
+
+<Theorem kind="theorem" number="1" title="Realizable PAC — 유한 가설공간">
+$|\mathcal{H}| < \infty$이고 $\exists h^* \in \mathcal{H}$ s.t. $L_\mathcal{D}(h^*) = 0$일 때, ERM은
+
+$$m(\epsilon, \delta) = \left\lceil \frac{\log(|\mathcal{H}|/\delta)}{\epsilon} \right\rceil$$
+
+개의 샘플로 PAC learn한다.
+</Theorem>
+
+<Proof>
+"나쁜 사건"을 정의한다: $B_h := \{L_\mathcal{D}(h) > \epsilon\} \cap \{L_S(h) = 0\}$. 이는 진짜로는 나쁜데 샘플에서 우연히 완벽하게 맞는 가설이다.
+
+각 $h$에 대해 $L_\mathcal{D}(h) > \epsilon$이면 $L_S(h) = 0$일 확률은 $(1-\epsilon)^n \leq e^{-n\epsilon}$.
+
+Union bound로 묶으면
+
+$$\mathbb{P}[\exists h: B_h] \leq |\mathcal{H}| \cdot e^{-n\epsilon}.$$
+
+이를 $\delta$ 이하로 하면 $n \geq \log(|\mathcal{H}|/\delta)/\epsilon$. $\square$
+</Proof>
+
+핵심 관찰: sample complexity가 **$1/\epsilon$에 선형**이다. $\epsilon$을 절반으로 줄이면 샘플이 2배면 된다. 그리고 $|\mathcal{H}|$에는 **로그로** 의존하므로, 가설공간이 100배 커져도 샘플은 $\log 100 \approx 7$배만 늘면 된다.
+
+## Agnostic으로 — $\epsilon$이 $\epsilon^2$이 되는 이유
+
+현실 데이터에는 노이즈가 있다. $\mathcal{H}$ 안에 완벽한 가설이 없을 수 있다. 이것이 **agnostic case**다: $\inf_h L_\mathcal{D}(h) =: L_\mathcal{H}^* \geq 0$.
+
+realizable에서는 "나쁜 가설이 우연히 $L_S = 0$이 되는" 한 방향만 막으면 됐다. agnostic에서는 **양방향**을 모두 통제해야 한다 — $L_S(h)$가 $L_\mathcal{D}(h)$보다 너무 작거나 너무 클 수 있다. Hoeffding의 양쪽 꼬리를 쓴다:
+
+$$\mathbb{P}\!\left[|L_S(h) - L_\mathcal{D}(h)| \geq \frac{\epsilon}{2}\right] \leq 2e^{-n\epsilon^2/2}.$$
+
+Union bound 후 $2|\mathcal{H}|e^{-n\epsilon^2/2} \leq \delta$를 정리하면
+
+$$m(\epsilon, \delta) = \left\lceil \frac{2\log(2|\mathcal{H}|/\delta)}{\epsilon^2} \right\rceil.$$
+
+지수의 $\epsilon \to \epsilon^2$ 변환이 sample complexity를 $1/\epsilon$에서 $1/\epsilon^2$으로 만든다. 정확도를 2배 높이려면 샘플이 4배 필요하다.
+
+<Callout type="note" title="트레이드오프">
+Realizable($1/\epsilon$ rate)은 "완벽한 가설이 존재한다"는 강한 가정 위에 서 있다. 이 가정을 버리는 순간 — 즉 노이즈나 모델 미스매치를 허용하는 순간 — sample complexity가 제곱으로 악화된다. 현실 문제는 거의 항상 agnostic이다.
+</Callout>
+
+## VC 차원과 Fundamental Theorem
+
+유한 $\mathcal{H}$에서 한 걸음 더 나가면 무한 가설공간의 문제가 기다린다. 선형 분류기, 신경망, SVM — 이들은 모두 $|\mathcal{H}| = \infty$다. 여기서 **VC 차원**이 등장한다.
+
+$\text{VC}(\mathcal{H})$는 $\mathcal{H}$가 임의의 레이블 패턴으로 분류할 수 있는 점의 최대 개수다. SLT의 핵심 정리는 이것이 유한성의 올바른 척도임을 말한다:
+
+> **다음 네 조건은 동치다**:  
+> (a) $\mathcal{H}$가 agnostic PAC learnable  
+> (b) $\mathcal{H}$가 uniform convergence property 만족  
+> (c) ERM이 $\mathcal{H}$를 agnostic PAC learn  
+> (d) $\text{VC}(\mathcal{H}) < \infty$
+
+핵심 방향은 (d) → (b)다. VC가 유한이면 **Sauer-Shelah Lemma**에 의해 성장 함수가 다항식으로 억제된다:
+
+$$\Pi_\mathcal{H}(n) \leq \left(\frac{en}{d}\right)^d.$$
+
+이 다항 성장이 지수 감소 $e^{-n\epsilon^2/8}$에 압도당하므로 uniform convergence가 성립한다. 그리고 sample complexity는
+
+$$m_\mathcal{H}(\epsilon, \delta) = \Theta\!\left(\frac{d + \log(1/\delta)}{\epsilon^2}\right).$$
+
+VC 차원에 선형으로, 지수적으로 의존하지 않는다.
+
+## Occam의 면도날 — 짧은 설명의 보상
+
+또 다른 각도에서 같은 현상을 볼 수 있다. 각 가설에 description length $|h|$ (비트)를 배정하고 Kraft 부등식 $\sum_h 2^{-|h|} \leq 1$을 만족시키면, realizable case에서 다음 bound가 성립한다:
+
+$$L_\mathcal{D}(h) \leq \frac{|h| + \log(1/\delta)}{n}.$$
+
+"더 짧은 설명"이 "더 강한 일반화 보장"으로 직접 변환된다. 이것이 MDL(Minimum Description Length) 원리의 수학적 내용이다.
+
+<Aside label="Bayesian 연결">
+prior $p(h) \propto 2^{-|h|}$를 사용한 MAP estimation은 MDL과 동일한 최적화 문제다. 간단한 모델에 높은 prior를 주는 Bayesian 추론이 곧 Occam의 면도날이다.
+</Aside>
+
+유한 $\mathcal{H}$ bound $m \sim \log|\mathcal{H}|/\epsilon$과 비교하면, Occam bound $m \sim |h|/\epsilon$은 가설공간 전체가 아니라 **선택된 가설 하나**의 복잡도에만 의존한다. 가설공간이 넓더라도 간단한 해를 찾을 수 있다면 샘플을 아낄 수 있다.
+
+## 정리
+
+- PAC learnability는 "점근 수렴" 대신 **유한 샘플에서의 확률적 보장** — $m(\epsilon, \delta)$개 샘플로 확률 $1-\delta$로 오차 $\epsilon$ 이하.
+- Realizable case: $m = O(\log|\mathcal{H}|/\epsilon)$, **fast rate $1/\epsilon$**.
+- Agnostic case: $m = O(\log|\mathcal{H}|/\epsilon^2)$, **$1/\epsilon^2$로 악화**. 양쪽 꼬리를 통제해야 하기 때문.
+- **Fundamental Theorem**: PAC learnability ⟺ uniform convergence ⟺ $\text{VC}(\mathcal{H}) < \infty$.
+- Occam bound: 짧은 description length가 직접 강한 일반화 보장으로 변환된다.
+
+VC 차원이 무한인 신경망이 왜 실전에서 일반화하는지는 이 고전 이론으로 설명되지 않는다. 다음은 Rademacher 복잡도와 안정성 기반 bound로 넘어간다.
+
+<Reference
+  title="A Theory of the Learnable"
+  authors="Valiant, L. G."
+  year={1984}
+  venue="Communications of the ACM"
+  url="https://dl.acm.org/doi/10.1145/1968.1972"
+/>
+
+<Reference
+  title="Occam's Razor"
+  authors="Blumer, A., Ehrenfeucht, A., Haussler, D., and Warmuth, M. K."
+  year={1987}
+  venue="Information Processing Letters"
+  url="https://www.sciencedirect.com/science/article/pii/0020019087900542"
+/>

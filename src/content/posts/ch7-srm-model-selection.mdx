@@ -1,0 +1,132 @@
+---
+title: "모델 복잡도를 어떻게 선택해야 하는가"
+description: "SRM의 VC 기반 penalty부터 AIC/BIC의 정보이론적 근거, Cross-Validation의 경험적 추정, 그리고 VC·Rademacher·Stability 세 관점의 대비까지, 일반화 이론의 통일 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [statistical-learning-theory, srm, aic-bic, cross-validation, rademacher]
+difficulty: advanced
+series:
+  slug: statistical-learning-theory-deep-dive
+  title: Statistical Learning Theory Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+훈련 오차 $L_S$는 모델이 복잡할수록 단조 감소한다. 하지만 테스트 오차는 그렇지 않다. 그렇다면 "얼마나 복잡한 모델을 써야 하는가"라는 질문에, 우리는 어떤 원리로 답할 수 있는가?
+
+## 복잡도 선택의 첫 원리: SRM
+
+Vapnik의 **Structural Risk Minimization**은 이 질문에 최초로 원리적인 답을 제시했다. 아이디어는 단순하다 — 모델 복잡도를 **비용**으로 명시적으로 수식화하라.
+
+중첩된 가설공간 $\mathcal{H}_1 \subset \mathcal{H}_2 \subset \cdots$ (예: 다항식 degree 1, 2, 3, …)에서 SRM은 다음 기준으로 $k$를 고른다.
+
+$$\hat{k} = \arg\min_{k} \left\{ L_S(\hat{h}_k) + \Omega_k(n, \delta) \right\}$$
+
+여기서 $\Omega_k$는 VC bound에서 유도된 복잡도 penalty다.
+
+$$\Omega_k(n, \delta) = C \sqrt{\frac{d_k \log(n/d_k) + \log(2^k/\delta)}{n}}$$
+
+이 penalty는 Union Bound를 통해 구성된다. $\delta_k = \delta/2^k$로 설정하면 $\sum_k \delta_k = \delta$가 되어, **무한한 $k$ 시퀀스에 대해 동시에** 확률 $1-\delta$ 보장을 유지할 수 있다.
+
+<Theorem kind="theorem" number="7.1" title="SRM의 Oracle 비교 (Vapnik)">
+SRM 규칙이 선택한 $\hat{h} = \hat{h}_{\hat{k}}$의 excess risk는 확률 $\geq 1-\delta$로 다음을 만족한다.
+
+$$L_\mathcal{D}(\hat{h}) - L^* \leq 2\min_k \left\{ L_\mathcal{D}(h^*_k) - L^* + \Omega_k(n, \delta) \right\} + o(1/\sqrt{n})$$
+</Theorem>
+
+<Proof>
+각 $k$에 대해 VC bound로 $L_\mathcal{D}(h_k) - L_S(h_k) \leq \Omega_k$를 얻고, Union Bound로 모든 $k$에 동시에 적용한다. SRM이 선택한 $\hat{k}$에 대해 $L_S(\hat{h}_{\hat{k}}) + \Omega_{\hat{k}} \leq L_S(h^*_k) + \Omega_k$이고, 이를 $L_\mathcal{D}$로 변환하면 각 $(L_\mathcal{D} - L_S)$ 항이 다시 $\Omega$ 항으로 흡수되어 $2\min_k(\cdot)$ 형태가 된다. $\square$
+</Proof>
+
+SRM의 실전 형태가 Ridge와 LASSO의 **regularization path**다. $\lambda$를 다양화하면 $\mathcal{H}_\lambda = \{w : \|w\|_2 \leq 1/\sqrt{\lambda}\}$라는 implicit 중첩 가설공간이 생성되고, GCV나 AIC로 $\lambda$를 고르는 것이 SRM과 점근적으로 동치다.
+
+## AIC와 BIC: 다른 목표, 다른 penalty
+
+SRM이 VC 기반 이론적 penalty를 제시했다면, AIC와 BIC는 **통계적 해석**을 더한다. 둘 다 형태는 같다.
+
+$$\text{AIC} = -2\log\widehat{L} + 2k, \qquad \text{BIC} = -2\log\widehat{L} + k\log n$$
+
+하지만 이 둘이 최소화하는 것은 **다르다**.
+
+AIC는 Akaike(1973)의 결과로, out-of-sample KL divergence의 비편향 추정량이다. MLE $\hat{\theta}$의 기대 위험도에 Fisher Information 관련 bias correction $k/n$이 붙으면서 penalty $2k$가 도출된다. 즉 **예측 정확도**를 최적화한다.
+
+BIC는 마지널 우도 $p(S | M_k)$의 Laplace 근사에서 온다.
+
+$$\log p(S | M_k) \approx \log L_S(\hat{\theta}) - \frac{k}{2}\log\frac{2\pi}{n} - \frac{1}{2}\log|I(\hat{\theta})|$$
+
+$-2$를 곱하면 BIC 형태가 나오고, 이는 **모델의 사후확률** 최대화, 즉 "참 모델 복원"을 목표로 한다. $n \to \infty$에서 BIC는 확률 1로 참 모델을 선택한다(Consistency). AIC는 이 성질이 없다 — 예측을 위해 참보다 복잡한 모델을 선택할 수 있다.
+
+<Callout type="note" title="트레이드오프: AIC vs BIC">
+$k=5$, $n=1000$일 때 AIC penalty $= 10$, BIC penalty $= 5\log 1000 \approx 34.5$. $n$이 클수록 BIC가 훨씬 강하게 단순 모델을 선호한다. "참 모델이 클래스 안에 있다"고 믿으면 BIC, 예측 성능만 중요하면 AIC, 계산 여유가 있으면 CV.
+</Callout>
+
+MDL(Minimum Description Length)은 Rissanen(1978)의 정보이론적 관점을 추가한다. "데이터와 모델을 합쳐 설명하는 비트 수를 최소화하라"는 원칙으로, BIC와 점근적으로 동치다.
+
+## Cross-Validation: 가정 최소의 경험적 추정
+
+AIC/BIC의 정교함에도 불구하고 현대 ML의 실질적 표준은 CV다. 이유는 단순하다 — **분포 가정이 없고**, 직접 일반화 오차를 추정한다.
+
+K-fold CV는 데이터를 $K$개 fold로 나누어 각 fold를 순서대로 검증 세트로 사용한다. LOO($K=n$)는 근사 비편향적이다.
+
+$$\mathbb{E}[\widehat{\text{LOO}}] \approx \mathbb{E}_{S' \sim \mathcal{D}^{n-1}}[L_\mathcal{D}(\hat{h}(S'))]$$
+
+즉 LOO는 "크기 $n-1$ 샘플에서 훈련한 모델의 test error"를 추정한다. 이 결과는 각 $(X_i, Y_i)$가 $S^{(-i)}$와 독립이라는 iid 가정에서 직접 따라온다.
+
+Bias-Variance 관점에서는 LOO가 가장 작은 bias를 가지지만 fold 간 상관으로 variance가 높다. 실전에서 $K=5$ 또는 $K=10$이 "계산 비용 대비 가장 좋은 균형점"이다.
+
+주의할 점이 하나 있다. **Bengio & Grandvalet(2004)**은 "CV variance의 비편향 추정량은 일반적으로 존재하지 않는다"고 증명했다. CV fold들이 완전히 독립이 아니기 때문이다. 신뢰도 구간 구성이 어려운 이유가 여기 있다.
+
+hyperparameter 선택에 CV를 쓸 때는 **Nested CV**가 필요하다. 단일 CV loop에서 hyperparameter를 선택하면, 그 검증 세트가 선택 과정에 오염된다. 외부 loop로 test error를 추정하고 내부 loop로 hyperparameter를 선택해야 "contamination" 없이 정직한 추정이 가능하다.
+
+## VC · Rademacher · Stability — 세 관점의 통일
+
+이 장에서 다룬 세 종류의 일반화 이론은 서로 다른 질문에 답한다.
+
+**VC 이론**은 가설공간의 조합적 용량을 측정한다. 분포 자유이고 직관적이다. 하지만 DL에서는 VC 차원이 $O(W^2 \log W)$로 거대해져 bound가 의미 없는 수준(vacuous)이 된다.
+
+**Rademacher 복잡도**는 데이터와 함수족의 조합이 노이즈를 얼마나 fit할 수 있는지를 측정한다. VC보다 tight하고 데이터에 적응적이다. 두 bound의 관계는 다음과 같다.
+
+$$\mathcal{R}_n(\mathcal{F}) \leq C \cdot \frac{\sqrt{d\log n}}{n}$$
+
+즉 같은 $O(\sqrt{d/n})$ 스케일이지만, Rademacher는 분포에 적응하여 보통 더 tight하다. Kernel, margin 기반 분류기에서 가장 강력하다.
+
+**Algorithmic Stability**는 알고리즘이 샘플 하나의 변화에 얼마나 민감한지를 측정한다. Ridge regression은 $\beta = O(1/(\lambda n))$ stable이므로, VC 차원이 무한이어도 $\lambda$ 선택만으로 일반화를 제어할 수 있다. Hardt et al.(2016)은 SGD가 $T$ step 후 $\beta \leq O(\eta T)$ stable임을 보였고, 이것이 **early stopping의 수학적 정당화**다.
+
+<Aside label="현대 DL의 함의">
+Zhang et al.(2017)은 ResNet이 random label도 완벽히 암기함을 보였다. 이는 고전 VC bound와 Rademacher bound가 모두 vacuous임을 실증했다. 세 관점 중 DL을 가장 잘 설명하는 것은 Stability — "early stopping이 implicit regularization"이라는 해석이다. 고전 SLT 너머의 이론(NTK, Double Descent, PAC-Bayes)이 필요한 이유다.
+</Aside>
+
+## 정리
+
+- **SRM**: 중첩 가설공간에서 $L_S + \Omega_k$를 최소화하는 $k$를 고른다. Oracle을 상수 배 이내에서 따른다. Ridge/LASSO의 regularization path가 그 실전화다.
+- **AIC**는 예측 KL loss의 비편향 추정, **BIC**는 마지널 우도의 Laplace 근사이며 $n \to \infty$에서 참 모델에 수렴한다. 목표가 다르므로 상황에 따라 선택한다.
+- **CV**는 가정 최소의 경험적 추정이다. 실전 표준은 5-fold 또는 10-fold, hyperparameter 선택이 포함되면 nested CV.
+- VC는 고전 이론의 토대이나 DL에서 vacuous하다. Rademacher는 margin 기반 모델에서 tight하다. Stability는 SGD와 정규화를 가장 직관적으로 설명한다.
+
+복잡도 선택의 이론은 하나의 공통 원리 위에 있다 — **근사 오차와 추정 오차의 균형**. SRM, AIC, BIC, CV, Stability 모두 이 균형을 다른 언어로 표현한 것이다.
+
+<Reference
+  title="Statistical Learning Theory"
+  authors="Vapnik, V."
+  year={1998}
+  venue="Wiley"
+  url="https://www.wiley.com/en-us/Statistical+Learning+Theory-p-9780471030034"
+/>
+<Reference
+  title="A new look at the statistical model identification"
+  authors="Akaike, H."
+  year={1974}
+  venue="IEEE Transactions on Automatic Control"
+  url="https://ieeexplore.ieee.org/document/1100705"
+/>
+<Reference
+  title="Train Faster, Generalize Better: Stability of Stochastic Gradient Descent"
+  authors="Hardt, M., Recht, B., Singer, Y."
+  year={2

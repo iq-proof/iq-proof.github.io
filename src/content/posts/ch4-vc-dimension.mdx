@@ -1,0 +1,119 @@
+---
+title: "VC 차원은 왜 신경망을 설명하지 못하는가"
+description: "Shattering과 VC 차원의 정의부터 Sauer-Shelah Lemma를 거친 VC 경계 유도, 그리고 현대 딥러닝에서 이 경계가 왜 완전히 무너지는지까지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [vc-dimension, statistical-learning-theory, sauer-shelah, generalization, deep-learning]
+difficulty: advanced
+series:
+  slug: statistical-learning-theory-deep-dive
+  title: Statistical Learning Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+유한한 가설공간에서는 샘플 복잡도가 $O(\log|\mathcal{H}|)$에 비례한다는 것을 PAC Learning이 보여준다. 그런데 신경망의 가설공간은 연속 매개변수 때문에 무한하다. 그렇다면 무한 $\mathcal{H}$를 어떻게 분석할 것인가? VC 차원은 이 질문에 대한 고전적 답이다 — 그리고 현대 딥러닝은 그 답이 틀렸음을 증명한다.
+
+## Shattering — 가설공간의 표현력을 측정하는 방법
+
+$m$개 점의 집합 $C = \{x_1, \ldots, x_m\}$에 대해, 각 점을 양/음으로 분류하는 방법은 최대 $2^m$가지다. 이 각각을 **dichotomy**라 부른다. 가설공간 $\mathcal{H}$가 $C$를 **shatter**한다는 것은 이 $2^m$가지를 모두 구현할 수 있다는 뜻이다.
+
+$$\mathcal{H}|_C := \{(h(x_1), \ldots, h(x_m)) : h \in \mathcal{H}\}, \quad |\mathcal{H}|_C| = 2^{|C|}$$
+
+**VC 차원**은 이를 기반으로 정의된다.
+
+<Theorem kind="definition" number="1" title="VC 차원 (Vapnik-Chervonenkis dimension)">
+
+$$\text{VC}(\mathcal{H}) := \max\{m : \exists C \subseteq \mathcal{X}, |C| = m, \mathcal{H} \text{ shatters } C\}$$
+
+"$\mathcal{H}$가 완벽하게 분류할 수 있는 점집합의 최대 크기". 단, 모든 $m$-점 집합이 shatter될 필요는 없고, 그런 집합이 하나라도 존재하면 충분하다.
+
+</Theorem>
+
+몇 가지 예시를 보면 직관이 선다. $\mathbb{R}$ 위의 threshold classifier $h_\theta(x) = \mathbb{1}[x \geq \theta]$는 VC = 1이다 — 1개 점은 shatter할 수 있지만, 2개 점에서 "왼쪽만 양"인 dichotomy를 만들 수 없다. Interval classifier $h_{a,b}(x) = \mathbb{1}[a \leq x \leq b]$는 VC = 2다. $\mathbb{R}^d$의 선형 분류기(반공간)는 VC = $d+1$이다.
+
+<Theorem kind="theorem" number="1" title="선형 분류기의 VC 차원">
+
+$$\text{VC}\left(\{x \mapsto \text{sign}(w^\top x + b) : w \in \mathbb{R}^d, b \in \mathbb{R}\}\right) = d + 1$$
+
+</Theorem>
+
+<Proof>
+하한($\geq d+1$): 표준 기저 벡터와 원점 $C = \{0, e_1, \ldots, e_d\}$는 affine independent이다. Affine independent한 $d+1$개 점에 대해서는 임의의 부분집합을 양/음으로 분류하는 초평면이 존재함이 보장된다.
+
+상한($\leq d+1$): Radon의 정리에 의해, $\mathbb{R}^d$의 임의 $d+2$개 점은 convex hull이 교차하는 두 부분집합 $I, J$로 분할된다. $I$를 양, $J$를 음으로 분류하는 초평면은 존재할 수 없다 — 교점 $y \in \text{conv}(I) \cap \text{conv}(J)$가 초평면의 양쪽에 동시에 있어야 하기 때문이다. 따라서 모든 $d+2$-점 집합은 shatter 불가능하다. $\square$
+</Proof>
+
+## 성장함수와 Sauer-Shelah — 지수에서 다항으로
+
+VC 차원은 "복잡도를 나타내는 단일 정수"지만, 일반화 경계를 유도하려면 고정 샘플 크기 $m$에서 가설공간이 실제로 얼마나 많은 dichotomy를 만드는지 알아야 한다. 이것이 **성장함수**다.
+
+$$\Pi_\mathcal{H}(m) := \max_{|C|=m} |\mathcal{H}|_C|$$
+
+$\text{VC}(\mathcal{H}) = d$이면 $m \leq d$에서 $\Pi(m) = 2^m$이고, $m > d$에서는 지수보다 작아진다. 얼마나 작아지는가?
+
+<Theorem kind="theorem" number="2" title="Sauer-Shelah Lemma">
+
+$\text{VC}(\mathcal{H}) = d < \infty$이면 모든 $m \geq 1$에 대해
+
+$$\Pi_\mathcal{H}(m) \leq \sum_{i=0}^d \binom{m}{i} \leq \left(\frac{em}{d}\right)^d$$
+
+</Theorem>
+
+<Aside label="핵심 직관">
+VC가 $d$라는 제약이 "shatter 불가능한 패턴"을 쌓아가면서, 지수 $2^m$을 다항 $m^d$로 압축한다. 이것이 무한 가설공간을 PAC 분석에서 다룰 수 있게 만드는 핵심 기술이다.
+</Aside>
+
+Pajor의 귀납법으로 증명한다. $m$번째 점 $x^*$를 추가할 때, 나머지 $m-1$개 점의 dichotomy 중 "$x^*$의 라벨이 양/음 둘 다 가능한 것"과 "고정된 것"으로 나눈다. 고정된 dichotomy는 자유도가 1 줄어든 가설공간(VC $\leq d-1$)에서 오므로, Pascal의 항등식과 귀납 가정으로 원하는 부등식이 나온다.
+
+기하학적 도형의 VC도 같은 틀로 이해된다. $\mathbb{R}^2$의 축정렬 직사각형은 VC = 4 ($\mathbb{R}^d$에서는 $2d$), 원판은 VC = 3, convex 집합은 VC = $\infty$다. 각 차원마다 독립적인 "interval" 2개씩 조합하므로 직사각형의 VC가 $2d$가 된다는 점이 흥미롭다.
+
+## VC 경계의 유도 — ghost sample과 union bound
+
+Sauer-Shelah가 확보되면 무한 $\mathcal{H}$에서도 uniform convergence를 증명할 수 있다. 핵심 아이디어는 **symmetrization** — ghost sample $S'$를 도입해 분포 $\mathcal{D}$에 대한 의존을 제거하는 것이다.
+
+$$\mathbb{E}_{S'}[L_{S'}(h)] = L_\mathcal{D}(h)$$
+
+이므로 $|L_S(h) - L_\mathcal{D}(h)|$를 $|L_S(h) - L_{S'}(h)|$로 근사할 수 있다. 이제 $S \cup S'$ ($2n$개 점) 위에서 실현되는 dichotomy만 고려하면 되는데, 그 수는 $|\mathcal{H}|_{S \cup S'}| \leq \Pi_\mathcal{H}(2n)$으로 유한하다. 유한한 집합 위에서 Hoeffding을 적용하고 상수를 정리하면:
+
+$$\mathbb{P}_S\!\left(\sup_{h \in \mathcal{H}} |L_\mathcal{D}(h) - L_S(h)| \geq \epsilon\right) \leq 4\,\Pi_\mathcal{H}(2n)\,e^{-n\epsilon^2/8}$$
+
+Sauer-Shelah를 대입하면 샘플 복잡도가 나온다.
+
+$$m = O\!\left(\frac{d \log(1/\epsilon) + \log(1/\delta)}{\epsilon^2}\right)$$
+
+"VC 유한 $\Leftrightarrow$ PAC 학습 가능"이라는 **Fundamental Theorem**의 핵심 방향이 이렇게 완성된다.
+
+<Callout type="note" title="트레이드오프">
+VC bound는 **worst-case over all distributions**를 보장한다. 이 강인함이 곧 약점이다 — 특정 분포에서는 실제 복잡도가 훨씬 낮아도, bound는 최악의 경우를 상정한다. 또한 symmetrization의 Markov 적용에서 상수 4가 들어오고, Sauer-Shelah도 상계이므로, 최종 bound는 실제보다 수십 배 loose하다.
+</Callout>
+
+## 현대 딥러닝과 vacuous bound
+
+이 아름다운 이론이 현대 딥러닝 앞에서 무너진다.
+
+ReLU 신경망의 VC 차원은 width $W$, depth $L$에 대해 $\Theta(WL \log W)$다 (Bartlett et al. 2019). ResNet-50의 경우 $W \approx 25 \times 10^6$, $L \approx 50$이므로 VC $\sim 10^9$ 수준이다. ImageNet 훈련 샘플은 $n = 1.2 \times 10^6$. 따라서 $n/\text{VC} \approx 10^{-3} \ll 1$.
+
+$$4\left(\frac{2en}{d}\right)^d e^{-n\epsilon^2/8} \gg 1 \quad \text{(ResNet-50 기준)}$$
+
+경계가 1 이상이면 "일반화 gap은 1 이하"라는 자명한 사실 이상을 말하지 못한다. **Vacuous bound**다.
+
+Zhang et al. (2017)이 이 문제를 실험적으로 확인했다. ResNet은 ImageNet 랜덤 라벨 전체를 외울 수 있다 — 즉 VC $\geq 1.2 \times 10^6$. 그런데 실제 라벨로 훈련하면 test error 약 10%까지 일반화한다. VC 이론은 "random label도 외울 수 있는 모델"이 왜 "real label은 일반화하는가"를 설명하지 못한다.
+
+<Callout type="warning" title="VC 이론의 근본 한계">
+VC는 가설공간의 **표현력(what can be fitted)**을 측정하지, 알고리즘이 **실제로 찾는 해(what is actually found)**를 측정하지 않는다. 신경망이 random label을 외울 수 있다는 사실과, SGD가 real label에서 일반화되는 해를 찾는다는 사실은 서로 다른 층위의 현상이다.
+</Callout>
+
+돌파구는 복수의 방향에서 나왔다. Norm-based Rademacher (Bartlett, Foster, Telgarsky 2017)는 파라미터 수 대신 가중치 norm의 곱을 복잡도 척도로 쓴다. SGD stability (Hardt, Recht, Singer 2016)는 알고리즘이 implicit regularization을 수행한다는 것을 보인다 — step size와 iteration 수가 effective 복잡도를 제어한다. Neural Tangent Kernel과 double descent는 overparameterized regime을 새로운 이론적 틀로 다룬다.
+
+## 정리
+
+- **Shattering**은 가설공간이 점집합의 모든 $2^m$가지 dichotomy를 구현할 수 있음이고, **VC 차원**은 그 최대 크기다 — 선형 분류기는 $d+1$, Radon 정리가 상한을 준다.
+- **Sauer-Shelah Lemma**는 지수 $2^m$을 다항 $(em/d)^d$로 압축한다. 이것이 무한 $\mathcal{

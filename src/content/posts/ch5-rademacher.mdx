@@ -1,0 +1,145 @@
+---
+title: "Rademacher 복잡도는 왜 VC보다 강한가"
+description: "랜덤 라벨 상관성으로 함수족의 표현력을 측정하는 Rademacher 복잡도의 정의부터, Symmetrization-McDiarmid 기반 일반화 경계, Contraction Lemma를 통한 surrogate loss 정당화, 그리고 신경망 norm-based bound까지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [statistical-learning-theory, rademacher-complexity, generalization, svm, neural-network]
+difficulty: advanced
+series:
+  slug: statistical-learning-theory-deep-dive
+  title: Statistical Learning Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+VC 차원은 가설공간이 얼마나 많은 패턴을 구분할 수 있는가를 묻는다. 하지만 이 질문은 데이터를 보기 전에 답해야 한다. Rademacher 복잡도는 다르게 묻는다 — **실제 샘플 위에서, 함수족이 완전히 랜덤한 라벨을 얼마나 잘 학습하는가?** 이 차이가 왜 현대 ML 이론의 tighter bound를 가능하게 하는가?
+
+## 랜덤 라벨 상관성이 복잡도를 측정하는 이유
+
+$\sigma_i \in \{\pm 1\}$을 각각 확률 1/2로 취하는 Rademacher 변수라 하자. 동전 던지기로 생성한 노이즈 라벨이다. 고정된 샘플 $S = (x_1, \ldots, x_n)$과 함수족 $\mathcal{F}$에 대해 **경험적 Rademacher 복잡도**를 다음과 같이 정의한다.
+
+$$
+\hat{\mathcal{R}}_S(\mathcal{F}) := \mathbb{E}_\sigma\left[\sup_{f \in \mathcal{F}} \frac{1}{n} \sum_{i=1}^n \sigma_i f(x_i)\right]
+$$
+
+직관은 단순하다. $\mathcal{F}$가 표현력이 높으면 어떤 랜덤 라벨 패턴이든 맞출 수 있고 이 값은 크다. 표현력이 낮으면 랜덤 신호에 거의 상관되지 않아 값이 작다. **큰 Rademacher 복잡도 = 함수족이 노이즈까지 학습하려는 욕심** = 높은 과적합 위험이다.
+
+VC 차원과의 결정적 차이는 **데이터 의존성**이다. VC는 가설공간의 기하학적 성질(shattering)만 본다. $\hat{\mathcal{R}}_S$는 실제 샘플 $S$에서 함수족이 어떻게 행동하는지 측정하므로, 데이터가 margin structure나 low-density 구조를 가지면 VC보다 훨씬 tighter한 bound를 준다.
+
+## 일반화 경계의 핵심 구조
+
+Rademacher 복잡도가 실제로 쓸모있으려면 일반화 gap을 bound해야 한다. 핵심 정리는 다음이다.
+
+<Theorem kind="theorem" number="1" title="Rademacher 일반화 경계">
+$\ell \in [0, 1]$인 손실 함수와 iid 샘플 $S \sim \mathcal{D}^n$에 대해, 확률 $\geq 1 - \delta$로:
+
+$$
+\sup_{h \in \mathcal{H}} |L_\mathcal{D}(h) - L_S(h)| \leq 2\mathcal{R}_n(\ell \circ \mathcal{H}) + \sqrt{\frac{\log(2/\delta)}{2n}}
+$$
+</Theorem>
+
+<Proof>
+증명은 두 단계로 이루어진다.
+
+**Step 1 — Symmetrization**: $S$와 독립인 ghost sample $S' \sim \mathcal{D}^n$을 도입하면
+
+$$
+\mathbb{E}_S\left[\sup_h |L_\mathcal{D}(h) - L_S(h)|\right] \leq \mathbb{E}_{S,S'}\left[\sup_h |L_{S'}(h) - L_S(h)|\right]
+$$
+
+이 성립한다. $S'$과 $\mathcal{D}$가 교환 가능하기 때문이다. 이제 Rademacher 변수 $\sigma_i \in \{\pm 1\}$로 두 샘플을 "섞으면" 우변이 $2\mathcal{R}_n(\ell \circ \mathcal{H})$로 bound된다.
+
+**Step 2 — McDiarmid 집중**: $\hat{\mathcal{R}}_S$는 한 샘플을 교체할 때 $\leq 1/n$만큼 변한다(bounded differences). McDiarmid 부등식에 의해 $\hat{\mathcal{R}}_S$는 기대값 주변 $O(\sqrt{\log(1/\delta)/n})$ 범위에 high probability로 집중된다. 두 단계를 결합하면 결론을 얻는다. $\square$
+</Proof>
+
+이 정리의 강점은 **VC bound를 특수 경우로 포함**한다는 것이다. Massart's Lemma에 의해 유한 함수족의 Rademacher는 $O(\sqrt{\log|\mathcal{F}|/n})$이고, 여기에 Sauer-Shelah lemma($|\mathcal{H}(S)| \leq (en/d)^d$)를 대입하면 VC bound $O(\sqrt{d\log n/n})$이 정확히 회복된다.
+
+## Contraction Lemma — Surrogate Loss의 정당화
+
+실전에서 0-1 loss는 불연속이어서 직접 최적화할 수 없다. hinge, log, cross-entropy 같은 surrogate loss를 쓴다. 왜 이 대체가 이론적으로 정당한가?
+
+<Theorem kind="theorem" number="2" title="Contraction Lemma (Ledoux-Talagrand 1991)">
+$\phi: \mathbb{R} \to \mathbb{R}$이 $L$-Lipschitz이고 $\phi(0) = 0$이면:
+
+$$
+\mathcal{R}_n(\phi \circ \mathcal{F}) \leq L \cdot \mathcal{R}_n(\mathcal{F})
+$$
+</Theorem>
+
+직관은 "수축"이다. Lipschitz 함수는 거리를 $L$배로 압축한다. Rademacher 신호의 힘도 같은 비율로 감소한다.
+
+응용이 강력하다. hinge loss $\ell(z) = \max(0, 1-z)$는 1-Lipschitz이므로 $\mathcal{R}_n(\ell_{\text{hinge}} \circ \mathcal{H}) \leq \mathcal{R}_n(\mathcal{H})$. 또한 margin $\gamma > 0$에 대한 margin loss $\ell_\gamma(z) = \max(0, 1 - z/\gamma)$는 $1/\gamma$-Lipschitz이므로:
+
+$$
+\mathcal{R}_n(\ell_\gamma \circ \mathcal{F}) \leq \frac{1}{\gamma} \mathcal{R}_n(\mathcal{F})
+$$
+
+**margin이 클수록 Rademacher 복잡도가 줄어들고, 일반화 경계가 개선된다.** 이것이 SVM margin 최대화의 수학적 정당화다.
+
+<Callout type="note" title="트레이드오프">
+Contraction Lemma는 surrogate loss의 Lipschitz 상수만큼 복잡도 bound가 완화된다는 뜻이기도 하다. hinge($L=1$), log loss($L \approx 1/4$), squared loss(locally Lipschitz)는 각각 다른 상수를 가진다. log loss가 이론적으로는 더 tight하지만, SVM은 kernel trick과 sparse solution으로 실용적 이점을 보완한다. surrogate 선택은 이론과 계산 효율성의 트레이드오프다.
+</Callout>
+
+## 선형·커널·신경망으로의 전개
+
+Rademacher 복잡도는 알고리즘마다 구체적인 값으로 계산된다.
+
+**선형 함수족** $\mathcal{F} = \{w^\top x : \|w\| \leq B\}$의 경우, Cauchy-Schwarz에 의해:
+
+$$
+\hat{\mathcal{R}}_S(\mathcal{F}) \leq \frac{B}{n}\sqrt{\sum_{i=1}^n \|x_i\|^2} \leq \frac{B \cdot \max_i \|x_i\|}{\sqrt{n}}
+$$
+
+파라미터 수가 아니라 **norm 제약 $B$와 데이터 norm**만이 복잡도를 결정한다. L2 regularization이 $\|w\|$를 줄이면 Rademacher가 직접 감소한다.
+
+**RKHS(kernel method)**에서는 무한차원인데도 결과가 놀랍도록 간단하다. kernel matrix $K_{ij} = k(x_i, x_j)$에 대해:
+
+$$
+\mathcal{R}_n(\mathcal{F}_B) \leq \frac{B\sqrt{\text{tr}(K)}}{n}
+$$
+
+kernel matrix의 trace, 즉 대각 원소합이 복잡도를 완전히 제어한다.
+
+**신경망**으로 가면 Contraction Lemma가 층마다 적용된다. $L$층 망에서 각 activation이 Lipschitz(ReLU는 1, sigmoid는 1/4)이고 weight Frobenius norm이 $\|W_l\|_F \leq M_l$이면(Bartlett & Mendelson 2002):
+
+$$
+\mathcal{R}_n(\mathcal{F}) = O\left(\frac{1}{\sqrt{n}} \prod_{l=1}^L \|W_l\|_F\right)
+$$
+
+층이 깊어질수록 norm 곱이 커져 bound가 느슨해질 수 있다. 하지만 SGD는 암묵적 정규화(implicit regularization)를 통해 자연스럽게 norm-small solution으로 수렴한다는 관찰이 있다. 이 때 norm-based bound는 VC bound(파라미터 수에 비례, 거대한 값)와 달리 의미있는 값을 준다.
+
+<Aside label="핵심 인사이트">
+VC는 "파라미터가 몇 개인가"를 본다. Rademacher는 "파라미터가 얼마나 큰가"를 본다. 같은 100만 파라미터 신경망이라도 weight가 작으면 Rademacher bound가 작다. 이것이 "고전 VC는 딥러닝에서 vacuous하지만 norm-based bound는 의미있다"는 관찰의 수학적 근거다.
+</Aside>
+
+## 정리
+
+- **Rademacher 복잡도**는 함수족이 랜덤 라벨에 상관되는 정도로 표현력을 측정한다. 데이터에 의존하므로 VC보다 tighter하다.
+- **Symmetrization + McDiarmid**로 $\sup_h |L_\mathcal{D}(h) - L_S(h)| \leq 2\mathcal{R}_n + O(\sqrt{\log(1/\delta)/n})$을 얻는다. VC bound는 이 틀의 특수 경우다.
+- **Contraction Lemma**는 surrogate loss(hinge, log)의 Rademacher가 원래 함수족의 Lipschitz 상수 배로 bound됨을 보인다. margin 최대화의 이론적 정당화가 여기서 나온다.
+- **선형→커널→신경망**: norm 제약이 복잡도를 제어한다. 파라미터 수가 아니라 weight의 크기가 일반화를 결정한다.
+
+신경망에서 이 bound가 실제로 얼마나 tight한지, 그리고 Double Descent 현상을 설명하려면 추가 도구(NTK, PAC-Bayes, stability)가 필요하다.
+
+<Reference
+  title="Rademacher and Gaussian Complexities: Risk Bounds and Structural Results"
+  authors="Bartlett, P. L. and Mendelson, S."
+  year={2002}
+  venue="Journal of Machine Learning Research"
+  url="https://www.jmlr.org/papers/v3/bartlett02a.html"
+/>
+
+<Reference
+  title="Spectrally-normalized margin bounds for neural networks"
+  authors="Bartlett, P. L., Foster, D. J., and Telgarsky, M."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.08498"
+/>
