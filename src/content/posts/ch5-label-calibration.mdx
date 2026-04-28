@@ -1,0 +1,129 @@
+---
+title: "모델은 왜 자신을 과신하는가 — Calibration의 수학"
+description: "Over-confidence의 수학적 원인부터 Label Smoothing, Knowledge Distillation, Confidence Penalty, Temperature Scaling까지, 훈련 목적함수가 만들어내는 calibration 왜곡과 그 교정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [calibration, label-smoothing, knowledge-distillation, temperature-scaling, regularization]
+difficulty: advanced
+series:
+  slug: regularization-theory-deep-dive
+  title: Regularization Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Softmax cross-entropy로 훈련된 분류 모델은 구조적으로 over-confident해진다. 예측 확률 99%가 실제 정확도 95%를 가리킨다면 그 모델은 틀리지 않았지만 **잘못 보정**되어 있다. 이 왜곡은 우연이 아니라 One-hot 손실 함수가 만들어내는 필연적 결과다. 그렇다면 훈련 목적함수를 어떻게 바꾸면, 혹은 훈련 후 무엇을 조정하면 이 왜곡을 교정할 수 있는가?
+
+## Gradient가 Logit을 무한히 밀어붙이는 이유
+
+표준 cross-entropy는 One-hot 타깃 $y$에서 오직 정답 클래스의 log-probability만 최소화한다.
+
+$$L = -\log p_{\text{true}}$$
+
+Gradient를 보면 문제가 명확해진다. 정답 클래스 logit에 대한 편미분은 $-(1 - p_{\text{true}})$이고, $p_{\text{true}} \to 1$이 될 때까지 그 방향으로 밀어붙인다. 오답 클래스는 반대로 $p_k \to 0$이 될 때까지 억누른다. 손실의 최솟값은 $p_{\text{true}} = 1$, 즉 정답 logit이 $+\infty$일 때다.
+
+유한한 데이터로 훈련하는 깊은 신경망은 이 극한에 도달하지 못하지만, 그 방향으로 끊임없이 이동한다. Guo et al. (2017)의 관찰에 따르면 LeNet처럼 얕은 네트워크는 비교적 잘 보정되어 있었지만, ResNet이나 DenseNet 같은 깊은 구조는 ImageNet에서 ECE가 7~8%에 달한다. CIFAR-100에서는 더 심각하다.
+
+## Label Smoothing — Optimal Logit에 상한을 두다
+
+Szegedy et al. (2016)의 Label Smoothing은 One-hot 타깃 자체를 대체한다.
+
+$$\tilde{y}_k = (1 - \alpha) y_k + \frac{\alpha}{K}$$
+
+정답 클래스의 타깃이 1 대신 $1 - \alpha + \alpha/K \approx 0.91$ ($\alpha = 0.1$, $K = 1000$)이 된다.
+
+<Theorem kind="proposition" number="1" title="Optimal Logit Margin (Szegedy 2016)">
+Label Smoothing loss 하에서 gradient가 0이 되는 optimal logit은 다음 조건을 만족한다.
+
+$$z_c^* - z_k^* = \log\frac{K(1-\alpha) + 1 - 1}{\alpha} \approx \log\frac{K}{\alpha}$$
+
+즉 정답 클래스 logit이 오답 클래스보다 **유한한 크기**만큼 크다. One-hot 손실의 $+\infty$와 달리.
+</Theorem>
+
+<Proof>
+$\partial L_{\text{LS}}/\partial z_k = p_k - \tilde{y}_k$. Optimality 조건 $p_k^* = \tilde{y}_k$에서 $p_c^* = 1 - \alpha + \alpha/K$, $p_{k \neq c}^* = \alpha/K$. Logit 관점에서 $\log p_c^* - \log p_k^* = z_c - z_k$이므로 $z_c - z_k = \log\frac{1 - \alpha + \alpha/K}{\alpha/K} \approx \log(K/\alpha)$. $\square$
+</Proof>
+
+$\alpha = 0.1$, $K = 1000$ (ImageNet)일 때 margin은 약 9.21이다. $K = 10$ (CIFAR-10)이면 4.61로 절반이 된다. 같은 $\alpha$라도 클래스 수에 따라 regularization 강도가 다르다는 점은 실전에서 중요한 직관이다.
+
+더 나아가 Label Smoothing loss는 다음과 동치다.
+
+$$L_{\text{LS}} \propto (1-\alpha) L_{\text{CE}} + \alpha \cdot \text{KL}(\text{Uniform} \| p)$$
+
+Cross-entropy에 **output 분포를 uniform에 가깝게 당기는 KL 항**을 더한 것이다. 이 관점이 Confidence Penalty와의 연결고리가 된다.
+
+## Knowledge Distillation — Dark Knowledge와 LS의 통일
+
+Hinton et al. (2015)의 Knowledge Distillation(KD)은 표면적으로 다른 기법처럼 보이지만, Label Smoothing과 같은 수학적 뿌리를 공유한다.
+
+$$L_{\text{KD}} = \alpha \cdot T^2 \cdot \text{KL}(p_{\text{teacher}}^{(T)} \| p_{\text{student}}^{(T)}) + (1-\alpha) \cdot L_{\text{CE}}$$
+
+Teacher의 softmax를 temperature $T > 1$로 부드럽게 만든 soft target을 학습 타깃으로 삼는다. Teacher가 "3"에 대해 $(0.95, 0.03, 0.01, \ldots)$를 출력한다면, 그 안에는 "3이 8과 유사하다"는 정보가 담겨 있다. 이것이 **dark knowledge**다.
+
+<Callout type="note" title="LS = Uniform Teacher의 KD">
+Teacher가 아무 정보도 없어 uniform 분포를 출력한다고 가정하면, KD loss는 Label Smoothing과 수학적으로 동치가 된다. 즉 LS는 "정보가 없는 teacher로부터의 지식 증류"로 해석할 수 있다.
+</Callout>
+
+그러나 이 통일성이 반드시 좋은 조합을 의미하지는 않는다. Müller et al. (2019)의 핵심 발견은 **LS로 훈련된 teacher가 오히려 나쁜 teacher**라는 것이다. LS는 모든 오답 클래스를 $\alpha/K$로 균등하게 끌어올려, class 간 semantic 구조(dark knowledge)를 지워버린다. LS teacher의 logit 공간에서 클래스들은 tighter cluster로 뭉치고 inter-class distance 정보가 소실된다. 따라서 distillation pipeline에서는 teacher 훈련에 LS를 쓰지 말아야 한다.
+
+## Confidence Penalty와 Maximum Entropy
+
+Pereyra et al. (2017)의 Confidence Penalty(CP)는 Label Smoothing과 목적은 같으나 접근 방향이 다르다.
+
+$$L_{\text{CP}} = L_{\text{CE}} - \beta \cdot H(p)$$
+
+LS가 **타깃**을 부드럽게 만드는 반면, CP는 **output 분포의 entropy**를 직접 최대화하도록 강제한다. Jaynes(1957)의 Maximum Entropy 원리와 연결되는 지점이다 — 제약이 주어진 상태에서 가장 "편향 없는" 분포를 선택하라.
+
+두 기법의 gradient를 비교하면 mechanism이 다름을 확인할 수 있다. LS gradient는 $p_k - \tilde{y}_k$로, 타깃 이동의 결과다. CP gradient는 $(p_k - y_k) - \beta p_k [\log p_k - \mathbb{E}[\log p]]$로, high-confidence 클래스에 추가적인 반발력을 가한다. 수학적 형태는 다르지만 실전 성능은 거의 동등하다. 이 때문에 구현이 단순한 LS가 표준으로 자리잡았다.
+
+<Callout type="warning" title="트레이드오프">
+LS와 CP는 모두 over-confidence를 줄이지만 **KD와 함께 쓸 때 상호작용을 조심**해야 한다. CP teacher는 LS teacher보다 dark knowledge를 더 잘 보존한다는 직관이 있으나 경험적 검증은 아직 부족하다. 두 기법의 $\alpha$와 $\beta$를 동시에 키우면 under-confidence로 역전된다.
+</Callout>
+
+## Temperature Scaling — 훈련 후 한 줄의 교정
+
+앞의 세 기법은 모두 훈련 중 개입이다. 하지만 이미 배포된 모델, 또는 재훈련이 불가능한 대형 모델에는 **post-hoc calibration**이 필요하다.
+
+Guo et al. (2017)의 Temperature Scaling은 단 하나의 scalar $T$로 모든 logit을 나눈다.
+
+$$p^{\text{cal}} = \text{softmax}(z / T), \quad T^* = \arg\min_T \sum_i -\log p^{(T)}_{c_i}(x_i)$$
+
+이 방법의 핵심 성질은 두 가지다. 첫째, top-1 argmax가 불변이다 — $\exp$의 단조성으로 prediction이 바뀌지 않고 accuracy가 정확히 보존된다. 둘째, validation NLL은 $T$에 대해 convex다 ($u = 1/T$로 치환하면 log-sum-exp의 convexity에서 나온다), 따라서 global optimum이 유일하게 존재한다.
+
+<Aside label="왜 단순한 것이 이긴다">
+Temperature Scaling은 parameter가 하나뿐이라 validation set이 작아도 overfitting이 사실상 불가능하다. Matrix Scaling이나 Isotonic Regression은 더 유연하지만, 그 유연성이 오히려 소규모 validation에서 overfitting으로 이어진다. ResNet-50 ImageNet에서 TS 하나로 ECE를 7% → 1% 수준으로 줄일 수 있다는 Guo 2017의 결과는 이 단순성의 승리다.
+</Aside>
+
+Label Smoothing으로 훈련된 모델에 Temperature Scaling을 추가하면 complementary하게 작동한다. LS가 훈련 dynamics를 바꿔 $T^*$를 1에 가깝게 만들고, TS가 남은 residual over-confidence를 정리한다. 의료 진단이나 자율주행처럼 uncertainty가 중요한 영역에서는 이 조합이 표준이 되어가고 있다.
+
+## 정리
+
+- **Over-confidence는 One-hot + cross-entropy의 구조적 귀결**이다. Gradient가 정답 logit을 무한히 밀어붙이도록 설계되어 있다.
+- **Label Smoothing**은 optimal logit에 유한한 상한 $\log(K/\alpha)$를 두고, CE + KL-to-uniform으로 재해석된다.
+- **KD와 LS는 수학적으로 통일**된다. 단 LS teacher는 dark knowledge를 소거하므로 distillation pipeline에서는 teacher에게 LS를 쓰지 말아야 한다.
+- **Temperature Scaling**은 accuracy를 건드리지 않고 훈련 후 calibration을 교정하는 가장 안전한 방법이다.
+
+네 기법 모두 하나의 질문에서 출발한다 — "모델이 얼마나 확신하는가"가 "모델이 얼마나 맞는가"와 일치하게 만들 수 있는가.
+
+<Reference
+  title="On Calibration of Modern Neural Networks"
+  authors="Guo et al."
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1706.04599"
+/>
+
+<Reference
+  title="When Does Label Smoothing Help?"
+  authors="Müller et al."
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1906.02629"
+/>

@@ -1,0 +1,135 @@
+---
+title: "Regularization은 Prior다 — L1/L2부터 Group Sparsity까지"
+description: "L2가 Gaussian prior의 negative log이고 L1이 Laplace prior인 이유부터, 기하학적 sparsity와 SVD shrinkage, 그리고 Elastic Net/Group Lasso의 구조적 확장까지 하나의 Bayesian 프레임으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [regularization, bayesian, lasso, ridge, sparsity]
+difficulty: advanced
+series:
+  slug: regularization-theory-deep-dive
+  title: Regularization Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+실전에서 $\lambda$는 대부분 grid search로 튜닝된다. 왜 $\|w\|^2$ 형태인지, 왜 $\|w\|_1$이 sparsity를 만드는지, Elastic Net의 grouping effect는 어디서 오는지 — 이 질문들이 "관행"으로 묻혀 있다. 이 모든 것에 단일한 답이 있다. **regularization term은 prior의 negative log**다.
+
+## Prior로서의 Regularization
+
+Bayesian linear regression 모델을 쓰자. 노이즈 $\varepsilon \sim \mathcal{N}(0, \sigma^2 I)$, prior $w \sim \mathcal{N}(0, \sigma_w^2 I)$에서 MAP 추정량은 posterior를 최대화하는 $w$다.
+
+$$
+\hat{w}_{\text{MAP}} = \arg\min_w \Big[ -\log p(y \mid w) - \log p(w) \Big]
+$$
+
+likelihood의 negative log는 $\frac{1}{2\sigma^2}\|y - Xw\|^2$, Gaussian prior의 negative log는 $\frac{1}{2\sigma_w^2}\|w\|^2$다. 합치면 정확히 Ridge regression의 목적함수이며 대응 관계는 다음과 같다.
+
+$$
+\boxed{\lambda_{\text{Ridge}} = \frac{\sigma^2}{\sigma_w^2}}
+$$
+
+$\lambda$는 임의의 hyperparameter가 아니다. **noise 분산 대 prior 분산의 비**다. $\sigma_w^2$이 작을수록 (prior 믿음이 강할수록) $\lambda$가 크고, regularization이 강해진다. $\lambda = 0$은 flat prior(MLE), $\lambda \to \infty$는 $w = 0$ 고집이다.
+
+<Aside label="실전 함의">
+noise 수준 $\sigma$를 cross-validation으로 추정하고 prior 강도 $\sigma_w$를 도메인 지식으로 고르면 $\lambda$가 원리적으로 결정된다. Grid search는 이 과정의 empirical Bayes적 근사다.
+</Aside>
+
+한편 Ridge 해는 closed form으로 $\hat{w}_{\text{MAP}} = (X^TX + \lambda I)^{-1}X^Ty$이며, Gaussian posterior에서 mode = mean이므로 이것은 동시에 **posterior mean**이기도 하다. posterior covariance는 $\Sigma_w = \sigma^2(X^TX + \lambda I)^{-1}$이고, 새 점 $x^*$에서의 predictive variance $\sigma^2 + x^{*T}\Sigma_w x^*$를 즉시 계산할 수 있다.
+
+## L1과 Laplace — sparsity의 확률적 뿌리
+
+prior를 $\mathcal{N}(0, \sigma_w^2 I)$ 대신 Laplace $p(w_j) = \frac{\tau}{2}e^{-\tau|w_j|}$로 바꾸면 어떻게 되는가? negative log는 $\tau\|w\|_1$이 된다. 따라서:
+
+$$
+\boxed{\hat{w}_{\text{Lasso}} = \arg\min_w \frac{1}{2\sigma^2}\|y - Xw\|^2 + \tau\|w\|_1}
+$$
+
+sparsity는 이 prior의 **모양**에서 나온다. Laplace 분포는 $w = 0$에서 cusp(뾰족점)을 갖는다. 이 cusp 때문에 subdifferential $\partial|w|$가 $w = 0$에서 구간 $[-1, 1]$이 되고, 1차원 Lasso의 최적성 조건 $0 \in \partial f(\hat{w})$를 $\hat{w} = 0$으로 충족할 수 있다.
+
+<Theorem kind="theorem" number="1" title="Soft Thresholding">
+$\min_w \frac{1}{2}(z - w)^2 + \lambda|w|$의 해는 $\hat{w} = S_\lambda(z) := \text{sign}(z)\max(|z| - \lambda, 0)$이다.
+</Theorem>
+
+<Proof>
+$w > 0$이면 최적성 조건이 $z - w = \lambda$, 즉 $w = z - \lambda > 0$이므로 $z > \lambda$일 때 성립. $w < 0$이면 대칭으로 $z < -\lambda$. $w = 0$이면 $0 \in \{-z\} + \lambda[-1, 1]$이 되어 $|z| \leq \lambda$일 때 충족. 세 경우를 합치면 $S_\lambda(z)$.
+</Proof>
+
+$|z| \leq \lambda$인 구간에서 해가 **정확히 0**이 된다. Gaussian prior MAP에서는 이런 점 해가 나오지 않는다 — 이것이 L1의 sparsity와 L2의 continuous shrinkage의 근본 차이다.
+
+## 기하학: non-smoothness가 sparsity를 만든다
+
+같은 현상을 기하로 보자. 제약 최적화 $\min \|y - Xw\|^2 \ \text{s.t.} \ \|w\|_1 \leq t$에서 해는 loss contour(타원)가 L1 ball과 처음 접하는 점이다.
+
+$d$차원 L1 ball의 꼭짓점은 정확히 $2d$개: $\{\pm t \cdot e_j\}$. 각 꼭짓점은 **정확히 하나의 coordinate만 nonzero**다. 꼭짓점에서 normal cone이 full-dimensional이기 때문에, generic한 loss 타원이 꼭짓점과 접할 양의 확률이 있다. L2 ball은 어디서나 smooth하므로 접점이 좌표 축 위에 있을 확률은 0이다.
+
+KKT 조건으로 쓰면, $\hat{w}_j = 0$인 coordinate에 대해 $|X_j^T(y - X\hat{w})| \leq \lambda$여야 한다. **residual과 feature의 correlation이 $\lambda$ 이하인 feature는 선택되지 않는다.**
+
+<Callout type="note" title="트레이드오프">
+L1은 sparsity(feature selection)를 주지만 상관된 feature 중 하나만 임의로 선택하는 불안정성이 있다. L2는 stable하지만 정확히 0인 coefficient를 만들지 못한다. 둘 다 "일반적인" prior를 가정하며, 실제 weight 분포가 다르면 sub-optimal이다.
+</Callout>
+
+## SVD로 보는 Ridge — spectral shrinkage
+
+Ridge 해를 SVD $X = U\Sigma V^T$로 전개하면 메커니즘이 투명해진다.
+
+$$
+\hat{w}_R = \sum_{i=1}^{r} \frac{\sigma_i}{\sigma_i^2 + \lambda}(u_i^T y)\,v_i
+$$
+
+각 principal direction에 **filter** $f(\sigma_i) = \sigma_i^2/(\sigma_i^2 + \lambda)$가 곱해진다. $\sigma_i \gg \sqrt{\lambda}$이면 $f \approx 1$ (signal-dominated 방향, 거의 변화 없음), $\sigma_i \ll \sqrt{\lambda}$이면 $f \approx 0$ (noise-dominated 방향, 강한 shrink). Ridge는 "noise에 취약한 방향을 더 많이 축소"하는 **adaptive spectral filter**다.
+
+effective degrees of freedom은 $\text{df}(\lambda) = \sum_i \sigma_i^2/(\sigma_i^2 + \lambda)$로 정의된다. $\lambda = 0$이면 $\text{df} = r$ (full rank 사용), $\lambda \to \infty$이면 $\text{df} \to 0$.
+
+$p > n$ overparameterized 설정에서 $\lambda \to 0^+$의 극한은 minimum-norm solution $X^+ y$로 수렴한다. 이것이 "SGD가 0에서 시작할 때 수렴하는 해"와 같다 — Ridge의 spectral 관점이 implicit regularization과 만나는 지점이다.
+
+## Elastic Net과 Group Lasso — 구조를 prior로
+
+L1의 상관-불안정 문제(Zou & Hastie 2005)는 Elastic Net으로 해결한다.
+
+$$
+\min_w \tfrac{1}{2n}\|y - Xw\|^2 + \lambda_1\|w\|_1 + \lambda_2\|w\|^2
+$$
+
+L1이 sparsity를, L2가 **grouping effect**(상관된 feature의 coefficient를 고르게 분산)를 담당한다. feature $x_1 = x_2$인 완전 상관 경우, L2 항이 $w_1 = w_2$를 강제한다 — "공평하게 나눠라"는 prior.
+
+feature에 자연스러운 그룹 구조가 있다면 Group Lasso(Yuan & Lin 2006)를 쓴다.
+
+$$
+\min_w \tfrac{1}{2n}\|y - Xw\|^2 + \lambda \sum_{g} \sqrt{p_g}\|w_g\|_2
+$$
+
+각 그룹 내부는 L2 norm(smooth), 그룹 단위로는 L1 structure — **그룹 전체가 on이거나 off**다. proximal operator는 block soft thresholding: $\text{prox}_{\lambda\|\cdot\|_2}(z) = (1 - \lambda/\|z\|_2)_+ z$. $\|z\|_2 \leq \lambda$이면 그룹 전체가 0이 된다.
+
+CNN channel pruning에서 출력 채널 전체를 하나의 그룹으로 설정하면, Group Lasso가 채널 단위의 structured sparsity를 만들어 실제 추론 가속으로 이어진다.
+
+## 정리
+
+- **L2 = Gaussian prior**, **L1 = Laplace prior** — regularization term은 prior의 negative log다. $\lambda = \sigma^2/\sigma_w^2$은 noise-to-prior 분산비다.
+- **Sparsity의 원천은 non-smoothness**: L1 ball의 꼭짓점(기하), Laplace의 cusp(확률), subdifferential의 구간(해석) — 모두 같은 현상의 다른 언어다.
+- **Ridge는 spectral filter**: SVD 기저에서 작은 singular value 방향을 더 강하게 shrink하며, effective df로 모델 복잡도를 연속적으로 제어한다.
+- **구조적 prior**: Elastic Net은 상관 feature의 grouping을, Group Lasso는 명시적 그룹 구조를 prior로 인코딩한다.
+
+$\lambda$를 튜닝할 때 우리는 사실 prior 강도를 조정하고 있다. 이 프레임이 없으면 Dropout = VI, SWA = SWAG로 가는 Bayesian 다리가 끊어진다.
+
+<Reference
+  title="Regression Shrinkage and Selection via the Lasso"
+  authors="Tibshirani, R."
+  year={1996}
+  venue="Journal of the Royal Statistical Society, Series B"
+  url="https://www.jstor.org/stable/2346178"
+/>
+
+<Reference
+  title="Regularization and Variable Selection via the Elastic Net"
+  authors="Zou, H. and Hastie, T."
+  year={2005}
+  venue="Journal of the Royal Statistical Society, Series B"
+  url="https://doi.org/10.1111/j.1467-9868.2005.00503.x"
+/>

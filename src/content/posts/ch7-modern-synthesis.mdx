@@ -1,0 +1,130 @@
+---
+title: "Regularization의 4축 — 33개 기법을 하나의 틀로"
+description: "SWA의 iterate 평균부터 SAM의 worst-case minimax, AdamW의 decoupled weight decay까지, 현대 regularization 기법들이 Prior·Ensemble·Landscape·Invariance 4축 위에서 어떻게 통합되는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [regularization, swa, sam, adamw, optimization]
+difficulty: advanced
+series:
+  slug: regularization-theory-deep-dive
+  title: Regularization Theory Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Regularization 기법은 수십 개다. L1, L2, Dropout, BatchNorm, Mixup, SWA, SAM, AdamW — 각각 배경이 다르고 수식도 다르다. 그런데 이 기법들이 공통적으로 막으려는 것, 즉 "훈련 데이터에 대한 과잉 의존"을 어떤 각도에서 공략하는지를 따라가면, 네 개의 축이 보인다. 그 틀 안에서 최신 기법들은 어떤 위치에 있는가?
+
+## Loss Surface를 직접 다루는 기법들
+
+SGD가 flat minimum을 선호한다는 것은 Ch6에서 봤다. 하지만 SGD가 수렴한 이후에도 iterate $\theta_t$는 minimum 주변에서 진동한다. mini-batch noise 때문이다. 단일 $\theta_t$는 정확한 minimum이 아니라 근처의 noisy point다.
+
+**SWA** (Izmailov et al. 2018)의 아이디어는 단순하다. 훈련 후반부의 iterate를 평균한다.
+
+$$\bar{\theta}_{\text{SWA}} = \frac{1}{T}\sum_{t=t_0}^{T} \theta_t$$
+
+SGD iterate를 SDE $d\theta = -\nabla L\, dt + \sqrt{2T_{\text{eff}}}\, dB$로 모델링하면, stationary distribution 아래서 대수의 법칙이 작동한다.
+
+$$\bar{\theta}_T \to \mathbb{E}_{p^*}[\theta], \quad \text{Var}(\bar{\theta}_T) \approx \text{Var}(\theta_t)/T$$
+
+Wide valley(flat minimum)에서는 iterate가 valley 전체를 커버하고, 평균이 valley의 **중심**으로 이동한다. Narrow valley에서는 iterate가 한 점에 집중되어 평균도 큰 차이가 없다. SWA의 generalization 개선 메커니즘이 바로 이것이다. CIFAR-100 ResNet-164에서 SGD 74.8% → SWA 76.3%이 이 메커니즘의 경험적 확인이다.
+
+**SAM** (Foret et al. 2021)은 같은 목표를 명시적 최적화로 달성한다. flat minimum을 **찾는** 게 아니라 **강제**한다.
+
+$$\min_\theta \max_{\|\epsilon\|_2 \leq \rho} L(\theta + \epsilon)$$
+
+Inner max를 1차 Taylor 근사로 풀면 최악의 perturbation 방향이 나온다.
+
+$$\epsilon^*(\theta) = \rho \cdot \frac{\nabla L(\theta)}{\|\nabla L(\theta)\|_2}$$
+
+이 adversarial point에서 gradient를 계산해 실제 update에 쓴다. 매 step에 forward-backward가 두 번 필요하다는 것이 SAM의 비용이다. $\rho = 0.05$에서 CIFAR-100 WideResNet은 SGD 대비 1.5~2% 개선을 보인다.
+
+<Callout type="note" title="SWA와 SAM의 관계">
+SWA는 iterate를 **사후적으로 평균**해 flat center를 찾고, SAM은 매 step에서 **명시적으로** flat basin을 향해 움직인다. 둘을 조합하면 추가 0.2~0.5%의 개선이 관측된다. 하지만 비용도 두 배로 쌓인다.
+</Callout>
+
+## Weight Decay가 Adam에서 망가지는 이유
+
+L2 regularization과 weight decay는 SGD에서는 동치다. $-\eta(g + \lambda\theta) = -\eta g - \eta\lambda\theta$. 그런데 Adam에서는 다르다.
+
+Adam에 L2를 더하면 gradient가 $\tilde{g} = g + \lambda\theta$가 되고, 이 gradient로 2차 moment $\hat{v}_t$를 업데이트한다. Adam의 update step은 $\hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)$이므로, weight decay 항도 $\sqrt{\hat{v}_t}$로 나눠진다.
+
+결과적으로 parameter $i$의 effective weight decay strength는 다음과 같다.
+
+$$\lambda_{\text{eff},i} = \frac{\lambda \cdot \theta_i}{\sqrt{\hat{v}_{t,i}}}$$
+
+gradient가 크던 parameter(큰 $\hat{v}$)는 weight decay가 **약해진다**. 큰 weight을 더 강하게 shrink해야 한다는 L2의 의도에 정반대다.
+
+**AdamW** (Loshchilov & Hutter 2019)는 weight decay를 gradient 계산에서 분리한다.
+
+$$\theta_{t+1} = \theta_t - \eta \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} - \eta\lambda\theta_t$$
+
+$\hat{m}_t$와 $\hat{v}_t$는 순수 gradient $g$만으로 계산된다. weight decay $-\eta\lambda\theta_t$는 직접 subtract다. 모든 parameter에 **uniform한** $\lambda$가 적용된다. ImageNet ResNet에서 Adam+L2 75.2% → AdamW 76.4%의 차이가 이 균일성에서 나온다.
+
+현대 LLM(GPT, Llama, Mistral 등)이 모두 AdamW를 쓰는 이유도 여기에 있다. 대규모 Transformer에서 parameter별 왜곡 없는 uniform regularization이 훈련 안정성에 직접 영향을 준다.
+
+## 4축 통합 프레임워크
+
+이 시리즈의 33개 기법은 네 축으로 분류된다.
+
+| 축 | 정의 | 대표 기법 |
+|:---|:---|:---|
+| **Prior** | 파라미터 사전 분포 $p(\theta)$ | L1, L2, AdamW weight decay |
+| **Ensemble** | 여러 hypothesis의 평균 | Dropout, Stochastic Depth, SWA |
+| **Landscape** | Loss surface 곡률 제어 | BatchNorm, LayerNorm, SAM, SWA |
+| **Invariance** | 변환에 대한 불변성 | Augmentation, Mixup, Label Smoothing |
+
+SWA는 Ensemble과 Landscape 두 축에 걸친다. SAM은 Landscape가 주축이다. AdamW는 Prior 축의 정제다. 한 기법이 여러 축에 속할 수 있지만, **주 역할**로 분류하면 각 기법의 설계 의도가 명확해진다.
+
+<Theorem kind="proposition" number="1" title="축별 Architecture 친화성">
+CNN은 Invariance + Landscape 축이 중심이고, Transformer는 Landscape + Prior 축이 중심이며, GNN은 Ensemble + Landscape 축이 중심이다.
+</Theorem>
+
+<Proof>
+CNN의 natural image는 rotation/flip/crop에 대한 대칭성이 있어 Invariance 기법(augmentation, Mixup)이 직접 작용한다. BatchNorm은 깊은 CNN의 훈련을 가능하게 하는 Landscape 기법이다. Transformer에서 token 순서는 의미를 담으므로 natural invariance가 약하다. Pre-RMSNorm과 warmup+cosine이 Landscape를, AdamW가 Prior를 담당한다. GNN은 message passing이 graph permutation invariance를 architectural하게 내장하므로, DropEdge/DropNode 같은 Ensemble 기법과 LayerNorm이 실질적 정규화를 맡는다.
+</Proof>
+
+## 트레이드오프
+
+같은 축 내에서 중복 적용은 주의가 필요하다. CNN에서 BatchNorm과 Dropout을 함께 쓰면 BN의 variance 통계가 Dropout의 stochastic masking과 충돌한다는 것이 알려져 있다. 다른 축 조합은 대체로 안전하다 — 다른 메커니즘으로 작동하기 때문이다.
+
+<Callout type="warning" title="과잉 정규화">
+4축 모두를 최대 강도로 쌓으면 underfit이 확실하다. 하나의 축을 강하게 쓰면 다른 축의 의존도를 줄일 수 있다. 예: Mixup(Invariance)을 강하게 쓰면 Dropout rate(Ensemble)을 낮춰도 비슷한 generalization을 얻는다.
+</Callout>
+
+실전 진단 순서도 있다. generalization gap이 크면 Prior(weight decay 적절성)와 Invariance(augmentation)를 먼저 점검한다. 훈련 동역학이 불안정하면(gradient exploding, activation collapse) Landscape를 본다. 예측이 brittle하거나 calibration이 나쁘면 Ensemble을 추가한다.
+
+<Aside label="큰 weight_decay 수치의 해석">
+AdamW의 weight_decay=0.1은 SGD의 weight_decay=1e-4와 "다른 숫자"지만 비슷한 regularization strength다. Adam의 adaptive lr이 effective step size를 SGD의 약 1/1000 수준으로 낮추기 때문이다. $\lambda$ 수치를 비교할 때는 항상 optimizer와 lr을 함께 고려해야 한다.
+</Aside>
+
+## 정리
+
+- SWA는 iterate 평균으로 flat valley center를 찾는다. SWAG는 여기에 Gaussian posterior를 씌워 Bayesian uncertainty를 거의 무료로 제공한다.
+- SAM은 $\rho$-neighborhood의 worst-case loss를 직접 최소화한다. 비용은 2배지만 Landscape 축에서 가장 명시적인 flat minimum 탐색이다.
+- AdamW는 Adam의 adaptive lr에 의한 weight decay 왜곡을 decoupling으로 해결한다. 현대 LLM 훈련의 표준이 된 이유다.
+- Prior·Ensemble·Landscape·Invariance 4축은 33개 기법의 설계 의도를 분류하는 틀이면서, architecture별 recipe의 차이를 설명하는 언어다.
+
+새 regularization 기법이 나왔을 때 "이것이 4축 중 어디에 속하는가"를 묻는 것만으로 기존 지식과의 연결고리가 생긴다. 틀의 가치는 분류에 있지 않다 — 이해의 전이 가능성에 있다.
+
+<Reference
+  title="Averaging Weights Leads to Wider Optima and Better Generalization"
+  authors="Izmailov, Podoprikhin, Garipov, Vetrov, Wilson"
+  year={2018}
+  venue="UAI"
+  url="https://arxiv.org/abs/1803.05407"
+/>
+
+<Reference
+  title="Sharpness-Aware Minimization for Efficiently Improving Generalization"
+  authors="Foret, Kleiner, Mobahi, Neyshabur"
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2010.01412"
+/>

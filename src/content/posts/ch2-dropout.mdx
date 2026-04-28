@@ -1,0 +1,144 @@
+---
+title: "Dropout은 왜 세 가지 얼굴을 가지는가"
+description: "앙상블 근사, Variational Inference, Adaptive L2라는 세 해석이 하나의 알고리즘에서 어떻게 공존하는지, 그리고 변종들이 그 철학을 어떻게 확장하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [dropout, regularization, variational-inference, ensemble, deep-learning]
+difficulty: advanced
+series:
+  slug: regularization-theory-deep-dive
+  title: Regularization Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+`nn.Dropout(p=0.5)` 한 줄은 누구나 안다. 하지만 그것이 **왜 작동하는가**라는 질문에 대한 답은 하나가 아니다. 같은 알고리즘을 앙상블로 읽는 사람, Bayesian 추론으로 읽는 사람, Feature-scale 적응 정규화로 읽는 사람이 모두 옳다. 이 세 해석은 서로를 반박하지 않는다 — 그렇다면 이 해석들은 어떤 관계에 있는가?
+
+## 앙상블로 읽기: $2^N$개의 thinned network
+
+Srivastava 2014의 원래 직관은 단순하다. 매 forward pass마다 뉴런을 확률 $p$로 끄면, 각 pass는 서로 다른 subnetwork를 통과한다. $N$개 뉴런이면 이론적으로 $2^N$개의 thinned network가 존재한다.
+
+문제는 test time이다. $2^N$번의 forward pass 평균을 실제로 낼 수는 없다. Srivastava의 해결책은 weight scaling이다.
+
+$$
+\hat{y}_{\text{ens}} = \mathbb{E}_m[f(x;\, m \odot W)] \approx f(x;\, (1-p)W)
+$$
+
+이 근사가 정확히 성립하는 경우는 linear model뿐이다.
+
+<Theorem kind="proposition" number="1" title="Linear model에서의 정확한 동치">
+$f(x; W) = Wx$ (linear, no nonlinearity)일 때, weight scaling은 앙상블 평균과 정확히 같다.
+</Theorem>
+
+<Proof>
+$\mathbb{E}_m[f(x; m \odot W)] = \mathbb{E}_m[\sum_i m_i w_i x_i] = \sum_i \mathbb{E}[m_i] w_i x_i = (1-p) \sum_i w_i x_i = f(x; (1-p)W)$. $\square$
+</Proof>
+
+Softmax network에서는 geometric mean 앙상블의 근사로 해석된다. 오차는 $O(p^2 \|W\|^2)$이며, 작은 $p$에서 좋은 근사다. PyTorch의 `nn.Dropout`이 inverted dropout(훈련 때 $1/(1-p)$ 스케일링)을 쓰는 이유도 여기서 나온다 — 훈련과 추론 양쪽에서 기댓값을 일치시키기 위해서다.
+
+## Bayesian으로 읽기: ELBO가 Dropout loss로
+
+Gal & Ghahramani 2016은 훨씬 급진적인 주장을 한다. Dropout으로 훈련된 네트워크는 **weight에 대한 Bayesian 근사 posterior**라는 것이다.
+
+핵심 아이디어는 variational family의 선택에 있다. Layer $l$의 weight matrix에 다음 posterior를 가정한다.
+
+$$
+q(W_l) = M_l \,\text{diag}(z_l), \quad z_{l,i} \stackrel{\text{iid}}{\sim} \text{Bernoulli}(1-p_l)
+$$
+
+$M_l$은 deterministic 행렬, $z_l$이 랜덤 Bernoulli 벡터다. 이 $q$로부터 $W_l$을 샘플하는 것은 $M_l$의 열 일부를 랜덤하게 0으로 만드는 것 — 정확히 Dropout이다.
+
+이 variational family로 ELBO를 전개하면 다음이 나온다.
+
+$$
+-\text{ELBO} \propto \frac{\tau}{2}\sum_i \|y_i - f_{\hat{W}_i}(x_i)\|^2 + \sum_l \frac{(1-p_l)\tau_l}{2} \|M_l\|_F^2
+$$
+
+첫 항은 Dropout forward-pass loss, 둘째 항은 L2 weight decay다. 즉 **Dropout + weight decay 훈련 = approximate BNN의 VI 최적화**다.
+
+<Callout type="note" title="MC Dropout의 정당화">
+test time에 Dropout을 끄지 않고 $T$번 forward pass를 돌리면, 각 pass가 $q(W)$에서의 한 샘플이 된다. 이 $T$개 예측의 분산이 **epistemic uncertainty**다. 추가 훈련 없이 어느 Dropout 네트워크에서도 불확실성 추정이 가능하다.
+</Callout>
+
+단, "Dropout = exact Bayesian"은 과장이다. Gal의 variational family는 거친 근사이며, KL 계산에도 Gaussian-Bernoulli 혼합 근사가 들어간다. uncertainty quality는 Deep Ensembles보다 낮을 수 있다.
+
+## Adaptive L2로 읽기: feature scale에 비례하는 penalty
+
+Wager, Wang, Liang 2013은 더 구체적인 질문을 던진다. **Linear regression에서 Dropout의 기댓값 loss는 정확히 무엇인가?** 닫힌 형태로 계산하면 다음이 나온다.
+
+$$
+\mathbb{E}_m[\|y - \tilde{X}w\|^2] = \|y - (1-p)Xw\|^2 + p(1-p)\cdot w^\top \text{diag}(X^\top X)\, w
+$$
+
+두 번째 항을 보면, feature $j$에 가해지는 penalty 계수가 $\lambda_j = p(1-p)\|X_j\|^2$다. **feature scale이 클수록 더 강한 L2 penalty**가 자동으로 걸린다. 표준 Ridge($\lambda \|w\|^2$)는 모든 feature에 동일한 penalty를 주지만, Dropout은 feature scale에 적응한다.
+
+feature를 표준화하여 $\|X_j\|^2 = n$으로 만들면 $\Gamma = \frac{np}{1-p}I$가 되어 통상 Ridge로 환원된다. 이것이 "Dropout을 쓸 때 feature normalization이 덜 critical한" 이유다.
+
+이 결과는 linear model에서만 엄밀하다. 깊은 네트워크에서는 hidden activation이 학습된 representation이라 $\|X_j\|^2$가 훈련 중 변하고, layer 간 interaction이 생긴다. 정성적 직관으로만 사용해야 한다.
+
+## 변종들: 같은 철학, 다른 granularity
+
+세 해석이 공존한다는 사실은 Dropout의 다양한 변종이 **각각 다른 해석을 강조하면서 확장**했음을 보여준다.
+
+**Spatial Dropout**은 CNN feature map의 공간 상관성 문제를 해결한다. 인접 pixel은 강한 상관을 가지므로 element-wise drop은 실질적인 정보 제거가 약하다. Channel 단위로 drop하면 같은 mask probability에서 훨씬 강한 regularization 효과를 얻는다.
+
+**Variational RNN Dropout**은 VI 해석에서 직접 나온다. 하나의 sequence 안에서 같은 weight $W$를 반복 적용하므로, VI의 "같은 posterior sample을 유지"한다는 원칙에 따라 **sequence 전체에 동일한 mask를 공유**해야 한다. 매 step 다른 mask는 consistent computation을 파괴한다.
+
+**Concrete Dropout**은 rate $p$를 hyperparameter가 아니라 **학습 파라미터**로 만든다. Bernoulli mask는 미분 불가능하므로 Gumbel-softmax relaxation을 사용한다.
+
+$$
+\tilde{z} = \sigma\!\left(\frac{\log\frac{1-p}{p} + \log U - \log(1-U)}{\tau}\right), \quad U \sim \text{Uniform}(0,1)
+$$
+
+$\tau \to 0$에서 Bernoulli로 수렴하고, $\tau > 0$에서는 $p$에 대한 gradient가 흐른다. 이렇게 하면 layer별로 최적의 dropout rate가 자동으로 결정된다.
+
+**Stochastic Depth**는 activation이나 weight가 아니라 **residual block 전체**를 drop한다. ResNet의 identity path가 있으므로 block을 drop해도 gradient flow가 끊기지 않는다. 이것이 plain network에 적용하기 어려운 이유이기도 하다. granularity를 activation → weight → block으로 높여갈수록 앙상블 크기는 줄지만($2^N$ → $2^L$), 각 subnetwork의 architecture적 다양성은 커진다.
+
+<Aside label="설계 철학">
+Dropout, DropConnect, Stochastic Depth는 같은 원리를 다른 입도(granularity)로 구현한다 — "훈련 중 랜덤하게 capacity를 제한하라". 어느 단위를 drop하느냐가 어떤 구조적 의존성을 파괴하느냐를 결정한다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="세 해석의 유효 범위">
+- **앙상블 해석**: linear에서 정확, nonlinear에서 geometric mean 근사. weight scaling의 정당화를 제공하지만 uncertainty는 주지 않는다.
+- **VI 해석**: MC Dropout으로 uncertainty 추정 가능. 하지만 variational family가 거칠고, KL 근사가 있다. Deep Ensembles보다 uncertainty 품질이 낮다.
+- **Adaptive L2 해석**: linear에서만 엄밀. feature scale 불균형에 대한 robustness를 설명하지만 nonlinear layer에서는 정성적 직관에 그친다.
+
+세 해석은 서로를 대체하지 않는다. 각각 다른 질문에 답한다.
+</Callout>
+
+현대 대형 언어 모델에서 Dropout이 거의 사용되지 않는 이유도 이 트레이드오프에서 나온다. 충분한 데이터와 weight decay, label smoothing이 있으면 Dropout의 세 효과가 이미 다른 기제로 충족된다. 그리고 MC Dropout의 uncertainty 추정은 inference 비용이 $T$배 증가하는 문제가 있다.
+
+## 정리
+
+- Dropout의 세 해석 — 앙상블, VI, Adaptive L2 — 은 서로 모순되지 않는다. 각각 다른 측면을 기술한다.
+- weight scaling $(1-p)$는 linear model에서 앙상블 평균과 정확히 같고, softmax에서는 geometric mean의 근사다.
+- Dropout + weight decay 훈련은 Bernoulli variational posterior의 ELBO 최적화로 해석된다. 이 해석이 MC Dropout uncertainty의 Bayesian 근거를 제공한다.
+- Linear regression에서 Dropout의 기댓값 loss는 feature-scale에 비례하는 adaptive L2 regularization이다.
+- Spatial, Variational, Concrete, Stochastic Depth는 같은 철학을 다른 granularity와 다른 구조적 가정 위에서 구현한다.
+
+세 해석이 공존한다는 것은 Dropout이 단순한 noise injection이 아님을 뜻한다 — 그것은 앙상블이고, posterior이고, 적응적 정규화다.
+
+<Reference
+  title="Dropout: A Simple Way to Prevent Neural Networks from Overfitting"
+  authors="Srivastava et al."
+  year={2014}
+  venue="JMLR"
+  url="https://jmlr.org/papers/v15/srivastava14a.html"
+/>
+
+<Reference
+  title="Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning"
+  authors="Gal & Ghahramani"
+  year={2016}
+  venue="ICML"
+  url="https://arxiv.org/abs/1506.02142"
+/>

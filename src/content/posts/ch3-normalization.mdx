@@ -1,0 +1,131 @@
+---
+title: "Normalization은 어떻게 깊은 네트워크를 훈련 가능하게 만드는가"
+description: "BatchNorm의 ICS 신화 반박부터 RMSNorm이 현대 LLM의 표준이 되기까지, 정규화 기법의 설계 철학과 진화를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [normalization, batch-norm, layer-norm, rms-norm, transformer]
+difficulty: advanced
+series:
+  slug: regularization-theory-deep-dive
+  title: Regularization Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+깊은 신경망은 왜 정규화 없이 훈련이 어려운가? 2015년 BatchNorm이 제안될 때 내세운 이유("Internal Covariate Shift 완화")는 3년 후 실험으로 반박됐다. 그런데도 BN은 효과적이었고, 그 뒤 LayerNorm, GroupNorm, RMSNorm이 계보를 이었다. 각 기법이 서로 다른 모양이지만 같은 목표를 향하고 있다면, 그 목표는 정확히 무엇인가?
+
+## BN이 해결한 것과 해결하지 못한 것
+
+Ioffe & Szegedy(2015)의 원래 주장은 layer 입력 분포가 훈련 중 계속 변하는 "internal covariate shift"를 완화한다는 것이었다. BN의 수식은 명확하다.
+
+$$\hat{x}_i = \frac{x_i - \mu_B}{\sqrt{\sigma_B^2 + \epsilon}}, \quad y_i = \gamma \hat{x}_i + \beta$$
+
+mini-batch 통계로 정규화하고, 학습 가능한 $\gamma, \beta$로 표현력을 복원한다. train mode에서는 batch 통계를, eval mode에서는 훈련 중 수집한 running statistics를 사용한다 — 두 모드는 완전히 다른 함수다.
+
+Santurkar et al.(2018)은 이 설명에 정면으로 반박한다. BN 직후 의도적으로 noise를 주입해 ICS를 강제로 재유발해도, 훈련 속도와 수렴은 표준 BN과 거의 동일했다. ICS 완화는 BN의 효과를 설명하지 못한다.
+
+<Callout type="note" title="실제 메커니즘">
+Santurkar의 핵심 기여는 BN이 loss landscape의 **Lipschitz 상수와 gradient Lipschitz 상수를 감소**시킨다는 것이다. 더 smooth한 landscape는 더 큰 learning rate를 허용하고, 수렴을 가속한다. "분포 안정화"가 아니라 "optimization 기하의 개선"이 실제 메커니즘이다.
+</Callout>
+
+수학적으로, BN layer의 gradient Lipschitz 상수는 pre-BN 대비 $1/\sigma_B$로 감소한다.
+
+$$\|\nabla_x L\| \leq \|J\|_{\text{op}} \|\nabla_{\hat{x}} L\| = \frac{1}{\sigma_B} \|\nabla_{\hat{x}} L\|$$
+
+이것이 "BN이 있으면 lr = 1.0도 수렴하고 없으면 lr > 0.1에서 발산"하는 경험적 관찰의 이론적 설명이다.
+
+## 축(axis)의 선택 — BN에서 LN, GN, IN으로
+
+BN의 landscape smoothing 효과는 실재하지만, batch 축에 의존한다는 근본적 한계가 있다. batch size가 작으면 통계가 noisy해지고, RNN/Transformer처럼 시퀀스 구조에서는 batch 축 자체가 모호해진다.
+
+Ba et al.(2016)의 LayerNorm은 축을 바꾼다. batch 축 대신 feature 축으로 정규화한다.
+
+$$\mu = \frac{1}{D}\sum_{i=1}^D x_i, \quad \hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}, \quad y_i = \gamma_i \hat{x}_i + \beta_i$$
+
+결정적 차이는 두 가지다. 첫째, running statistics가 불필요하다 — train과 eval에서 동일한 함수를 쓴다. 둘째, batch size에 무관하다 — batch size 1에서도 안정적으로 동작한다. 이것이 Transformer의 사실상 표준이 된 이유다.
+
+Wu & He(2018)의 GroupNorm은 BN과 LN 사이 스펙트럼을 채운다. Conv feature $x \in \mathbb{R}^{B \times C \times H \times W}$에서 채널을 $G$개 그룹으로 나누고 각 그룹 내에서 정규화한다. $G = 1$이면 LayerNorm과 동치, $G = C$이면 InstanceNorm과 동치다. $G = 32$는 object detection처럼 small batch가 강제되는 task에서 BN보다 안정적이고 LN보다 CNN에 적합하다.
+
+<Aside label="Santurkar의 통합 관점">
+BN, LN, GN, IN은 모두 같은 landscape smoothing family다. 다른 축에 smoothness를 부여할 뿐이다. 어떤 normalization이든 "어떤 차원에서 $1/\sigma$ rescaling을 적용할 것인가"라는 하나의 질문으로 귀결된다.
+</Aside>
+
+## Post-LN의 함정과 Pre-LN의 해결
+
+원 Transformer(Vaswani 2017)는 residual 이후에 LN을 적용하는 Post-LN 구조를 썼다.
+
+```
+Post-LN:  x → Attention → (+) → LN → next
+                           ↑
+                        residual
+
+Pre-LN:   x → LN → Attention → (+) → next
+                                ↑
+                             residual (x 그대로)
+```
+
+Xiong et al.(2020)은 Post-LN의 gradient가 depth에 따라 $O(\sqrt{L})$로 증가함을 보인다. 12-layer 모델에서 gradient norm이 $\sqrt{12} \approx 3.46$배 증폭된다. 이것이 Post-LN에서 warmup이 필수인 이유다 — 초기 몇 step에서 큰 gradient와 작지 않은 lr가 만나면 파라미터가 좋은 지역 밖으로 날아간다.
+
+<Theorem kind="theorem" number="1" title="Pre-LN gradient bound (Xiong et al. 2020)">
+$L$-layer Pre-LN Transformer에서, 초기화 시 $\|\nabla_{x_0} y\| = \Theta(1)$.
+</Theorem>
+
+<Proof>
+Pre-LN: $x_{\ell+1} = x_\ell + F_\ell(\text{LN}(x_\ell))$. $F_\ell \approx 0$ (초기화에서)이면 $x_{\ell+1} \approx x_\ell$. Jacobian $= I + O(\text{small})$. $L$번 곱해도 $I^L = I$ — depth에 무관하게 bounded.
+
+Post-LN: $x_{\ell+1} = \text{LN}(x_\ell + F_\ell(x_\ell))$. LN Jacobian의 특정 방향에서 $O(\sqrt{L})$ 성장이 누적된다. $\square$
+</Proof>
+
+Pre-LN의 핵심은 residual path가 LN을 우회한다는 것이다 — gradient가 $I$-like 행렬을 통해 직접 전달된다. 현재 Llama, GPT 계열, Mistral 등 대부분의 LLM이 Pre-LN(혹은 Pre-RMSNorm)을 사용한다.
+
+## BN 없이 깊은 네트워크 — 초기화로 landscape를 만든다
+
+Santurkar의 "BN = landscape tool" 해석이 맞다면, landscape smoothing을 BN 없이 다른 방식으로 달성할 수 있어야 한다. Fixup(Zhang 2019)과 SkipInit(De & Smith 2020)은 그 시도다.
+
+Fixup의 핵심은 $L$-block ResNet에서 각 residual branch의 마지막 conv weight를 $L^{-1/(2m-2)}$로 스케일링하는 것이다 ($m$: block당 conv 개수). $m = 2$이면 $L^{-1/2}$.
+
+$$\text{Var}(h_L) = (1 + O(1/L)) \cdot \text{Var}(h_0)$$
+
+더 깊을수록 각 block의 기여를 더 작게 시작해 variance explosion을 막는다. BN이 "훈련 중 매 step variance를 1로 리셋"한다면, Fixup은 "초기화에서 미리 variance를 제어"한다.
+
+SkipInit은 더 단순하다. 각 residual block에 learnable scalar $\alpha_l$을 추가하고 $\alpha_l = 0$으로 초기화한다.
+
+$$h_{\ell+1} = h_\ell + \alpha_l F_\ell(h_\ell)$$
+
+초기에는 identity network다. 훈련하면서 $\alpha_l$이 점진적으로 증가하며 각 block을 "활성화"한다. 이 철학은 Transformer의 LayerScale(CaiT 2021)로 이어진다 — per-dimension $\lambda_l \in \mathbb{R}^D$를 $\epsilon$으로 초기화해 residual branch를 점진 개방한다.
+
+<Callout type="note" title="트레이드오프">
+**Fixup**: 정밀한 초기화, architecture 변경 시 공식 재유도 필요. **SkipInit**: 단순하고 유연하지만 초기 수렴이 매우 느림($\alpha_l$ 학습 시간). **BN**: 훈련 중 adaptive하게 landscape를 조정하지만 batch 의존성과 running stats 관리 부담이 따른다. BN의 완전 대체는 NFNet처럼 Scaled Weight Standardization + AGC를 결합해야 실용적이다.
+</Callout>
+
+## Centering은 잉여였다 — RMSNorm으로의 수렴
+
+LayerNorm은 두 연산을 수행한다: centering($x - \mu$)과 rescaling($/ \sigma$). Zhang & Sennrich(2019)의 관찰은 간단하다 — centering은 학습 동역학에 거의 기여하지 않는다.
+
+$$\text{RMSNorm}(x) = \gamma \odot \frac{x}{\sqrt{\frac{1}{D}\sum_i x_i^2 + \epsilon}}$$
+
+mean 계산과 subtraction을 제거한다. $\beta$ 파라미터도 없다. 계산은 ~25% 빠르고, 성능은 LN과 거의 동등하다. 왜 centering이 잉여인가?
+
+$$\text{RMSNorm}(x + c) \neq \text{RMSNorm}(x) \quad \text{(shift invariance 없음)}$$
+
+LN은 shift invariant지만 RMSNorm은 그렇지 않다. 그러나 Transformer의 residual stream은 훈련 과정에서 점진적으로 zero-centered되는 경향이 있다 — residual 합산의 cancellation 효과 때문이다. $\mu \approx 0$이면 $\sigma \approx \text{RMS}$이고 centering은 실질적으로 잉여가 된다.
+
+2023년 이후 새로 발표된 LLM의 normalization 선택을 보면 패턴이 명확하다. Llama 1/2/3, Mistral, Mixtral, Qwen, Gemma 모두 RMSNorm을 택했다. Pre-RMSNorm + SwiGLU + RoPE + AdamW가 현재 LLM 훈련의 de facto 표준 조합이다.
+
+## 정리
+
+BN에서 LN, GN, IN, RMSNorm에 이르는 정규화 계보는 하나의 질문에 대한 반복적 답변이다 — **어떤 축에서, 어떤 방식으로 gradient가 잘 흐르게 할 것인가**.
+
+- BN의 실제 효과는 ICS 완화가 아니라 loss landscape의 Lipschitz 상수 감소다(Santurkar 2018).
+- LN은 batch 독립성을 얻었고, Pre-LN은 $O(\sqrt{L})$ gradient explosion을 $O(1)$로 해결했다.
+- Fixup과 SkipInit은 초기화만으로 BN의 landscape smoothing을 근사한다.
+- RMSNorm은 centering이 잉여임을 경험적으로 발견하고 연산을 줄였다.
+
+각 기법은 전임자의 한계를 설계 선택으로 바꾼 것
