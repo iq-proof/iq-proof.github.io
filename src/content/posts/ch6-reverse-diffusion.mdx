@@ -1,0 +1,152 @@
+---
+title: "Diffusion 모델은 왜 Score를 배우는가"
+description: "Anderson의 시간반전 공식부터 Tweedie, Score Matching, Denoising Score Matching, VP/VE-SDE, DDPM까지 — 생성모델의 수학적 뼈대를 하나의 흐름으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [diffusion, score-matching, sde, ddpm, generative-model]
+difficulty: advanced
+series:
+  slug: sde-deep-dive
+  title: Sde Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Diffusion 모델은 노이즈를 추가하는 방법은 이미 알고 있다. 문제는 반대 방향이다 — 노이즈에서 데이터로 돌아오려면 무엇이 필요한가? 답은 하나다: **score function** $\nabla \log p_t(x)$. 왜 이 함수 하나가 역방향 전체를 결정하는가?
+
+## 시간을 거꾸로 돌리는 공식
+
+Anderson (1982)의 핵심 결과는 간결하다. Forward SDE
+
+$$
+dX_t = b(t, X_t)\,dt + \sigma(t)\,dB_t
+$$
+
+가 주어졌을 때, 역시간 프로세스 $\bar X_\tau = X_{T-\tau}$는 다음 SDE를 만족한다.
+
+$$
+d\bar X_\tau = \Bigl(-b(T-\tau,\,\bar X_\tau) + \sigma(T-\tau)^2\,\nabla\log p_{T-\tau}(\bar X_\tau)\Bigr)d\tau + \sigma(T-\tau)\,d\bar B_\tau
+$$
+
+Forward drift의 부호만 뒤집어서는 부족하다. 반드시 $\sigma^2 \nabla \log p_t$ 항이 추가되어야 주변분포 $p_t$가 역순으로 보존된다.
+
+증명의 핵심은 Fokker-Planck 방정식의 시간 대칭이다. Forward의 FP 방정식을 $\tau = T - t$로 치환하면 Reverse SDE의 FP 방정식과 일치하려면 drift에 정확히 score 보정항이 필요하다는 것이 부분적분으로 유도된다.
+
+<Callout type="note" title="왜 score가 나타나는가">
+역방향 drift는 forward drift의 단순 반대가 아니다. "현재 시점의 확률밀도가 어느 방향으로 증가하는가" — 이 정보(score)를 더해야 확률질량 보존이 성립한다. 이것이 Anderson 정리의 물리적 직관이다.
+</Callout>
+
+## Tweedie: Score와 Denoising의 등가
+
+Score를 안다면 denoising도 공짜로 따라온다. $Y = X + \sigma Z$ ($Z \sim \mathcal{N}(0,I)$, $X \sim p$)일 때, Bayes optimal 추정기는 다음과 같다.
+
+$$
+\mathbb{E}[X \mid Y = y] = y + \sigma^2\,\nabla\log p_Y(y)
+$$
+
+증명은 $\nabla_y p_Y(y) = \int p(x)\,\frac{y-x}{\sigma^2}\,\phi_\sigma(y-x)\,dx$임을 이용해 score를 posterior 기댓값으로 표현하는 것이다. 결론: **score × 노이즈 분산** 만큼 관측값을 보정하면 posterior mean이 된다.
+
+이 공식은 DDPM 손실의 기원이다. $x_t = \alpha_t x_0 + \sigma_t \epsilon$로 재매개변수화하면 조건부 score는 $-\epsilon/\sigma_t$이고, $\epsilon_\theta$를 학습하는 것은 곧 score를 학습하는 것이다.
+
+## Score Matching: $p(x)$ 없이 Score 배우기
+
+문제는 역설이다. $\nabla \log p(x)$를 학습하려면 $p(x)$가 필요하고, $p(x)$는 데이터에서 알 수 없다.
+
+Hyvärinen (2005)의 등가 변환이 이를 해결한다. 원래 손실
+
+$$
+J_{SM}(\theta) = \tfrac{1}{2}\mathbb{E}_p\bigl[\|s_\theta - \nabla\log p\|^2\bigr]
+$$
+
+을 전개하면 $p$ 무관 상수항과, 부분적분으로 변환 가능한 교차항이 남는다. 결과:
+
+$$
+J_{SM}^{\text{Hyv}}(\theta) = \mathbb{E}_p\!\left[\tfrac{1}{2}\|s_\theta\|^2 + \operatorname{tr}(\nabla_x s_\theta)\right]
+$$
+
+$p(x)$ 자체 없이 Jacobian 대각합만으로 score를 학습할 수 있다. 단, 비용이 $O(d)$ — 고차원에서 병목이 된다.
+
+<Theorem kind="proposition" number="1" title="Hyvärinen 등가">
+$s_\theta$와 $p$가 충분히 정칙이고 경계 소실 조건이 성립하면, $J_{SM}(\theta)$와 $J_{SM}^{\text{Hyv}}(\theta)$는 $\theta$에 무관한 상수만큼 차이난다. 따라서 최적점이 동일하다.
+</Theorem>
+
+<Proof>
+$\|a-b\|^2 = \|a\|^2 - 2a\cdot b + \|b\|^2$로 전개 후, $\|b\|^2 = \|\nabla\log p\|^2$ 항을 상수로 드롭한다. 교차항 $\mathbb{E}_p[s_\theta \cdot \nabla\log p] = \int s_\theta \cdot \nabla p\,dx$를 성분별 부분적분하면 $-\mathbb{E}_p[\operatorname{tr}(\nabla s_\theta)]$가 된다. 부호를 정리하면 $J_{SM}^{\text{Hyv}}$와 상수 차이만 남는다. $\square$
+</Proof>
+
+## Denoising Score Matching: Trace를 제거한다
+
+고차원에서 $O(d)$ trace 계산은 현실적으로 불가능하다. Vincent (2011)의 Denoising Score Matching (DSM)은 이를 우회한다. Perturbed distribution $p_\sigma(\tilde x) = \int p(x)\phi_\sigma(\tilde x - x)\,dx$에서 조건부 score는 명시적으로 알려져 있다.
+
+$$
+\nabla_{\tilde x}\log q(\tilde x \mid x) = -\frac{\tilde x - x}{\sigma^2}
+$$
+
+DSM 손실:
+
+$$
+J_{DSM}(\theta) = \tfrac{1}{2}\mathbb{E}_{x\sim p,\,\tilde x\sim q(\cdot|x)}\!\left[\left\|s_\theta(\tilde x) + \frac{\tilde x - x}{\sigma^2}\right\|^2\right]
+$$
+
+<Theorem kind="proposition" number="2" title="DSM-ESM 동등성">
+DSM과 perturbed distribution 위의 ESM (Explicit Score Matching)은 $\theta$ 무관 상수 차이만 있다.
+</Theorem>
+
+<Proof>
+Bayes 정리로 $\nabla\log p_\sigma(\tilde x) = \mathbb{E}_{p(x|\tilde x)}[\nabla\log q(\tilde x|x)]$임을 보인다. 이를 ESM 손실에 대입하면 교차항이 DSM 교차항과 일치한다. 나머지 항은 $\theta$ 무관. $\square$
+</Proof>
+
+비용은 $O(1)$ — Jacobian 계산이 완전히 불필요하다. DDPM의 $\epsilon$ 예측 손실이 DSM의 $\sigma_t^2$-weighted 버전임을 재매개변수화로 확인할 수 있다.
+
+## VP/VE-SDE: 연속 시간 통합
+
+Song et al. (2021)은 이산 DDPM을 연속 시간으로 일반화한다. Variance Preserving (VP) SDE는
+
+$$
+dX_t = -\tfrac{1}{2}\beta(t)X_t\,dt + \sqrt{\beta(t)}\,dB_t
+$$
+
+이고 marginal은 $X_t \mid X_0 \sim \mathcal{N}(\alpha(t)X_0,\,[1-\alpha(t)^2]I)$, $\alpha(t) = \exp(-\int_0^t \beta(s)/2\,ds)$이다. Euler-Maruyama 이산화를 쓰면 $X_{k+1} \approx \sqrt{1-\beta_k}X_k + \sqrt{\beta_k}Z_k$로, **이것이 정확히 DDPM 한 스텝**이다.
+
+Variance Exploding (VE) SDE는 drift 없이 $dX_t = \sqrt{d\sigma^2(t)/dt}\,dB_t$로 분산을 폭발시킨다. 이 둘은 같은 Anderson-역방향 프레임워크 아래 통합된다 — reverse SDE에서 $b$와 $\sigma$만 달라질 뿐, score가 역방향을 결정하는 구조는 동일하다.
+
+<Callout type="note" title="트레이드오프">
+VP는 분산이 제어되어 학습이 안정적이나 schedule 설계가 민감하다. VE는 극단적 노이즈 덕분에 score가 어디서나 잘 정의되지만 수치적으로 불안정할 수 있다. 연속 시간 프레임워크의 이점은 ODE solver (DPM-Solver, DDIM)로 스텝 수를 1000 → 20으로 줄여도 수렴이 보장된다는 것이다.
+</Callout>
+
+<Aside label="설계 철학">
+Anderson → Tweedie → Score Matching → DSM → Score-SDE — 이 체인은 하나의 질문을 서로 다른 각도에서 공략한다: "미지의 $p_t$에서 score를 어떻게 쓸 수 있는가?" 각 단계가 이전 단계의 병목(역방향 공식의 미지항 → 직접 손실의 $p$ 의존성 → trace 비용)을 제거하는 방식으로 진행된다.
+</Aside>
+
+## 정리
+
+- Anderson 정리: Forward SDE의 역방향 drift는 score $\nabla\log p_t$에 의해 유일하게 결정된다.
+- Tweedie 공식: score를 알면 posterior mean (denoising)이 공짜다. DDPM $\epsilon$-예측은 이것의 재매개변수화다.
+- Score Matching (Hyvärinen): $p$ 없이 trace만으로 score 학습 가능. 고차원에서 $O(d)$ 병목.
+- DSM (Vincent): 명시적 조건부 score로 trace를 제거. $O(1)$ 비용. DDPM 손실의 이론적 기초.
+- VP/VE-SDE: DDPM을 연속 시간으로 통합. 유연한 solver로 빠른 샘플링 가능.
+
+역방향 SDE 한 줄 안에 이 모든 것이 압축되어 있다 — 생성모델이 "score를 배운다"는 말은 곧 시간을 거꾸로 돌리는 나침반을 학습한다는 뜻이다.
+
+<Reference
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
+/>
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
+/>

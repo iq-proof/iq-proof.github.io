@@ -1,0 +1,125 @@
+---
+title: "SDE 수치 해법의 통일 원리: 오차, 안정성, 다중 레벨"
+description: "Euler-Maruyama의 강/약수렴 차이부터 Milstein의 이토 Taylor 보정, 암시적 기법의 A-안정성, Multilevel Monte Carlo의 복잡도 최적화까지, SDE 수치 해법의 설계 논리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [sde, euler-maruyama, milstein, mlmc, diffusion-model]
+difficulty: advanced
+series:
+  slug: sde-deep-dive
+  title: Sde Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+연속 시간 SDE $dX_t = b(X_t)\,dt + \sigma(X_t)\,dB_t$를 컴퓨터로 푸는 방법은 하나가 아니다. Euler-Maruyama(EM), Milstein, Implicit Euler, Multilevel Monte Carlo — 이 기법들은 서로 다른 문제를 해결하지만, 모두 같은 하나의 물음에서 출발한다. **이산화 오차를 어디서 줄이고, 어디서 버릴 것인가?**
+
+## 이산화의 출발점: Euler-Maruyama
+
+EM의 아이디어는 단순하다. 시간 구간 $[0, T]$를 $N$개 스텝으로 나누고, 각 스텝에서 드리프트와 확산을 선형 근사한다.
+
+$$X_{n+1} = X_n + b(X_n)\,h + \sigma(X_n)\,\Delta B_n, \quad \Delta B_n \sim \mathcal{N}(0, h)$$
+
+이때 오차는 두 종류로 갈라진다.
+
+**강수렴(strong convergence)**은 경로 자체의 정확도다.
+
+$$\mathbb{E}\!\left[\sup_{t \in [0,T]} |X_t - \bar{X}_t^h|\right] \leq C\,h^{1/2}$$
+
+**약수렴(weak convergence)**은 분포의 정확도다.
+
+$$\left|\mathbb{E}[f(X_T)] - \mathbb{E}[f(\bar{X}_T^h)]\right| \leq C_f\,h \quad (f \in C_b^4)$$
+
+같은 스킴이 강수렴 차수 $1/2$, 약수렴 차수 $1$을 가진다. 왜 다른가?
+
+<Theorem kind="proposition" number="1" title="강/약수렴 차수 분리">
+EM의 국소 오차 $e_n^{\text{local}} = \int_{t_n}^{t_{n+1}} \int_{t_n}^s \sigma'(X_u)\sigma(X_u)\,dB_u\,dB_s$는 마팅게일이다. 경로 노름에서는 Doob 최대값 부등식으로 $O(h^{1/2})$가 살아남고, 기댓값에서는 마팅게일 성질로 이 항이 사라져 3차 항에서 $O(h)$가 나온다.
+</Theorem>
+
+<Proof>
+국소 오차의 $\mathbb{L}^2$ 크기: $\mathbb{E}[|e_n^{\text{local}}|^2] = O(h^3)$ (이토 등거리). $N = T/h$ 스텝 누적 후 Discrete Gronwall 부등식을 적용하면 $\mathbb{E}[|X_T - \bar{X}_T^h|^2] = O(h)$, 제곱근으로 강수렴 차수 $1/2$. 약수렴은 $\mathbb{E}[e_n^{\text{local}}] = 0$ (마팅게일)이므로 3차 항이 지배하여 $O(h)$. $\square$
+</Proof>
+
+이 구분은 실전에서 중요하다. DDPM 샘플링에서 각 생성 경로의 품질은 **강수렴**에 달려 있고, 유럽형 옵션 가격 추정은 **약수렴**으로 충분하다. 배리어 옵션처럼 경로 의존 payoff가 불연속이면 약수렴이 $O(h^{1/2})$로 붕괴된다.
+
+## Milstein: 이토 Taylor 전개의 다음 항
+
+EM이 이토 Taylor 전개의 1차 항만 취한다면, Milstein은 2차 항을 추가한다.
+
+$$\int_{t_n}^{t_{n+1}} \int_{t_n}^s \sigma'(X_u)\sigma(X_u)\,dB_u\,dB_s \approx \frac{1}{2}\sigma'(X_n)\sigma(X_n)\left[(\Delta B_n)^2 - h\right]$$
+
+이토 공식으로 $\int_t^{t+h}(B_s - B_t)\,dB_s = \frac{1}{2}[(\Delta B)^2 - h]$임을 유도할 수 있다. Milstein 스킴은 이 항을 더한다.
+
+$$X_{n+1} = X_n + b(X_n)h + \sigma(X_n)\Delta B_n + \frac{1}{2}\sigma'(X_n)\sigma(X_n)\left[(\Delta B_n)^2 - h\right]$$
+
+결과로 국소 오차가 $O(h^{3/2}) \to O(h^{5/2})$로 감소하고, 전역 강수렴 차수가 $1/2 \to 1$로 올라간다.
+
+<Callout type="note" title="Additive noise의 특례">
+$\sigma(X_t) = \sigma_0$ (상수)이면 $\sigma' = 0$이어서 Milstein 추가항이 자동으로 0이 된다. Additive noise SDE에서는 EM이 이미 강수렴 차수 1을 가진다.
+</Callout>
+
+실용적 함의: GBM처럼 multiplicative noise가 있는 SDE에서 동일 정확도를 달성하려면, Milstein은 EM보다 4배 적은 스텝으로 충분하다. 다차원에서는 교차 Lévy 영역 $L^{jk}_{n}(j \neq k)$ 샘플링이 필요해 복잡도가 늘지만, Stratonovich 해석으로 단순화할 수 있다.
+
+## 안정성: Stiff SDE와 암시적 기법
+
+수렴 차수만이 전부가 아니다. Ornstein-Uhlenbeck SDE $dX_t = -\lambda X_t\,dt + \sigma\,dB_t$에서 $\lambda = 1000$이면, EM의 mean-square 안정 조건
+
+$$h < \frac{2}{\sigma^2 + 2\lambda}$$
+
+은 $h < 0.001$을 요구한다. 즉 100만 스텝 이상이 필요하다.
+
+Implicit Euler(drift-implicit)는 이 제약에서 자유롭다.
+
+$$X_{n+1} = \frac{X_n + \sigma\,\Delta B_n}{1 + \lambda h}$$
+
+분모 $1 + \lambda h$가 $\lambda$가 클수록 커지므로, 어떤 $h$에서도 자동으로 감쇠한다 — A-stable이다.
+
+| 기법 | 강수렴 | 약수렴 | 안정성 | 비용 |
+|------|--------|--------|--------|------|
+| EM | $1/2$ | $1$ | 조건부 | $1\times$ |
+| Milstein | $1$ | $1$ | 조건부 | $1.5\times$ |
+| Implicit IE | $1/2$ | $1/2$ | A-stable | $2\times+$ |
+| Stochastic Heun | $1$ | $1$ | 개선됨 | $2\times$ |
+
+DDPM fast sampling 연구에서 큰 스텝을 사용하려면 안정성이 필수다. Score network의 기울기가 크면(고주파 학습) drift 계수가 커져 stiff SDE가 되고, EM은 스텝 수를 강제로 늘리게 된다. 암시적 기법이나 Stochastic Heun을 쓰면 4~8 스텝으로도 reasonable한 샘플을 생성할 수 있다.
+
+<Aside label="안정성 ≠ 정확도">
+A-stable 기법도 $h$가 크면 약수렴 상수 $C$가 커져 실질 오차가 증가한다. 안정성은 발산하지 않는다는 보장이지, 정확하다는 보장이 아니다.
+</Aside>
+
+## Multilevel Monte Carlo: 복잡도의 근본 문제
+
+표준 Monte Carlo로 $\mathbb{E}[f(X_T)]$를 오차 $\epsilon$으로 추정하려면, bias와 variance를 동시에 제어해야 한다. EM($\beta=1$)에서 bias를 $O(\epsilon)$으로 맞추면 $h = O(\epsilon)$, 각 샘플 비용 $O(\epsilon^{-1})$, 총 비용 $O(\epsilon^{-3})$이다.
+
+Giles(2008)의 **Multilevel Monte Carlo(MLMC)**는 이 복잡도를 망원합으로 깬다.
+
+$$\mathbb{E}[f(X_T)] = \mathbb{E}[Y_0] + \sum_{l=1}^L \mathbb{E}[Y_l - Y_{l-1}]$$
+
+각 레벨 $l$에서 스텝 크기 $h_l = 2^{-l}h_0$의 fine 경로와 coarse 경로를 **같은 브라운 운동**으로 생성해 차이 $\Delta Y_l = Y_l - Y_{l-1}$를 계산한다. 높은 레벨일수록 두 경로가 비슷해져 분산이 급격히 줄어든다. 최적 샘플 배분은 라그랑주 최적화로 결정된다.
+
+Milstein($\gamma=1$)을 쓰면 $\text{Var}[\Delta Y_l] = O(2^{-l})$이고 비용은 $O(2^l)$이므로, 총 복잡도가 $O(\epsilon^{-2})$로 줄어든다.
+
+$$\boxed{
+\text{MC(EM)}: O(\epsilon^{-3}) \quad \longrightarrow \quad \text{MLMC(Milstein)}: O(\epsilon^{-2})
+}$$
+
+$\epsilon = 0.001$에서 이 차이는 1000배다.
+
+<Callout type="note" title="트레이드오프">
+MLMC의 이득은 분산이 레벨에 따라 decay할 때만 현실화된다. Barrier option처럼 payoff가 불연속이면 분산 decay가 약해져($\gamma < 1$) 이득이 줄어든다. Milstein의 다차원 교차항 계산이 복잡할 경우 EM MLMC($O(\epsilon^{-2.5})$)로 타협하는 선택도 있다.
+</Callout>
+
+## 정리
+
+- EM의 강수렴 $O(h^{1/2})$과 약수렴 $O(h)$ 차이는 마팅게일 성질에서 온다. 경로가 필요하면 강수렴, 기댓값이면 약수렴을 기준으로 삼는다.
+- Milstein은 이토 Taylor 2차 항 $\frac{1}{2}\sigma'\sigma[(\Delta B)^2 - h]$를 추가해 강수렴 차수를 1로 올린다. Multiplicative noise가 있는 SDE에서 실질적인 계산 절감을 준다.
+- Stiff SDE에서 EM은 스텝 크기 제약에 발목이 잡힌다. Implicit Euler는 A-stable이지만 정확도는 별개다.
+- MLMC는 수렴 구조를 계층화해 복잡도를 $O(\epsilon^{-3}) \to O(\epsilon^{-2})$로 낮춘다. 이 이득은 강수렴이 좋은 Milstein과 결합할 때 최대화된다.
+
+이 네 기법은 각자 다른 병목을 공격하지만, 공통 질문에 답한다 — 이토 Taylor 전개의 어느 항을 보존하고, 어느 항을 버릴 것인가.

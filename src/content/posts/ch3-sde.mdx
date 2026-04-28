@@ -1,0 +1,133 @@
+---
+title: "SDE는 미분방정식이 아니다 — 적분, 해의 존재, 그리고 생성모델의 연결"
+description: "SDE의 진정한 의미인 적분방정식에서 출발해 Picard 반복·Grönwall 부등식·OU 해석해·Itô 보정항·Yamada-Watanabe 정리까지, 생성모델이 작동하는 수학적 기반을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [sde, diffusion-model, stochastic-calculus, ito-integral, score-sde]
+difficulty: advanced
+series:
+  slug: sde-deep-dive
+  title: Sde Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+$dX_t = b(t, X_t)\,dt + \sigma(t, X_t)\,dB_t$라는 표기는 얼핏 미분방정식처럼 보인다. 하지만 Brownian motion은 어디서도 미분 가능하지 않기 때문에, 이 "미분"은 존재하지 않는다. 그렇다면 SDE는 무엇을 뜻하는가? 그리고 왜 이 수학이 DDPM, Score-SDE, Flow Matching 같은 생성모델의 언어가 됐는가?
+
+## SDE의 진짜 얼굴: 적분방정식
+
+SDE의 약식 표기는 다음 **적분방정식**의 미분 형태일 뿐이다.
+
+$$
+X_t = X_0 + \int_0^t b(s, X_s)\,ds + \int_0^t \sigma(s, X_s)\,dB_s
+$$
+
+첫 번째 적분은 Riemann 적분이고, 두 번째는 Itô 적분이다. 이 둘은 본질적으로 다르다. Brownian motion $B_t$는 총변동(total variation)이 무한하기 때문에, 경로별 Riemann-Stieltjes 적분으로는 두 번째 항을 정의할 수 없다. $L^2$-극한으로 구성되는 Itô 적분이 필요한 이유가 여기 있다.
+
+Drift $b$는 과정의 결정론적 경향(평균 변화율)을, diffusion $\sigma$는 노이즈의 강도를 제어한다. $\sigma = 0$이면 SDE는 고전적 ODE로 축소된다.
+
+<Aside label="생성모델과의 연결">
+DDPM의 forward process $dX_t = f(t)X_t\,dt + g(t)\,dB_t$는 이 적분방정식의 직접적 응용이다. Score-SDE (Song et al., 2021)는 reverse SDE를 통해 생성을 수행하는데, 이때 score function $\nabla_x \log p_t(x)$가 Itô 적분의 구조에서 필수적으로 등장한다.
+</Aside>
+
+## 해는 항상 존재하는가: Picard 반복과 Grönwall 부등식
+
+모든 SDE가 해를 갖는 것은 아니다. 강해(strong solution)의 존재와 유일성은 두 조건을 요구한다.
+
+**Lipschitz 조건**: $|b(t,x)-b(t,y)| + |\sigma(t,x)-\sigma(t,y)| \leq K|x-y|$
+
+**선형 성장 조건**: $|b(t,x)| + |\sigma(t,x)| \leq K(1+|x|)$
+
+<Theorem kind="theorem" number="1" title="존재성과 유일성 (Itô)">
+위 두 조건과 $\mathbb{E}[|X_0|^2] < \infty$가 성립하면, 구간 $[0,T]$에서 SDE의 강해가 존재하고 pathwise에서 a.s. 유일하며, $\mathbb{E}[\sup_{t \leq T}|X_t|^2] < \infty$이다.
+</Theorem>
+
+<Proof>
+존재성은 **Picard 반복**으로 구성한다. $X_t^{(0)} = X_0$으로 시작해
+
+$$X_t^{(n+1)} = X_0 + \int_0^t b(s, X_s^{(n)})\,ds + \int_0^t \sigma(s, X_s^{(n)})\,dB_s$$
+
+로 반복한다. Doob 최대 부등식과 Itô 등장성(isometry)으로 오차를 묶으면 $\Delta_n(T) \leq \frac{(CT)^n}{n!}\Delta_0(T)$가 되어 a.s. 균일 수렴한다.
+
+유일성은 **Grönwall 부등식**으로 증명한다. 두 강해 $X_t, \tilde X_t$의 차이 $u(t) = \mathbb{E}[|X_t - \tilde X_t|^2]$가 $u(t) \leq C\int_0^t u(s)\,ds$를 만족하면, $u(0)=0$으로부터 $u(t)=0$.
+</Proof>
+
+Lipschitz 조건을 위반하는 예로 $dX_t = X_t^2\,dt$가 있다. 이 ODE의 해는 $X_t = X_0/(1-X_0 t)$로, $t^* = 1/X_0$에서 유한 시간 폭발(finite-time blow-up)이 일어난다.
+
+## OU 과정: 평균회귀의 해석해
+
+Ornstein-Uhlenbeck(OU) 과정은 $dX_t = -\theta X_t\,dt + \sigma\,dB_t$로 정의된다. 두 조건을 모두 만족하므로 강해가 존재하고, **적분인자** 기법으로 닫힌 형태를 구할 수 있다.
+
+$Y_t = e^{\theta t}X_t$로 치환하면 $dY_t = \sigma e^{\theta t}\,dB_t$가 되어 적분하면
+
+$$
+X_t = x_0 e^{-\theta t} + \sigma \int_0^t e^{-\theta(t-s)}\,dB_s
+$$
+
+이 해의 평균은 $\mathbb{E}[X_t] = x_0 e^{-\theta t}$, 분산은 $\frac{\sigma^2}{2\theta}(1-e^{-2\theta t})$이다. $t\to\infty$에서 분포는 $\mathcal{N}(0,\, \sigma^2/(2\theta))$로 수렴한다. 시상수 $\tau = 1/\theta$는 "기억의 길이"다.
+
+Score-SDE의 reverse dynamics $dX = -\frac{\beta(t)}{2}X\,dt + g(t)^2\nabla\log p_t(X)\,dt + g(t)\,dB$는 선형 drift $-\frac{\beta}{2}X$를 가진 OU 과정에 score term을 더한 구조다. OU의 정상성 이론을 알면 이 reverse의 수렴성을 분석할 수 있다.
+
+## Itô 보정항: $-\sigma^2/2$는 어디서 오는가
+
+기하 브라운 운동(GBM) $dS_t = \mu S_t\,dt + \sigma S_t\,dB_t$의 해는
+
+$$
+S_t = S_0 \exp\!\left[\left(\mu - \frac{\sigma^2}{2}\right)t + \sigma B_t\right]
+$$
+
+지수에 $-\sigma^2/2$가 들어가는 이유는 Itô 공식의 **이차변동(quadratic variation)** 항 때문이다. $Y_t = \log S_t$에 Itô 공식을 적용하면
+
+$$
+dY_t = \frac{1}{S_t}dS_t - \frac{1}{2S_t^2}(dS_t)^2
+$$
+
+$(dS_t)^2 = \sigma^2 S_t^2\,dt$이므로 $-\sigma^2/2$ 항이 자동으로 등장한다. 보정 없이 $\mathbb{E}[e^{\mu t + \sigma B_t}]$를 계산하면 Jensen 부등식에 의해 $e^{\mu t}$보다 크다 — Itô 보정이 이 과잉을 정확히 상쇄한다.
+
+$$
+\mathbb{E}[S_t] = S_0 e^{\mu t}
+$$
+
+<Callout type="warning" title="Itô 보정을 빠뜨리면">
+신경망이 GBM 계열의 forward process를 시뮬레이션할 때 $-\sigma^2/2$ 항을 누락하면 기댓값이 이론값보다 체계적으로 크게 추정되어 모델이 분산을 과소평가한다. Black-Scholes의 $d_1$ 공식에도 이 보정항이 명시적으로 들어간다.
+</Callout>
+
+## 강해 vs 약해: 생성모델이 약해의 세계에서 사는 이유
+
+강해(strong solution)는 **주어진** 확률공간과 Brownian motion 위에서 pathwise로 유일하게 정의된다. 약해(weak solution)는 새로운 확률공간을 함께 구성하는 것을 허용하고, 분포만 일치하면 된다.
+
+<Theorem kind="theorem" number="2" title="Yamada-Watanabe">
+약해 존재 + pathwise 유일성 $\Rightarrow$ 강해 존재 + 분포 유일성.
+</Theorem>
+
+Tanaka 방정식 $dX_t = \mathrm{sgn}(X_t)\,dB_t$는 이 구분을 가장 날카롭게 보여준다. $\mathrm{sgn}$은 $x=0$에서 불연속이므로 Lipschitz 조건을 위반한다. 약해는 존재한다 — $X_t = B_t$ 자체가 약해다. 하지만 강해는 존재하지 않는다. $X_0=0$에서 Brownian motion은 0을 무한 번 방문하고, 매 방문마다 $\mathrm{sgn}$의 부호가 스위칭되어 pathwise 유일성이 깨진다.
+
+Score-SDE의 reverse process에서 score function $\nabla\log p_t(x)$는 저밀도 영역에서 발산할 수 있다 — Lipschitz 조건 위반이다. 그러나 score matching loss로 근사 score $s_\theta$를 학습하면, **약해의 존재 + 근사적 pathwise 유일성**을 통해 Yamada-Watanabe를 적용할 수 있고, 샘플링이 분포적으로 수렴한다. DDPM과 Score-SDE가 이론적으로 건전한 이유가 여기에 있다.
+
+<Callout type="note" title="트레이드오프">
+강해는 이론적 분석(moment 계산, 수렴 속도 분석)이 정확하지만 Lipschitz를 요구한다. 약해는 조건이 훨씬 유연하고 생성모델 역방향 과정에 적합하지만, 각 경로가 유일하게 결정된다는 보장이 없다. Flow Matching (Lipman et al., 2023)은 score 없이 조건부 흐름을 직접 학습해 약해의 유연성을 최대로 활용하는 새 접근이다.
+</Callout>
+
+## 정리
+
+- SDE $dX_t = b\,dt + \sigma\,dB_t$의 진정한 의미는 Itô 적분을 포함한 적분방정식이다. "미분"은 약식 표기다.
+- Lipschitz + 선형 성장 조건 아래 Picard 반복이 강해를 구성하고, Grönwall 부등식이 유일성을 보증한다.
+- OU 과정의 해석해 $X_t = x_0 e^{-\theta t} + \sigma\int_0^t e^{-\theta(t-s)}dB_s$와 GBM의 Itô 보정항 $-\sigma^2/2$는 모두 이 이론의 직접적 결과다.
+- 생성모델의 reverse SDE는 일반적으로 강해의 조건을 만족하지 않는다. 약해 + Yamada-Watanabe 정리가 수렴성의 수학적 근거다.
+
+다음 글에서는 SDE의 분포 진화를 기술하는 **Fokker-Planck 방정식**과, 이것이 Langevin MCMC의 정상분포 수렴을 어떻게 보장하는지 추적한다.
+
+<Reference
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
+/>

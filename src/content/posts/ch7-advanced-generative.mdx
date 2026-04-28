@@ -1,0 +1,142 @@
+---
+title: "SDE, ODE, Flow — 생성 모델을 하나의 언어로"
+description: "Probability Flow ODE부터 Föllmer SDE, Flow Matching, Langevin MCMC까지 — 현대 생성 모델이 공유하는 하나의 수학적 언어를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [diffusion, flow-matching, sde, score-matching, bayesian-sampling]
+difficulty: advanced
+series:
+  slug: sde-deep-dive
+  title: Sde Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DDIM은 왜 1000 스텝 DDPM보다 50 스텝에서 더 빠른가? Flux.1과 Stable Diffusion 3는 왜 "Flow Matching 기반"이라고 불리는가? Bayesian Neural Network의 불확실성 추정은 diffusion과 어떤 수학을 공유하는가? 이 질문들은 겉보기엔 각자 따로 놀지만, 하나의 언어로 수렴한다 — **확률 흐름(probability flow)**.
+
+## 출발점: SDE와 ODE는 같은 분포를 만든다
+
+Forward SDE $dX_t = b(t, X_t)\,dt + \sigma(t, X_t)\,dB_t$가 주어졌을 때, 확률론적 요소를 제거한 결정론적 ODE가 **동일한 주변분포** $p_t$를 유지할 수 있다. 이것이 Probability Flow ODE다.
+
+$$
+d\bar{X}_t = \left[b(t,\bar{X}_t) - \frac{1}{2}\sigma\sigma^T\nabla\log p_t(\bar{X}_t)\right]dt
+$$
+
+증명의 핵심은 Fokker-Planck 방정식이다. SDE의 확산 항 $\frac{1}{2}\nabla^2:(\sigma\sigma^T p_t)$을 $\sigma\sigma^T\nabla p_t = \sigma\sigma^T p_t \nabla\log p_t$로 다시 쓰면 연속방정식 $\partial_t p_t + \nabla\cdot(\tilde{b}\,p_t) = 0$ 형태가 된다. 이 형태가 바로 드리프트 $\tilde{b}$를 따르는 ODE의 주변분포 방정식이다.
+
+<Theorem kind="theorem" number="1" title="Probability Flow ODE의 주변분포 보존">
+스코어 함수 $s_t(x) = \nabla\log p_t(x)$가 주어지면, Probability Flow ODE의 해 $\bar{X}_t$의 주변분포는 원래 SDE의 주변분포 $p_t$와 동일하다.
+</Theorem>
+
+<Proof>
+SDE의 Fokker-Planck 방정식에서 $\sigma\sigma^T\nabla p_t = \sigma\sigma^T p_t\nabla\log p_t$ 치환으로 연속방정식을 얻는다. ODE의 주변분포 $\tilde{p}_t$도 동일한 연속방정식을 만족하고 초기조건 $\tilde{p}_0 = p_0$이 같으므로, 유일성에 의해 $\tilde{p}_t = p_t$. $\square$
+</Proof>
+
+DDIM의 deterministic sampling이 바로 이 ODE의 이산화다. VP-SDE에서 $\sigma_t = 0$으로 설정하면 DDIM update rule은 Euler 방법 수준의 1차 근사가 된다. 결정론적 경로는 확률적 경로보다 **이산화 오차가 더 작게 누적**되기 때문에, 같은 스코어 네트워크로도 훨씬 적은 스텝에서 수렴한다.
+
+ODE의 또 다른 이점은 likelihood 계산이다. CNF 이론에 의해:
+
+$$
+\log p_0(x_0) = \log p_T(x_T) - \int_0^T \text{tr}\bigl(\nabla_x\tilde{b}(t, \bar{X}_t)\bigr)\,dt
+$$
+
+Jacobian 전체를 계산하는 대신 divergence를 추적하면 exact log-likelihood를 얻는다. 고차원에서는 Hutchinson trace estimator로 $O(1/\sqrt{N})$ 오차를 감수하고 근사한다.
+
+## 최소 엔트로피 경로: Föllmer SDE
+
+Probability Flow ODE가 "같은 분포를 유지하는 결정론적 경로"라면, Föllmer SDE는 "목표 분포 $\mu$에 수렴하는 최소 에너지 확률 경로"다.
+
+$$
+dX_t = v_t(X_t)\,dt + dB_t, \quad v_t(x) = \nabla_x\log\,\mathbb{E}_{Y\sim\mu}[\phi_{T-t}(Y-x)]
+$$
+
+Girsanov 정리를 사용하면, 임의의 드리프트 SDE의 Wiener measure에 대한 상대 엔트로피는:
+
+$$
+\text{Ent}(\mathbb{P}\|\mathbb{W}) = \frac{1}{2}\mathbb{E}\!\left[\int_0^T |u_t|^2\,dt\right]
+$$
+
+Föllmer 드리프트는 경계 조건 $X_T \sim \mu$를 만족하는 모든 드리프트 중에서 이 에너지를 최소화한다. 이것이 Schrödinger bridge — 두 분포 사이의 최소 엔트로피 경로 — 다.
+
+<Aside label="Diffusion은 Schrödinger bridge의 특수 경우">
+Reverse diffusion의 경계 조건 $X_0 \sim p_T$ (Gaussian), $X_T \sim p_0$ (데이터)는 정확히 Schrödinger bridge의 양 끝점이다. 즉, diffusion model은 Gaussian과 데이터 분포 사이의 최소 엔트로피 경로를 근사한다.
+</Aside>
+
+## 벡터장을 직접 학습하다: Flow Matching
+
+Flow Matching (Lipman et al., 2023)은 같은 목표를 다르게 접근한다. SDE나 스코어 함수 없이, **신경망이 따라야 할 벡터장 자체**를 학습한다.
+
+진짜 한계 벡터장 $u_t(x)$를 직접 학습하는 손실은 구현 불가능하다. $p_t$를 모르기 때문이다. Lipman et al.의 핵심 통찰은 **조건부 벡터장으로 대체해도 gradient가 같다**는 것이다.
+
+<Theorem kind="theorem" number="2" title="CFM = FM (gradient 동등성)">
+조건부 경로 $p_t(x|x_1)$를 정의하면,
+$$\nabla_\theta\,\mathcal{L}_{\text{CFM}}(\theta) = \nabla_\theta\,\mathcal{L}_{\text{FM}}(\theta)$$
+</Theorem>
+
+<Proof>
+$\mathcal{L}_{\text{CFM}}$을 전개하면 교차항에서 $\mathbb{E}_{x_1|x}[u_t(x|x_1)] = u_t(x)$ (한계 벡터장의 정의)가 성립하므로, 두 손실은 동일하다. $\square$
+</Proof>
+
+가장 간단한 경로 선택은 직선이다 — Rectified Flow:
+
+$$
+x_t = (1-t)x_0 + t\,x_1, \quad u_t(x|x_1) = x_1 - x_0
+$$
+
+이 경로는 Brenier 정리에 의해 Wasserstein-2 거리를 최소화하는 최적수송 경로다. 직선에 가까울수록 이산화 오차가 작고, 적은 스텝으로 수렴한다. Flux.1과 Stable Diffusion 3가 Flow Matching을 채택한 이유다.
+
+<Callout type="note" title="트레이드오프">
+Rectified Flow(직선 경로)는 최적수송 관점에서 효율적이지만, 신경망이 표현해야 할 벡터장의 복잡도는 경로 선택에 따라 달라진다. 직선 경로는 $u_t = x_1 - x_0$으로 단순하지만, 복잡한 분포에서는 조건부 기댓값 계산 자체가 어렵다. 한편 Score Matching과의 동등성은 특정 noise schedule($b=0$, $\sigma=\sqrt{2}$)에서만 성립하므로, 일반적인 경로에서는 FM이 더 자유롭고 더 많은 설계 선택을 요구한다.
+</Callout>
+
+## Bayesian Sampling: 같은 수학, 다른 목적
+
+Langevin SDE는 생성이 아니라 **추론**을 위한 도구다. Posterior $\pi(\theta) \propto \exp(-U(\theta))$를 정상분포로 가지는 SDE:
+
+$$
+d\theta_t = -\nabla U(\theta_t)\,dt + \sqrt{2}\,dB_t
+$$
+
+Fokker-Planck 정상상태 방정식 $p_\infty = Ce^{-U}$로 검증된다. SGLD(Welling & Teh, 2011)는 여기에 mini-batch 그래디언트를 결합한다:
+
+$$
+\theta_{k+1} = \theta_k + \frac{\eta_k}{2}\tilde{g}_k(\theta_k) + \xi_k, \quad \sum\eta_k=\infty,\;\sum\eta_k^2<\infty
+$$
+
+스텝사이즈 감소 조건이 충족되면 $\theta_k$는 posterior에 수렴한다. MALA는 Langevin 제안에 Metropolis accept/reject를 더해 bias를 완전히 제거하고, Underdamped Langevin은 속도 항을 추가하여 혼합 시간을 조건수 $\kappa$에서 $\sqrt{\kappa}$로 줄인다.
+
+생성 모델과 Bayesian sampling의 연결은 스코어 함수 $\nabla\log p_t$에 있다. Langevin의 드리프트 $-\nabla U = \nabla\log\pi$는 diffusion model의 스코어와 같은 역할을 한다. 두 문제 모두 **분포의 로그 밀도 기울기를 따라 이동**한다.
+
+## 정리
+
+네 챕터를 관통하는 공통 구조가 있다.
+
+- **Probability Flow ODE**: 스코어 $\nabla\log p_t$로 SDE를 결정론적 등가 경로로 변환한다. DDIM은 그 이산화다.
+- **Föllmer SDE**: 같은 스코어를 조건부 기댓값으로 재해석하면 최소 엔트로피 경로가 된다. Diffusion은 Schrödinger bridge의 특수 경우다.
+- **Flow Matching**: 스코어 없이 벡터장을 직접 학습한다. 조건부 경로만 알면 한계 벡터장이 자동으로 학습된다.
+- **Langevin/SGLD**: 같은 스코어 구조로 posterior sampling을 수행한다. 생성과 추론은 같은 수학을 공유한다.
+
+공통 언어는 하나다 — $\nabla\log p_t$, 즉 분포의 로그 밀도 기울기. 이것을 어떻게 추정하고, 어떤 경로를 따르고, 어떤 목적에 쓰느냐가 DDPM, DDIM, Flow Matching, SGLD를 갈라놓는다.
+
+<Reference
+  title="Flow Matching for Generative Modeling"
+  authors="Lipman et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2210.02747"
+/>
+
+<Reference
+  title="Bayesian Learning via Stochastic Gradient Langevin Dynamics"
+  authors="Welling & Teh"
+  year={2011}
+  venue="ICML"
+  url="https://proceedings.mlr.press/v15/welling11a.html"
+/>
