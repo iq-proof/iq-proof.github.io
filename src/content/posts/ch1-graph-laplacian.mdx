@@ -1,0 +1,128 @@
+---
+title: "그래프를 행렬로 보는 순간 GNN이 보인다"
+description: "Adjacency matrix의 정의부터 Graph Fourier Transform과 PageRank의 연결까지, GNN의 모든 연산이 공유하는 수학적 토대를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gnn, graph-laplacian, spectral-theory, graph-fourier, pagerank]
+difficulty: advanced
+series:
+  slug: gnn-deep-dive
+  title: Gnn Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+GNN의 모든 연산은 결국 행렬 곱셈이다. GCN의 propagation $\tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2}HW$, GraphSAGE의 mean aggregator, APPNP의 PageRank propagation — 전부 adjacency matrix $A$를 사전에 정의해야 가능하다. 그런데 이 $A$가 무엇을 인코딩하고, Laplacian $L = D - A$가 왜 PSD(양반정치)이며, 고유벡터가 왜 "그래프 주파수 기저"가 되는가? 이 질문들에 답하지 않으면 GNN의 설계 결정을 이해할 수 없다.
+
+## 그래프의 행렬 표현
+
+그래프 $G = (V, E)$는 두 관점으로 볼 수 있다. 조합론적 객체(노드와 엣지의 집합)이자, 선형대수적 객체(행렬과 그 위에서 정의되는 연산자). GNN은 이 두 관점을 잇는 다리다.
+
+**Adjacency matrix** $A \in \mathbb{R}^{n \times n}$는 연결 관계를 인코딩한다.
+
+$$
+A_{ij} = \begin{cases} 1 & (i,j) \in E \\ 0 & \text{otherwise} \end{cases}
+$$
+
+Undirected graph에서 $A = A^T$ (symmetric). 행 $A_i$는 노드 $i$의 이웃 indicator vector이고, $\sum_j A_{ij} = d_i$는 노드 $i$의 degree다. **Degree matrix** $D = \text{diag}(d_1, \ldots, d_n)$은 이 degree를 대각에 배치한다.
+
+$A^k$의 $(i, j)$ 성분은 $i$에서 $j$로 가는 길이 $k$의 walk 수와 같다. 귀납법으로 증명된다. $(A^k)_{ij} = \sum_l (A^{k-1})_{il} A_{lj}$는 "길이 $k-1$의 walk $i \to l$"과 "엣지 $l \to j$"의 조합이기 때문이다. 이 사실이 message passing의 수학적 뿌리다 — GCN 한 layer가 1-hop neighbor 정보를 모으듯, $A^k$는 $k$-hop reachability를 인코딩한다.
+
+그래프의 sparsity가 GNN 비용을 결정한다. $AH$의 비용은 dense matmul $O(n^2 d)$가 아니라 sparse matmul $O(md)$다. Cora($m = O(n)$)에서는 $O(nd)$로 선형이지만, 분자 그래프처럼 dense한 경우($m = O(n^2)$)에는 MLP와 비슷한 비용이 든다.
+
+## Graph Laplacian과 Smoothness
+
+**Graph Laplacian** $L = D - A$는 연속 Laplacian $-\Delta$의 이산판이다.
+
+$$
+(Lf)_i = \sum_{j \in N(i)} (f_i - f_j) = d_i f_i - \sum_j A_{ij} f_j
+$$
+
+Laplacian의 핵심 성질은 **quadratic form**이 smoothness를 측정한다는 것이다.
+
+$$
+x^T L x = \frac{1}{2} \sum_{(i,j) \in E} (x_i - x_j)^2
+$$
+
+<Theorem kind="theorem" number="1" title="Laplacian PSD">
+$L \succeq 0$. 즉, 모든 $x \in \mathbb{R}^n$에 대해 $x^T L x \geq 0$.
+</Theorem>
+
+<Proof>
+$x^T L x = \frac{1}{2} \sum_{(i,j) \in E} (x_i - x_j)^2$는 제곱의 합이므로 항상 비음이다. $\square$
+</Proof>
+
+따라서 모든 고유값 $\lambda_i(L) \geq 0$이고, $L\mathbb{1} = 0$이므로 $\lambda_1 = 0$은 항상 성립한다. 더 나아가 $\dim \ker(L)$는 connected component 수와 정확히 같다. 각 component의 indicator vector가 kernel의 기저를 이루기 때문이다.
+
+Unnormalized Laplacian의 실전 한계는 고유값 scale이 그래프마다 다르다는 것이다($\lambda_{\max}(L) \leq 2\Delta$, $\Delta$ = max degree). **Symmetric normalized Laplacian** $L_{\text{sym}} = D^{-1/2}LD^{-1/2} = I - D^{-1/2}AD^{-1/2}$은 이를 $[0, 2]$로 고정한다. **Random walk Laplacian** $L_{\text{rw}} = D^{-1}L = I - P$ ($P = D^{-1}A$)는 확률적 해석이 명확하다. 두 normalized Laplacian의 고유값은 일치하지만($L_{\text{rw}} = D^{-1/2} L_{\text{sym}} D^{1/2}$, similarity transform), 고유벡터는 $D^{-1/2}$ 만큼 다르다.
+
+<Callout type="note" title="트레이드오프">
+$L_{\text{sym}}$은 symmetric이어서 spectral 분석이 쉽고 GCN·ChebNet에 사용된다. $L_{\text{rw}}$는 random walk 해석이 직접적이고 GraphSAGE mean aggregator와 APPNP에 대응된다. Inductive learning에서는 $L_{\text{rw}}$ 기반의 mean aggregator가 새 노드에 더 자연스럽게 적용된다.
+</Callout>
+
+## Spectral Theory — Fiedler Value와 Cheeger 부등식
+
+$L$의 고유값을 $0 = \lambda_1 \leq \lambda_2 \leq \cdots \leq \lambda_n$으로 정렬하면, $\lambda_2$ (Fiedler value)가 connectivity의 정량적 지표다. $\lambda_2 = 0$이면 그래프가 disconnected다.
+
+Graph conductance $h(G) = \min_{S: |S| \leq n/2} \text{cut}(S, \bar{S}) / \text{vol}(S)$와 $\lambda_2$ 사이에는 다음 **Cheeger 부등식**이 성립한다.
+
+$$
+\frac{h^2(G)}{2} \leq \lambda_2(L_{\text{rw}}) \leq 2h(G)
+$$
+
+이것이 spectral clustering의 이론적 근거다. $\lambda_2$의 eigenvector인 **Fiedler vector** $v_2$의 부호로 노드를 두 그룹으로 분리하면, 그 분리가 conductance를 거의 최소화함이 보장된다. Zachary's Karate Club에서 Fiedler vector 부호 분리가 실제 두 파벌과 거의 정확히 일치하는 것은 이 보장의 실증이다.
+
+Spectral gap $1 - \mu_2$ (여기서 $\mu_2$는 $P = D^{-1}A$의 두 번째 고유값)는 random walk mixing time을 결정한다. $\tau_{\text{mix}} = O(\log(1/\epsilon) / (1 - \mu_*))$. GCN의 over-smoothing 속도도 이 spectral gap의 함수다 — gap이 작은 커뮤니티 구조가 강한 그래프일수록 over-smoothing이 천천히 일어난다.
+
+## Graph Fourier Transform — 주파수 기저로서의 고유벡터
+
+고전 Fourier transform에서 $e^{2\pi i \xi t}$는 $-\Delta$의 eigenfunction이다. Graph Laplacian $L_{\text{sym}}$이 $-\Delta$의 이산판이므로, 그 고유벡터 $\{u_k\}$가 자연스럽게 "그래프 주파수 기저"가 된다.
+
+**Graph Fourier Transform (GFT)**: $L_{\text{sym}} = U\Lambda U^T$에 대해
+
+$$
+\hat{x} = U^T x \quad (\text{forward}), \qquad x = U\hat{x} \quad (\text{inverse})
+$$
+
+작은 $\lambda_k$에 대응하는 $u_k$는 인접 노드끼리 비슷한 값을 갖는 smooth basis vector이고, 큰 $\lambda_k$의 $u_k$는 이웃 노드 부호가 반대인 oscillatory vector다. 이로부터 두 핵심 항등식이 따라온다.
+
+$$
+\|x\|^2 = \|\hat{x}\|^2 \quad \text{(Parseval)}, \qquad x^T L x = \sum_k \lambda_k |\hat{x}_k|^2 \quad \text{(smoothness)}
+$$
+
+두 번째 식은 graph energy가 GFT 계수의 $\lambda_k$-weighted L2 norm임을 뜻한다. Filter $g(\lambda)$가 polynomial $\sum_k \alpha_k \lambda^k$이면 $g(L)x = \sum_k \alpha_k L^k x$로 계산할 수 있어 — $U$ 없이 $L$의 sparsity를 직접 활용한다. 이것이 ChebNet의 핵심이다. Cycle graph $C_n$에서 GFT는 고전 DFT와 정확히 일치하며, 이는 GFT가 DFT의 그래프 일반화임을 보여준다.
+
+## Random Walk와 PageRank
+
+Random walk transition $P = D^{-1}A$는 row-stochastic이다. Connected undirected graph에서 stationary distribution은 $\pi_i = d_i / (2|E|)$ — 고차수 노드일수록 자주 방문된다. 이는 detailed balance $\pi_i P_{ij} = \pi_j P_{ji}$로부터 즉시 따라온다.
+
+**PageRank**는 teleport가 추가된 personalized random walk다.
+
+$$
+\pi = (1-\alpha)v + \alpha P^T \pi \quad \Rightarrow \quad \pi = (1-\alpha)(I - \alpha P^T)^{-1} v
+$$
+
+$v = e_s$로 두면 Personalized PageRank(PPR)가 된다. GNN 관점에서 초기 feature $H^{(0)}$에 PPR을 적용하면 APPNP의 propagation이 된다.
+
+$$
+Z = (1-\alpha)(I - \alpha \hat{A})^{-1} H^{(0)} = (1-\alpha)\sum_{k=0}^\infty \alpha^k \hat{A}^k H^{(0)}
+$$
+
+$\alpha$는 teleport probability다. 각 step에서 $\alpha$ 확률로 $H^{(0)}$으로 reset하므로 초기 feature가 보존된다. 이것이 over-smoothing 회피의 메커니즘이다 — $\hat{A}^L H$가 $\ker(L_{\text{sym}})$으로 collapse하는 것을 teleport가 차단한다.
+
+<Aside label="통일된 시각">
+$A^k$의 walk-counting, $L$의 smoothness 측정, GFT의 주파수 분해, PageRank의 diffusion — 이 모두는 하나의 질문에 대한 다른 표현이다. "그래프 위에서 정보는 어떻게 전파되는가?" GNN은 이 전파를 학습 가능한 파라미터로 제어하는 기계다.
+</Aside>
+
+## 정리
+
+- $A^k$의 $(i,j)$ 성분 = 길이 $k$ walk 수. Message passing의 수학적 뿌리이며, $k$-layer GNN이 $k$-hop 정보를 모으는 이유다.
+- $L = D - A \succeq 0$. Quadratic form $x^T Lx = \frac{1}{2}\sum_E (x_i - x_j)^2$는 smoothness를 측정하고, $\dim\ker(L)$은 connected component 수와 같다.
+- Cheeger 부등식 $h^2/2 \leq \lambda_2 \leq 2h$는 spectral clustering의 이론적 보장이다. Fiedler vector 부호로 그래프를 bisection하면 conductance가 거의 최적이다.
+- GFT $\hat{x} = U^T x$에서 $L$의 고유벡터가 그래프 주파수 기저가 된다. Polynomial filter

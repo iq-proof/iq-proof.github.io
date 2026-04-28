@@ -1,0 +1,124 @@
+---
+title: "GNN은 어디까지 확장될 수 있는가"
+description: "Graph Transformer의 구조적 encoding부터 E(3) equivariance, LLM과의 융합까지, GNN 고급 이론의 핵심 흐름을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gnn, graph-transformer, equivariance, graphormer, foundation-model]
+difficulty: advanced
+series:
+  slug: gnn-deep-dive
+  title: Gnn Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GNN 은 message passing 의 단순함에서 출발했지만, 어느 순간 Transformer 와 만나고, 물리 법칙의 대칭성을 품고, LLM 과 경쟁하기 시작했다. 이 진화의 공통 축은 하나다 — **어떻게 graph 구조를 더 풍부하게 표현할 것인가**. 1-WL 이라는 천장을 넘으려는 시도들은 모두 그 질문의 다른 답이다.
+
+## Transformer가 Graph를 만났을 때
+
+Message passing 의 본질적 한계는 **locality** 다. $L$ 레이어 GNN 은 $L$-hop 이웃까지만 본다. CSL 처럼 고도로 대칭적인 그래프에서 1-WL 이 동등하게 판정하는 구조를 GIN 도 구분하지 못한다.
+
+Graphormer(Ying 2021)는 이 한계를 Transformer 의 dense attention 으로 정면 돌파한다. 모든 노드 쌍이 한 번에 상호작용한다. 그러나 단순히 Transformer 를 graph 에 올리는 것은 구조 정보를 버리는 것이기도 하다. Graphormer 의 설계는 이 손실을 세 가지 encoding 으로 회복한다.
+
+**Centrality encoding** 은 노드의 degree 를 입력 embedding 에 더한다.
+
+$$
+h_i^{(0)} \leftarrow h_i^{(0)} + z_{\text{deg}^-(i)} + z_{\text{deg}^+(i)}
+$$
+
+Hub 노드가 attention 에서 더 큰 역할을 하도록 intrinsic importance 를 심어두는 것이다. **Spatial encoding** 은 두 노드 사이의 shortest path distance(SPD) 를 attention bias 로 주입한다.
+
+$$
+\alpha_{ij} = \text{softmax}\left(\frac{(h_i W_Q)(h_j W_K)^T}{\sqrt{d/H}} + b_{\phi(i,j)} + c_{ij}\right)
+$$
+
+$b_{\phi(i,j)}$ 는 SPD 값마다 학습되는 스칼라다. 가까운 노드일수록 강한 attention bias 를 받는다. **Edge encoding** $c_{ij}$ 는 두 노드를 잇는 최단 경로 위의 edge feature 를 평균해 attention 에 더한다. 분자의 bond type 같은 정보가 이 경로로 흘러들어온다.
+
+ablation 결과는 명확하다. spatial encoding 이 세 가지 중 가장 큰 효과를 낸다. SPD 정보가 graph structure 주입의 핵심이다. OGB-LSC PCQM4M 에서 Graphormer 는 MAE 0.099 를 달성했다 — GIN + Virtual Node 의 0.128 대비 30% 이상 개선이다.
+
+<Callout type="note" title="트레이드오프">
+Dense attention 은 $O(n^2 d)$ 비용을 수반한다. SPD matrix 사전 계산도 $O(n^3)$ 이다. Graphormer 의 주요 적용 도메인이 분자($n \sim 30$-$50$)인 이유가 여기 있다. $n > 1000$ 규모에서는 linear attention 또는 subgraph sampling 이 필요하다.
+</Callout>
+
+## GNN과 Transformer의 위계
+
+Graphormer 가 등장하면서 GNN 과 Transformer 가 사실 같은 framework 의 다른 instantiation 임이 명확해졌다.
+
+<Theorem kind="theorem" number="1" title="GAT ⊂ Sparse Graph Transformer">
+GAT 는 graph adjacency 를 attention mask 로 사용하는 Transformer 의 special case 다.
+</Theorem>
+
+<Proof>
+GAT 의 attention 은 $j \in N(i)$ 에 대해서만 softmax 를 계산하고 그 외는 0 이다. 이는 Transformer 에서 $M_{ij} = 0$ if $j \in N(i)$, $M_{ij} = -\infty$ otherwise 인 mask 를 사용하는 것과 동일하다. $\square$
+</Proof>
+
+이로부터 엄격한 위계가 성립한다.
+
+$$
+\text{MPNN} \subsetneq \text{GAT (sparse)} \subsetneq \text{Graphormer (dense)} \subsetneq \text{Transformer + structural PE}
+$$
+
+GAT 는 input-dependent attention 으로 fixed aggregation 의 MPNN 보다 flexible 하지만, 여전히 graph edge 안에 갇혀 있다. Graphormer 는 그 경계를 dense attention + structural encoding 으로 열어 1-WL 을 초과한다.
+
+현대의 best practice 인 GraphGPS(Rampášek 2022) 는 이 위계를 하이브리드로 종합한다. local branch(GIN/GatedGCN) 가 근접 구조를 포착하고, global branch(Transformer) 가 long-range dependency 를 처리한다. ZINC 에서 GIN 은 MAE 0.20, Graphormer 는 0.12, GraphGPS 는 0.09 를 기록한다. local + global 의 조합이 단독보다 일관되게 강하다.
+
+## 물리가 요구하는 대칭성
+
+Chemistry 와 physics 는 graph structure 를 넘어 **3D 공간의 대칭성** 을 요구한다. 분자를 공간에서 임의로 회전해도 에너지는 변하지 않는다. 하지만 분자에 작용하는 힘(force vector)은 회전과 함께 회전해야 한다.
+
+이를 수학적으로 표현하면 E(3) equivariance 다.
+
+$$
+\phi(Rx + t) = R\phi(x) + t \quad \forall R \in \text{SO(3)}, t \in \mathbb{R}^3
+$$
+
+일반 GNN 은 3D coordinate 를 무시하거나, 무시하지 않더라도 이 대칭성을 보장하지 못한다.
+
+EGNN(Satorras 2021)의 핵심 insight 는 놀랍도록 단순하다. coordinate update 에 $(x_i - x_j)$ 형태만 사용하면 equivariance 가 자동으로 성립한다.
+
+$$
+x_i^{(l+1)} = x_i^{(l)} + \sum_{j \neq i}(x_i^{(l)} - x_j^{(l)}) \phi_x(\|x_i - x_j\|^2, h_i, h_j)
+$$
+
+$(x_i - x_j)$ 는 translation 아래 불변이고($t$ 가 소거된다), rotation 아래 equivariant 다($R(x_i - x_j) = Rx_i - Rx_j$). $\phi_x$ 는 거리의 제곱이라는 invariant scalar 만 받으므로 rotation 에 민감하지 않다. 이 두 가지가 결합해 전체 coordinate update 가 E(3)-equivariant 가 된다.
+
+QM9 분자 특성 예측 벤치마크에서 equivariant GNN 의 효과는 뚜렷하다. distance 만 쓰는 SchNet 이 평균 MAE 0.061 을 기록하는 반면, EGNN 은 0.029, SE(3)-Transformer 는 0.026 을 달성한다. SE(3)-Transformer 는 spherical harmonics 기반의 higher-order tensor feature 로 이론적으로 더 강력하지만, 비용이 $O(m d l^3)$ 으로 증가한다. EGNN 은 $O(m d)$ 의 단순함으로 competitive 한 성능을 낸다 — 단순성과 표현력의 sweet spot 이다.
+
+<Aside label="설계 원칙">
+E(3) equivariance 는 inductive bias 다. 데이터 augmentation(random rotation 학습)으로 우회할 수 있지만, equivariant 설계는 그 bias 를 구조에 새겨 sample efficiency 와 일반화를 동시에 얻는다.
+</Aside>
+
+## 규모의 도전과 WL 한계의 실전 의미
+
+GNN 이 실제 산업 규모($n = 100M$ 이상)에서 작동하려면 별도의 전략이 필요하다. graph 는 non-i.i.d. 구조를 가지므로 단순한 mini-batch 가 불가능하다.
+
+Cluster-GCN(Chiang 2019)은 METIS 로 graph 를 $K$ partition 으로 나눠 induced subgraph 위에서 학습한다. 메모리가 $O(n d)$ 에서 $O((n/K) \cdot B \cdot d)$ 로 줄어든다. GraphSAINT(Zeng 2020)는 random walk 기반 subgraph 를 추출하고 bias correction 으로 불편 gradient 를 보장한다.
+
+이론적 한계인 1-WL 이 실전에서 얼마나 중요한가라는 질문의 답은 task-dependent 다. PCQM4M(chemistry) 에서 Graphormer 는 GIN 대비 34% 개선을 보인다. Cora(citation) 에서는 3% 에 불과하다. chemistry 는 3D 구조와 long-range interaction 이 결정적이므로 표현력 향상이 실전 성능으로 직결된다. citation 은 local community 구조가 지배적이라 GCN 으로 충분하다.
+
+## LLM 시대의 GNN
+
+LLM 이 SMILES 문자열로 분자를 처리할 수 있게 되면서 GNN 의 역할에 대한 질문이 생겼다. 그러나 LLM 의 정성적 이해와 GNN 의 정량적 정밀도는 상보적이다.
+
+LLM 은 "benzene 은 aromatic" 을 안다. GNN 은 HOMO-LUMO gap = 4.72 eV 를 예측한다. SMILES 는 2D connectivity 만 담는다. EGNN 은 3D coordinate 를 equivariant 하게 처리한다. drug screening 에서 10B 후보를 처리할 때 LLM 의 $O(n^2)$ forward pass 는 GNN 의 $O(m d)$ 와 비교할 수 없다.
+
+현대의 best practice 는 융합이다. LLM encoder 가 text attribute 를 embedding 하고, GNN 이 graph structure 위에서 propagation 한다. Graph RAG 는 query 에 관련된 subgraph 를 retrieval 해 LLM context 에 추가한다. OGB-TAG 실험에서 LLM embedding + GNN 은 baseline GNN 대비 5-10% 개선을 일관되게 보인다.
+
+Graph foundation model 은 NLP 의 BERT/GPT 와 같은 길을 걷고 있지만, 여러 bottleneck 이 있다. architecture 가 domain 마다 다르고, pretraining data 는 text 의 1/1000 수준이며, graph 에서의 scaling law 는 over-smoothing 때문에 monotonic 하지 않다. chemistry-specific foundation model 은 2-3년 내 성숙할 것으로 보이지만, universal graph foundation model 은 5-10년이 더 필요하다.
+
+## 정리
+
+- Graphormer 의 세 가지 structural encoding(centrality, spatial, edge)은 모두 같은 목표를 향한다 — graph structure 를 attention mechanism 에 주입하라.
+- GNN 과 Transformer 는 같은 framework 의 다른 axis 다. MPNN ⊊ GAT ⊊ Graphormer 의 위계는 strict 하며, 현대 best practice 는 local + global hybrid 다.
+- E(3) equivariance 는 분자·물리 GNN 의 필수 inductive bias 다. EGNN 의 $(x_i - x_j)$ 기반 coordinate update 는 이를 단순하고 효율적으로 달성한다.
+- 1-WL 한계의 실전 영향은 task-specific 이다. chemistry 에서는 결정적, citation 에서는 marginal 이다.
+- GNN 의 미래는 LLM 과의 경쟁이 아니라 융합이다 — graph 의 구조적 정밀도와 LLM 의 의미론적 이해는 상보적이다.
+
+GNN 을 공부한다는 것은 결국 "구조

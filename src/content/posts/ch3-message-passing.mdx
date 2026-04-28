@@ -1,0 +1,118 @@
+---
+title: "GNN 아키텍처들은 같은 문법으로 쓰여 있다"
+description: "MPNN 프레임워크가 GCN·GraphSAGE·GAT·GIN을 하나의 방정식으로 통일하는 과정부터 Aggregator 선택이 표현력을 결정하는 이유까지, 메시지 패싱의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gnn, mpnn, graph-attention, message-passing, aggregator]
+difficulty: advanced
+series:
+  slug: gnn-deep-dive
+  title: Gnn Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GCN, GraphSAGE, GAT, GIN — 이름도 다르고 논문도 다르다. 그런데 이들을 나란히 놓으면 공통 구조가 보인다: 이웃에서 메시지를 만들고, 모으고, 자신을 갱신한다. Gilmer et al.(2017)은 이 패턴을 **Message Passing Neural Network(MPNN)** 이라는 하나의 프레임워크로 정식화했다. 그렇다면 이 공통 문법 안에서 모델들을 갈라놓는 것은 무엇인가?
+
+## 메시지 패싱의 공통 문법
+
+MPNN 한 레이어는 두 줄로 요약된다.
+
+$$
+m_{ij}^{(l)} = M_l(h_i^{(l)},\, h_j^{(l)},\, e_{ij})
+$$
+
+$$
+h_i^{(l+1)} = U_l\!\left(h_i^{(l)},\; \bigoplus_{j \in N(i)} m_{ij}^{(l)}\right)
+$$
+
+$M_l$은 엣지 위에서 메시지를 만들고, $\bigoplus$는 순서 불변 방식으로 모으고, $U_l$은 자신의 상태를 갱신한다. 이것이 전부다. GCN은 $M$을 degree-normalized linear transform으로, GraphSAGE는 이웃과 자신을 concat 후 linear로, GAT는 attention-weighted sum으로, GIN은 MLP + sum으로 채운다. 구현 선택이 달라도 문법은 같다.
+
+$L$레이어 MPNN이 노드 $i$의 $L$-hop 이웃 정보만 사용한다는 것은 귀납법으로 쉽게 증명된다. 0레이어는 자기 자신($X_i$)만 보고, 한 레이어가 쌓일 때마다 receptive field가 정확히 1-hop씩 확장된다.
+
+## Aggregator가 모델을 결정한다
+
+프레임워크가 공유되면 남는 자유도는 $\bigoplus$의 선택이다. 같아 보이는 네 가지가 실제로는 다른 것을 학습한다.
+
+```
+이웃 multiset 예시
+A = {1, 1, 2, 2}
+B = {1, 2}
+
+sum:  A → 6,  B → 3   (다름)
+mean: A → 1.5, B → 1.5 (같음)
+max:  A → 2,  B → 2   (같음)
+```
+
+mean과 max는 위 두 multiset을 구분하지 못한다. Xu et al.(2019)은 이를 이론으로 정리했다: countable feature domain에서 sum aggregator는 proper한 함수 $f$와 결합하면 multiset-injective — 즉 다른 이웃 집합을 반드시 다른 벡터로 보낸다. mean과 max는 이 성질이 없다.
+
+$$
+\text{sum} \;>\; \text{mean},\, \text{max} \;>\; \text{trivial}
+$$
+
+이 위계가 곧 **표현력의 위계**다. GIN이 sum + MLP를 고집하는 이유가 여기에 있다.
+
+## Attention은 sparse Transformer다
+
+GAT는 이 프레임워크 안에서 $\bigoplus$를 attention-weighted sum으로 교체한다.
+
+$$
+e_{ij} = \text{LeakyReLU}(a^T [Wh_i \| Wh_j]), \quad \alpha_{ij} = \text{softmax}_j(e_{ij})
+$$
+
+GCN이 degree에 반비례하는 고정 가중치를 쓰는 반면, GAT는 이 가중치를 데이터로부터 학습한다. 구조적으로 보면 GAT는 그래프 엣지 위에서만 softmax를 수행하는 sparse self-attention이다 — 그래서 Transformer를 완전 연결 그래프 위의 GAT로 볼 수도 있다.
+
+단 표준 GAT에는 한계가 있다. $e_{ij} = f(h_i) + g(h_j)$ 형태로 분해되기 때문에 query node $i$와 관계없이 같은 key ranking을 출력한다. Brody et al.(2022)의 GATv2는 LeakyReLU 안에 $W[h_i \| h_j]$를 넣어 이 static attention 문제를 해결한다.
+
+<Callout type="note" title="GAT → GATv2 → Graphormer">
+GAT(additive, sparse) → GATv2(query-dependent, sparse) → Graphormer(dot-product, dense + structural bias). 이 계보는 그래프 위에서 attention의 표현력을 점진적으로 확장하는 흐름이다.
+</Callout>
+
+## 이질적 그래프와 프레임워크의 확장
+
+현실 그래프는 노드 타입과 엣지 타입이 하나가 아니다. 지식 그래프에는 수백 가지 relation이 있고, 추천 시스템에는 user·item·click·purchase가 뒤섞인다. 이 경우 단순히 하나의 $W$를 공유하면 relation별 의미 차이가 사라진다.
+
+R-GCN(Schlichtkrull et al. 2018)은 relation $r$마다 별도 가중치 $W_r$을 두는 방식으로 이를 해결한다.
+
+$$
+h_i^{(l+1)} = \sigma\!\left(W_0 h_i^{(l)} + \sum_{r} \sum_{j \in N_r(i)} \frac{1}{c_{i,r}} W_r h_j^{(l)}\right)
+$$
+
+relation이 수백 개면 파라미터가 폭발한다. 이를 막는 것이 basis decomposition: $W_r = \sum_{b=1}^B a_{rb} V_b$. $B$개의 공유 basis matrix를 relation별 계수로 조합하면 파라미터가 $O(|\mathcal{R}| d^2)$에서 $O(Bd^2 + |\mathcal{R}|B)$로 줄어든다. $|\mathcal{R}| = 100,\, d = 64,\, B = 8$이면 12배 절감이다.
+
+<Aside label="트레이드오프">
+MPNN 프레임워크의 표현력 상한은 1-WL graph isomorphism test와 동치다(Xu 2019). 즉 1-WL이 구분하지 못하는 그래프 쌍은 어떤 MPNN도 구분하지 못한다. sum aggregator + MLP(GIN)가 이 상한을 정확히 달성하지만, strongly regular graph나 circulant skip-link 같은 구조는 여전히 구분 불가다. k-WL, position-aware GNN, Graphormer가 이 한계를 우회한다.
+</Aside>
+
+## 정리
+
+- MPNN은 GCN·GraphSAGE·GAT·GIN 전체를 두 줄의 방정식 — message + aggregate + update — 으로 통일한다.
+- Aggregator 선택이 표현력의 위계를 결정한다: sum > mean, max.
+- GAT는 sparse self-attention이며, GATv2·Graphormer로 이어지는 attention-on-graph 계보의 출발점이다.
+- Heterogeneous graph는 relation별 가중치 + basis decomposition으로 확장된다.
+- 모든 MPNN의 표현력 상한은 1-WL — 이 한계를 넘으려면 프레임워크 자체를 확장해야 한다.
+
+문법이 같다는 것은 모델들이 단순히 비슷하다는 뜻이 아니다. 같은 제약 안에서 무엇을 최대화하느냐가 각 모델의 정체다.
+
+<Reference
+  title="Neural Message Passing for Quantum Chemistry"
+  authors="Gilmer et al."
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1704.01212"
+/>
+
+<Reference
+  title="How Powerful are Graph Neural Networks?"
+  authors="Xu et al."
+  year={2019}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1810.00826"
+/>

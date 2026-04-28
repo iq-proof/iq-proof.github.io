@@ -1,0 +1,145 @@
+---
+title: "GCN은 어디서 왔는가 — Spectral 이론에서 한 줄 식까지"
+description: "Bruna의 spectral convolution 정의부터 ChebNet의 polynomial 근사, GCN 유도의 4단계 단순화, 그리고 spectral-spatial 동치까지 하나의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gnn, spectral-gcn, graph-laplacian, chebnet, message-passing]
+difficulty: advanced
+series:
+  slug: gnn-deep-dive
+  title: Gnn Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GCN의 propagation rule $H^{(l+1)} = \sigma(\tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2} H^{(l)} W^{(l)})$은 단 한 줄이다. 그런데 이 한 줄은 2014년 Bruna의 spectral convolution 정의, Defferrard의 Chebyshev 근사, Kipf-Welling의 4단계 단순화를 거쳐 나온 결과다. 왜 하필 이 형태인가, 그리고 이 식의 각 항은 어디서 왔는가?
+
+## Convolution을 그래프로 가져오기
+
+CNN의 convolution은 "frequency domain의 element-wise 곱"이다.
+
+$$
+\widehat{f * g} = \hat{f} \cdot \hat{g}
+$$
+
+그래프에는 translation이 없으므로 spatial convolution을 직접 정의할 수 없다. 대신 Graph Fourier Transform(GFT)이 있다 — Laplacian의 고유벡터 행렬 $U$를 이용한 $\hat{x} = U^T x$. Bruna(2014)는 이 GFT를 이용해 convolution을 frequency domain에서 정의했다.
+
+$$
+g *_G x := U \hat{g}(\Lambda) U^T x = \hat{g}(L) x
+$$
+
+학습 파라미터는 각 frequency에서의 filter response $\theta_k = \hat{g}(\lambda_k)$, 즉 $n$개. Cycle graph $C_n$에서 이 정의가 classical circular convolution과 정확히 일치한다는 점이 이 접근이 "옳다"는 결정적 근거다.
+
+<Callout type="warning" title="Bruna spectral GCN의 세 가지 한계">
+(1) $O(n^3)$ eigendecomposition 비용, (2) 파라미터 수가 그래프 크기 $n$에 비례해 대규모 그래프에서 비현실적, (3) filter가 graph-specific eigenvalue $\lambda_k$에 묶여 있어 다른 그래프로 이전 불가.
+</Callout>
+
+## Chebyshev로 $U$ 없애기
+
+Bruna의 세 한계를 동시에 해결하는 아이디어는 단순하다 — spectral filter $\hat{g}(\lambda)$를 polynomial로 제약한다.
+
+$$
+g_\theta(\tilde{L}) = \sum_{k=0}^{K} \theta_k T_k(\tilde{L}), \quad \tilde{L} = \frac{2L}{\lambda_{\max}} - I
+$$
+
+$T_k$는 Chebyshev polynomial이다. rescaling $\tilde{L}$은 고유값을 Chebyshev의 정의역 $[-1, 1]$로 맞추기 위한 것이다. 이 선택이 가져오는 이점은 두 가지다.
+
+<Theorem kind="theorem" number="1" title="Polynomial filter의 K-hop locality">
+$\hat{g}(\lambda) = \sum_{k=0}^{K} \theta_k \lambda^k$이면 spectral convolution은 $K$-hop localized다.
+
+$$g *_G x = \sum_{k=0}^{K} \theta_k L^k x$$
+
+각 항 $L^k x$의 노드 $i$ 성분은 $i$의 $k$-hop 이내 노드에만 의존한다.
+</Theorem>
+
+<Proof>
+$L^k$의 $(i,j)$ 성분은 $i$와 $j$ 사이 hop 거리가 $k$를 초과하면 0이다. 따라서 $g(L)x = \sum_k \theta_k L^k x$의 노드 $i$ 출력은 $K$-hop 이내 노드의 가중합이다. $\square$
+</Proof>
+
+Chebyshev recurrence $T_{k+1}(\tilde{L}) = 2\tilde{L} T_k(\tilde{L}) - T_{k-1}(\tilde{L})$를 이용하면 $U$ 없이 sparse matrix-vector 곱만으로 $O(KmD)$ 비용으로 계산할 수 있다($m$은 간선 수). 파라미터도 $(K+1) \cdot d_{\text{in}} \cdot d_{\text{out}}$으로 그래프 크기와 무관하고, 계수 $\theta_k$가 graph-agnostic이므로 inductive transfer도 가능하다. ChebNet(Defferrard 2016)이 Bruna의 세 한계를 모두 해결한 방식이다.
+
+## GCN 유도의 4단계
+
+Kipf-Welling(2017)은 ChebNet을 더 단순화해 한 줄 식을 만들었다. 단계마다 표현력을 일부 포기하는 대신 단순성과 안정성을 얻는다.
+
+**Step 1 — $K=1$**: Chebyshev filter를 1차 polynomial로 제한한다.
+
+$$g_\theta(\tilde{L})X = \theta_0 X + \theta_1 \tilde{L} X$$
+
+**Step 2 — $\lambda_{\max} \approx 2$**: normalized Laplacian의 최대 고유값이 대부분의 그래프에서 2에 가깝다는 근사를 사용한다. $\tilde{L} \approx L_{\text{sym}} - I = -D^{-1/2}AD^{-1/2}$이 되어
+
+$$g_\theta X \approx \theta_0 X - \theta_1 D^{-1/2}AD^{-1/2} X$$
+
+**Step 3 — parameter tying**: $\theta_0 = -\theta_1 = \theta$로 묶는다. 파라미터가 2개에서 1개로 줄고 과적합이 억제된다.
+
+$$g_\theta X = \theta(I + D^{-1/2}AD^{-1/2})X$$
+
+**Step 4 — renormalization trick**: $I + D^{-1/2}AD^{-1/2}$의 spectral radius는 이분 그래프에서 정확히 2에 도달한다. 깊은 층에서 수치 불안정이 생긴다. self-loop $\tilde{A} = A + I$, $\tilde{D} = D + I$를 추가하면 spectral radius가 1 이하로 안정된다.
+
+$$\boxed{H^{(l+1)} = \sigma\!\left(\tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2} H^{(l)} W^{(l)}\right)}$$
+
+Kipf-Welling 논문의 ablation에서 renormalization trick 유무가 정확도 5%p 이상 차이를 만들었다.
+
+## Spectral과 Spatial은 동치다
+
+GCN은 spectral 유도에서 출발했지만 결과는 순수한 spatial 연산이다. 이것이 우연이 아님을 보이는 정리가 있다.
+
+<Theorem kind="theorem" number="2" title="Polynomial spectral ↔ localized spatial 동치">
+$g_\theta(L) = \sum_{k=0}^{K} \theta_k L^k$인 spectral filter는 $K$-hop localized spatial aggregation과 함수적으로 동치다. 역으로, $K$-hop locality와 permutation equivariance를 만족하는 선형 spatial aggregator는 degree $K$ 이하의 $L$의 polynomial로 표현된다.
+</Theorem>
+
+GCN의 전파 행렬 $\hat{A} = \tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2}$의 고유값은 $1 - \tilde{\lambda}$이다($\tilde{\lambda}$는 augmented $L_{\text{sym}}$의 고유값). 따라서 GCN은 다음 spectral filter에 해당한다.
+
+$$\hat{g}_{\text{GCN}}(\tilde{\lambda}) = 1 - \tilde{\lambda}$$
+
+작은 $\tilde{\lambda}$(smooth component)는 통과시키고 큰 $\tilde{\lambda}$(oscillatory component)는 약화한다 — GCN은 저역통과 필터다. $L$층 GCN의 effective spectral response는 $(1-\tilde{\lambda})^L$이고, $L$이 커질수록 smooth 성분만 남아 모든 노드 feature가 평탄화된다. **over-smoothing의 spectral 설명이다**.
+
+<Aside label="설계 철학">
+Spectral 관점의 장점은 이론이다 — closed-form 표현력 분석, over-smoothing 정량화, filter design의 원칙적 기반. Spatial 관점의 장점은 구현이다 — $U$ 불필요, inductive learning, PyG/DGL의 message passing API와 자연스러운 대응. GCN은 polynomial 제약으로 두 관점을 하나로 합친 교차점이다.
+</Aside>
+
+## 트레이드오프
+
+세 모델을 나란히 놓으면 각 설계 결정의 비용이 선명해진다.
+
+| 항목 | Bruna (2014) | ChebNet (2016) | GCN (2017) |
+|:--|:--|:--|:--|
+| 파라미터 수 | $d_{\text{in}} \cdot d_{\text{out}} \cdot n$ | $(K+1) \cdot d_{\text{in}} \cdot d_{\text{out}}$ | $d_{\text{in}} \cdot d_{\text{out}}$ |
+| Eigendecomposition | $O(n^3)$ 필수 | 불필요 ($\lambda_{\max}$ 추정만) | 불필요 |
+| Locality | 보장 없음 | $K$-hop 보장 | 1-hop (layer당) |
+| Inductive transfer | 불가 | 가능 | 가능 |
+| Spectral filter | 임의 함수 | Chebyshev poly. | $1 - \tilde{\lambda}$ (고정) |
+
+<Callout type="note" title="트레이드오프">
+GCN이 잃은 것은 표현력이다 — $K=1$ 고정으로 한 층에서 1-hop만 본다. 얻은 것은 단순성, 안정성, 하이퍼파라미터 부재다. 실증적으로 Cora(81.5%), Citeseer(70.3%), Pubmed(79.0%)에서 ChebNet과 대등하거나 우월한 성능이 이 선택을 정당화했다. 다만 이웃과 다른 레이블을 가진 heterophilic 그래프에서는 저역통과 편향이 오히려 해가 되어, GPRGNN과 JacobiConv 등 adaptive spectral filter 연구의 동기가 됐다.
+</Callout>
+
+## 정리
+
+- Bruna(2014)는 Graph Fourier Transform을 이용해 $g *_G x = U\hat{g}(\Lambda)U^T x$로 spectral convolution을 정의했다. $C_n$에서 classical circular convolution과 일치한다는 점이 이론적 정당성이다.
+- ChebNet(2016)은 $\hat{g}$를 Chebyshev polynomial로 제약해 $U$ 없이 $O(KmD)$로 계산하고, $K$-hop locality와 inductive transfer를 동시에 확보했다.
+- GCN(2017)은 $K=1$, $\lambda_{\max} \approx 2$, parameter tying, renormalization trick의 4단계 단순화로 $\hat{A}HW$ 한 줄에 도달했다. 각 단계는 표현력의 일부를 포기하고 안정성과 실용성을 얻는 교환이다.
+- Polynomial spectral filter와 localized spatial aggregation은 수학적으로 동치다. GCN의 spectral filter $1-\tilde{\lambda}$는 저역통과이고, 이것이 over-smoothing의 근본 원인이다.
+
+다음 글에서는 이 spectral-spatial 동치 위에서 Message Passing Neural Network(MPNN) 프레임워크가 어떻게 GAT, GIN, GraphSAGE를 통합하는지 추적한다.
+
+<Reference
+  title="Semi-Supervised Classification with Graph Convolutional Networks"
+  authors="Kipf and Welling"
+  year={2017}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1609.02907"
+/>
+
+<Reference
+  title="Convolutional Neural Networks on Graphs with Fast Localized Spectral Filtering"
+  authors="Defferrard, Bresson, and Vandergheynst"
+  year={2016}
+  venue="NeurIPS

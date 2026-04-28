@@ -1,0 +1,152 @@
+---
+title: "GNN은 왜 깊이 쌓을수록 나빠지는가"
+description: "GCN의 over-smoothing이 수학적 필연인 이유부터 APPNP의 closed-form 해결까지, 노드 표현이 붕괴하는 메커니즘을 스펙트럼 관점에서 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [gnn, over-smoothing, graph-laplacian, appnp, jumping-knowledge]
+difficulty: advanced
+series:
+  slug: gnn-deep-dive
+  title: Gnn Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ResNet은 152층을 쌓아 성능을 올린다. GCN은 4층만 넘어도 성능이 떨어진다. 같은 딥러닝인데 왜 이렇게 다른가? 그리고 이것이 구현 버그가 아니라 수학적 필연이라면, 어떻게 우회할 수 있는가?
+
+## 현상: 노드가 모두 같아진다
+
+GCN의 propagation은 다음과 같다.
+
+$$
+H^{(l+1)} = \sigma(\hat{A} H^{(l)} W^{(l)})
+$$
+
+$\hat{A} = \tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2}$는 self-loop을 포함한 정규화된 인접행렬이다. 이 연산의 본질은 **각 노드가 이웃의 가중 평균을 취하는 smoothing**이다.
+
+한 층이면 이웃과 비슷해지고, 두 층이면 이웃의 이웃과 비슷해진다. 층이 깊어질수록 평균을 취하는 반경이 넓어진다. 그래프의 지름(diameter)이 $O(\log n)$인 경우, 몇 층 만에 모든 노드가 그래프 전체의 평균 정보를 보게 된다. 결국 **모든 노드의 표현이 같은 방향으로 수렴**한다.
+
+$$
+\lim_{L \to \infty} h_i^{(L)} = \lim_{L \to \infty} h_j^{(L)} \quad \forall i, j \in V
+$$
+
+이를 **over-smoothing**이라 한다. Li et al. (2018)의 실증 데이터는 단조적이다.
+
+| Layer | Cora | Citeseer | Pubmed |
+|-------|------|----------|--------|
+| 2 | 81.5% | 70.3% | 79.0% |
+| 4 | 79.0% | 68.0% | 77.0% |
+| 8 | 71.0% | 60.0% | 70.0% |
+| 16 | 50.0% | 38.0% | 55.0% |
+
+Layer 16에서 Cora 정확도 50%는 7-class 문제의 random guess(~14%)보다는 높지만, 모델이 거의 아무것도 학습하지 못했다는 뜻이다.
+
+## 왜 필연인가: 스펙트럼 분석
+
+over-smoothing은 구현 실수가 아니다. $\hat{A}$의 거듭제곱이 수렴하는 방향이 고정되어 있기 때문이다.
+
+<Theorem kind="theorem" number="1" title="GCN의 Power Iteration 수렴">
+$P = \tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2}$의 스펙트럼 분해를 $P = U\Lambda U^T$라 하면,
+
+$$
+\lim_{L \to \infty} P^L H = v_1 v_1^T H
+$$
+
+여기서 $v_1 = \sqrt{\tilde{d}} / \|\sqrt{\tilde{d}}\|$는 최대 고유값 1에 대응하는 고유벡터이다.
+</Theorem>
+
+<Proof>
+$P$의 고유값을 $1 = \mu_1 > |\mu_2| \geq \cdots \geq |\mu_n|$으로 정렬하면,
+
+$$
+P^L = \sum_k \mu_k^L v_k v_k^T = v_1 v_1^T + \sum_{k \geq 2} \mu_k^L v_k v_k^T
+$$
+
+$k \geq 2$에서 $|\mu_k| < 1$이므로 $\mu_k^L \to 0$. 따라서 $P^L \to v_1 v_1^T$ (rank-1). self-loop 추가($\tilde{A}$)로 $P$가 bipartite structure를 갖지 않으므로 $|\mu_n| < 1$도 보장된다. $\square$
+</Proof>
+
+수렴 속도는 spectral gap이 결정한다.
+
+$$
+\|P^L H - v_1 v_1^T H\|_F \leq |\mu_2|^L \cdot \|H\|_F
+$$
+
+$|\mu_2|$가 1에 가까울수록(예: path graph) 느리게 붕괴하고, 0에 가까울수록(예: complete graph) 한 층 만에 붕괴한다. **완전 연결 그래프 $K_n$에서 over-smoothing은 단 1층 만에 완성된다.**
+
+<Aside label="CNN과의 차이">
+CNN의 receptive field는 이미지의 큰 공간을 천천히 확장한다. GNN은 그래프 지름 $O(\log n)$ 안에서 전체 그래프를 보게 된다. 깊이의 의미 자체가 다르다.
+</Aside>
+
+## 임시 방편들: DropEdge와 PairNorm
+
+over-smoothing을 완화하는 표면적 방법들이 있다.
+
+**DropEdge** (Rong 2020)는 매 학습 step마다 edge를 랜덤하게 제거한다. Propagation matrix $P$가 매번 달라지면 단일 dominant eigenvector로의 결정론적 수렴이 방해된다. **PairNorm** (Zhao 2020)은 각 층 출력의 pairwise distance 평균을 일정하게 유지한다. centering과 rescaling으로 Dirichlet energy $E(H) = \text{tr}(H^T L H)$에 하한을 준다.
+
+실증 결과는 인상적이다. Cora 16층에서 vanilla GCN 50% → DropEdge 65% → PairNorm 73.5%. 하지만 이들은 근본을 고치지 않는다.
+
+<Callout type="warning" title="트레이드오프">
+DropEdge와 PairNorm은 $P^L \to v_1 v_1^T$라는 동역학 자체를 바꾸지 않는다. 노이즈와 정규화로 붕괴 속도를 늦출 뿐이다. 뮤추얼 인포메이션 $I(X; H^{(L)})$는 여전히 층이 깊어질수록 감소한다. GraphSAGE의 neighbor sampling도 마찬가지다 — expected dynamics는 vanilla GCN과 같고, variance만 커진다. 16층 이상에서는 이 방법들 모두 한계에 부딪힌다.
+</Callout>
+
+## 본질적 해결: APPNP
+
+APPNP (Klicpera 2019)는 **propagation과 prediction을 분리**한다.
+
+먼저 MLP로 초기 예측을 만든다: $H^{(0)} = f_\theta(X)$. 그다음 personalized PageRank 방식으로 propagate한다.
+
+$$
+Z^* = \alpha (I - (1 - \alpha) \tilde{P})^{-1} H^{(0)} = \alpha \sum_{k=0}^{\infty} (1-\alpha)^k \tilde{P}^k H^{(0)}
+$$
+
+$\alpha$는 teleport probability다. 매 hop마다 확률 $\alpha$로 초기 표현 $H^{(0)}$으로 리셋된다. 이 구조의 spectral filter는 다음과 같다.
+
+$$
+\hat{g}_{\text{APPNP}}(\mu_k) = \frac{\alpha}{1 - (1-\alpha)\mu_k}
+$$
+
+$\mu_1 = 1$에서 $\hat{g} = 1$, $\mu_k < 1$에서도 $\hat{g} > 0$이다. **모든 spectral component가 살아남는다.** vanilla GCN에서 $\mu_k^L \to 0$($k \geq 2$)으로 사라졌던 고주파 성분들이 보존된다. $K \to \infty$에서도 rank-1 붕괴가 없다.
+
+실용적으로는 $K = 10$번 power iteration으로 충분하다. $K = 10$의 오차는 closed-form 대비 $10^{-4}$ 이하다.
+
+**Jumping Knowledge Network** (JKN, Xu 2018)는 다른 접근이다. 모든 층의 출력을 최종 표현에 결합한다.
+
+$$
+h_v^{\text{JK}} = \text{concat}(h_v^{(1)}, h_v^{(2)}, \ldots, h_v^{(L)})
+$$
+
+깊은 층이 붕괴해도 얕은 층의 정보가 보존된다. concat 외에 max-pool, LSTM-aggregate 변종도 있다.
+
+## 정리
+
+- Over-smoothing은 버그가 아니다. $P^L \to v_1 v_1^T$라는 spectral 필연이다.
+- 수렴 속도는 spectral gap $1 - |\mu_2|$에 의해 결정된다. dense graph일수록 빠르게 붕괴한다.
+- DropEdge, PairNorm, neighbor sampling은 붕괴를 늦추지만 막지 못한다. 16층 이상에서 한계가 온다.
+- APPNP는 모든 hop의 정보를 기하급수 가중합으로 보존한다 — 이론적으로 무한 층도 가능하다.
+- JKN은 all-layer concat으로 계층적 정보를 보존한다.
+- heterophilic graph에서는 APPNP의 low-pass bias가 오히려 해가 된다. learnable polynomial filter(GPR-GNN)가 필요하다.
+
+GNN의 깊이 문제는 결국 하나의 질문으로 수렴한다 — propagation이 어떤 spectral shape을 만드는가. 이 질문에 정직하게 답한 것이 APPNP이고, 그 일반화가 현대 spectral GNN 연구의 주류다.
+
+<Reference
+  title="Predict then Propagate: Graph Neural Networks meet Personalized PageRank"
+  authors="Klicpera et al."
+  year={2019}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1810.05997"
+/>
+
+<Reference
+  title="Deeper Insights into Graph Convolutional Networks for Semi-Supervised Classification"
+  authors="Li et al."
+  year={2018}
+  venue="AAAI"
+  url="https://arxiv.org/abs/1801.07606"
+/>
