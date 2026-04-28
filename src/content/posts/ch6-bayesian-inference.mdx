@@ -1,0 +1,155 @@
+---
+title: "베이즈 추론의 다섯 가지 얼굴"
+description: "사전분포 선택부터 Bernstein-von Mises 수렴까지, 베이즈 추론의 설계 결정 다섯 가지를 하나의 철학으로 꿰뚫는다."
+pubDate: 2026-04-28
+category: ai
+tags: [bayesian-inference, conjugate-prior, jeffreys-prior, bernstein-von-mises, credible-interval]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+베이즈 추론의 수식은 간단하다 — 사전 곱하기 우도, 나누기 증거. 그런데 이 단순한 뼈대 위에서 수십 년간 논쟁이 이어졌다. 사전분포를 어떻게 선택하는가, 켤레 구조는 언제 깨지는가, 데이터가 충분할 때 사전은 무의미해지는가, 그리고 "95% 구간"은 무엇을 의미하는가. 이 다섯 챕터의 물음은 사실 하나로 귀결된다 — **불확실성을 확률로 표현할 때 어떤 일관성을 요구할 것인가?**
+
+## 파이프라인의 출발점: 사후는 어디서 오는가
+
+베이즈 정리의 연속 버전은 결합밀도를 두 방향으로 인수분해한다.
+
+$$
+\pi(\theta \mid \mathbf{x}) = \frac{f(\mathbf{x} \mid \theta)\, \pi(\theta)}{m(\mathbf{x})}, \quad m(\mathbf{x}) = \int f(\mathbf{x} \mid \theta)\, \pi(\theta)\, d\theta
+$$
+
+분모 $m(\mathbf{x})$는 정규화 상수이므로 실용적으로는 비례 형태로 작업한다.
+
+$$
+\pi(\theta \mid \mathbf{x}) \propto f(\mathbf{x} \mid \theta)\, \pi(\theta)
+$$
+
+이 파이프라인의 핵심 성질이 **순차 갱신(sequential updating)**이다. $n$번째 데이터를 받으면 어제의 사후가 오늘의 사전이 된다.
+
+$$
+\pi(\theta \mid x_{1:n}) \propto \pi(\theta \mid x_{1:n-1}) \cdot f(x_n \mid \theta)
+$$
+
+점추정은 손실함수에 따라 달라진다. 제곱 손실이면 사후 기댓값, 절댓값 손실이면 사후 중앙값, 0-1 손실이면 MAP(최빈값). 이 결정론적 대응이 베이즈 추정량의 최적성 근거다.
+
+## 켤레 구조: 닫힌 계산의 대수학
+
+지수족 우도에 켤레 사전을 쓰면 사후가 같은 족 안에 머문다. 이 "기적"은 우연이 아니라 지수족의 대수 구조에서 나온다.
+
+지수족 우도를 $f(x \mid \eta) = h(x) \exp(\eta^\top T(x) - A(\eta))$로 쓸 때, 켤레 사전의 표준형은
+
+$$
+\pi(\eta \mid \chi, \nu) \propto \exp\!\left(\eta^\top \chi - \nu A(\eta)\right)
+$$
+
+이다. $n$개 데이터를 관측하면 파라미터가 $(\chi, \nu) \to (\chi + \sum T(x_i),\; \nu + n)$으로 갱신된다. 구조 자체는 바뀌지 않는다.
+
+Diaconis-Ylvisaker(1979) 정리는 이 갱신의 해석을 준다. 사후 기대 충분통계량은 사전과 데이터의 정밀도 가중평균이다.
+
+$$
+\mathbb{E}[\bar{T} \mid \mathbf{x}] = \frac{\nu \cdot (\chi/\nu) + n \cdot \bar{T}_n}{\nu + n}
+$$
+
+$\nu$는 "가상 관측 수(pseudo-count)"다. Beta(α, β) 사전은 "이미 α−1번 성공, β−1번 실패를 본 것과 같다"는 해석을 갖는다. Normal-Normal 갱신에서는 **정밀도가 더해진다** — 새 정보가 기존 정보에 가산된다.
+
+<Callout type="note" title="트레이드오프">
+켤레 구조는 계산 편의를 위한 선택이다. 실제 사전 믿음이 켤레 족 안에 없다면 MCMC나 변분 추론을 써야 한다. 데이터가 많으면 사전 형태의 영향이 줄어들므로 켤레 근사의 오류도 작아진다. 반대로 소표본·희귀 사건에서는 사전 형태의 선택이 결정적이다.
+</Callout>
+
+## 사전 선택의 원칙: Jeffreys와 재매개변수화 불변성
+
+균등 사전 $\pi(\theta) = 1$은 "무정보적"처럼 보인다. 그러나 $\phi = g(\theta)$로 재매개변수화하면 $\pi(\phi) = |g'(g^{-1}(\phi))|^{-1}$이 되어 균등이 아니다. "무정보"는 좌표 표현에 의존한다.
+
+Jeffreys(1939)의 해결이다.
+
+$$
+\pi_J(\theta) \propto \sqrt{\det I(\theta)}
+$$
+
+Fisher 정보 $I(\theta)$의 행렬식 제곱근을 사전으로 쓰면 재매개변수화 불변성이 성립한다.
+
+<Theorem kind="proposition" number="1" title="Jeffreys 사전의 재매개변수화 불변성">
+$\phi = g(\theta)$가 매끄러운 전단사 함수일 때, $\pi_J(\theta) d\theta = \pi_J(\phi) d\phi$가 성립한다. 즉 Jeffreys 사전은 좌표 선택에 무관하게 같은 확률 측도를 표현한다.
+</Theorem>
+
+<Proof>
+스칼라 경우. 연쇄율로 $I(\phi) = I(\theta) \cdot (d\theta/d\phi)^2$. 따라서
+
+$$
+\sqrt{I(\phi)}\, d\phi = \sqrt{I(\theta)} \cdot \left|\frac{d\theta}{d\phi}\right| d\phi = \sqrt{I(\theta)}\, d\theta. \quad \square
+$$
+</Proof>
+
+정보기하학 관점에서 $I(\theta)$는 통계적 다양체 위의 Riemann 계량이고, $\sqrt{\det I(\theta)}\, d\theta$는 그 부피 원소다. Jeffreys 사전은 다양체 위의 균등 측도다.
+
+단, 다차원에서 Full Jeffreys($\propto 1/\sigma^2$)는 nuisance 파라미터 문제에서 나쁜 빈도주의 성질을 보이기도 한다. $N(\mu, \sigma^2)$에서는 $\pi(\mu, \sigma) \propto 1/\sigma$를 쓰는 것이 실전에서 더 많이 추천된다 — 이 독립 Jeffreys는 marginal 사후 $\mu \mid \mathbf{x}$를 정확히 $t_{n-1}$로 만들어 빈도주의 신뢰구간과 수치적으로 일치한다.
+
+## Bernstein-von Mises: 사전은 점근적으로 사라진다
+
+정규 조건 하에서 데이터가 쌓이면 어떤 사전에서 출발했든 사후가 하나의 극한으로 수렴한다.
+
+$$
+\left\| \Pi(\cdot \mid X_{1:n}) - N\!\left(\hat\theta_n,\; [nI(\theta_0)]^{-1}\right) \right\|_{TV} \xrightarrow{P_0} 0
+$$
+
+사후 평균은 MLE로, 사후 분산은 Cramér-Rao 하한으로 수렴한다. 이 결과가 **Bernstein-von Mises(BvM) 정리**다.
+
+증명의 핵심은 로그 사후의 Taylor 전개다. $\theta = \hat\theta_n + h/\sqrt{n}$ 근방에서
+
+$$
+\log\pi(\theta \mid \mathbf{x}) = \text{const} - \tfrac{1}{2} h^\top I(\theta_0) h + o_P(1)
+$$
+
+사전의 기여 $\log\pi(\hat\theta_n + h/\sqrt{n}) = \log\pi(\theta_0) + O(n^{-1/2})$는 2차 항보다 작다. 지수를 취하면 $N(0, I(\theta_0)^{-1})$이 남는다.
+
+<Aside label="BvM의 실패 조건">
+BvM은 정규 조건을 요구한다. Uniform$(0, \theta)$처럼 support가 파라미터에 의존하면 MLE가 정규 극한을 갖지 않으므로 실패한다. 신경망처럼 식별성이 깨진 모형에서도 사후가 다봉(multimodal)으로 남아 BvM 근사가 부정확하다.
+</Aside>
+
+BvM의 가장 중요한 함의는 **prior 민감도의 점근 소멸**이다. 아래는 같은 데이터에서 서로 다른 사전들이 큰 $n$에서 같은 사후로 합쳐지는 구조다.
+
+```
+n = 10 :  Prior [███]    Likelihood [████]   → Posterior ≈ 중간
+n = 100:  Prior [█]      Likelihood [██████] → Posterior ≈ Likelihood 중심
+n = 10000: Prior ε        Likelihood (날카로움) → Posterior ≈ N(MLE, CR bound)
+```
+
+실전 함의: 소표본·희귀 사건에서 사전을 신중히 선택해야 하는 이유가 바로 이 수렴이 아직 일어나지 않았기 때문이다.
+
+## 두 구간의 해석: 무엇이 랜덤인가
+
+베이즈와 빈도주의의 차이가 가장 극명하게 드러나는 곳이 구간 추정이다.
+
+**신뢰구간(CI, Neyman 1937)**: 표본마다 달라지는 구간 $C(\mathbf{X})$를 반복 생성했을 때 그 95%가 고정된 $\theta$를 포함한다. 구간이 랜덤, $\theta$는 고정.
+
+$$
+P_\theta(\theta \in C(\mathbf{X})) \ge 1 - \alpha \quad \forall\, \theta
+$$
+
+**신용구간(CrI, Bayesian)**: 관측된 데이터가 주어졌을 때 $\theta$가 구간에 있을 사후 확률이 95%다. $\theta$가 랜덤, 데이터는 고정.
+
+$$
+P(\theta \in C \mid \mathbf{X}) = 1 - \alpha
+$$
+
+이 차이는 $n$이 작거나 모형이 비정규일 때 결정적이다. Binomial에서 $x = 0$이면 Wald CI는 $[0, 0]$으로 퇴화한다. Jeffreys CrI(Beta(0.5, 10.5))는 non-degenerate 구간을 내놓는다. 경계 파라미터 $\theta \ge 0$에서 CI는 음수 하한을 가질 수 있지만, 사전이 양수 반직선을 지정하면 CrI는 자동으로 이를 따른다.
+
+BvM은 점근적으로 두 구간이 수치적으로 가까워짐을 보장하지만, 철학적 해석은 대표본에서도 바뀌지 않는다. "95% CI가 [2.1, 3.4]"를 "θ가 이 구간에 있을 확률이 95%"로 읽는 것은 빈도주의 해석을 베이즈식으로 혼용한 오류다.
+
+## 정리
+
+- 베이즈 파이프라인의 본질은 **순차 갱신**이다. 오늘의 사후가 내일의 사전이 된다.
+- 켤레 구조는 지수족의 대수적 특성에서 나온다. 파라미터 공간에서 affine 이동으로 표현되므로 계산이 닫힌다.
+- Jeffreys 사전은 재매개변수화 불변성을 만족하는 Fisher 정보의 부피 원소다. 그러나 다차원 nuisance 파라미터에서는 Reference prior를 검토해야 한다.
+- BvM은 정규 조건 하에서 사전을 점근

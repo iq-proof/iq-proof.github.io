@@ -1,0 +1,101 @@
+---
+title: "통계 추론은 무엇을 가정하고 있는가"
+description: "통계 모델의 집합론적 정의부터 식별가능성, 표집분포, CLT의 유한표본 오차, 그리고 t·F 통계량의 수학적 뿌리까지 — 추론이 의존하는 가정들을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mathematical-statistics, identifiability, sampling-distribution, central-limit-theorem, t-distribution]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`scipy.stats.ttest_ind` 한 줄로 A/B 테스트를 돌리고, `statsmodels`로 회귀 계수의 p-value를 읽는다. 그런데 이 숫자들이 의미를 갖기 위해 어떤 수학적 가정들이 먼저 성립해야 하는가? 그 가정이 깨지면 p-value는 무엇인가?
+
+## 통계 모델이란 무엇인가
+
+"모델을 세운다"는 말은 데이터 $x_1, \ldots, x_n$을 어떤 확률측도 $\mathbb{P}$의 iid 표본으로 보겠다는 것만이 아니다. 그보다 한 단계 더 나아가, 그 $\mathbb{P}$가 **미리 정한 후보 분포들의 집합** 안에 있다고 가정하는 것이다.
+
+$$\mathcal{E} = \left( \mathcal{X},\ \mathcal{F},\ \{\mathbb{P}_\theta : \theta \in \Theta\} \right)$$
+
+표본공간 $(\mathcal{X}, \mathcal{F})$, 모수 공간 $\Theta$, 확률측도들의 족. 이것이 통계 실험(statistical experiment)의 정의다. 모든 추정·검정·점근 이론은 이 삼중쌍을 전제로 의미를 가진다.
+
+이 구조 안에서 두 세계가 갈라진다. **M-closed** 세계에서는 참 분포 $\mathbb{P}_*$가 모델 안에 있다($\mathbb{P}_* = \mathbb{P}_{\theta_0}$인 $\theta_0$가 존재). **M-open** 세계에서는 참 분포가 모델 밖에 있고, MLE는 KL 거리를 최소화하는 pseudo-true parameter $\theta^* = \arg\min_\theta \mathrm{KL}(\mathbb{P}_* \| \mathbb{P}_\theta)$로 수렴한다. 실무에서는 거의 항상 M-open이다.
+
+## 식별가능성 — 추정이 가능한 조건
+
+통계적 추론이란 관측된 분포로부터 $\theta$를 역추적하는 작업이다. 서로 다른 $\theta_1 \neq \theta_2$가 동일한 분포 $\mathbb{P}_{\theta_1} = \mathbb{P}_{\theta_2}$를 만들면, 역추적 자체가 불가능하다.
+
+$$\theta_1 \neq \theta_2 \;\Longrightarrow\; \mathbb{P}_{\theta_1} \neq \mathbb{P}_{\theta_2}$$
+
+이 조건이 **식별가능성(identifiability)**이다. 사상 $\theta \mapsto \mathbb{P}_\theta$가 단사함수여야 한다 — 역함수가 없으면 추정도 없다.
+
+<Theorem kind="proposition" number="1" title="이성분 가우시안 혼합의 식별 불가능성">
+$\theta = (w, \mu_1, \sigma_1^2, \mu_2, \sigma_2^2)$로 매개변수화된 혼합 모델에서, 라벨 스와핑 $\theta' = (1-w, \mu_2, \sigma_2^2, \mu_1, \sigma_1^2)$은 $\theta \neq \theta'$이지만 $\mathbb{P}_\theta = \mathbb{P}_{\theta'}$를 만든다.
+</Theorem>
+
+<Proof>
+혼합 밀도 $w \cdot p_1(x) + (1-w) \cdot p_2(x)$와 $(1-w) \cdot p_2(x) + w \cdot p_1(x)$는 완전히 동일한 함수다. $\square$
+</Proof>
+
+신경망에서도 같은 현상이 나타난다. $L$-층 MLP에서 같은 층의 뉴런을 재순열하거나 ReLU의 양의 동차성에 의한 weight rescaling을 적용해도 함수 $f_\theta$는 불변이다. 결과적으로 loss landscape에 $h!$배의 대칭 극소들이 생긴다. SGD의 수렴 이론에서 "어느 모드로든 수렴"이라 해석하는 근거가 여기에 있다.
+
+## 통계량은 확률변수다
+
+통계량 $T(X_1, \ldots, X_n)$은 파라미터 $\theta$를 포함하지 않는 가측함수다. 그러나 이것이 단순히 "데이터에서 계산한 숫자"를 의미하지 않는다. $T$는 $\mathbb{P}_\theta^{\otimes n}$에서 유도된 **확률변수**이고, 그 분포(표집분포)가 $\theta$에 의존한다는 점이 추론의 출발점이다.
+
+경험분포함수 $\hat{F}_n(t) = \frac{1}{n}\sum_{i=1}^n \mathbb{1}(X_i \leq t)$는 이 관점의 극단적 사례다. 각 $t$에서 $n\hat{F}_n(t) \sim \mathrm{Bin}(n, F(t))$이고 $\mathbb{E}\hat{F}_n(t) = F(t)$, $\mathrm{Var}(\hat{F}_n(t)) = F(t)(1-F(t))/n$이다. Glivenko-Cantelli 정리는 이로부터 $\sup_{t} |\hat{F}_n(t) - F(t)| \xrightarrow{\text{a.s.}} 0$을 보장한다. Bootstrap의 consistency, KS 검정, conformal prediction 모두 여기에 뿌리를 둔다. Dvoretzky-Kiefer-Wolfowitz 부등식이 유한표본 속도를 준다:
+
+$$\mathbb{P}\!\left(\sup_t |\hat{F}_n(t) - F(t)| > \varepsilon\right) \leq 2 e^{-2 n \varepsilon^2}$$
+
+## 표본평균의 수렴과 그 한계
+
+$\mathrm{Var}(\bar{X}_n) = \sigma^2/n$은 통계적 추정 전체를 지배하는 $1/\sqrt{n}$ 수렴률의 수학적 표현이다. Mini-batch SGD의 그래디언트 분산 $\sigma_g^2/B$, A/B 테스트의 표본크기 공식 $n \propto \sigma^2/\delta^2$, Monte Carlo 적분의 표준오차 — 모두 이 단순한 공식의 귀결이다.
+
+정규 iid 표본에서는 $\bar{X}_n \sim \mathcal{N}(\mu, \sigma^2/n)$이 유한표본 등식이다. 비정규에서는 CLT가 점근 정규성만 보장한다:
+
+$$Z_n := \frac{\sqrt{n}(\bar{X}_n - \mu)}{\sigma} \xrightarrow{d} \mathcal{N}(0, 1)$$
+
+유한 $n$에서의 오차 한계는 Berry-Esseen이 준다: $\sup_t |\mathbb{P}(Z_n \leq t) - \Phi(t)| \leq C\rho/(\sigma^3\sqrt{n})$, $C \leq 0.4748$ (Shevtsova 2011). "$n \geq 30$이면 CLT OK"는 rule of thumb이며, $p$가 0에 가까운 베르누이나 치우친 분포에서는 $n = 1000$에서도 근사가 나쁠 수 있다.
+
+<Callout type="warning" title="Cauchy: CLT가 깨지는 경우">
+$X_i \sim \text{Cauchy}(0,1)$ iid이면 $\bar{X}_n \sim \text{Cauchy}(0,1)$ for all $n$. 2차 적률이 없어 $n$이 커져도 분산이 줄지 않는다. IQR이 줄지 않는 것을 시뮬레이션으로 확인할 수 있다.
+</Callout>
+
+## 정규성이 만드는 구조 — $\chi^2$, t, F
+
+정규 iid 가정에서 표본평균과 표본분산이 독립이라는 사실은 $\mathbb{R}^n$의 직교 분해에서 직접 나온다. 사영행렬 $P = \frac{1}{n}\mathbf{1}\mathbf{1}^T$ (rank 1)과 $I - P$ (rank $n-1$)으로 분해하면:
+
+- $Y^T P Y = n\bar{Y}^2 \sim \chi^2_1$
+- $Y^T(I-P)Y = (n-1)S^2/\sigma^2 \sim \chi^2_{n-1}$
+- 두 이차형식은 독립 (Cochran 정리)
+
+자유도 $n-1$이 나오는 이유는 대각선 방향 $\mathbf{1}$로의 사영이 자유도 1을 소모하기 때문이다. 이 분해에서 t-통계량이 자연스럽게 유도된다:
+
+$$T = \frac{\bar X - \mu}{S/\sqrt n} = \frac{Z}{\sqrt{V/(n-1)}} \sim t_{n-1}, \qquad Z \perp V$$
+
+$\sigma$를 모르고 $S$로 추정하는 비용이 **꼬리의 두꺼움**으로 나타난다. $n = 5$에서 95% 임계값은 2.776 — 정규의 1.960보다 41% 더 넓은 구간이 필요하다. $n \to \infty$이면 $t_{n-1} \to \mathcal{N}(0,1)$이다. F-통계량은 두 독립 $\chi^2$의 비율이고, $T^2 \sim F_{1, n-1}$이 성립한다 — t와 F는 같은 뿌리의 다른 표현이다.
+
+<Callout type="note" title="트레이드오프">
+정규 가정을 받아들이면 유한표본에서 정확한 분포(t, F, $\chi^2$)를 얻는다. 대신 비정규 데이터에서는 이 결과들이 깨진다. 비모수·점근 접근은 분포 가정 없이 작동하지만 유한표본 보장이 약해진다. M-closed를 가정하면 MLE 점근 정규성이 깨끗하게 나온다. M-open을 인정하면 pseudo-true $\theta^*$로 수렴하고 분산 추정에 샌드위치 공식이 필요하다.
+</Callout>
+
+<Aside label="설계 철학">
+t·F·$\chi^2$은 서로 다른 분포가 아니라 **사영행렬의 랭크가 통계량의 자유도로 번역된다**는 하나의 원리의 다른 표현들이다. 회귀의 잔차 제곱합 $\mathrm{RSS}/\sigma^2 \sim \chi^2_{n-p}$, ANOVA의 $F_{k-1, n-k}$, Wilks 정리의 $\chi^2_p$ — 모두 같은 뿌리에서 나온다.
+</Aside>
+
+## 정리
+
+- 통계 모델은 후보 분포들의 매개변수화된 집합이다. 추정·검정의 모든 결과는 이 집합이 공리적으로 정의되었을 때만 의미를 가진다.
+- 식별가능성은 $\theta \mapsto \mathbb{P}_\theta$의 단사성이다. 혼합 모델과 신경망은 구조적으로 식별 불가능하며, MLE는 유일해를 갖지 못한다.
+- 표집분포를 확률변수로 다루는 관점이 Bootstrap, KS 검정, conformal prediction의 공통 출발점이다.
+- $\mathrm{Var}(\bar{X}) = \sigma^2/n$이라는 단순한 공식이 SGD 배치 크기 규칙에서 A/B 테스트 표본크기까지 지배한다. 단, 2차 적률이 없는 분포에서는 성립하지 않는다.
+- 사영행렬의 랭크가 자유도로 번역된다 — 이

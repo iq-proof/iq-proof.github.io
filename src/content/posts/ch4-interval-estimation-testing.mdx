@@ -1,0 +1,129 @@
+---
+title: "가설검정의 최적성은 어디서 오는가"
+description: "신뢰구간의 pivot 구조부터 Neyman-Pearson 보조정리와 UMP 검정까지, 고전 통계 추론의 최적성 이론이 어떻게 ML의 설계 결정을 정당화하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mathematical-statistics, hypothesis-testing, neyman-pearson, confidence-interval, power-analysis]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+고전 통계 추론에는 하나의 반복되는 질문이 있다. "이 절차가 최선인가?" 신뢰구간은 왜 특정 pivot을 써야 하는가, 가설검정은 왜 우도비를 기준으로 삼는가, 그리고 그 답이 ML의 이진 분류·이상 탐지·A/B 테스트와 어떻게 연결되는가?
+
+## 신뢰구간 — 모수가 아니라 절차가 랜덤이다
+
+신뢰구간에 대한 가장 흔한 오해는 "참값 $\theta$가 95% 확률로 구간 안에 있다"는 해석이다. 이것은 틀렸다. 참값은 고정되어 있고, **구간이 랜덤**이다.
+
+정확한 해석: 같은 절차를 반복하면 100번 중 95번은 만들어진 구간이 $\theta$를 포함한다. 개별 구간에 대해서는 "포함하거나 포함하지 않거나" 둘 중 하나일 뿐이다.
+
+형식적으로, $(1-\alpha)$-신뢰구간 $[L(X), U(X)]$의 정의는 다음과 같다.
+
+$$
+P_\theta(L(X) \le \theta \le U(X)) \ge 1 - \alpha, \quad \forall \theta \in \Theta
+$$
+
+이 구간을 체계적으로 만드는 도구가 **pivot**이다. $Q(X, \theta)$의 분포가 $\theta$와 무관할 때 이를 pivot이라 부른다. 이유는 단순하다. 분포를 알고 있으므로 분위수를 구할 수 있고, $P(q_1 \le Q \le q_2) = 1-\alpha$를 $\theta$에 대해 풀면 신뢰구간이 나온다.
+
+표준 예제들은 이 아이디어의 변주다. $\sigma$ 기지면 $Z = \sqrt{n}(\bar{X} - \mu)/\sigma \sim N(0,1)$, $\sigma$ 미지면 $T = \sqrt{n}(\bar{X} - \mu)/S \sim t_{n-1}$, 분산 추정에는 $(n-1)S^2/\sigma^2 \sim \chi^2_{n-1}$. 지수분포 $\text{Exp}(\lambda)$에서는 $2\lambda \sum X_i \sim \chi^2_{2n}$이 pivot이 된다.
+
+<Callout type="warning" title="이항 비율의 함정">
+Wald CI $\hat{p} \pm z_{\alpha/2}\sqrt{\hat{p}(1-\hat{p})/n}$은 $\hat{p} \approx 0$이나 $1$ 근방에서 실제 커버리지가 명목 수준 아래로 급락한다. Wilson score CI가 실용적 표준이다.
+</Callout>
+
+## Pivot의 구조 — 위치-척도 패밀리와 equivariance
+
+Pivot이 자연스럽게 등장하는 조건이 있다. **위치-척도 패밀리** $f(x;\mu,\sigma) = \frac{1}{\sigma}f_0\left(\frac{x-\mu}{\sigma}\right)$에서 location-equivariant 추정량 $\hat\mu$와 scale-equivariant 추정량 $\hat\sigma$를 쓰면
+
+$$
+\frac{\hat\mu - \mu}{\hat\sigma}, \quad \frac{\hat\sigma}{\sigma}, \quad \frac{X_i - \hat\mu}{\hat\sigma}
+$$
+
+모두 $(\mu, \sigma)$와 무관한 분포를 가진다. 정규분포의 $T$ 통계량이 $t_{n-1}$이 되는 것은 이 구조의 귀결이다.
+
+1-parameter 지수족 $p(x;\theta) = h(x)\exp(\eta(\theta)T(x) - A(\eta))$에서 $\eta$가 단조이면 $T$에 대한 MLR이 성립하고, 점근적으로 $\sqrt{n}\hat{I}^{1/2}(\hat\theta - \theta) \to N(0,I)$가 pivot 역할을 한다. Normalizing flow의 핵심 아이디어 — 데이터 $x$를 단순한 $z \sim N(0,I)$로 변환하는 $z = f^{-1}(x)$ — 는 이 pivot 발상의 학습 버전이다.
+
+## 가설검정의 프레임워크 — Type I과 Type II는 왜 비대칭인가
+
+가설검정은 의사결정 이론의 특수한 사례다. $H_0$를 잘못 기각하는 **Type I 오류**와, $H_0$를 잘못 유지하는 **Type II 오류** 사이의 trade-off를 관리한다.
+
+법정 비유가 유용하다. $H_0$는 "무죄 추정"이다. Type I은 무고한 사람을 유죄로 만드는 오류, Type II는 범인을 놓치는 오류다. 사회는 전자를 더 심각하게 본다. 그래서 유의수준 $\alpha$를 작게 설정하고, Type II 오류($\beta$)는 어느 정도 허용한다.
+
+p-value의 정확한 정의는 "관측된 검정통계량보다 같거나 더 극단적인 값이 $H_0$ 하에서 관측될 확률"이다. $H_0$가 참일 때 p-value는 $U(0,1)$을 따른다. 이로부터 검정과 신뢰구간의 **쌍대성**이 나온다.
+
+<Theorem kind="proposition" number="1" title="검정-CI 쌍대성">
+$(1-\alpha)$-신뢰구간 $C(X)$와 크기 $\alpha$ 검정은 쌍대적이다. $\theta_0 \in C(X)$인 것과 $H_0: \theta = \theta_0$가 기각되지 않는 것은 동치다.
+</Theorem>
+
+검정력(power) $= 1 - \text{Type II}$는 $\alpha$, 효과 크기, 표본 크기 $n$, 분산의 함수다. Z-test 단측 검정의 필요 표본 크기 공식은 다음과 같다.
+
+$$
+n = \frac{(z_\alpha + z_\beta)^2 \sigma^2}{\Delta^2}
+$$
+
+효과 크기 $d = 0.3$, $\alpha = 0.05$, power 0.8을 목표로 하면 group당 약 87명이 필요하다. 이 네 요소 중 세 개가 고정되면 나머지 하나가 결정된다 — 표본을 줄이면 검정력이 떨어지고, 검정력을 높이려면 표본이 늘거나 $\alpha$가 올라가야 한다.
+
+## Neyman-Pearson 보조정리 — 우도비가 왜 최적인가
+
+단순 가설 대 단순 가설 검정에서 "크기 $\alpha$를 지키면서 검정력을 최대화하는" 검정이 무엇인지 물으면, 답은 **우도비 검정**이다.
+
+<Theorem kind="theorem" number="2" title="Neyman-Pearson 보조정리">
+단순 $H_0: \theta = \theta_0$ vs $H_1: \theta = \theta_1$에서, 상수 $k \ge 0$와 $\gamma \in [0,1]$에 대해
+
+$$
+\phi^*(x) = \begin{cases} 1 & L(x;\theta_1) > k\,L(x;\theta_0) \\ \gamma & L(x;\theta_1) = k\,L(x;\theta_0) \\ 0 & L(x;\theta_1) < k\,L(x;\theta_0) \end{cases}
+$$
+
+가 크기 $\alpha$를 가지면, $\phi^*$는 MP(most powerful) level-$\alpha$ 검정이다.
+</Theorem>
+
+<Proof>
+임의의 level-$\alpha$ 검정 $\phi$에 대해, 다음 부등식이 $\forall x$에서 성립한다.
+
+$$
+(\phi^*(x) - \phi(x))(L(x;\theta_1) - k\,L(x;\theta_0)) \ge 0
+$$
+
+양변을 적분하면
+
+$$
+(E_{\theta_1}[\phi^*] - E_{\theta_1}[\phi]) - k(E_{\theta_0}[\phi^*] - E_{\theta_0}[\phi]) \ge 0
+$$
+
+$E_{\theta_0}[\phi^*] = \alpha \ge E_{\theta_0}[\phi]$이고 $k \ge 0$이므로, $\beta_{\phi^*}(\theta_1) \ge \beta_\phi(\theta_1)$. ∎
+</Proof>
+
+이 증명의 핵심은 "우도비가 높은 $x$부터 기각역에 채운다"는 직관과 정확히 일치한다. ROC 곡선의 각 점은 서로 다른 임계값 $k$에서의 NP 검정이며, NP 검정이 ROC의 upper boundary를 그린다.
+
+Bayes 분류기와의 연결도 직접적이다. 사전확률 $\pi_0, \pi_1$이 있을 때 Bayes 최적 분류기는 $L(x;\theta_1)/L(x;\theta_0) > \pi_0/\pi_1$을 기준으로 결정한다 — $k = \pi_0/\pi_1$로 놓은 NP 검정이다.
+
+## UMP와 MLR — 최적성이 성립하는 조건
+
+복합 대립 가설 $\Theta_1$의 **모든** 점에서 동시에 MP인 검정을 UMP(Uniformly Most Powerful)라 한다. 이것이 존재하는 조건이 **Monotone Likelihood Ratio(MLR)**다.
+
+$\theta_1 > \theta_0$일 때마다 $L(x;\theta_1)/L(x;\theta_0)$가 통계량 $T(x)$의 증가함수이면 MLR이 성립한다. **Karlin-Rubin 정리**는 MLR 모형에서 단측 검정 $H_0: \theta \le \theta_0$ vs $H_1: \theta > \theta_0$의 UMP가 $T(x) > c$ 형태임을 보장한다.
+
+1-parameter 지수족 $p(x;\theta) = h(x)\exp(\eta(\theta)T(x) - A(\eta))$는 $\eta$가 단조이면 자동으로 MLR을 만족한다. 정규분포의 $\bar{X}$, 지수분포의 $\sum X_i$, Poisson의 $\sum X_i$ 모두 여기 해당한다.
+
+<Callout type="note" title="트레이드오프: UMP의 한계">
+양측 검정 $H_1: \theta \ne \theta_0$에서는 UMP가 거의 존재하지 않는다. $\theta_1 > \theta_0$과 $\theta_1 < \theta_0$에서 NP의 기각역이 반대 방향이므로 하나로 일치시킬 수 없다. 이 경우 **UMPU**(unbiased 제약 추가)나 **LRT**(5장)를 사용한다. 다변량 정규에서 Hotelling의 $T^2$는 불변성(invariance) 제약 하에서 UMP invariant가 된다.
+</Callout>
+
+<Aside label="ML과의 연결">
+Logistic regression의 이론적 정당화가 여기 있다. 두 Gaussian 클래스에서 LDA의 결정경계는 $w^T x = c$ 형태의 선형 분리자인데, 이것이 정확히 MLR 구조에서 나오는 UMP 검정이다. 지수족 생성모형 → MLR → threshold rule이 최적이라는 흐름이다.
+</Aside>
+
+## 정리
+
+- 신뢰구간은 "모수의 확률"이 아니라 "절차의 커버리지"로 해석해야 한다. Pivot은 모수를 소거하고 남은 순수한 랜덤성이며, 위치-척도 패밀리에서 자연스럽게 등장한다.
+- 가설검정은 Type I 오류를 $\alpha

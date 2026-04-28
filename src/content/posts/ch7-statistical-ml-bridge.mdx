@@ -1,0 +1,168 @@
+---
+title: "통계학과 머신러닝은 왜 같은 말을 다른 이름으로 부르는가"
+description: "ERM과 MLE의 수학적 동치부터 정규화의 MAP 해석, GLM의 통합 구조, 통계학습이론의 일반화 보장, 그리고 베이지안 신경망의 불확실성 정량화까지 — 두 분야를 관통하는 하나의 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [statistics, machine-learning, erm, mle, bayesian]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+통계학은 MLE를 쓰고, 머신러닝은 ERM을 쓴다. 통계학은 prior를 쓰고, 머신러닝은 regularization을 쓴다. 통계학은 GLM을 쓰고, 머신러닝은 softmax classification을 쓴다. 그런데 수식을 나란히 놓으면 전부 같다. 왜 두 분야는 수십 년 동안 같은 것을 다른 이름으로 불러왔고, 이 이중성을 이해하면 무엇이 달라지는가?
+
+## ERM = MLE: 이름이 다른 같은 최적화
+
+머신러닝의 경험적 위험 최소화(ERM)는 다음과 같이 정의된다.
+
+$$
+\hat h = \arg\min_{h \in \mathcal{H}} \frac{1}{n}\sum_{i=1}^n \ell(h(x_i), y_i)
+$$
+
+통계학의 최대우도추정(MLE)은 다음과 같다.
+
+$$
+\hat\theta = \arg\min_\theta -\sum_i \log f(x_i; \theta)
+$$
+
+손실 함수로 $\ell = -\log f(\cdot; h)$를 선택하는 순간 두 식은 문자 그대로 같아진다. 이 대응은 단순한 비유가 아니다. 제곱 오차 손실은 Gaussian 조건부 우도의 음의 로그이고, 이진 교차 엔트로피는 Bernoulli 우도의 음의 로그이며, 소프트맥스 교차 엔트로피는 다항 우도의 음의 로그다.
+
+역방향도 성립한다. 모집단 위험을 KL 발산으로 분해하면
+
+$$
+R(\theta) = -\mathbb{E}_{P_0}[\log p_\theta(Y|X)] = H(P_0) + \text{KL}(P_0 \| P_\theta)
+$$
+
+이므로 MLE의 모집단 버전은 KL 발산 최소화, 즉 ERM의 또 다른 얼굴이다. `nn.MSELoss`는 Gaussian NLL이고, `nn.CrossEntropyLoss`는 categorical NLL이다. PyTorch의 손실 메뉴는 사실 통계 모형 메뉴다.
+
+<Callout type="note" title="모형 오특정(misspecification)의 경우">
+참 분포 $P$가 모형 가족 밖에 있을 때 MLE는 $\theta^* = \arg\min \text{KL}(P \| p_\theta)$로 수렴한다(quasi-MLE). 표준 크래머-라오 한계는 깨지고 샌드위치 표준 오차가 필요하다. 딥러닝에서 모형은 거의 항상 오특정되어 있다.
+</Callout>
+
+## 정규화 = MAP: 페널티 뒤에 숨은 prior
+
+머신러닝에서 정규화는 과적합을 막는 공학적 기법처럼 보인다. 그런데 다음 두 식을 비교해보자.
+
+$$
+\hat\theta_{\text{reg}} = \arg\min_\theta \left[ \ell(\theta; D) + \lambda \Omega(\theta) \right]
+$$
+
+$$
+\hat\theta_{\text{MAP}} = \arg\max_\theta \left[ \log p(D|\theta) + \log \pi(\theta) \right]
+$$
+
+$\log \pi(\theta) = -\lambda \Omega(\theta)$이면 두 식은 동일하다. Ridge 정규화는 Gaussian prior MAP이고, LASSO는 Laplace prior MAP이다.
+
+직교 설계에서 두 추정량의 차이는 기하학적으로 명확하다.
+
+```
+   LASSO (diamond)     Ridge (circle)
+          ◆                 ●
+      (꼭짓점 = 축)       (smooth)
+```
+
+LASSO의 제약 집합은 다이아몬드 모양이어서 OLS 등위선과의 교점이 축 위 꼭짓점에 생기기 쉽다. 이것이 희소성의 기원이다. 반면 Ridge는 매끄럽게 수축시킨다. Prior의 모양이 추정량의 모양을 결정한다.
+
+이 연결의 실용적 가치는 하이퍼파라미터 선택에 있다. $\lambda$를 교차검증으로 찾는 대신, 주변 우도(marginal likelihood)를 최대화하는 경험적 베이즈로 찾을 수 있다. Dropout은 변분 Bayesian 근사(Gal & Ghahramani 2016), AdamW의 weight decay는 SGD L2 정규화와 분리된 Gaussian prior — 현대 최적화 기법들도 같은 틀로 읽힌다.
+
+## GLM: 통합 구조가 드러내는 것
+
+Nelder & Wedderburn(1972)의 일반화 선형 모형(GLM)은 선형 회귀, 로지스틱 회귀, 포아송 회귀를 하나의 구조로 묶는다.
+
+$$
+\begin{cases}
+Y_i | X_i \sim \text{지수족}(\eta_i), \\
+\eta_i = g(\mu_i), \quad \mu_i = \mathbb{E}[Y_i | X_i], \\
+\eta_i = X_i^\top \beta.
+\end{cases}
+$$
+
+정준 링크(canonical link)를 쓰면 기대 피셔 정보와 관찰 피셔 정보가 일치하고, 반복 가중 최소 제곱(IRLS)이 뉴턴-랩슨과 같아진다. 수학적 편의성이 최대가 되는 파라미터화다.
+
+신경망 출력층은 대부분 GLM이다. 소프트맥스 분류는 다항 GLM, sigmoid 출력은 Bernoulli 정준 역링크, Poisson NLL 손실은 Poisson GLM. "딥러닝 모형 설계"의 상당 부분은 "어떤 GLM을 마지막 층으로 쓸 것인가"의 선택이다.
+
+<Aside label="지수족의 흔적">
+Transformer의 어텐션 가중치 $\propto \exp(QK^\top/\sqrt{d})$도 소프트맥스 구조, 즉 다항 지수족의 흔적이다. 아키텍처 곳곳에 지수족이 스며 있다.
+</Aside>
+
+## 통계학습이론: 일반화를 보장하는 방법
+
+ERM이 왜 작동하는가? 통계학습이론(SLT)은 이 질문에 수학적 답을 제공한다.
+
+<Theorem kind="theorem" number="1" title="VC 일반화 한계">
+가설 클래스 $\mathcal{H}$의 VC 차원이 $d$이면, 확률 $1-\delta$ 이상으로
+
+$$
+R(h) \le \hat R_n(h) + O\!\left(\sqrt{\frac{d \log(n/d) + \log(1/\delta)}{n}}\right).
+$$
+</Theorem>
+
+<Proof>
+샘플과 고스트 샘플의 대칭화(symmetrization), Sauer-Shelah 보조정리 $\Pi_\mathcal{H}(n) \le (en/d)^d$, 그리고 McDiarmid 부등식을 순서대로 적용하면 얻어진다.
+</Proof>
+
+이 한계는 바이어스-분산 분해의 이론적 기반이다. $\mathcal{H}$가 풍부할수록 근사 오차는 줄지만 추정 오차는 늘어난다. 반대 방향도 마찬가지다.
+
+현대 딥러닝은 이 고전적 그림을 깨뜨린다. 보간(interpolation) 임계점을 넘어 모형이 더 커지면 테스트 오차가 다시 줄어드는 **이중 하강(double descent)** 현상이 관찰된다. Bartlett et al.(2020)의 양성 과적합(benign overfitting) 이론은 고차원 과파라미터 모형에서도 훈련 오차 0을 달성하면서 테스트 오차가 작을 수 있음을 보인다. VC 이론은 틀린 것이 아니라 불완전하다.
+
+## 베이지안 신경망: 포인트 추정의 너머
+
+MAP 추정은 손실 지형에서 하나의 골짜기 바닥을 찾는다. 베이지안 신경망(BNN)은 posterior 전체를 유지한다.
+
+$$
+p(y^* | x^*, D) = \int p(y^* | x^*, W) \, p(W | D) \, dW
+$$
+
+이 적분이 불확실성을 출력한다. 총 분산은 환원 불가능한 우연적 불확실성(aleatoric)과 데이터를 더 모으면 줄어드는 인식론적 불확실성(epistemic)으로 분해된다.
+
+문제는 고차원 posterior가 계산 불가능하다는 것이다. 실제 방법들은 모두 근사다.
+
+| 방법 | 근사 형태 | 특징 |
+|---|---|---|
+| HMC | 점근적 정확 | 대규모 NN에 느림 |
+| Laplace | MAP + Hessian Gaussian | 빠름, 단봉 가정 |
+| MC Dropout | Bernoulli 마스크 평균 | 간단, 이론적 정당화 불완전 |
+| Deep Ensembles | 다중 MAP 혼합 | 실전 강력, 비용 $\times K$ |
+| SWAG | SGD 궤적 Gaussian | 실용적 균형 |
+
+<Callout type="warning" title="트레이드오프">
+정확도가 높은 방법(HMC)은 대규모 모형에 실용적이지 않고, 실용적인 방법(MC Dropout)은 이론적 정당화가 약하다. Deep Ensembles는 완전한 Bayesian이 아니지만 calibration이 가장 좋은 경우가 많다. Wenzel et al.(2020)의 cold posterior 효과 — $T < 1$의 온도로 posterior를 날카롭게 만들면 성능이 향상된다 — 는 표준 Gaussian prior가 신경망에 부적합할 수 있음을 시사한다.
+</Callout>
+
+## 정리
+
+다섯 챕터가 말하는 것은 하나다. 통계학과 머신러닝은 **같은 추론 문제를 다른 문화에서 발전시킨 두 언어**다.
+
+- ERM과 MLE는 손실 선택이 곧 노이즈 모형 선택임을 의미한다.
+- 정규화와 MAP는 "어떤 prior를 쓰는가"의 질문이다.
+- GLM 구조는 신경망 출력층 설계의 통계적 원칙을 제공한다.
+- VC/Rademacher 이론은 왜 학습이 가능한지를 보장하고, 이중 하강은 그 한계를 보여준다.
+- BNN은 포인트 추정을 넘어 불확실성을 first-class citizen으로 다룬다.
+
+이 이중성을 알고 모형을 설계하는 것과 모르고 설계하는 것은 다르다. 손실 함수를 선택할 때, 정규화 강도를 정할 때, 출력층 활성화를 고를 때 — 매번 통계적 결정을 내리고 있다.
+
+<Reference
+  title="The Nature of Statistical Learning Theory"
+  authors="Vapnik, V."
+  year={1995}
+  venue="Springer"
+  url="https://link.springer.com/book/10.1007/978-1-4757-3264-1"
+/>
+
+<Reference
+  title="Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning"
+  authors="Gal, Y. and Ghahramani, Z."
+  year={2016}
+  venue="ICML"
+  url="https://arxiv.org/abs/1506.02142"
+/>

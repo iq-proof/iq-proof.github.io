@@ -1,0 +1,140 @@
+---
+title: "점근 이론의 통일된 언어 — Delta부터 M-estimator까지"
+description: "비선형 변환의 불확실성을 Taylor 전개로 추적하는 Delta method부터, MLE·OLS·ERM을 하나의 틀로 묶는 M-estimator 이론의 Sandwich 공식까지, 점근 통계학의 다섯 챕터를 관통하는 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mathematical-statistics, asymptotic-theory, m-estimator, delta-method, sandwich]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+점근 통계학에는 하나의 반복되는 질문이 있다: **추정량이 수렴할 때, 그 수렴을 어떻게 정량화하는가?** Delta method는 비선형 변환에, Wilks 정리는 우도비에, Sandwich 공식은 오지정 모형에 각각 답을 준다. 표면적으로 다른 다섯 챕터의 결과들이 사실 같은 도구—Taylor 전개와 CLT의 조합—에서 나온다는 것을 알아채는 순간, 점근 이론 전체가 하나의 언어로 보이기 시작한다.
+
+## 선형 근사라는 반복 주제
+
+Delta method의 핵심은 단순하다. $g(\hat\theta) - g(\theta) \approx g'(\theta)(\hat\theta - \theta)$. 이 1차 Taylor 근사가 성립하는 한, 추정량의 비선형 함수도 점근 정규성을 물려받는다.
+
+$$
+\sqrt{n}(g(\hat\theta_n) - g(\theta)) \xrightarrow{d} N(0,\ g'(\theta)^2 \sigma^2)
+$$
+
+분산은 $g'(\theta)^2$으로 "스케일"된다. $g'(\theta) = 0$인 특이점에서는 1차 항이 사라지므로 2차 Delta method가 등장하고 극한 분포가 $\chi^2$로 바뀐다.
+
+$$
+n(g(\hat\theta_n) - g(\theta)) \xrightarrow{d} \frac{1}{2}g''(\theta)\sigma^2\chi^2_1
+$$
+
+이 두 경우의 전환점—미분 가능성과 $g'(\theta) \neq 0$ 조건—은 이후 모든 챕터에서 같은 형태로 재등장한다.
+
+## 일치성: 수렴의 전제 조건
+
+점근 정규성을 논하기 전에 추정량이 참값 근방에 있어야 한다. 일치성 증명의 세 가지 도구는 직관적으로 구분된다.
+
+첫째, **Chebyshev 부등식**: 분산이 $1/n$으로 감소하면 충분하다. 둘째, **연속사상정리(CMT)**: $\bar X_n \xrightarrow{P} \mu$이면 $g(\bar X_n) \xrightarrow{P} g(\mu)$가 자동이다. 셋째, **균등수렴**: M-estimator에서는 목적함수 전체가 균등하게 수렴해야 argmax도 수렴한다.
+
+<Callout type="warning" title="점수렴만으로는 부족하다">
+M-estimator에서 목적함수 $Q_n(\theta)$가 각 $\theta$에서 $Q(\theta)$로 수렴해도, $\sup_\theta |Q_n(\theta) - Q(\theta)| \to 0$이 없으면 argmax가 엉뚱한 곳에 있을 수 있다. Cauchy 분포의 표본평균이 일치하지 않는 이유도 WLLN 자체가 실패하기 때문이다—1차 적률이 존재하지 않는다.
+</Callout>
+
+Neyman-Scott 문제는 이 한계의 극단적 예다. 관측마다 incidental parameter가 하나씩 늘어나면 파라미터 차원이 표본 크기와 함께 증가하고, 표준 MLE 이론이 붕괴한다.
+
+## Wilks 정리: 같은 도구, 다른 결론
+
+LRT 통계량 $-2\log\Lambda_n$이 귀무가설 하에서 $\chi^2_r$로 수렴한다는 Wilks 정리도 Taylor 전개와 CLT의 조합이다. 증명의 핵심 흐름을 추적하면:
+
+1. 로그우도를 MLE 근방에서 2차 Taylor 전개
+2. Score 통계량에 CLT 적용
+3. Slutsky 정리로 합성
+
+$$
+-2\log\Lambda_n \approx \frac{[U_n(\theta_0)]^2}{n I(\theta_0)} \xrightarrow{d} \chi^2_1
+$$
+
+자유도 $r = \dim\Theta - \dim\Theta_0$는 "제거된 파라미터 수"다. 이 단순한 차원 세기가 분할표 독립성 검정의 $(r-1)(c-1)$, ANOVA의 그룹 수 차이를 모두 설명한다.
+
+<Theorem kind="theorem" number="1" title="Wilks (1938)">
+정규 조건 하에서 $H_0: \theta \in \Theta_0$가 참일 때,
+$$
+-2\log\Lambda_n = -2(\ell_n(\tilde\theta_n) - \ell_n(\hat\theta_n)) \xrightarrow{d} \chi^2_r
+$$
+단, $r = \dim\Theta - \dim\Theta_0$.
+</Theorem>
+
+<Proof>
+스칼라 경우. 점수 $U_n(\theta_0) = \sum \partial_\theta \log f(X_i|\theta_0)$에 대해 $\text{Var}(U_n) = nI(\theta_0)$이므로 CLT에 의해 $U_n/\sqrt{n I(\theta_0)} \xrightarrow{d} N(0,1)$. 로그우도의 2차 Taylor로 $\ell_n(\hat\theta) - \ell_n(\theta_0) \approx [U_n(\theta_0)]^2 / [2nI(\theta_0)]$. 따라서 $-2\log\Lambda_n \approx [U_n/\sqrt{nI}]^2 \xrightarrow{d} \chi^2_1$. $\square$
+</Proof>
+
+## 세 검정의 동등성과 실전적 차이
+
+Wald, Score, LRT — 세 검정은 같은 귀무가설을 서로 다른 관점에서 측정한다.
+
+```
+              ℓ(θ)
+         ─────/─────╲─────
+             ╱        ╲
+           ╱     θ̂      ╲
+          │◄────►│         │
+          θ₀  Wald       LRT: 수직 차이
+               Score: θ₀에서의 기울기 크기
+```
+
+quadratic 근사 하에서 $W_n = R_n = \Lambda_n + o_P(1)$이 성립하고, Pitman 인접 대립가설 $\theta_n = \theta_0 + h/\sqrt{n}$에서 세 통계량 모두 같은 비중심도 $\lambda = h^2 I(\theta_0)$를 가지므로 **검정력도 점근적으로 같다**.
+
+그러나 유한 표본에서는 차이가 크다. Wald는 재매개변수화에 불변하지 않는다—$\theta$ 스케일과 $\log\theta$ 스케일에서 다른 p-value를 준다. Hauck-Donner 효과: 로지스틱 회귀에서 완전 분리(perfect separation)가 발생하면 $|\hat\beta| \to \infty$이고 표준오차도 발산해 Wald p-value가 오히려 증가한다. LRT는 이 경우 제대로 기각한다.
+
+<Callout type="note" title="트레이드오프">
+**Wald**: unrestricted MLE만 필요. 재매개변수화 민감, 경계 근처 불안정. **Score**: $H_0$ 하에서의 추정만 필요—전체 모형을 피팅하지 않아도 된다. **LRT**: 양쪽 모두 필요, 가장 정확하고 재매개변수화 불변. 유한 표본 정확도는 일반적으로 LRT > Score > Wald.
+</Callout>
+
+## M-estimator: 통일된 점근 이론
+
+MLE, OLS, quantile regression, ERM—이들은 전부 같은 틀이다.
+
+$$
+\hat\theta_n = \arg\min_\theta \frac{1}{n}\sum_{i=1}^n \rho(X_i; \theta)
+$$
+
+first-order condition을 $\theta_0$ 근방에서 Taylor 전개하면 점근 정규성이 나온다:
+
+$$
+\sqrt{n}(\hat\theta_n - \theta_0) \xrightarrow{d} N(0,\ A^{-1}BA^{-\top})
+$$
+
+여기서 $A = -\mathbb{E}[\partial_\theta \psi]$는 Hessian("bread"), $B = \mathbb{E}[\psi\psi^\top]$는 score의 분산("meat")이다. 이 **Sandwich 공식**이 핵심이다.
+
+MLE가 정확히 지정된 경우에는 Bartlett identity에 의해 $A = B = I(\theta_0)$가 성립하고 sandwich가 Fisher information으로 축약된다. 모형이 오지정되면 $A \neq B$이고, 표준오차는 반드시 sandwich로 계산해야 한다. OLS의 White robust SE, logistic regression의 이분산-robust SE가 모두 이 공식의 특수 경우다.
+
+<Aside label="영향 함수의 직관">
+Influence function $\text{IF}(x;\theta_0) = A^{-1}\psi(x;\theta_0)$는 "한 관측값이 추정량에 미치는 영향"이다. OLS는 $\psi(r) = r$로 무한히 커질 수 있고, Huber는 $\min(|r|, k)$로 bounded, LAD(중위수 회귀)는 $\text{sign}(r)$으로 상수다. unbounded IF가 반드시 나쁜 것은 아니다—정확한 모형 하에서 OLS는 Fisher 효율적이다. 문제는 오지정 또는 outlier가 있을 때다.
+</Aside>
+
+## 정리
+
+다섯 챕터는 사실 하나의 논리 사슬이다.
+
+- **일치성**: 추정량이 참값 근방에 있다는 출발점. 균등수렴 없이는 M-estimator의 argmax 수렴도 보장되지 않는다.
+- **Delta method**: 비선형 함수 $g(\hat\theta)$의 불확실성을 $g'(\theta)^2\sigma^2$으로 계산한다. 분산 안정화 변환(arcsin, logit)은 이 공식을 역으로 이용한 것이다.
+- **Wilks 정리**: 로그우도의 2차 Taylor + CLT = $\chi^2_r$ 수렴. 자유도는 제약된 파라미터 수.
+- **세 검정의 동등성**: 큰 표본에서 Wald = Score = LRT. 유한 표본에서는 LRT가 우세하다.
+- **Sandwich 공식**: MLE부터 ERM까지 모든 "목적함수 최적화" 추정량의 점근 분산은 $A^{-1}BA^{-\top}$이다. Bartlett identity는 정확한 모형에서만 성립한다.
+
+이 모든 결과의 뼈대는 두 가지다: **Taylor 전개로 비선형을 선형화하고, CLT로 합을 정규화한다.** 수식이 다르고 맥락이 달라도, 같은 두 단계가 반복된다.
+
+<Reference
+  title="Asymptotic Statistics"
+  authors="van der Vaart, A. W."
+  year={1998}
+  venue="Cambridge University Press"
+  url="https://www.cambridge.org/9780521784504"
+/>

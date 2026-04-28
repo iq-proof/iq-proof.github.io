@@ -1,0 +1,121 @@
+---
+title: "지수족은 왜 통계학의 중심에 있는가"
+description: "충분통계량의 압축 원리부터 지수족의 로그분할함수, MLE 모멘트 매칭, Basu 정리까지 — 데이터를 파라미터로 연결하는 하나의 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [statistics, exponential-family, sufficient-statistic, mle, information-geometry]
+difficulty: advanced
+series:
+  slug: mathematical-statistics-deep-dive
+  title: Mathematical Statistics Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+정규분포, 베르누이, 포아송, 감마 — 이 분포들은 서로 전혀 다른 것처럼 보이지만, 모두 같은 수식 구조에서 나온다. 그리고 로지스틱 회귀의 gradient가 "예측 확률 − 실제 레이블"이라는 아름다운 형태를 갖는 것도, MLE가 항상 수렴한다는 것도 우연이 아니다. 이 모든 것이 하나의 구조 — **지수족(exponential family)** — 에서 나온다. 왜 이 구조가 그토록 많은 것을 설명하는가?
+
+## 충분통계량 — 데이터 압축의 한계
+
+통계 추론의 첫 번째 질문은 단순하다: 원본 데이터 중 무엇을 버려도 되는가?
+
+$X_1, \ldots, X_n \sim \mathrm{Ber}(p)$에서 $p$를 추정하려면 $\sum X_i$ 하나로 충분하다. 주어진 $\sum X_i = k$ 조건에서 $X$의 조건부 분포는 $p$와 무관하게 $\binom{n}{k}$가지 배열 위의 균일분포다. 파라미터에 관한 모든 정보가 $\sum X_i$에 담겨 있다는 뜻이다. 이것이 **충분통계량(sufficient statistic)** 의 핵심이다.
+
+$$\mathbb{P}_\theta(X \in A \mid T(X) = t) = K(A \mid t) \quad \text{(} \theta \text{에 독립)}$$
+
+충분통계량을 판별하는 실용적 도구는 **Fisher-Neyman 인수분해 정리**다.
+
+<Theorem kind="theorem" number="1" title="Fisher-Neyman 인수분해">
+$T$가 $\theta$에 대해 충분통계량 $\iff$ 음이 아닌 함수 $g_\theta$와 $h$가 존재해
+
+$$p_\theta(x) = g_\theta(T(x)) \cdot h(x)$$
+
+가 거의 모든 $x$에서 성립한다. $h$는 $\theta$에 의존하지 않는다.
+</Theorem>
+
+<Proof>
+이산 버전의 역방향($\Leftarrow$)만 보인다. $p_\theta(x) = g_\theta(T(x)) h(x)$ 가정 아래, $T(x) = t$인 집합을 $A_t$라 하면
+
+$$\mathbb{P}_\theta(X = x \mid T = t) = \frac{g_\theta(t) h(x)}{g_\theta(t) \sum_{y \in A_t} h(y)} = \frac{h(x)}{\sum_{y \in A_t} h(y)}$$
+
+$\theta$가 사라졌다. 따라서 $T$는 충분이다. $\square$
+</Proof>
+
+이 정리로 주요 분포의 충분통계량을 바로 읽어낼 수 있다.
+
+| 분포 | 충분통계량 |
+|------|-----------|
+| $\mathrm{Ber}(p)$, $\mathrm{Poi}(\lambda)$, $\mathrm{Exp}(\lambda)$ | $\sum X_i$ |
+| $\mathcal{N}(\mu, \sigma^2)$ | $(\sum X_i,\ \sum X_i^2)$ |
+| $U(0, \theta)$ | $\max X_i$ |
+| $\mathrm{Gamma}(\alpha, \beta)$, 둘 다 미지 | $(\sum X_i,\ \sum \log X_i)$ |
+
+$U(0,\theta)$의 경우 support가 $\theta$에 의존하지만 충분성은 이를 요구하지 않는다. 인수분해가 성립하면 충분하다.
+
+## 최소충분통계량과 정보의 한계
+
+충분통계량은 유일하지 않다. 표본 전체 $(X_1, \ldots, X_n)$도 충분이다. 그렇다면 "가장 많이 압축한" 충분통계량은 무엇인가?
+
+**Lehmann-Scheffé 판정법**은 이 질문에 직접 답한다. 우도비 $p(x;\theta)/p(y;\theta)$가 $\theta$에 무관한 것과 $T(x) = T(y)$가 동치이면 $T$가 최소충분통계량이다. 직관적으로, 우도비가 $\theta$와 무관하다는 것은 두 데이터 포인트 $x$와 $y$가 파라미터 추론 관점에서 완전히 같은 정보를 담는다는 뜻이다. 이 동치관계로 표본공간을 분할하면 그것이 최소충분통계량의 역상 구조가 된다.
+
+$\mathcal{N}(\mu, \sigma^2)$에서 우도비를 계산하면 $(\sum x_i, \sum x_i^2) = (\sum y_i, \sum y_i^2)$일 때만 $\theta$ 무관이 되므로, $(\bar X, S^2)$이 최소충분이다. 파라미터가 하나인 $\mathcal{N}(\theta, \theta^2)$에서는 오히려 최소충분이 2차원이다 — 이런 **curved exponential family**는 파라미터 개수보다 충분통계량 차원이 클 수 있다.
+
+<Callout type="note" title="정보이론과의 연결">
+최소충분통계량은 AI에서 **information bottleneck**의 이론적 한계점이다. 표현 $T(X)$가 $\theta$에 대한 정보 $I(T;\theta) = I(X;\theta)$를 보존하면서 크기를 최소화한 것이 바로 최소충분이다. 이미지 임베딩이 "태스크에 대한 근사 최소충분"을 찾는 과정으로 해석되는 이유다.
+</Callout>
+
+## 완비성과 Basu 정리
+
+충분통계량이 있을 때 또 다른 질문이 생긴다: 기댓값이 모든 $\theta$에서 0이 되는 비자명한 함수가 존재하는가? 통계량 $T$가 **완비**라는 것은, 임의의 가측 함수 $g$에 대해 $E_\theta[g(T)] = 0 \ \forall\theta$이면 $P_\theta(g(T) = 0) = 1 \ \forall\theta$가 성립함이다. Regular 지수족에서 자연매개변수 공간이 $\mathbb{R}^k$의 개집합을 포함하면 자연충분통계량은 완비다 — 증명의 핵심은 $E_\theta[g(T)] = 0$이 Laplace 변환의 소멸을 의미하고 유일성 정리에 의해 $g = 0$ a.s.가 따라온다는 것이다.
+
+완비성의 가장 강력한 귀결은 **Basu 정리**다.
+
+<Theorem kind="theorem" number="2" title="Basu">
+$T$가 완비충분통계량이고 $A$가 보조통계량(분포가 $\theta$와 무관)이면, $T \perp A$이다.
+</Theorem>
+
+<Proof>
+$A$가 보조이므로 $P(A \in B) = p_B$는 $\theta$와 무관한 상수. $T$의 충분성에 의해 $h_B(t) \equiv P(A \in B \mid T = t)$도 $\theta$와 무관하다. $g(t) = h_B(t) - p_B$로 정의하면
+
+$$E_\theta[g(T)] = P_\theta(A \in B) - p_B = 0 \quad \forall\theta$$
+
+완비성에 의해 $g(T) = 0$ a.s., 즉 $P(A \in B \mid T) = P(A \in B)$. $\square$
+</Proof>
+
+$\mathcal{N}(\mu, \sigma^2)$에서 $\bar X$는 $\mu$에 대한 완비충분통계량이고 $S^2$는 $\mu$에 보조이므로 $\bar X \perp S^2$ — Cochran 정리를 분포 계산 없이 얻는다.
+
+## 지수족 — 로그분할함수 하나에서 모든 것이
+
+이제 이 구조들이 하나로 모인다. **지수족**은 다음 형태를 갖는 분포족이다.
+
+$$p(x;\eta) = h(x) \exp\!\left\{\eta^T T(x) - A(\eta)\right\}$$
+
+여기서 $\eta$는 자연매개변수, $T(x)$는 충분통계량, $A(\eta) = \log \int h(x) e^{\eta^T T(x)} dx$는 **로그분할함수**다. $A(\eta)$ 하나에서 모든 통계적 구조가 나온다.
+
+$$\nabla A(\eta) = E_\eta[T(X)] \equiv \mu(\eta), \qquad \nabla^2 A(\eta) = \mathrm{Cov}_\eta(T(X)) = I(\eta)$$
+
+$A$의 1차 미분이 기댓값 매개변수, 2차 미분이 Fisher 정보행렬이다. $A$가 볼록함수이므로 $\eta \leftrightarrow \mu$는 Legendre 변환으로 연결되는 쌍대 구조를 형성한다. KL divergence도 $A$의 Bregman divergence로 표현된다.
+
+$$\mathrm{KL}(\eta_1 \| \eta_2) = A(\eta_2) - A(\eta_1) - \nabla A(\eta_1)^T(\eta_2 - \eta_1)$$
+
+베르누이를 예로 들면 $\eta = \log(p/(1-p))$ (로짓), $A(\eta) = \log(1+e^\eta)$ (softplus), $\nabla A = \sigma(\eta)$ (시그모이드). 로지스틱 회귀의 활성함수가 왜 시그모이드인지, 로짓이 왜 "자연스러운" 매개변수인지가 여기서 나온다. Softmax는 categorical 분포의 $\nabla A$이고, cross-entropy loss는 지수족의 음의 로그우도다.
+
+지수족에서 $n$개의 iid 표본으로부터의 로그우도는
+
+$$\ell(\eta) = n\bigl[\eta^T \bar T - A(\eta)\bigr] + \text{const}, \qquad \bar T = \frac{1}{n}\sum_{i=1}^n T(X_i)$$
+
+Score 방정식 $\nabla \ell = 0$을 풀면 $\nabla A(\hat\eta) = \bar T$ — **이론 모멘트 = 표본 모멘트**. MLE는 모멘트 매칭이다. $A$의 볼록성에 의해 로그우도는 오목하므로, $\bar T$가 $T(\mathcal{X})$의 convex hull 내부에 있는 한 MLE는 유일하게 존재한다.
+
+<Callout type="note" title="트레이드오프">
+지수족의 강점은 구조의 단순함에서 나오지만, 그 단순함이 곧 한계다. Regular 지수족이 아닌 Cauchy, 혼합분포는 차원이 축소된 충분통계량을 갖지 않아 순서통계량 전체가 필요하다. Curved exponential family는 최소충분하지만 완비가 아니므로 UMVUE가 유일하지 않을 수 있다. 실제 데이터가 지정된 지수족에서 벗어나면 MLE는 KL 투영으로 수렴하는 근사 추정이 된다.
+</Callout>
+
+## 정리
+
+- 충분통계량 $T$는 Fisher-Neyman 인수분해 $p_\theta(x) = g_\theta(T(x)) h(x)$로 판별하며, 조건부 분포 $X \mid T$가 $\theta$에 독립인 통계량이다.
+- 최소충분통계량은 우도비 $p(x;\theta)/p(y;\theta)$가 $\theta$ 무관인 것과 $T(x) = T(y)$가 동치인 가장 거친 분할이다.
+- 완비충분통계량과 보조통
