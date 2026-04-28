@@ -1,0 +1,134 @@
+---
+title: "Double Descent는 왜 일어나는가"
+description: "고전 bias-variance U-shape이 설명하지 못하는 interpolation threshold부터 Marchenko-Pastur 분포로 유도되는 variance 발산, 그리고 regularization이 peak를 완화하는 정확한 수학적 이유까지."
+pubDate: 2026-04-28
+category: ai
+tags: [double-descent, bias-variance, marchenko-pastur, generalization, regularization]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+고전 통계학습 이론은 모델 복잡도를 늘리면 test error가 U자로 움직인다고 말한다. 그런데 딥러닝은 파라미터가 데이터보다 훨씬 많은데도 잘 일반화한다. 이 두 사실이 어떻게 공존하는가?
+
+## 고전 U-shape의 암묵적 가정
+
+bias-variance decomposition은 다음과 같다.
+
+$$\mathbb{E}[(\hat f(x_*) - y_*)^2] = \underbrace{(\mathbb{E}[\hat f(x_*)] - f^*(x_*))^2}_{\text{Bias}^2} + \underbrace{\mathbb{E}[(\hat f(x_*) - \mathbb{E}[\hat f(x_*)])^2]}_{\text{Variance}} + \sigma^2$$
+
+파라미터 $p$가 작으면 bias가 크고, $p$가 커지면 variance가 커진다. 이 trade-off가 U-shape을 만든다. 그러나 이 프레임에는 숨겨진 가정이 있다 — $p < n$. 훈련 데이터 수보다 파라미터가 적다는 가정이다. $p \geq n$, 즉 **interpolation regime**이 시작되는 순간 이 그림은 더 이상 완전하지 않다.
+
+Belkin et al. 2019 "Reconciling Modern Machine Learning Practice and the Classical Bias-Variance Trade-off"는 이 너머에 **modern regime**이 존재한다고 주장했다. U-shape에 이어 $p = n$에서 peak가 발생하고, $p \gg n$에서 test error가 다시 감소하는 이중 곡선 — **Double Descent**.
+
+## Peak는 어디서 오는가: Marchenko-Pastur
+
+$p = n$에서 정확히 무슨 일이 일어나는지 추적하면, 답은 random matrix theory에 있다.
+
+$X \in \mathbb{R}^{n \times p}$가 Gaussian일 때, $\Sigma = X^\top X / n$의 eigenvalue 분포는 $p/n \to \psi$에서 **Marchenko-Pastur 분포**로 수렴한다.
+
+$$f(\lambda) = \frac{\sqrt{(\lambda_+ - \lambda)(\lambda - \lambda_-)}}{2\pi\psi\lambda}, \quad \lambda_\pm = (1 \pm \sqrt\psi)^2$$
+
+결정적인 것은 support의 하한 $\lambda_- = (1 - \sqrt\psi)^2$다. $\psi = 1$에서 $\lambda_- = 0$ — support가 0을 포함한다. 이 순간 variance는 다음 적분을 따른다.
+
+$$\text{Var} \propto \int \frac{1}{\lambda} \, d\mu_{\text{MP}}(\lambda)$$
+
+0을 포함하는 support에서 $1/\lambda$를 적분하면 **발산**한다. $p = n$이 interpolation threshold인 이유가 이것이다 — 행렬이 거의 singular해지면서 min-norm solution의 variance가 폭발한다.
+
+<Theorem kind="theorem" number="1" title="Hastie et al. 2019 — Ridgeless risk">
+$p, n \to \infty$, $p/n \to \psi$, isotropic Gaussian $X$, $\|\beta^*\|^2/p \to r^2$. Min-norm interpolator의 test risk는 다음으로 수렴한다.
+
+$$R(\hat\beta) \to \begin{cases} \sigma^2 \dfrac{\psi}{1 - \psi} & \psi < 1 \\ \infty & \psi = 1 \\ r^2\!\left(1 - \dfrac{1}{\psi}\right) + \sigma^2 \dfrac{1}{\psi - 1} & \psi > 1 \end{cases}$$
+</Theorem>
+
+<Proof>
+Over-parameterized ($\psi > 1$) case. Min-norm solution은 $\hat\beta = X^\top(XX^\top)^{-1}y$. Variance component는
+
+$$\text{Var} = \sigma^2 \, \mathbb{E}\!\left[\text{tr}\!\left((X^\top X/n)^{-1}\right)\right] / p \;\to\; \int \frac{1}{\lambda} \, d\mu_{\text{MP}}(\lambda)$$
+
+Stieltjes transform을 이용하면 이 적분이 $1/(\psi - 1)$임을 보일 수 있다. Bias component는 isotropy 대칭에 의해 $\mathbb{E}[\hat\beta] = (1 - 1/\psi)\beta^*$가 되어 $r^2(1 - 1/\psi)$로 수렴한다. $\square$
+</Proof>
+
+## Modern Regime — 왜 variance가 다시 감소하는가
+
+$\psi > 1$에서 variance가 $\sigma^2/(\psi - 1)$로 감소하는 이유는 무엇인가? 두 가지 직관이 있다.
+
+첫째, **min-norm이 자동으로 regularize한다**. $p > n$이면 무수히 많은 interpolator 중 $\|\beta\|^2$가 가장 작은 것이 선택된다. $p$가 커질수록 null space가 넓어지고, 그 안에서 "가장 작은" 해를 고를 여지가 많아진다. 즉 더 큰 hypothesis class가 더 stable한 solution을 제공한다.
+
+둘째, **각 feature에 weight가 분산된다**. $p \gg n$에서 min-norm solution은 소수의 feature에 큰 weight를 주는 대신 모든 feature에 작은 weight를 분산시킨다. noise에 대한 의존성이 약해진다.
+
+<Callout type="note" title="Effective degrees of freedom의 비단조성">
+Ridge regression의 유효 자유도를 $\psi$의 함수로 다시 쓰면
+
+$$\tilde{\text{df}}(\psi) = \begin{cases} \psi/(1-\psi) & \psi < 1 \\ 1/(\psi - 1) & \psi > 1 \end{cases}$$
+
+흥미롭게도 $\psi = 0.5$와 $\psi = 2$에서 이 값이 동일하다. 모델 크기가 2배로 늘어나도 데이터 대비 비율이 역전되면 동일한 수준의 variance를 가질 수 있다는 **duality**다.
+</Callout>
+
+## 실제 NN에서의 세 가지 형태
+
+Nakkiran et al. 2019 "Deep Double Descent"는 현상을 세 축으로 확장했다. 이를 통합하는 개념이 **Effective Model Complexity (EMC)**다.
+
+$$\text{EMC}(\mathcal{T}) := \max\{n : \mathbb{E}_{S \sim \mathcal{D}^n}[\hat L(\mathcal{T}(S))] \leq \epsilon\}$$
+
+- **Model-wise**: width/depth 증가 → EMC 증가, EMC = $n$에서 peak
+- **Sample-wise**: $n$ 증가 → 동일 모델의 effective $\psi$가 변하며 peak crossing
+- **Epoch-wise**: 훈련 시간 증가 → EMC 증가, 동일 모델에서 시간에 따라 peak 발생
+
+세 형태 모두 "EMC vs $n$의 비율이 1을 지날 때" peak가 생긴다는 같은 법칙의 다른 표현이다. Label noise가 있을 때 peak가 더 뚜렷해지는 이유는 variance가 $\sigma^2$에 비례하기 때문이다 — noise가 클수록 peak의 높이가 높아진다.
+
+<Aside label="RFF가 canonical 모델인 이유">
+Random Fourier Features $\phi_p(x) = \cos(Wx + b)$는 second layer만 훈련하는 선형 모델이라 Marchenko-Pastur 분석이 정확히 적용된다. Mei-Montanari 2019는 이 모델에서 asymptotic test error 공식을 closed form으로 유도했으며, 이론 곡선이 실험과 거의 완벽하게 일치함을 보였다. 실제 NN의 Double Descent는 이보다 복잡하지만, RFF가 정성적 메커니즘을 완전히 드러낸다.
+</Aside>
+
+## Regularization이 Peak를 지우는 이유
+
+Ridge $\lambda > 0$를 추가하면 variance 적분이 바뀐다.
+
+$$\text{Var} \propto \int \frac{t}{(t + \lambda)^2} \, d\mu_{\text{MP}}(t)$$
+
+$\lambda > 0$이면 support가 0을 포함하더라도 이 적분이 유한하다. Peak가 사라진다. 실전 딥러닝에서 Double Descent peak를 거의 보기 어려운 이유가 이것이다 — 표준 훈련에는 여러 implicit regularizer가 중첩되어 있다.
+
+| 기법 | 작용 방식 | 등가 $\lambda$ 근사 |
+|:---|:---|:---|
+| L2 weight decay | 명시적 ridge | $\lambda = \text{wd}$ |
+| SGD (소 batch) | noise injection | $\lambda \sim \eta/n_{\text{batch}}$ |
+| Early stopping | 유한 훈련 시간 | $\lambda \sim 1/t$ |
+| Data augmentation | effective $n$ 증가 | $\psi$ 감소 → peak 회피 |
+
+Early stopping과 ridge의 등가성은 gradient flow에서 직접 확인할 수 있다. SVD $X = U\Sigma V^\top$에서 gradient flow solution은 shrinkage factor $1 - e^{-t\sigma_i^2}$를 가지고, ridge solution은 $\sigma_i^2/(\sigma_i^2 + \lambda)$를 가진다. 둘 다 작은 singular value를 수축시키고 큰 것은 보존한다 — 정성적으로 동일하며, $\lambda \sim 1/t$ 대응이 성립한다.
+
+## 정리
+
+- Double Descent는 $p = n$에서 $\lambda_{\min}(X^\top X/n) \to 0$이 되어 variance가 발산하는 현상이다.
+- Modern regime ($p > n$)에서 min-norm solution은 암묵적 ridge처럼 동작하여 variance가 다시 감소한다.
+- EMC = $n$이라는 단일 조건이 model-wise, sample-wise, epoch-wise 세 형태를 통합한다.
+- $\lambda > 0$이면 peak가 사라진다. 실전 표준 훈련의 implicit regularizer들이 이 역할을 한다.
+
+Double Descent는 이론이 틀렸거나 딥러닝이 예외적인 것이 아님을 보여준다 — bias-variance 프레임이 $p \geq n$ 영역으로 확장되면 자연스럽게 나타나는 귀결이다.
+
+<Reference
+  title="Reconciling Modern Machine Learning Practice and the Classical Bias-Variance Trade-off"
+  authors="Belkin, Hsu, Ma, Mandal"
+  year={2019}
+  venue="PNAS"
+  url="https://arxiv.org/abs/1812.11118"
+/>
+
+<Reference
+  title="Deep Double Descent: Where Bigger Models and More Data Hurt"
+  authors="Nakkiran, Kaplun, Bansal, Yang, Barak, Sutskever"
+  year={2019}
+  venue="ICLR 2020"
+  url="https://arxiv.org/abs/1912.02292"
+/>

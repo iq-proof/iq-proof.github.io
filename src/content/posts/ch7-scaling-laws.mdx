@@ -1,0 +1,133 @@
+---
+title: "LLM의 스케일링은 예측 가능한가"
+description: "Chinchilla compute-optimal ratio의 수학적 유도부터 Broken Scaling Law, Emergent Abilities 논쟁, ICL의 implicit gradient descent 이론까지, LLM 스케일링의 예측 가능성을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [scaling-laws, llm, emergent-abilities, in-context-learning, chinchilla]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 스케일링 연구의 핵심 주장은 하나다 — **loss는 scale에 대해 놀랍도록 예측 가능한 power-law를 따른다**. 그런데 그 예측 가능성의 범위는 어디까지인가? Chinchilla는 compute를 어떻게 쪼개야 한다고 말하고, Broken Scaling Law는 그 단순함에 어떤 균열을 냈으며, Emergent Abilities 논쟁은 "예측 불가능성"을 주장하는가?
+
+## Chinchilla: compute-optimal ratio의 수학
+
+Kaplan et al. 2020은 loss의 parametric form을 다음과 같이 제안했다.
+
+$$
+L(N, D) = \frac{A}{N^\alpha} + \frac{B}{D^\beta} + E
+$$
+
+$N$은 파라미터 수, $D$는 훈련 토큰 수, $E$는 irreducible error다. 주어진 compute $C \propto N \cdot D$ 하에서 $L$을 최소화하는 $N^*, D^*$는 Lagrangian 조건에서 구한다.
+
+$$
+\frac{A\alpha}{N^{\alpha+1}} \cdot D = \frac{B\beta}{D^{\beta+1}} \cdot N
+\quad \Rightarrow \quad
+N_{\text{opt}} \propto C^{\beta/(\alpha+\beta)},\; D_{\text{opt}} \propto C^{\alpha/(\alpha+\beta)}
+$$
+
+Kaplan 2020의 결론은 $N \propto C^{0.73}$, 즉 compute 대부분을 파라미터에 투입하라는 것이었다. Hoffmann et al. 2022(Chinchilla)는 IsoFLOPs 방법론으로 재측정해 $\alpha \approx \beta \approx 0.34$를 얻었다. 따라서:
+
+$$
+N_{\text{opt}} \propto C^{0.5},\quad D_{\text{opt}} \propto C^{0.5}
+$$
+
+**파라미터와 데이터를 동등하게 늘려야 한다.** GPT-3(175B 파라미터, 300B 토큰)는 Chinchilla 기준으로 약 10배 undertrained이었고, Chinchilla(70B, 1.4T 토큰)이 GPT-3를 능가했다. 두 실험의 exponent 차이는 방법론에서 왔다 — Kaplan은 코사인 스케줄 끝점을 모델 크기별로 맞추지 않았고, 큰 모델일수록 schedule이 일찍 끝나 loss가 과대평가되었다.
+
+<Callout type="note" title="트레이드오프">
+Chinchilla-optimal은 **training efficiency** 기준이지 **deployment** 기준이 아니다. LLaMA 2(7B, 2T 토큰)는 Chinchilla 권고량(~150B 토큰)의 13배를 사용한다 — inference cost를 낮추기 위해 작은 모델을 더 많이 훈련하는 것이 실용적으로 더 유리하기 때문이다.
+</Callout>
+
+## Broken Scaling: 단일 power law의 균열
+
+단일 power law는 하나의 exponent로 전 구간을 설명한다. 그러나 실제 데이터는 scale에 따라 exponent가 달라지고, 특정 구간에서 성능이 일시적으로 정체하거나 하락하기도 한다. Caballero et al. 2022는 이를 하나의 smooth broken power law로 통합했다.
+
+$$
+L(x) = A \prod_{i=1}^{k} \left(1 + \left(\frac{x}{b_i}\right)^{1/f_i}\right)^{-c_i f_i}
+$$
+
+$b_i$는 breaking point, $c_i$는 구간별 exponent, $f_i$는 전환의 날카로움을 결정한다. $f_i \to 0$이면 $x = b_i$에서 전환이 계단함수에 가까워지고, $f_i$가 크면 부드럽게 연결된다. $k = 0$이면 Kaplan/Chinchilla의 단일 power law와 동일하다.
+
+이 framework는 double descent in scale($k = 2$의 중간 plateau)과 emergent-looking behavior($k = 1$의 flat → fast decrease)를 같은 함수로 설명한다. Chinchilla의 $\alpha \approx \beta \approx 1/3$은 "한 regime의 평균"일 수 있다 — 여러 regime이 혼합된 효과가 단일 exponent로 압축된 결과다.
+
+<Aside label="실용적 해석">
+Broken scaling은 descriptive tool이다. Breaking point $b_i$가 phase transition을 나타내는지, 아니면 fitting artifact인지 — 이론적 유도는 없다. 실용적으로는 "power law로 extrapolate하고, broken으로 regime transition을 의심하라"가 합리적이다.
+</Aside>
+
+## Emergent Abilities vs Mirage: metric의 역할
+
+Wei et al. 2022는 특정 scale threshold에서 능력이 "갑자기" 등장하는 현상을 emergent abilities로 정의했다. Chain-of-Thought reasoning, 모듈러 산술, in-context learning이 대표 사례다. 작은 모델에서 chance 수준이다가 특정 scale에서 급격히 성능이 오른다.
+
+Schaeffer, Miranda, Koyejo 2023은 이것이 **metric의 artifact**라고 반박했다. 핵심 주장은 간단하다 — underlying per-token probability $p$가 smooth하게 증가하더라도, 이를 nonlinear metric으로 측정하면 sharp transition이 나타난다.
+
+$L$단계 chain-of-thought가 필요한 task를 예로 들면, 전체 정답 확률은 $p^L$이다. $p = 0.7$이면 $0.7^{10} \approx 0.028$, $p = 0.99$이면 $0.99^{10} \approx 0.90$이다. $p$가 smooth하게 증가하는데 exact match accuracy는 emergent하게 보인다.
+
+<Theorem kind="proposition" number="1" title="Metric-induced apparent emergence">
+Underlying per-token likelihood $p(x)$가 $\log x$에 대해 smooth하고, metric이 $m = p^L$(large $L$) 또는 threshold function $m = \mathbf{1}[p > \tau]$이면, $m(x)$는 $\log x$에 대해 sharp transition으로 보인다.
+</Theorem>
+
+<Proof>
+$p(x) = \sigma(a \log x + b)$(logistic smooth). $m = p^L$이면, $p \ll 1$인 regime에서 $m \approx 0$이고, $p \to 1$이면 $m \to 1$이다. $L$이 클수록 $p = 0.5$ 근방에서 $m$의 기울기가 $L \cdot p^{L-1}(1-p)$로 커진다 — smooth $p$의 transition이 증폭된다. Continuous metric(log-likelihood)으로 보면 같은 데이터가 smooth scaling을 보인다.
+</Proof>
+
+그러나 Olsson et al. 2022가 발견한 **induction head**의 sudden formation은 내부 circuit 수준의 discontinuous event다 — metric을 바꿔도 transition이 사라지지 않는다. 이것은 Schaeffer의 "smooth underlying + metric artifact" 설명으로는 포괄되지 않는다. 현재 합의는 "**어떤 emergent는 artifact, 어떤 emergent는 mechanistic**"이며, 그 경계를 정하는 작업이 진행 중이다.
+
+## In-Context Learning: attention이 gradient descent를 한다
+
+In-Context Learning은 weight 업데이트 없이 forward pass만으로 새 task를 해결한다. 이것이 어떻게 가능한가?
+
+von Oswald et al. 2023은 linear attention 하에서 단일 attention layer가 linear regression의 한 gradient descent step과 동치임을 보였다. Demonstrations $\{(x_i, y_i)\}$와 query $x_q$를 다음과 같이 인코딩하면,
+
+$$
+w_1 = w_0 - \eta \sum_i (w_0^\top x_i - y_i) x_i = w_0 - \eta X^\top(Xw_0 - y)
+$$
+
+$w_0 = 0$에서 시작하면 $w_1 = \eta X^\top y$로, $L$-layer transformer는 $L$번의 GD step을 수행한다. 충분한 깊이에서 ridge regression 해에 수렴한다.
+
+$$
+\hat{w}_{\text{ridge}} = (X^\top X + \lambda I)^{-1} X^\top y
+$$
+
+Xie et al. 2022는 Bayesian 관점을 제시한다. Pretraining이 다양한 task의 혼합에서 이루어지면, LLM은 $P(w | \text{demos})$를 implicit하게 학습하고 ICL은 그 posterior에서의 marginal inference다.
+
+<Callout type="note" title="트레이드오프">
+ICL의 "gradient descent"는 activation space에서만 일어난다 — parameter에 저장되지 않으므로 다음 prompt에서 소실된다. Weight update(실제 SGD)와 달리 ephemeral하다. 이 덕분에 한 모델이 많은 task를 동시에 수행할 수 있지만, 학습 내용은 context window 밖으로 넘어가지 않는다.
+</Callout>
+
+실전 LLM에서 linear regression ICL은 이 이론과 거의 정확히 일치한다(Garg et al. 2022). 더 복잡한 reasoning task에서는 first-order approximation에 그치지만, "attention이 internal GD를 emulate한다"는 관점은 LLM의 few-shot generalization을 이해하는 가장 강력한 framework다.
+
+## 정리
+
+- Chinchilla는 $\alpha \approx \beta$에서 $N_{\text{opt}} \propto D_{\text{opt}} \propto C^{0.5}$를 유도한다. GPT-3는 데이터 기준으로 10배 undertrained이었다.
+- Broken Scaling Law는 단일 power law를 $k$개 breaking point를 가진 smooth function으로 일반화한다. Emergent와 double descent 모두 이 framework의 특수 경우다.
+- Emergent abilities 논쟁의 핵심은 metric 선택이다. Discontinuous metric이 smooth underlying을 sharp transition으로 보이게 만든다. 단, mechanistic-level emergence(induction head)는 이 설명으로 포괄되지 않는다.
+- ICL은 linear attention 하에서 정확히 ridge regression의 해를 내놓는다. Multi-layer transformer는 multi-step gradient descent를 activation space에서 수행한다.
+
+스케일링은 예측 가능하다 — 단, 어느 metric으로, 어느 scale range에서, 어떤 task를 측정하느냐에 따라 그 예측이 달라진다.
+
+<Reference
+  title="Training Compute-Optimal Large Language Models"
+  authors="Hoffmann et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2203.15556"
+/>
+
+<Reference
+  title="Are Emergent Abilities of Large Language Models a Mirage?"
+  authors="Schaeffer, Miranda, Koyejo"
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2304.15004"
+/>

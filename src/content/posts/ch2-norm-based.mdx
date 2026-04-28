@@ -1,0 +1,123 @@
+---
+title: "Norm-based 일반화 이론은 왜 진공에서 멈추는가"
+description: "Bartlett의 spectral norm 곱부터 PAC-Bayes의 KL capacity, compression의 effective bits, Nagarajan-Kolter의 구조적 반례까지 — norm-based 이론이 어디서 한계에 부딪히는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [generalization-theory, margin-theory, pac-bayes, compression, uniform-convergence]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+딥러닝의 일반화는 고전 이론으로 설명되지 않는다. VC 차원과 Rademacher complexity는 실제 네트워크에서 vacuous한 bound를 내놓는다. 그렇다면 norm을 기반으로 한 정제가 이 간극을 닫을 수 있을까? Bartlett 2017에서 시작해 PAC-Bayes, path-norm, compression을 거쳐 Nagarajan-Kolter 2019의 반례에 이르는 여정은, norm-based 이론이 가진 구조적 한계를 드러낸다.
+
+## Margin과 spectral norm 곱
+
+Bartlett, Foster, Telgarsky 2017의 출발점은 단순한 관찰이다. $L$-layer ReLU 네트워크의 Lipschitz 상수는 각 층의 spectral norm 곱 $\prod_l \|W_l\|_\sigma$으로 bound된다. 두 입력이 가까우면 출력도 그만큼 가깝고, 이는 covering number를 작게 만든다.
+
+여기에 margin normalization을 결합한다. ReLU는 positive homogeneous이므로 전체 네트워크를 $\alpha$배 rescale하면 margin도 $\alpha^L$배가 된다. 그러나 margin-to-Lipschitz 비율
+
+$$\frac{\gamma}{\prod_l \|W_l\|_\sigma}$$
+
+은 rescaling에 불변이다. 이것이 진짜 capacity measure다.
+
+<Theorem kind="theorem" number="1" title="Bartlett 2017 Main Bound">
+$L$-layer ReLU 네트워크, 입력 norm $\|x\| \leq R$, 초기화 $W^0$에 대해 확률 $\geq 1 - \delta$로:
+
+$$
+\mathcal{R}_0(f_W) \leq \hat{\mathcal{R}}_\gamma(f_W) + \tilde{O}\!\left(\frac{R \prod_l \|W_l\|_\sigma}{\gamma\sqrt{n}} \cdot \left(\sum_{l=1}^L \left(\frac{\|W_l - W_l^0\|_{2,1}}{\|W_l\|_\sigma}\right)^{2/3}\right)^{3/2}\right)
+$$
+</Theorem>
+
+<Proof>
+핵심은 세 단계다. (1) 레이어별 covering을 조합해 함수 클래스 $\mathcal{F}_{s,b}$의 $L^2$ covering number를 $O(R^2 s^2 b^2 / \epsilon^2)$으로 bound한다. (2) Dudley entropy integral로 Rademacher complexity를 유도한다. (3) Koltchinskii-Panchenko의 margin-based bound에 대입해 완성한다. $\sum b_l^{2/3}$ 항의 지수 $2/3$은 레이어별 covering error $\epsilon_l$를 최적 분배할 때 Lagrangian 조건에서 자연스럽게 나온다. $\square$
+</Proof>
+
+bound의 구조에서 중요한 것은 **초기화 기준 상대적 이동** $\|W_l - W_l^0\|_{2,1} / \|W_l\|_\sigma$이다. 절대적 norm이 아니라 초기화에서 얼마나 벗어났는가가 capacity를 결정한다. 이 아이디어는 이후 NTK의 "lazy regime"과 PAC-Bayes의 prior 설계에서 동일한 형태로 반복된다.
+
+## PAC-Bayes — 분포의 KL이 capacity가 되다
+
+Bartlett 2017은 단일 hypothesis의 bound다. PAC-Bayes는 패러다임을 전환한다. 단일 $h$가 아니라 **posterior distribution $Q$ over $h$**의 expected loss를 bound하면, $\mathcal{H}$ 전체의 worst-case 문제를 피할 수 있다.
+
+<Theorem kind="theorem" number="2" title="McAllester PAC-Bayes Bound (1999)">
+데이터와 독립인 prior $P$, 임의의 데이터 의존 posterior $Q$에 대해 확률 $\geq 1 - \delta$로:
+
+$$
+\mathbb{E}_{h \sim Q}[L(h)] \leq \mathbb{E}_{h \sim Q}[\hat{L}_n(h)] + \sqrt{\frac{\mathrm{KL}(Q \| P) + \log(n/\delta)}{2n}}
+$$
+</Theorem>
+
+capacity는 이제 $\mathrm{KL}(Q \| P)$다. Gaussian posterior $Q = \mathcal{N}(\hat{W}, \Sigma)$와 prior $P = \mathcal{N}(W^0, \lambda I)$를 취하면:
+
+$$
+\mathrm{KL}(Q \| P) \approx \frac{1}{2\lambda}\|\hat{W} - W^0\|^2 + (\text{분산 항})
+$$
+
+주 항이 다시 "초기화로부터의 거리"다. Bartlett의 $\|W - W^0\|_{2,1}$과 구조가 같다.
+
+Dziugaite & Roy 2017의 기여는 bound 자체를 minimization 목적함수로 삼아 $\mu$, $\Sigma$, $\lambda$를 SGD로 최적화한 것이다. 이로써 MNIST에서 $L \leq 0.161$이라는 **최초의 non-vacuous bound**를 달성했다. 이것이 역사적인 이유는 단순히 숫자가 작아서가 아니라, uniform convergence 프레임 안에서 non-vacuous가 가능함을 처음 보였기 때문이다.
+
+<Aside label="Flat minima와 PAC-Bayes">
+PAC-Bayes에서 KL이 작으려면 posterior가 넓게 퍼져도 low loss여야 한다 — 이것이 loss landscape의 flat minimum이다. Keskar et al. 2017이 경험적으로 보인 "large batch SGD → sharp minima → 일반화 나쁨"에 대한 이론적 기반이 여기 있다.
+</Aside>
+
+## Path-norm과 compression — 두 가지 정제
+
+Neyshabur 2015의 path-norm은 네트워크 구조를 직접 반영한다. 입력에서 출력까지 각 경로의 weight 곱의 $p$-norm:
+
+$$
+\|f\|_{\phi_p} = \left(\sum_{\text{path}} \left(\prod_{e \in \text{path}} |w_e|\right)^p\right)^{1/p}
+$$
+
+이것이 spectral norm product보다 자연스러운 이유는 **layerwise rescaling에 완전히 불변**하기 때문이다. $W_l \to \alpha_l W_l$, $W_{l+1} \to W_{l+1}/\alpha_l$을 취하면 각 경로에서 $\alpha$와 $1/\alpha$가 상쇄된다. 2-layer 경우 Rademacher complexity는 $O(\|f\|_{\phi_2}\sqrt{\log d / n})$으로, 입력 차원 $d$에 logarithmic하게만 의존한다.
+
+Arora et al. 2018은 전혀 다른 방향을 취한다. 훈련된 네트워크가 $k$-bit으로 압축 가능하면 effective capacity $\leq k$이고, 일반화 gap은 $O(\sqrt{k/n})$으로 bound된다. 핵심 관찰은 **noise sensitivity**다 — 훈련된 네트워크는 레이어 입력에 Gaussian noise를 넣어도 출력이 거의 변하지 않는다. 이는 각 레이어를 low-rank approximation으로 대체해도 출력이 유지됨을 의미하고, 따라서 압축이 가능하다.
+
+이 관점은 Lottery Ticket Hypothesis와 같은 아이디어를 공유한다 — overparameterized 네트워크 안에 작은 effective subnetwork가 숨어있다.
+
+<Callout type="note" title="트레이드오프">
+Bartlett의 spectral norm은 global Lipschitz를 측정하지만 초기화 기준 정제가 필요하다. PAC-Bayes는 non-vacuous를 달성하지만 bound 자체를 최적화한 특별한 weight의 bound다. Path-norm은 scale-invariant하지만 deep network에서 경로 수가 지수적이다. Compression은 직관적이지만 attention 같은 구조에서 low-rank 가정이 약하다. 각 refinement는 다른 가정 위에 서 있다.
+</Callout>
+
+## Nagarajan-Kolter 2019 — 구조적 실패
+
+그러나 훈련 중 $\prod \|W_l\|_\sigma$의 실제 거동을 보면 문제가 드러난다. ResNet CIFAR-10에서 훈련이 진행될수록 이 값은 $10^2$에서 $10^5$으로 단조 증가한다. 그러나 test accuracy는 함께 **개선**된다. Bound와 실제 일반화가 반대 방향으로 움직인다.
+
+이것은 우연이 아니다. Cross-entropy loss는 confidence를 높이기 위해 weight magnitude를 키우는 방향으로 작용한다. norm 증가는 자연스러운 훈련 현상이고, norm 기반 bound는 이를 capacity 증가로 잘못 해석한다.
+
+Nagarajan & Kolter 2019는 이 관찰을 구조적 불가능성 정리로 격상시킨다.
+
+<Theorem kind="theorem" number="3" title="Nagarajan-Kolter 2019">
+어떤 분포 $\mathcal{D}$, 2-layer ReLU 클래스 $\mathcal{H}$, SGD 알고리즘 $\mathcal{A}$가 존재하여: $\mathcal{A}$가 생성한 $h$의 실제 generalization gap $\leq 0.02$이지만, $\mathcal{A}$-의존적인 어떤 uniform convergence bound $\Omega$도 $\Omega \geq 1 - \epsilon$을 만족한다.
+</Theorem>
+
+반례의 핵심은 고차원 구 위의 분포다. SGD가 훈련 샘플 $S$ 위에서 정확히 학습하더라도, **반전 샘플** $S' = \{(-x, y)\}$에서는 완전히 오분류한다. 고차원에서 $x$와 $-x$는 거의 직교하므로 SGD가 "보지 않은" 방향이다. ReLU의 asymmetry로 $f(-x) \neq -f(x)$가 되어 오분류가 발생한다.
+
+uniform convergence는 "$\mathcal{H}$ 안의 어떤 $h$가 어떤 샘플에서도 나쁠 수 있음"을 제한해야 하므로 vacuous한 bound를 피할 수 없다. SGD가 찾는 $h$는 특정 샘플 방향으로 biased되어 있고, 이 미스매치는 해결 불가능하다.
+
+## 정리
+
+- Bartlett 2017의 spectral norm 곱과 distance from initialization은 norm-based refinement의 기초다. 모든 후속 연구가 이 구조를 반복한다.
+- PAC-Bayes는 패러다임 전환을 이뤄 MNIST에서 non-vacuous bound를 최초로 달성했지만, 이는 natural weight가 아닌 특별히 최적화된 weight의 bound다.
+- Path-norm과 compression은 각각 scale-invariance와 effective complexity라는 다른 렌즈를 제공한다.
+- Nagarajan-Kolter 2019는 uniform convergence 자체의 구조적 실패를 증명한다. 이것이 NTK(exact analysis), double descent(distribution-specific), implicit bias(algorithm-dependent)로 방향을 전환해야 하는 논리적 이유다.
+
+norm이 진공에 머무는 이유는 capacity measure가 틀려서가 아니라, uniform convergence라는 프레임이 SGD의 algorithm-specific trajectory를 담을 수 없기 때문이다.
+
+<Reference
+  title="Spectrally-normalized Margin Bounds for Neural Networks"
+  authors="Bartlett, Foster, Telgarsky"
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.08498"
+/>

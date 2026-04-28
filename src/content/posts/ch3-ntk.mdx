@@ -1,0 +1,129 @@
+---
+title: "무한폭 신경망은 왜 커널 회귀로 환원되는가"
+description: "Neural Tangent Kernel의 정의부터 NNGP, RKHS, Lazy vs Feature Learning까지 — 무한폭 극한이 딥러닝 훈련을 결정론적 선형 ODE로 환원하는 이유를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [neural-tangent-kernel, infinite-width, kernel-methods, generalization]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망은 왜 수렴하는가? 왜 일반화하는가? 이 질문들은 오랫동안 직관과 실험에 의존해왔다. Jacot et al. 2018이 Neural Tangent Kernel(NTK)을 발표했을 때, 비로소 수학적 대상이 생겼다 — 무한폭 극한에서 신경망 훈련이 **결정론적 커널 회귀**로 완전히 환원된다는 것이다. 이 통찰은 어디서 오는가, 그리고 어디에서 깨지는가?
+
+## NTK의 정체 — 그래디언트 내적으로서의 커널
+
+Neural Tangent Kernel $\Theta(x, y)$의 정의는 단순하다.
+
+$$\Theta(x, y; \theta) := \langle \nabla_\theta f_\theta(x),\, \nabla_\theta f_\theta(y) \rangle$$
+
+두 입력 $x, y$에 대해 파라미터 그래디언트의 내적이다. 직관은 명확하다 — "$y$에서의 그래디언트 스텝이 $x$의 예측을 얼마나 바꾸는가"를 측정한다. $\Theta(x, y)$가 크면 두 점이 훈련 중 서로 강하게 영향을 미친다.
+
+핵심은 **무한폭 극한**($n \to \infty$)에서 이 커널이 **상수**로 수렴한다는 것이다. 각 은닉층 뉴런이 독립적으로 기여하고, 폭이 커질수록 중심극한정리에 의해 랜덤 초기화의 fluctuation이 사라진다. NTK parametrization($1/\sqrt{n}$ scaling)에서 훈련 중 가중치 이동이 $O(1/\sqrt{n})$이므로, $\Theta$ 역시 시간에 대해 불변이 된다.
+
+층별 귀납 공식은 이를 명시적으로 계산 가능하게 한다.
+
+$$\Theta^{(l+1)}(x, y) = \Theta^{(l)}(x, y) \cdot \dot\Sigma^{(l+1)}(x, y) + \Sigma^{(l+1)}(x, y)$$
+
+여기서 $\Sigma^{(l)}$은 NNGP 공분산(순전파), $\dot\Sigma^{(l)}$은 미분 커널(역전파)이다. Forward path와 backward path가 layer마다 합산되어 NTK를 구성한다.
+
+## 훈련이 선형 ODE로 환원되는 이유
+
+$\Theta$가 상수라는 사실이 갖는 실용적 힘은 훈련 역학에서 드러난다. MSE 손실에서 연속 그래디언트 플로우를 쓰면
+
+$$\frac{df_t(x)}{dt} = -\sum_i \Theta(x, x_i)(f_t(x_i) - y_i)$$
+
+이다. $\Theta$가 상수이므로 이는 $f$에 대한 **선형 ODE**다. 행렬 형태로 쓰면 $\dot{f}_t(X) = -K(f_t(X) - y)$이고, 닫힌 형태 해가 존재한다.
+
+$$f_t(x) = f_0(x) + \Theta(x, X)(I - e^{-\eta K t})K^{-1}(y - f_0(X))$$
+
+$t \to \infty$ 극한에서 이것은 정확히 **커널 릿지 회귀 해**가 된다.
+
+$$f_\infty(x) = f_0(x) + \Theta(x, X) K^{-1}(y - f_0(X))$$
+
+수렴 속도는 커널 행렬의 최소 고유값 $\lambda_{\min}(K)$에 의해 결정된다. 즉 무한폭 신경망의 훈련은 초기 예측기 $f_0$에서 출발해 잔차를 커널로 보간하는 것과 수학적으로 동치다.
+
+<Theorem kind="theorem" number="1" title="NTK Regime Training Solution">
+무한폭 FCN, MSE 손실, 연속 그래디언트 플로우, NTK parametrization 하에서 임의의 테스트 점 $x$에 대한 시각 $t$의 예측은 위의 닫힌 형태로 주어지며, $t \to \infty$에서 $K$의 최소 고유값에 비례한 지수 속도로 수렴한다.
+</Theorem>
+
+## NNGP — 초기화 시점의 함수 공간 Prior
+
+NTK와 쌍을 이루는 개념이 Neural Network Gaussian Process(NNGP)다. 무한폭에서 랜덤 초기화 신경망의 출력 분포는 **가우시안 프로세스**로 수렴한다.
+
+$$f_{\theta_0}(\cdot) \xrightarrow{d} \text{GP}(0, \Sigma^{(L)})$$
+
+이유는 CLT다. $h^{(l+1)}_i(x) = \frac{1}{\sqrt{n}}\sum_j W_{ij}\phi(h^{(l)}_j(x))$에서 각 뉴런의 기여가 i.i.d.이므로, $n \to \infty$에서 합이 가우시안으로 수렴한다. 여러 입력점에 대한 결합 분포도 다변수 가우시안 — 이것이 GP다.
+
+NNGP($\Sigma$)와 NTK($\Theta$)의 구분은 중요하다.
+
+| | NNGP $\Sigma$ | NTK $\Theta$ |
+|---|---|---|
+| 의미 | 출력의 prior 공분산 | 그래디언트의 내적 |
+| 시점 | 랜덤 초기화 | 훈련 중 (불변) |
+| 역할 | Bayesian prior | 그래디언트 플로우의 geometry |
+
+$\Sigma$는 NTK 귀납 공식의 building block이다. ReLU에서 $\Sigma^{(l)}$은 arc-cosine 커널(Cho-Saul 2009)로 닫힌 형태를 갖는다.
+
+## RKHS와 일반화 — 커널 방법의 전통 연결
+
+NTK가 positive definite 커널이라는 사실에서 Moore-Aronszajn 정리에 의해 유일한 Hilbert 공간 $\mathcal{H}_\Theta$가 존재한다. 이 RKHS에서 representer theorem이 성립하고, $f_\infty - f_0$는 RKHS 노름을 최소화하는 보간자임을 보일 수 있다.
+
+이 연결이 갖는 실용적 가치는 일반화 bound다. RKHS ball $\{\|f\|_{\mathcal{H}_\Theta} \leq B\}$의 Rademacher complexity는
+
+$$\hat{\mathcal{R}}_n \leq B\sqrt{\frac{\text{tr}(K)}{n^2}}$$
+
+로 계산된다. 커널 행렬의 trace가 작을수록 — 즉 유효 차원이 낮을수록 — 일반화가 개선된다. 이는 kernel eigenvalue의 decay 속도와 직결된다.
+
+<Callout type="note" title="트레이드오프">
+NTK RKHS는 고정된 커널의 함수 공간이다. 이 프레임워크는 무한폭 극한에서 정확하지만, **feature learning을 배제**한다. 실전 신경망의 커널은 훈련 중 변하고, 이 변화가 NTK로는 포착되지 않는다. Analytic NTK는 강력한 baseline이지만(CIFAR-10 Conv NTK ~77%) 실제 훈련된 ResNet(~95%)에는 10-18%p 부족하다. 이 gap이 feature learning의 순 기여다.
+</Callout>
+
+## Lazy vs Feature Learning — NTK의 경계
+
+Chizat, Oyallon, Bach 2019는 NTK regime이 곧 **lazy training regime**임을 명확히 했다. 출력에 스케일 팩터 $\alpha$를 도입하면
+
+$$\|\theta_t^{(\alpha)} - \theta_0\| = O(1/\alpha)$$
+
+가 성립한다. $\alpha \to \infty$에서 가중치가 거의 움직이지 않고 훈련이 선형화된다 — 이것이 lazy regime, 곧 NTK regime이다. $\alpha = O(1)$에서는 가중치 이동이 $\Theta(1)$이 되고 feature가 실질적으로 변한다.
+
+반대 극단인 mean-field regime(Mei-Montanari-Nguyen 2018)에서는 $1/n$ normalization을 써서 경험적 분포 $\rho_t$의 Wasserstein 그래디언트 플로우가 feature learning을 기술한다. 두 regime 사이의 continuum을 통합하려는 시도가 Yang 2020의 $\mu$P(Maximal Update Parameterization)다.
+
+<Aside label="설계 함의">
+Parametrization choice — $1/\sqrt{n}$ vs $1/n$ vs 무엇 — 이 lazy와 rich regime을 결정한다. 이는 단순한 수식 표기 문제가 아니라 "신경망이 무엇을 학습하는가"를 바꾼다. NTK는 초기 feature의 선형 조합만 배우고, mean-field는 feature 자체를 바꾼다.
+</Aside>
+
+## 정리
+
+- 무한폭 극한에서 NTK는 상수 커널로 수렴하고, 훈련은 결정론적 선형 ODE로 환원된다. 해는 커널 릿지 회귀와 동치다.
+- NNGP는 초기화 시점의 함수 공간 prior이고, NTK는 그래디언트 플로우의 geometry다. 둘 다 layer별 귀납 공식으로 계산 가능하다.
+- NTK RKHS에서 Rademacher 복잡도가 $\sqrt{\text{tr}(K)/n^2}$로 계산되어 kernel eigenvalue decay와 일반화를 연결한다.
+- Lazy(NTK) vs rich(feature learning)는 이분법이 아니라 연속체다. Chizat의 $\alpha$가 이를 파라미터화하고, $\mu$P가 통합을 시도한다.
+
+수식 하나 뒤에는 "신경망이 초기화에서 얼마나 멀리 가느냐"라는 근본 질문이 숨어 있다.
+
+<Reference
+  title="Neural Tangent Kernel: Convergence and Generalization in Neural Networks"
+  authors="Jacot, Gabriel, Hongler"
+  year={2018}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1806.07572"
+/>
+
+<Reference
+  title="Lazy Training in Differentiable Programming"
+  authors="Chizat, Oyallon, Bach"
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1812.07956"
+/>

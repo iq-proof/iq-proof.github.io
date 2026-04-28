@@ -1,0 +1,120 @@
+---
+title: "Grokking은 왜 일어나는가 — 지연 일반화의 수학"
+description: "훈련 손실이 0이 된 이후에도 수만 스텝 뒤에 테스트 정확도가 갑자기 100%로 뛰는 grokking 현상의 메커니즘부터, SGD implicit bias와 simplicity bias의 양날 구조까지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [grokking, implicit-bias, generalization, sgd, simplicity-bias]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+훈련 손실이 0에 도달한 모델의 훈련은 끝난 것일까? Power et al. 2022는 그 가정이 틀렸음을 보여주는 실험을 발표했다. $(a + b) \bmod 97$ 같은 단순한 모듈러 산술 과제에서, 모델은 훈련 정확도 100%에 도달한 뒤 수만 스텝이 지나서야 테스트 정확도가 갑자기 100%로 뛰어오른다. 이 **지연 일반화(grokking)** 뒤에는 어떤 수학이 있는가?
+
+## Grokking — 현상의 정의
+
+Grokking은 세 조건의 동시 성립으로 정의된다.
+
+1. 어떤 시점 $t_1$에서 훈련 정확도가 1에 도달하고 이후 유지된다.
+2. $t_2 \gg t_1$인 시점에서 테스트 정확도가 $1 - \varepsilon$에 도달한다.
+3. $[t_1, t_2]$ 구간 내내 테스트 정확도는 무작위 수준에 머무른다.
+
+실험적으로 $t_1 \sim n^{0.5}$, $t_2 \sim n^{1.5}$ 근사가 성립하므로, 데이터가 작을수록 $t_2 / t_1$이 커지고 gap이 더 극적으로 드러난다.
+
+왜 이상한가? 고전 ML에서는 훈련 손실이 0에 도달하면 모델이 암기(memorization) 또는 일반화(generalization) 중 하나를 이미 완료한 것으로 본다. Grokking은 **암기 → 일반화 전이가 훈련 도중에 일어난다**는 것을 보여주며, 이 전이에 weight decay가 필수 조건으로 작용한다. WD = 0이면 암기에 고착되고, WD = 1.0 수준에서 적정 속도의 grokking이 나타난다.
+
+## 두 가지 해석 — Weight Norm과 Fourier 표현
+
+Grokking의 메커니즘을 설명하는 두 계열의 연구가 있다.
+
+**Weight norm dynamics (Liu et al. 2022)**: 훈련 초반 $\|\theta\|$가 빠르게 증가한다. 암기 해는 큰 가중치를 필요로 하기 때문이다. 훈련 손실이 수렴한 뒤에도 weight decay가 $\|\theta\|$를 서서히 끌어내린다. 특정 임계값 아래로 내려가면 "단순한 해"가 비로소 접근 가능해지고, 그 순간 테스트 정확도가 급등한다. 실측에서 **테스트 정확도 상승 시점과 weight norm 급감 시점이 정확히 일치**한다.
+
+**Fourier 표현 전이 (Nanda et al. 2023)**: Mechanistic interpretability 관점에서 Transformer 내부 활성화를 분석하면, 암기 단계에서는 각 $(a, b)$ 쌍이 독립적인 해시 항목처럼 저장된다. Grokking 이후에는 활성화가 $\cos(2\pi k(a+b)/p)$, $\sin(2\pi k(a+b)/p)$ 형태의 Fourier 기저 선형결합으로 재조직된다. 이 Fourier 표현이 구조적 일반화를 가능하게 한다 — 훈련에서 보지 않은 $(a, b)$ 쌍에도 작동하는 것이다.
+
+두 해석은 **공존하며 인과적으로 연결**된다. Weight norm 감소 → 모델 용량 제한 → Fourier 같은 단순한 구조만이 데이터를 보간 가능 → 표현 전이. Weight norm이 근본 원인이고 Fourier 표현이 결과다.
+
+## SGD의 Implicit Bias — Max-Margin 수렴
+
+Grokking의 수학적 뿌리는 Soudry et al. 2018의 결과다.
+
+<Theorem kind="theorem" number="1" title="Soudry 2018 — Max-Margin 수렴">
+분리 가능한 데이터 $\{(x_i, y_i)\}$에서 로지스틱 손실에 GD를 적용하면:
+
+$$\lim_{t \to \infty} \frac{w_t}{\|w_t\|} = \frac{\hat{w}}{\|\hat{w}\|}, \quad \hat{w} = \arg\min\{\|w\|_2 : y_i w^\top x_i \geq 1\}$$
+
+수렴 rate:
+
+$$\left\|\frac{w_t}{\|w_t\|} - \frac{\hat{w}}{\|\hat{w}\|}\right\| = O\!\left(\frac{\log\log t}{\log t}\right), \quad \|w_t\| = \Theta(\log t)$$
+</Theorem>
+
+<Proof>
+핵심 흐름만 추적한다. 로지스틱 기울기의 크기는 support vector(최소 margin 포인트)에 지수적으로 가중된다.
+
+$$-\nabla L \approx e^{-\min_i y_i w^\top x_i} \sum_{\text{support}} y_i x_i$$
+
+$\|w\|$의 연속 동역학:
+
+$$\frac{d\|w\|}{dt} \sim \eta e^{-\gamma \|w\|} \implies \|w(t)\| \sim \frac{1}{\gamma}\log(1 + \gamma\eta t) = \Theta(\log t)$$
+
+기울기 방향이 support vector만으로 구성되므로 SVM의 KKT 조건과 일치하고, $w_t$는 max-margin 방향으로 축적된다. $\log\log t$ 보정항은 non-support vector의 지수적으로 작지만 0이 아닌 기여에서 비롯된 2차 수정항이다. $\square$
+</Proof>
+
+Grokking은 이 $O(\log\log t / \log t)$짜리 느린 방향 수렴의 **가시적 폭발**이다. 훈련 손실이 0에 도달한 뒤에도 max-margin 방향으로의 수렴이 계속 진행되고, Fourier 구조가 바로 modular addition의 max-margin 표현이다.
+
+## Simplicity Bias의 양날
+
+<Callout type="warning" title="트레이드오프 — Implicit Bias의 어두운 면">
+Max-margin / min-norm 수렴은 IID 일반화를 돕지만, **분포 이동(OOD) 환경에서는 독이 된다**. Shah et al. 2020은 이를 구성적으로 증명한다.
+</Callout>
+
+Shah 2020의 설정: 입력 $x = (x^{\text{easy}}, x^{\text{hard}})$. 훈련 데이터에서 $x^{\text{easy}}$가 레이블과 완벽하게 상관되어 있지만, 진짜 원인은 $x^{\text{hard}}$다. SGD는 min-norm 방향으로 이끌리므로 단일 feature $x^{\text{easy}}$만으로 손실을 0으로 만드는 해를 선택한다. $x^{\text{hard}}$로 가는 기울기는 사실상 0이 된다. 테스트에서 spurious correlation이 깨지면 모델은 무작위 수준으로 떨어진다.
+
+이것이 Geirhos 2020의 "texture bias"가 일어나는 이유다. ImageNet으로 훈련된 ResNet은 shape보다 texture에 의존한다. 고양이 이미지에 코끼리 texture를 입히면 "코끼리"로 분류한다.
+
+```python
+# spurious correlation 효과 확인
+X_e_rand = torch.sign(torch.randn(n, 1))   # spurious 무관화
+X_test = torch.cat([X_e_rand, X_h], dim=1)
+# 예상: IID acc ≈ 1.0, OOD acc ≈ 0.5
+```
+
+Grokking과 비교하면 대칭적이다. Grokking에서는 simplicity bias가 올바른 구조(Fourier)로 수렴하고, Shah의 설정에서는 틀린 feature(spurious)로 수렴한다. **Simplicity bias 자체는 중립이다 — 데이터 구조가 결과를 결정한다.**
+
+<Aside label="통합 관점">
+Max-margin 수렴, Grokking, Simplicity bias는 하나의 현상의 세 얼굴이다. SGD는 항상 "가장 단순한 분리 방향"으로 느리게 수렴한다. 데이터에 진짜 단순 구조가 있으면(modular arithmetic) 결과는 아름다운 일반화다. 데이터에 spurious 단순 feature가 있으면 결과는 OOD 실패다.
+</Aside>
+
+## 정리
+
+- Grokking은 훈련 손실 수렴 이후에도 max-margin 방향 수렴이 계속 진행됨을 보여주는 명시적 증거다. Weight decay가 이 과정의 속도를 제어한다.
+- 내부에서는 두 가지가 동시에 일어난다: weight norm 감소와 Fourier 기저 표현 형성. 전자가 후자를 강제한다.
+- Soudry 2018의 $\|w_t\| = \Theta(\log t)$, 방향 수렴 rate $O(\log\log t / \log t)$가 이 느린 전이의 수학적 배경이다.
+- Simplicity bias는 IID 일반화를 돕고 OOD 일반화를 해친다. 이 trade-off는 SGD의 근본 성질이므로 완전한 회피는 불가능하다.
+
+"훈련 손실 수렴 = 학습 완료"라는 직관은 틀렸다. 내부 표현은 그 이후에도 계속 재조직된다.
+
+<Reference
+  title="Grokking: Generalization Beyond Overfitting on Small Algorithmic Datasets"
+  authors="Power et al."
+  year={2022}
+  venue="ICLR Workshop"
+  url="https://arxiv.org/abs/2201.02177"
+/>
+
+<Reference
+  title="Progress measures for grokking via mechanistic interpretability"
+  authors="Nanda et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2301.05217"
+/>

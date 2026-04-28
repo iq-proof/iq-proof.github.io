@@ -1,0 +1,145 @@
+---
+title: "복권 티켓은 처음부터 결정되어 있었는가"
+description: "LTH의 IMP 프로토콜부터 Stable Ticket의 early rewinding, Liu 2019 반론, Strong LTH의 constructive proof까지 — 희소 서브네트워크가 일반화를 설명하는 방식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [lottery-ticket, pruning, generalization, sparse-networks, over-parameterization]
+difficulty: advanced
+series:
+  slug: generalization-theory-deep-dive
+  title: Generalization Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+거대한 신경망이 일반화되는 이유를 설명하는 한 가지 방법은 "실제로 작동하는 부분이 훨씬 작다"는 것이다. Frankle & Carlin 2019의 Lottery Ticket Hypothesis(LTH)는 이 직관을 실험으로 굳혔다. 그런데 그 "작은 부분"은 훈련이 끝난 다음에 발견되는가, 아니면 **처음 초기화 시점에 이미 결정**되어 있는가?
+
+## IMP — 복권 번호를 찾는 프로토콜
+
+LTH의 핵심 주장은 이렇다. 큰 신경망 $f(x; \theta)$에는 훨씬 작은 희소 서브네트워크 $f_{\text{sub}}(x; \theta_0 \odot m)$이 존재하며, 이 서브네트워크를 **원래 초기값 $\theta_0$에서 scratch 훈련**하면 dense 원본과 같은 성능에 도달한다.
+
+이를 발견하는 프로토콜이 **Iterative Magnitude Pruning(IMP)**다.
+
+```
+1. θ₀ 저장 (random init)
+2. 전체 훈련 → θ_T
+3. 절댓값 기준 하위 p% weight 제거 → mask m
+4. θ₀ ⊙ m 으로 rewind (훈련된 weight가 아닌 init으로)
+5. θ₀ ⊙ m 에서 재훈련
+6. 2-5 반복
+```
+
+4번의 **rewind to $\theta_0$**가 핵심이다. 이미 훈련된 weight로 fine-tune하는 게 아니라, init으로 되돌려 scratch에서 다시 훈련한다. Frankle 2019는 MNIST LeNet에서 20% weight만으로도 원 accuracy 98.5%를 재현했고, 1% sparsity에서도 동등한 성능을 보였다.
+
+<Theorem kind="proposition" number="1" title="Lottery Ticket Hypothesis">
+Dense NN $f(x; \theta)$와 random init $\theta_0$에 대해, mask $m$($\|m\|_0 \ll |\theta|$)이 존재해 $f_{\text{sub}}(x; \theta_0 \odot m)$을 $\theta_0 \odot m$에서 scratch 훈련하면 원 dense network의 성능과 match 또는 능가한다. 이 mask는 magnitude pruning으로 발견된다.
+</Theorem>
+
+<Callout type="note" title="Init 민감성">
+같은 mask $m$을 다른 random init $\theta_0'$에 적용하면 훈련이 잘 안 된다. "mask + init"이 **짝**이 되어야 winning ticket이 작동한다 — 이것이 "복권" 해석의 근거다.
+</Callout>
+
+## Stable Ticket — init이 아니라 early checkpoint
+
+MNIST/CIFAR에서 확립된 LTH는 큰 ResNet과 ImageNet에서 실패했다. Rewind to $\theta_0$가 작동하지 않는 것이다.
+
+Frankle et al. 2020은 그 원인을 **loss landscape의 불안정성**에서 찾았다. 큰 모델에서는 random $\theta_0$가 지나치게 혼란스러운 landscape의 시작점이다. SGD의 초기 수십 step이 "어느 minimum 근방"으로 수렴할지를 결정하는데, $\theta_0$에서 rewind하면 다른 basin으로 떨어진다.
+
+해결책은 **early rewinding** — 전체 훈련의 1~7%에 해당하는 checkpoint $\theta_{t^*}$로 rewind하는 것이다.
+
+$$\text{Rewind to } \theta_{t^*} \Rightarrow \text{LMC holds} \Rightarrow \text{stable winning ticket}$$
+
+이때 도입된 개념이 **Linear Mode Connectivity(LMC)**다.
+
+<Theorem kind="definition" number="2" title="Linear Mode Connectivity">
+두 solution $\theta_A, \theta_B$가 $\epsilon$-linearly mode-connected:
+
+$$\max_{\alpha \in [0,1]} L(\alpha \theta_A + (1-\alpha)\theta_B) - \max(L(\theta_A), L(\theta_B)) \leq \epsilon$$
+
+linear interpolation 경로의 loss가 두 endpoint의 loss와 비슷하면, 두 solution은 **같은 basin**에 있다.
+</Theorem>
+
+$\theta_{t^*}$에서 rewind한 두 독립 훈련의 결과는 LMC를 만족한다. $\theta_0$에서 rewind한 경우는 만족하지 않는다. LMC는 basin membership의 경험적 테스트다. ResNet50 + ImageNet에서 $t^* \approx 7\%$ rewind로 10~20% sparsity에서 원 accuracy ~76%에 근접했다.
+
+## Liu 2019 반론 — 아키텍처가 중요한가, init이 중요한가
+
+Liu et al. 2019 "Rethinking the Value of Network Pruning"은 상반된 실험을 제시했다. Pruned architecture에 **random re-init**을 적용하고 scratch 훈련해도 성능이 비슷하다는 것이다.
+
+이 관찰의 함의는 단순하다. "winning ticket"의 본질이 특정 init이 아니라 **pruned architecture 자체**라면, lottery 해석은 틀렸고 init 저장도 불필요하다.
+
+Frankle 2020의 응답은 **스케일 의존성**이었다.
+
+| 모델 크기 | $\theta_0$ rewind | random re-init | $\theta_{t^*}$ rewind |
+|:---|:---:|:---:|:---:|
+| 작은 모델 (LeNet MNIST) | ~98% | ~98% | ~98% |
+| 큰 모델 (ResNet50 ImageNet) | ~40% | ~45% | ~74% |
+
+작은 모델에서는 세 방법이 수렴하기 때문에 Liu 2019의 관찰이 맞다. 큰 모델에서는 $\theta_{t^*}$ rewind만 작동한다. "init이 중요한가 vs 아키텍처가 중요한가"는 이분법이 아니라 **모델 크기에 따라 결정되는 스펙트럼**이다.
+
+<Aside label="실용적 결론">
+작은 모델 압축에서는 random init + scratch 훈련으로 충분하다. 큰 모델 압축에서는 pre-trained checkpoint가 자연스러운 $\theta_{t^*}$ 역할을 한다. SparseGPT(Frantar 2023), Wanda(Sun 2023) 같은 LLM pruning은 모두 이 관점에서 작동한다.
+</Aside>
+
+## Strong LTH — 훈련 없이 mask만으로
+
+Ramanujan et al. 2020 "What's Hidden in a Randomly Weighted Neural Network?"은 더 강한 주장을 증명했다. 충분히 over-parameterized된 random NN 안에는 **훈련 없이 mask만으로** target network를 근사하는 서브네트워크가 존재한다.
+
+이를 발견하는 **edge-popup 알고리즘**은 weight를 freeze하고 각 edge에 학습 가능한 score를 부여한다. Score 상위 $k$개의 edge만 사용하는 mask를 gradient descent로 최적화한다. Weight 자체는 random init에서 한 번도 업데이트되지 않는다.
+
+결과는 놀랍다. Random init ResNet-50에서 edge-popup으로 CIFAR-10 84%, ImageNet 56%를 달성했다 — 훈련 없이.
+
+Malach et al. 2020은 이를 rigorous하게 증명했다.
+
+<Theorem kind="theorem" number="3" title="Strong LTH (Malach 2020)">
+임의의 target NN $f^*$ (width $w^*$, depth $L^*$)와 $\epsilon > 0$에 대해, width
+
+$$W = O\!\left(w^* \log\frac{1}{\epsilon}\right), \quad L = 2L^*$$
+
+인 random NN에 mask가 존재해 해당 서브네트워크가 $f^*$의 $\epsilon$-approximation이다.
+</Theorem>
+
+<Proof>
+Target network의 각 neuron $\phi(w^{*\top} x)$를 두 random neuron의 조합으로 근사한다:
+
+$$\phi(w^{*\top} x) \approx \text{ReLU}(w_1^\top x) - \text{ReLU}(w_2^\top x)$$
+
+$W = O(w^* \log(1/\epsilon))$개의 random neuron 중, $w_1 \approx w^*$이고 $w_2 \approx w_1 - w^*$인 pair가 존재함을 probabilistic method(covering argument)로 보인다. 각 target layer를 두 random layer로 시뮬레이트하므로 depth가 $2L^*$이 된다.
+</Proof>
+
+이 결과는 over-parameterization의 해석을 바꾼다. "많은 parameter가 optimization을 쉽게 한다"는 고전적 view 대신, "충분히 큰 random NN은 모든 작은 target network의 근사를 서브네트워크로 내장한다"는 view다.
+
+<Callout type="note" title="트레이드오프">
+Strong LTH는 "weight 훈련 없음"이지 "훈련 없음"이 아니다. Score(mask)를 최적화하는 비용이 weight를 최적화하는 비용과 다르지 않을 수 있다. 그리고 edge-popup의 실전 accuracy는 fully trained 모델보다 여전히 낮다 — ImageNet ResNet-50 기준 56% vs 76%. 이론적 존재 증명과 실용적 효율성 사이의 간극이 크다.
+</Callout>
+
+## 정리
+
+- LTH의 핵심은 **"작은 서브네트워크 + 특정 init"이 winning ticket**이라는 주장이다. IMP 프로토콜이 이를 empirically 발견한다.
+- 큰 모델에서 $\theta_0$ rewind가 실패하는 이유는 loss landscape의 chaotic init 때문이다. Early rewinding($\theta_{t^*}$)과 LMC로 해결된다.
+- "Init vs Architecture" 논쟁은 scale-dependent로 수렴한다. 작은 모델은 architecture만으로 충분, 큰 모델은 checkpoint가 필요하다.
+- Strong LTH(Malach 2020)는 **over-parameterized random NN이 모든 target network의 근사를 서브네트워크로 포함**한다는 constructive proof를 제시했다.
+
+Compression bound(effective capacity ≪ total capacity)와 LTH는 같은 통찰의 두 표현이다. 네트워크가 크더라도 일반화를 담당하는 것은 sparse한 핵심이고, 그 핵심은 초기화 시점부터 잠재해 있다.
+
+<Reference
+  title="The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural Networks"
+  authors="Frankle, J. and Carlin, M."
+  year={2019}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1803.03635"
+/>
+
+<Reference
+  title="Proving the Lottery Ticket Hypothesis: Pruning is All You Need"
+  authors="Malach, E., Yehudai, G., Shalev-Shwartz, S., and Shamir, O."
+  year={2020}
+  venue="ICML"
+  url="https://arxiv.org/abs/2002.00585"
+/>
