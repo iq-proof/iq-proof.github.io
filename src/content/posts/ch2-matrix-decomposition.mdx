@@ -1,0 +1,126 @@
+---
+title: "행렬 분해는 왜 그렇게 설계됐는가"
+description: "LU부터 Jordan Form까지, 각 행렬 분해가 어떤 구조적 필요에 응답하는지 — 존재 조건, 계산량, 수치 안정성의 연쇄를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [linear-algebra, matrix-decomposition, numerical-stability, eigenvalue]
+difficulty: advanced
+series:
+  slug: linear-algebra-deep-dive
+  title: Linear Algebra Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+행렬 분해는 "어떻게 계산하는가"의 문제가 아니다. 각 분해는 행렬의 특정 구조를 **드러내기 위해 설계된 언어**다. $A = LU$는 소거 과정을 팩토링한 것이고, $A = QR$은 열 공간의 직교 기저를 추출한 것이며, $A = Q\Lambda Q^T$는 행렬이 결국 스케일링의 합임을 말한다. 그렇다면 이 분해들 사이의 관계는 무엇이고, 어떤 분해가 어떤 상황에서 **정확히 왜** 우월한가?
+
+## 가우스 소거는 왜 $A = LU$인가
+
+가우스 소거를 수행하는 각 행 연산은 하삼각 기본행렬 $E_k$를 왼쪽에서 곱하는 것과 같다.
+
+$$
+E_{n-1} \cdots E_1 \cdot A = U \implies A = \underbrace{(E_{n-1} \cdots E_1)^{-1}}_{L} \cdot U
+$$
+
+하삼각 행렬의 역과 곱은 하삼각이므로 $L$은 자동으로 하삼각이 된다. Doolittle 규약에서 $L$의 대각은 1로 고정된다. 분해가 존재하는 조건은 $A$의 모든 선행 주부분행렬 $A_k$가 비특이인 것이고, 이 조건 아래 유일성도 보장된다.
+
+대각에 0이 등장하거나 작은 수로 나누게 되면 수치 오차가 폭발한다. 이때 행을 교환하는 피벗팅이 필요하고, 분해는 $PA = LU$로 확장된다. 피벗팅을 하면 임의의 비특이 행렬에 대해 분해가 항상 존재한다.
+
+LU의 계산량은
+
+$$
+\sum_{k=1}^{n-1} 2(n-k)^2 \approx \frac{2}{3}n^3
+$$
+
+이다. 같은 $A$로 $k$개의 우변 $\mathbf{b}$를 풀어야 할 때의 진짜 강점이 여기서 나온다 — LU 한 번($O(n^3)$) 후 각 전·후진 대입은 $O(n^2)$이므로 총 비용은 $O(n^3 + kn^2)$이다. Newton 방법이나 implicit ODE solver처럼 같은 Hessian/Jacobian 구조로 반복 풀이를 해야 하는 경우 LU 재활용이 핵심이다.
+
+## QR과 촐레스키 — 구조가 계산량을 결정한다
+
+LU가 일반 정방행렬을 다룬다면, QR과 촐레스키는 더 강한 구조를 가진 행렬을 더 싸게 분해한다.
+
+**QR 분해**는 열 벡터들을 그람-슈미트 과정으로 정규직교화하는 것과 같다. Thin QR $A = \hat{Q}\hat{R}$에서 최소 제곱 문제 $\min\|A\mathbf{x} - \mathbf{b}\|^2$는 $\hat{R}\mathbf{x} = \hat{Q}^T \mathbf{b}$로 환원된다. 정규방정식 $A^T A \mathbf{x} = A^T \mathbf{b}$를 직접 푸는 것과 달리, QR은 조건수를 제곱하지 않는다.
+
+$$
+\kappa(A^T A) = \kappa(A)^2 \quad \text{vs} \quad \kappa(\hat{R}) = \kappa(A)
+$$
+
+Classical Gram-Schmidt(CGS)는 수치 불안정하다. 직교성 손실이 $\epsilon_M \kappa(A)^2$에 달한다. Modified GS(MGS)는 투영을 순차 적용하여 이를 $\epsilon_M \kappa(A)$로 줄이고, 하우스홀더 반사는 초평면 반사
+
+$$
+H = I - \frac{2\mathbf{v}\mathbf{v}^T}{\mathbf{v}^T\mathbf{v}}
+$$
+
+를 이용해 $\epsilon_M$ 수준까지 낮춘다.
+
+<Callout type="note" title="트레이드오프: 안정성 vs 계산량">
+수치 안정성 순서: SVD ≈ Householder QR > Cholesky > PLU > CGS. 계산량 순서는 반대 방향이다. 안전할수록 느리다. 대칭 PD 행렬에서 촐레스키는 LU의 절반 비용($\frac{1}{3}n^3$)으로 최고 수준의 안정성을 제공한다.
+</Callout>
+
+**촐레스키 분해**는 대칭 양의 정부호(PD) 행렬 $A = LL^T$를 구성한다. PD 조건이 Schur complement도 PD임을 보장하기 때문에 피벗팅이 필요 없다. 공분산 행렬 샘플링에서 $\Sigma = LL^T$로 분해한 뒤
+
+$$
+\mathbf{x} = \boldsymbol{\mu} + L\mathbf{z}, \quad \mathbf{z} \sim \mathcal{N}(\mathbf{0}, I)
+$$
+
+로 쓰면 스펙트럼 분해 경로보다 3배 빠르다. VAE의 reparameterization trick과 베이지안 최적화에서 촐레스키가 표준인 이유가 여기에 있다.
+
+## 스펙트럼 정리 — 대칭이 완전 대각화를 보장한다
+
+고유값 분해 $A = PDP^{-1}$는 행렬을 rank-1 연산의 합으로 분해한다. 대각화 가능 조건은 모든 고윳값에서 기하적 중복도 $m_g(\lambda)$가 대수적 중복도 $m_a(\lambda)$와 같아야 한다는 것이다. 일반 행렬에서는 이 조건이 성립하지 않을 수 있다. 실대칭 행렬에서는 **반드시** 성립한다.
+
+<Theorem kind="theorem" number="1" title="실대칭 행렬의 스펙트럼 정리">
+$A \in \mathbb{R}^{n \times n}$이 대칭($A = A^T$)이면, 직교 행렬 $Q$와 실수 대각 행렬 $\Lambda$가 존재하여
+
+$$
+A = Q \Lambda Q^T = \sum_{i=1}^n \lambda_i \mathbf{q}_i \mathbf{q}_i^T
+$$
+
+이때 $\lambda_i \in \mathbb{R}$이고 $\mathbf{q}_i$는 서로 정규직교다.
+</Theorem>
+
+<Proof>
+**고윳값의 실수성**: $A\mathbf{v} = \lambda \mathbf{v}$에서 $\mathbf{v}^H A \mathbf{v} = \lambda \|\mathbf{v}\|^2$이고, $A = A^T$이므로 $\mathbf{v}^H A \mathbf{v} = \bar{\lambda}\|\mathbf{v}\|^2$. 따라서 $\lambda = \bar{\lambda}$, 즉 $\lambda \in \mathbb{R}$.
+
+**다른 고윳값 → 직교**: $\lambda_1 \mathbf{v}_1^T \mathbf{v}_2 = (A\mathbf{v}_1)^T \mathbf{v}_2 = \mathbf{v}_1^T A \mathbf{v}_2 = \lambda_2 \mathbf{v}_1^T \mathbf{v}_2$. $\lambda_1 \neq \lambda_2$이면 $\mathbf{v}_1^T \mathbf{v}_2 = 0$.
+
+**귀납 구성**: 고윳값 $\lambda_1$과 정규 고유벡터 $\mathbf{q}_1$로부터 $U_1^T A U_1 = \operatorname{diag}(\lambda_1, B)$를 만들 수 있다. 대칭성에 의해 오프-대각 블록이 $\mathbf{0}$이 되고 $B$도 대칭이 된다. 귀납가정으로 $B = U_2 \Lambda_B U_2^T$를 조합하면 $A = Q\Lambda Q^T$. $\square$
+</Proof>
+
+스펙트럼 정리의 Rayleigh 원리
+
+$$
+\lambda_{\max} = \max_{\mathbf{x} \neq \mathbf{0}} \frac{\mathbf{x}^T A \mathbf{x}}{\mathbf{x}^T \mathbf{x}}
+$$
+
+는 AI 전반에 직접 나타난다. PCA에서 공분산 행렬의 최대 고유벡터가 분산 최대 방향인 이유, 그래프 Laplacian의 Fiedler value $\lambda_2$가 군집 구조를 측정하는 이유가 모두 이 원리에서 나온다.
+
+## Jordan Form과 수치 안정성의 경계
+
+대각화 조건이 성립하지 않는 결함(defective) 행렬에도 구조가 있다 — Jordan 표준형이다. 일반화된 고유벡터 사슬로부터 Jordan 블록이 자연스럽게 등장한다.
+
+$$
+J_k(\lambda) = \begin{pmatrix} \lambda & 1 & & \\ & \lambda & \ddots & \\ & & \ddots & 1 \\ & & & \lambda \end{pmatrix}
+$$
+
+블록 크기는 $\dim \ker(A - \lambda I)^j - \dim \ker(A - \lambda I)^{j-1}$의 수열로 유일하게 결정된다. Jordan form이 이론적으로 중요한 것은 행렬 함수 때문이다. 결함 행렬의 미분방정식 해 $e^{At}\mathbf{x}_0$에는 $t^j e^{\lambda t}$ 꼴의 다항 × 지수항이 나타나고, 이 구조를 Jordan form이 정확히 포착한다.
+
+그러나 Jordan form은 수치 계산에서 쓸 수 없다. $J_2(0)$에 $\epsilon = 10^{-8}$의 섭동을 가하면 고윳값이 $\pm\sqrt{\epsilon} = \pm 10^{-4}$으로 분리된다. 작은 섭동이 고윳값 구조를 완전히 바꿔버린다. 실무에서는 Schur 분해 $A = UTU^H$ (상삼각)이 수치 안정한 대체다.
+
+조건수 $\kappa_2(A) = \sigma_{\max}/\sigma_{\min}$는 데이터 섭동이 해에 얼마나 증폭되는지를 결정한다. 후방 안정 알고리즘의 전방 오차는
+
+$$
+\frac{\|\hat{\mathbf{x}} - \mathbf{x}\|}{\|\mathbf{x}\|} \leq C \cdot \kappa(A) \cdot \epsilon_M
+$$
+
+으로 한계 지어진다. 알고리즘이 아무리 정교해도 문제의 조건수 한계까지는 오차를 허용해야 한다. Hilbert 행렬처럼 $\kappa(A) \sim 10^{18}$인 경우, 배정밀도($\epsilon_M \approx 10^{-16}$)로 풀어도 유효숫자가 남지 않는다.
+
+## 정리
+
+- LU는 소거의 팩토링이다. 피벗팅으로 항상 존재하고, 같은 $A$에 대한 반복 풀이에서 $O(n^3 + kn^2)$의 재활용 이득을 준다.
+- QR은 조건수를 제곱하지 않는다. 최소 제곱 문제에서 정규방정식보다 수치적으로 안전하며, 하우스홀더 반사가 가장 안정적인 구현이다.
+- 촐레스키는 대칭 PD 행렬에서 피벗팅 없이 $\frac{1}{3}n^3$의 비용으로 풀린다. 공분산

@@ -1,0 +1,126 @@
+---
+title: "SVD는 왜 모든 행렬 분해의 황금 표준인가"
+description: "단위구가 타원체로 찌그러지는 기하학적 직관부터 Eckart-Young 저랭크 최적성, Randomized SVD의 확률론적 보장까지, SVD가 선형대수의 통합 언어가 되는 이유를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [svd, linear-algebra, pca, low-rank-approximation, randomized-algorithms]
+difficulty: advanced
+series:
+  slug: linear-algebra-deep-dive
+  title: Linear Algebra Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+행렬을 분해하는 방법은 여러 가지다. LU, QR, 고유값 분해 — 각각 목적이 다르고 제약이 있다. 그런데 SVD만은 정사각이든 직사각이든, 정칙이든 특이하든, **모든** 행렬에 존재하며 노름·랭크·역행렬·차원축소를 한 번에 준다. 어떻게 이것이 가능한가?
+
+## 단위구가 타원체로 찌그러진다
+
+SVD의 출발점은 기하다. 행렬 $A \in \mathbb{R}^{m \times n}$이 단위구 $S^{n-1}$에 작용하면 그 이미지는 언제나 **중심이 원점인 타원체**다. 이 타원체의 반지름이 특이값 $\sigma_i$이고, 반지름 방향이 우특이벡터 $\mathbf{v}_i$, 대응하는 출력 방향이 좌특이벡터 $\mathbf{u}_i$다.
+
+$$
+A \mathbf{v}_i = \sigma_i \mathbf{u}_i
+$$
+
+이를 행렬로 쓰면 $AV = U\Sigma$, 즉 $A = U\Sigma V^T$. $A^T A$가 대칭 PSD이므로 스펙트럼 정리에 의해 항상 직교 대각화 가능하고, 그 고유값이 $\sigma_i^2$다. 특이값이 항상 비음인 이유가 여기 있다 — $\|A\mathbf{x}\|^2 = \mathbf{x}^T A^T A \mathbf{x} \geq 0$.
+
+```
+     V^T                Σ                U
+ℝ^n ----> ℝ^n --(σ_i 확축)--> ℝ^m ----> ℝ^m
+(입력 회전)                          (출력 회전)
+```
+
+모든 선형 변환은 "입력 회전 → 축별 확대/축소 → 출력 회전"의 합성이다. SVD는 이 사실의 정확한 수학적 진술이다.
+
+## 특이값은 유일하지만 특이벡터는 아니다
+
+<Theorem kind="theorem" number="1" title="특이값 유일성">
+$A \in \mathbb{R}^{m \times n}$의 특이값 $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_p \geq 0$ ($p = \min(m,n)$)은 유일하다. 단, 특이벡터는 중복 특이값이 있을 때 대응 부분공간 내에서 임의의 정규직교 기저를 선택할 수 있다.
+</Theorem>
+
+<Proof>
+$\{\sigma_i^2\}$는 $A^T A$의 고유값 집합으로, 특성다항식의 근으로 유일 결정된다. 부호가 없으므로 $\sigma_i \geq 0$으로 유일하게 정해진다. 중복도 $\ell$인 특이값에 대해서는 $\ker(A^T A - \sigma^2 I)$가 $\ell$차원이며, 그 안에서 임의의 정규직교 기저가 유효한 특이벡터 집합이 된다. $\blacksquare$
+</Proof>
+
+특이값의 안정성도 주목할 만하다. 행렬 $A$를 $E$만큼 섭동했을 때 특이값 변화는 Weyl 부등식으로 제어된다:
+
+$$
+|\sigma_k(A + E) - \sigma_k(A)| \leq \|E\|_2
+$$
+
+고유값과 달리 비대칭 행렬에서도 Lipschitz-1 안정성이 보장된다. 이것이 수치 계산에서 SVD가 선호되는 근본 이유다.
+
+## Pseudoinverse와 최소 노름 최소 제곱
+
+역행렬이 없는 행렬에서 "최선의 해"를 구하는 문제가 있다. Moore-Penrose pseudoinverse $A^+ = V\Sigma^+ U^T$는 이 문제의 유일한 해답이다. $\Sigma^+$는 $\Sigma$의 0이 아닌 대각 성분을 역수로 바꾼 것이다.
+
+과결정 시스템 ($m > n$)에서 $A^+\mathbf{b}$는 $\|A\mathbf{x} - \mathbf{b}\|$를 최소화하는 최소 제곱 해고, 부족결정 시스템 ($m < n$)에서는 $\|A\mathbf{x} - \mathbf{b}\|$를 최소화하는 해 중 $\|\mathbf{x}\|$가 가장 작은 것이다. Rank-deficient 경우에는 두 조건을 동시에 만족한다.
+
+<Callout type="note" title="Tikhonov 정규화와의 연결">
+Ridge 해 $\mathbf{x}_\alpha = (A^T A + \alpha I)^{-1} A^T \mathbf{b}$는 SVD로 쓰면 각 $i$번째 성분에 $\sigma_i / (\sigma_i^2 + \alpha)$를 곱한다. $\alpha \to 0$이면 $\sigma_i > 0$인 성분에서 $1/\sigma_i$로 수렴하고, $\sigma_i = 0$인 성분은 0으로 유지된다 — 정확히 $A^+$다. Tikhonov 정규화는 작은 특이값에서 조건수 폭발을 막는 완충재다.
+</Callout>
+
+## Eckart-Young: 저랭크 근사의 최적성
+
+$A = \sum_i \sigma_i \mathbf{u}_i \mathbf{v}_i^T$에서 앞 $k$항만 남긴 Truncated SVD $A_k$는 rank-$k$ 근사 중 최선이다.
+
+$$
+\min_{\operatorname{rank}(B) \leq k} \|A - B\|_2 = \sigma_{k+1}, \qquad \min_{\operatorname{rank}(B) \leq k} \|A - B\|_F = \sqrt{\sum_{i > k} \sigma_i^2}
+$$
+
+두 노름에서 최적해가 **같은** $A_k$라는 점이 핵심이다. Mirsky의 일반화는 더 강하다: 2-norm, Frobenius, nuclear norm을 포함한 **모든 유니타리 불변 노름**에서 $A_k$가 동시에 최적이다. PCA의 $k$-차원 투영이 데이터 손실을 최소화하는 이유, 이미지 압축에서 상위 $k$ 특이값을 남기는 이유가 전부 이 정리에서 나온다.
+
+PCA의 경우 이 최적성은 두 가지 얼굴을 가진다 — 분산 최대화와 재구성 오차 최소화. 피타고라스 항등식 $\|\mathbf{x}\|^2 = \|\hat{\mathbf{x}}\|^2 + \|\mathbf{x} - \hat{\mathbf{x}}\|^2$의 합산이 두 목적함수를 동등하게 만든다. 공분산 행렬의 고유벡터 = 데이터 행렬의 우특이벡터 = 분산 최대화 방향 = 재구성 오차 최소화 방향. 셋이 하나다.
+
+## Randomized SVD: 확률이 정확도를 보장한다
+
+$m, n \gg 10^4$에서 full SVD의 $O(\min(mn^2, m^2n))$ 복잡도는 감당하기 어렵다. Halko-Martinsson-Tropp (2011)의 Randomized SVD는 이 문제를 $O(mnk)$로 해결한다.
+
+핵심 아이디어는 두 단계다.
+
+1. **Range finder**: 랜덤 Gaussian 행렬 $\Omega \in \mathbb{R}^{n \times (k+p)}$로 $Y = A\Omega$를 만들고 QR 분해로 $A$의 치역에 대한 근사 정규직교 기저 $Q$를 얻는다.
+2. **소규모 SVD**: $B = Q^T A$는 $(k+p) \times n$의 작은 행렬이다. 여기서 SVD를 수행하고 $Q$를 곱해 복원한다.
+
+오차 보장은 확률론적이다:
+
+$$
+\mathbb{E}\|A - QQ^T A\|_F \leq \left(1 + \frac{k}{p-1}\right)^{1/2} \sqrt{\sum_{j > k} \sigma_j^2}
+$$
+
+$p = 10$ 정도의 oversampling이면 Eckart-Young 최적 오차의 몇 배 이내로 들어온다. 스펙트럼이 완만히 감소하는 행렬에서는 power iteration $(AA^T)^q A\Omega$로 큰 특이값을 지수적으로 부각시켜 정확도를 높인다.
+
+<Aside label="왜 Gaussian이 작동하는가">
+$\Omega$의 열이 Gaussian이면 $V^T\Omega$도 Gaussian이다 (직교 불변성). $A$의 상위 $k$ 좌특이벡터들의 선형 결합을 랜덤으로 샘플링하는 셈이므로, 오버샘플링 $p$개가 추가될수록 중요한 방향을 빠짐없이 포착할 확률이 지수적으로 오른다.
+</Aside>
+
+## 정리
+
+- SVD $A = U\Sigma V^T$는 단위구 → 타원체 변환에서 직접 유도된다. 특이값은 유일하고, 항상 비음이며, Weyl 부등식으로 섭동에 안정적이다.
+- Pseudoinverse $A^+ = V\Sigma^+ U^T$는 역행렬이 없어도 "최소 노름 최소 제곱" 해를 유일하게 정의한다.
+- Eckart-Young 정리에 의해 Truncated SVD는 모든 유니타리 불변 노름에서 동시에 최적의 저랭크 근사다. PCA는 이 최적성의 데이터 분석 버전이다.
+- Randomized SVD는 $O(mnk)$ 복잡도로 확률론적으로 보장된 근사를 제공한다. 실무 파라미터 $p = 10, q = 2$이면 대부분의 경우 충분하다.
+
+SVD가 선형대수의 황금 표준인 이유는 하나다 — 다른 모든 분해가 "특별한 경우에만 작동할 때" SVD는 항상 작동하고, 그 작동의 결과가 기하·대수·확률 세 언어 모두로 해석된다.
+
+<Reference
+  title="Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions"
+  authors="Halko, N., Martinsson, P. G., and Tropp, J. A."
+  year={2011}
+  venue="SIAM Review"
+  url="https://epubs.siam.org/doi/10.1137/090771806"
+/>
+
+<Reference
+  title="The Approximation of One Matrix by Another of Lower Rank"
+  authors="Eckart, C. and Young, G."
+  year={1936}
+  venue="Psychometrika"
+  url="https://link.springer.com/article/10.1007/BF02288367"
+/>

@@ -1,0 +1,94 @@
+---
+title: "선형대수의 모든 정리는 왜 그렇게 많은 곳에서 다시 나타나는가"
+description: "벡터공간 공리부터 쌍대공간까지, '추상화 한 번으로 무한히 많은 객체를 동시에 다룬다'는 선형대수의 핵심 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [linear-algebra, vector-space, basis, rank-nullity, dual-space]
+difficulty: advanced
+series:
+  slug: linear-algebra-deep-dive
+  title: Linear Algebra Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+신경망의 파라미터 공간, Word2Vec의 embedding, Attention의 $Q/K/V$ projection, Backprop의 gradient — 이것들은 표면적으로 전혀 다른 대상처럼 보인다. 그런데 선형대수는 이것들을 모두 **동일한 공리 체계** 위에서 다룬다. 왜 가능한가?
+
+## 추상화의 출발: 8개 공리
+
+선형대수의 핵심은 벡터공간이다. 그런데 벡터공간을 "크기와 방향을 가진 양"으로 정의하는 순간, 연속함수나 행렬은 배제된다. 진짜 정의는 다르다.
+
+집합 $V$와 체 $\mathbb{F}$에 대해 덧셈 $+: V \times V \to V$와 스칼라곱 $\cdot: \mathbb{F} \times V \to V$가 8개 공리를 만족하면 $V$는 **$\mathbb{F}$-벡터공간**이다. 덧셈 4개(결합·교환·영원·역원)와 스칼라곱 4개(결합·단위원·두 분배법칙). 이 8개가 전부다.
+
+$$\boxed{V \text{는 }\mathbb{F}\text{-벡터공간} \iff (V, +) \text{ 아벨군} + \mathbb{F}\text{-스칼라곱이 8공리 만족}}$$
+
+$\mathbb{R}^n$, 연속함수 공간 $C[a,b]$, 다항식 공간 $\mathbb{R}[x]$, 행렬 공간 $\mathbb{R}^{m \times n}$ — 이 네 가지는 표현 형식이 완전히 다르지만 모두 8공리를 만족한다. **공리를 만족하는 순간, 선형대수의 모든 정리가 자동으로 적용된다.** SGD 갱신식 $\theta \leftarrow \theta - \eta \nabla L$이 수학적으로 타당한 이유는 $\theta \in \mathbb{R}^N$이 벡터공간이기 때문이다. Multi-task 손실 $L = \alpha L_1 + \beta L_2$가 합성 가능한 이유는 손실함수들이 함수공간의 원소로서 벡터공간 연산을 허용하기 때문이다.
+
+<Callout type="note" title="영벡터와 역원의 유일성">
+영벡터와 덧셈 역원은 공리에서 유도되는 파생 성질이다. $\mathbf{0}_1, \mathbf{0}_2$가 모두 영벡터라 하면 $\mathbf{0}_1 = \mathbf{0}_1 + \mathbf{0}_2 = \mathbf{0}_2$. 또한 $0 \cdot \mathbf{v} = \mathbf{0}$과 $(-1) \cdot \mathbf{v} = -\mathbf{v}$도 S4 분배법칙과 A4에서 유도된다. 8공리가 전제이고 나머지는 귀결이다.
+</Callout>
+
+## 차원: 기저 선택에 무관한 불변량
+
+벡터공간의 **기저**는 공간을 생성하면서 선형독립인 최소 집합이다. 기저가 있으면 모든 원소가 고유한 좌표로 표현된다. 그런데 여기서 자명하지 않은 질문이 생긴다. 기저를 고르는 방법은 무수히 많은데, **모든 기저가 같은 크기를 가지는가?**
+
+이를 보증하는 것이 Steinitz Exchange Lemma다.
+
+<Theorem kind="theorem" number="1" title="차원의 유일성">
+유한차원 벡터공간 $V$의 임의의 두 기저는 같은 크기를 가진다.
+</Theorem>
+
+<Proof>
+$\mathcal{B}_1$과 $\mathcal{B}_2$가 두 기저라 하자. $\mathcal{B}_1$이 $V$를 생성하고 $\mathcal{B}_2$가 선형독립이므로 Steinitz에 의해 $|\mathcal{B}_2| \leq |\mathcal{B}_1|$. 역방향으로도 같은 논리를 적용하면 $|\mathcal{B}_1| \leq |\mathcal{B}_2|$. 따라서 $|\mathcal{B}_1| = |\mathcal{B}_2|$. $\square$
+</Proof>
+
+이 정리 덕분에 **차원(dimension)이 well-defined**된다. "300차원 embedding"이라는 표현이 모호하지 않은 이유, VAE의 잠재 차원이 의미를 가지는 이유, PCA의 주성분 개수가 데이터의 "유효 차원"을 나타내는 이유 — 전부 여기서 온다.
+
+## 선형변환: 행렬이 어디서 나오는가
+
+선형변환 $T: V \to W$는 덧셈과 스칼라곱을 보존하는 사상이다. 기저 $\mathcal{B}$를 고정하면 모든 $\mathbf{v} = \sum x_i \mathbf{e}_i$에 대해 선형성으로
+
+$$T(\mathbf{v}) = \sum x_i T(\mathbf{e}_i).$$
+
+$T$는 기저벡터의 상 $T(\mathbf{e}_i)$만 알면 완전히 결정된다. 이 상들을 $W$의 기저로 전개한 계수들을 모은 것이 **행렬 표현** $[T]_{\mathcal{C}\mathcal{B}}$다. 합성 $S \circ T$의 행렬은 $[S \circ T] = [S] \cdot [T]$로 행렬곱에 대응한다 — 행렬곱의 정의는 임의의 약속이 아니라 선형변환 합성의 강제된 귀결이다.
+
+좌표계를 바꾸면 같은 $T$가 다른 행렬 $P^{-1}AP$로 표현된다. 유사행렬은 다른 기저로 표현된 같은 추상 선형변환이다. Representation learning은 곧 "더 좋은 기저를 찾는 일"이고, PCA와 autoencoder는 좌표 변환 $P$를 직접 학습한다.
+
+## Rank-Nullity: 차원의 보존 법칙
+
+선형변환 $T: V \to W$는 입력 공간을 두 부분으로 쪼갠다. $T$가 0으로 보내는 방향들의 집합 $\ker T$와, 실제로 도달 가능한 출력들의 집합 $\text{im}\, T$.
+
+$$\boxed{\dim(\ker T) + \dim(\text{im}\, T) = \dim V}$$
+
+"잃어버린 차원(kernel)"과 "보존된 차원(image)"의 합이 원래 차원이다. 이는 차원의 에너지 보존과 같다.
+
+신경망 손실 Hessian $H$에서 $\ker H$의 방향은 2차 근사에서 손실이 변하지 않는 방향이다. 과매개변수화된 신경망에서 $\dim(\ker H) \gg 0$이라는 관찰은 이 정리의 직접적 응용이다. LoRA의 $\Delta W = BA$ ($B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times d}$)에서 rank-nullity로 $\dim(\ker \Delta W) \geq d - r$이 보장된다 — "$d - r$차원만큼은 변경되지 않음"이 rank 제약의 기하학적 의미다.
+
+## 4개 기본 부분공간과 쌍대공간
+
+$A \in \mathbb{R}^{m \times n}$은 정의역 $\mathbb{R}^n$과 공역 $\mathbb{R}^m$ 각각을 두 부분공간으로 직교 분해한다.
+
+$$\mathbb{R}^n = \text{Row}(A) \oplus \text{Null}(A), \qquad \mathbb{R}^m = \text{Col}(A) \oplus \text{Null}(A^\top)$$
+
+$A$는 $\text{Row}(A)$를 $\text{Col}(A)$로 동형으로 보내고, $\text{Null}(A)$는 $\mathbf{0}$으로 보낸다. Least Squares $\min \|A\mathbf{x} - \mathbf{b}\|^2$의 해는 $\mathbf{b}$를 $\text{Col}(A)$로 직교투영한 것이고, 잔차는 $\text{Null}(A^\top)$에 놓인다.
+
+이 구조의 끝에는 **쌍대공간** $V^* = \mathcal{L}(V, \mathbb{F})$이 있다. 벡터를 스칼라로 보내는 선형 사상들의 공간이다. 선형변환 $T: V \to W$는 쌍대공간 사이의 사상 $T^*: W^* \to V^*$를 역방향으로 유도하고, $[T^*] = [T]^\top$이다. Backprop의 vector-Jacobian product $v^\top J$가 곧 쌍대사상 $T^*$이고, 이것이 gradient가 역방향으로 흐르는 이유다.
+
+<Callout type="note" title="트레이드오프: V ≅ V*는 자연스럽지 않다">
+유한차원에서 $V$와 $V^*$는 동형이지만, 이 동형은 기저 선택에 의존한다. 내적을 고정해야 Riesz 표현정리로 자연 동형 $\mathbf{w} \mapsto \langle \mathbf{w}, \cdot \rangle$을 얻는다. 내적이 바뀌면 gradient의 표현도 달라진다 — Fisher 계량으로 내적을 교체하면 $F^{-1} \nabla L$이 Natural Gradient가 되는 이유가 바로 여기다.
+</Callout>
+
+## 정리
+
+- 8개 공리를 만족하는 집합이면 선형대수의 모든 정리가 자동으로 적용된다. 수벡터·함수·행렬이 같은 틀 안에 있는 이유다.
+- 차원은 기저 선택에 무관한 불변량이다. Steinitz Exchange Lemma가 이를 보증한다.
+- 행렬곱은 선형변환 합성의 귀결이고, 전치는 쌍대사상의 행렬 표현이다.
+- Rank-Nullity는 "잃어버린 차원 + 보존된 차원 = 원래 차원"이라는 보존 법칙이다.
+- Gradient가 쌍대공간의 원소라는 관점은 Natural Gradient와 Backprop의 수학적 기반을 통일한다.
+
+선형대수의 정리들이 신경망·통계·최적화에서 계속 등장하는 것은 우연이 아니다. 모든 것이 8개 공리에서 흘러나온다.

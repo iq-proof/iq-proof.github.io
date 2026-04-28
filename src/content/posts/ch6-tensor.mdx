@@ -1,0 +1,129 @@
+---
+title: "텐서란 무엇인가 — 좌표를 넘어선 다중선형 대상"
+description: "다차원 배열이라는 직관에서 벗어나 다중선형 사상으로 텐서를 재정의하고, Kronecker 곱·einsum·분해·신경망 가중치까지 하나의 언어로 통합한다."
+pubDate: 2026-04-28
+category: ai
+tags: [tensor, linear-algebra, einsum, tensor-decomposition, neural-network]
+difficulty: advanced
+series:
+  slug: linear-algebra-deep-dive
+  title: Linear Algebra Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+텐서를 "다차원 배열"로 배우면 가장 중요한 것을 놓친다. 배열은 특정 기저를 선택한 뒤의 성분 표현이고, 텐서는 그 선택 이전에 존재하는 대상이다. 좌표가 바뀌어도 텐서가 기술하는 물리적·기하적 관계는 변하지 않는다 — 이것이 핵심이다. 그렇다면 신경망의 가중치 행렬과 아인슈타인의 곡률 텐서는 같은 언어로 쓰일 수 있는가?
+
+## 텐서의 진짜 정의
+
+$(p, q)$-형 텐서는 다음 다중선형 사상이다.
+
+$$
+T: \underbrace{V^* \times \cdots \times V^*}_{p} \times \underbrace{V \times \cdots \times V}_{q} \to \mathbb{R}
+$$
+
+각 슬롯에 대해 개별적으로 선형이라는 뜻이다. 스칼라는 $(0,0)$, 벡터는 $(1,0)$, 선형연산자(행렬)는 $(1,1)$, 내적은 $(0,2)$이다. 이것들은 서로 다른 대상이 아니라 같은 정의의 특수 경우다.
+
+왜 $V^{**} \simeq V$인가? $v \in V$에 대해 $\hat{v}(\phi) = \phi(v)$로 정의하면 $V \to V^{**}$ 선형사상이 구성된다. 유한차원에서 이 사상은 단사이고 $\dim V = \dim V^{**}$이므로 전사다. 따라서 "벡터 = $(1,0)$-텐서"는 단순한 편의 표기가 아니라 엄밀한 동형사상이다.
+
+기저를 $\tilde{e}_i = S^j_i e_j$로 바꾸면 성분은 다음 규칙에 따라 변환된다.
+
+$$
+\tilde{T}^{i_1 \cdots i_p}_{j_1 \cdots j_q} = (S^{-1})^{i_1}_{k_1} \cdots (S^{-1})^{i_p}_{k_p}\, S^{l_1}_{j_1} \cdots S^{l_q}_{j_q}\, T^{k_1 \cdots k_p}_{l_1 \cdots l_q}
+$$
+
+반변 지표는 $S^{-1}$로, 공변 지표는 $S$로 변환된다. 이 법칙을 만족하는 대상이 텐서다 — 이것이 고전적 정의이고, 다중선형 사상이라는 현대적 정의와 동치다.
+
+## Kronecker 곱 — 텐서를 행렬에 가두기
+
+추상적인 텐서곱 공간 $V \otimes W$를 구체적인 행렬 연산으로 구현하는 장치가 Kronecker 곱이다. $A \in \mathbb{R}^{m \times n}$, $B \in \mathbb{R}^{p \times q}$에 대해
+
+$$
+A \otimes B = \begin{pmatrix} a_{11}B & \cdots & a_{1n}B \\ \vdots & & \vdots \\ a_{m1}B & \cdots & a_{mn}B \end{pmatrix} \in \mathbb{R}^{mp \times nq}
+$$
+
+혼합곱 공식 $(A \otimes B)(C \otimes D) = (AC) \otimes (BD)$이 성립하고, 고유값은 $\alpha_i \beta_j$의 모든 쌍이 된다.
+
+Kronecker 곱의 진가는 **vec 연산자**와 결합할 때 드러난다.
+
+<Theorem kind="theorem" number="1" title="vec-Kronecker 관계">
+차원이 맞는 행렬 $A, X, B$에 대해
+
+$$
+\text{vec}(AXB) = (B^T \otimes A)\,\text{vec}(X)
+$$
+</Theorem>
+
+<Proof>
+$(AXB)_{ij} = \sum_{k,l} A_{ik} X_{kl} B_{lj}$이므로 $\text{vec}(AXB)$의 $(j-1)m+i$번째 성분은 $\sum_{k,l} A_{ik} B_{lj} X_{kl}$이다. 한편 $B^T \otimes A$의 $((j-1)m+i,\,(l-1)n+k)$ 성분은 $(B^T)_{jl} A_{ik} = B_{lj} A_{ik}$이므로 일치한다. $\blacksquare$
+</Proof>
+
+이 공식 하나로 Sylvester 방정식 $AX + XB = C$가 선형계 $(I \otimes A + B^T \otimes I)\,\text{vec}(X) = \text{vec}(C)$로 환원된다. 양자역학에서 합성계를 $\mathcal{H}_A \otimes \mathcal{H}_B$로 기술하는 것도, 딥러닝의 K-FAC가 Fisher 행렬을 $A \otimes B$로 근사하는 것도 같은 언어다.
+
+## einsum — 수식과 코드 사이의 다리
+
+Einstein 합 규약은 "반복되는 지표 하나는 위, 하나는 아래에 나타나면 합을 취한다"는 단 하나의 규칙이다. NumPy의 `einsum`은 이를 그대로 구현한다.
+
+```python
+# 행렬곱
+C = np.einsum("ik,kj->ij", A, B)
+
+# Scaled Dot-Product Attention (배치·멀티헤드)
+S = np.einsum("bhid,bhjd->bhij", Q, K) / np.sqrt(d_k)
+O = np.einsum("bhij,bjhd->bihd", A_attn, V)
+```
+
+`->` 오른쪽에 없는 지표는 합산(축약)되고, 있는 지표는 유지된다. 3차 텐서의 축약, 배치 행렬곱, 멀티헤드 분리가 모두 같은 문법으로 표현된다.
+
+계산 순서도 중요하다. $A \in \mathbb{R}^{1000 \times 10}$, $B \in \mathbb{R}^{10 \times 1000}$, $C \in \mathbb{R}^{1000 \times 5}$의 연쇄곱에서 $(AB)C$는 약 $1.5 \times 10^7$ FLOPs, $A(BC)$는 약 $10^5$ FLOPs로 100배 이상 차이가 난다. `einsum(optimize=True)`는 이 최적 경로를 자동으로 탐색한다.
+
+## 텐서 분해 — SVD를 고차원으로
+
+행렬 SVD가 2차 텐서에 대한 완전한 이론을 제공하듯, 고차 텐서에도 분해가 필요하다. 그러나 3차 이상에서는 상황이 근본적으로 달라진다.
+
+**CP 분해**는 텐서를 rank-1 텐서의 합으로 표현한다.
+
+$$
+T_{ijk} \approx \sum_{r=1}^R \lambda_r\, a_{ir} b_{jr} c_{kr}
+$$
+
+Kruskal 조건 $k_A + k_B + k_C \ge 2R + 2$가 만족되면 분해가 본질적으로 유일하다. SVD와 달리 회전 불변성이 없어 오히려 해석 가능성이 높다.
+
+**Tucker 분해**는 코어 텐서 $\mathcal{G}$와 인자 행렬 $U_n$으로 구성된다. HOSVD는 각 모드의 unfolding 행렬에 SVD를 적용해 직교 인자를 구한다.
+
+**Tensor Train**은 고차 텐서를 3차 텐서들의 사슬로 표현한다.
+
+$$
+T_{i_1 i_2 \cdots i_N} = \sum_{\alpha_1, \ldots, \alpha_{N-1}} G_1(i_1, \alpha_1)\, G_2(\alpha_1, i_2, \alpha_2) \cdots G_N(\alpha_{N-1}, i_N)
+$$
+
+전체 텐서 저장은 $I^N$이지만 TT는 $N I r^2$으로 $N$에 선형이다. 차원의 저주를 정면 돌파하는 구조다.
+
+<Callout type="note" title="분해 선택의 트레이드오프">
+CP는 해석 가능성과 유일성을 위해, Tucker는 각 모드의 독립적 압축을 위해, TT는 고차원 효율을 위해 존재한다. 텐서 랭크 결정은 NP-hard(Håstad 1990)이므로 세 방법 모두 근사 알고리즘에 의존하고, ALS 기반 반복법은 전역 최적을 보장하지 않는다.
+</Callout>
+
+## 신경망은 텐서 수축 그래프다
+
+여기서 모든 것이 연결된다. FC 계층 $Y = XW^T$, 컨볼루션 $O[c_o, y, x] = \sum_{c_i, k_y, k_x} K[c_o, c_i, k_y, k_x] \cdot I[c_i, y+k_y, x+k_x]$, Attention의 $QK^T$, LSTM의 4-게이트 행렬 — 모두 텐서 축약이다.
+
+FC 계층의 SVD 압축 $W \approx U_r \Sigma_r V_r^T$은 파라미터를 $mn$에서 $r(m+n)$으로 줄인다. 컨볼루션 커널 $K \in \mathbb{R}^{C_o \times C_i \times k \times k}$의 Tucker 분해는 "$1 \times 1$ conv → $k \times k$ conv → $1 \times 1$ conv" 세 단계로 구현되며, 이는 depthwise-separable의 일반화다. GPT-3의 파라미터 수 $\approx 12 d^2 L = 12 \times (1.2 \times 10^8) \times 96 \approx 1.7 \times 10^{11}$도 텐서 shape에서 바로 계산된다.
+
+역전파도 텐서 연산이다. $Y = XW$에서 $\partial L / \partial Y = G$가 주어지면 $\partial L / \partial W = X^T G$, $\partial L / \partial X = G W^T$ — 둘 다 forward와 같은 복잡도의 텐서 수축이다. 리버스 모드 자동미분의 본질은 VJP(vector-Jacobian product)를 Jacobian을 명시적으로 구성하지 않고 수행하는 것이다.
+
+<Aside label="통합의 관점">
+BatchNorm, LayerNorm, GroupNorm은 모두 "어떤 축에서 평균과 분산을 계산하는가"의 차이다. einsum 표기로 보면 이들은 같은 연산의 다른 인수 조합이다. 신경망을 텐서 수축 그래프로 보는 순간, 계층의 종류는 구분이 아닌 연속 스펙트럼이 된다.
+</Aside>
+
+## 정리
+
+- 텐서는 다차원 배열이 아니라 좌표변환 불변의 다중선형 사상이다. 배열은 기저를 선택한 뒤의 성분 표현이다.
+- Kronecker 곱과 vec 연산자는 텐서 방정식을 행렬 선형계로 환원한다. `vec(AXB) = (B^T ⊗ A) vec(X)` 한 줄이 Sylvester 방정식부터 K-FAC까지를 잇는다.
+- einsum은 반복 지표 규칙 하나로 행렬곱, attention, convolution을 통일한다. `optimize=True`는 경로 최적화까지 처리한다.
+- CP는 해석을, Tucker는 유연성을, TT는 고차원 효율을 위해 존재한다. 셋 모두 근사 알고리즘이며 전역 최적을 보장하지

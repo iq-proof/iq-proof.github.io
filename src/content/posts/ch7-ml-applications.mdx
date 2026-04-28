@@ -1,0 +1,152 @@
+---
+title: "Transformer의 선형대수 — 회전, 정규화, 스펙트럼이 만나는 곳"
+description: "Attention의 √d_k 스케일링부터 RoPE의 회전 행렬, Spectral Normalization의 Lipschitz 제약, Random Matrix Theory의 반원 법칙까지 — 현대 딥러닝 수학의 통합 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [transformer, attention, rope, spectral-normalization, random-matrix-theory]
+difficulty: advanced
+series:
+  slug: linear-algebra-deep-dive
+  title: Linear Algebra Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer는 "행렬 네 개와 softmax 하나"로 이루어진 기계다. 그런데 이 단순한 구조 위에 역전파의 VJP, 배치 정규화의 정사영, Lipschitz 제약, 위치 인코딩의 회전 군, 그리고 고차원 랜덤 스펙트럼 법칙이 켜켜이 쌓인다. 이 챕터의 여섯 주제가 공유하는 하나의 철학은 무엇인가?
+
+## 분산을 제어하라 — Attention과 역전파의 공통 언어
+
+Scaled dot-product attention의 핵심 수식은 다음과 같다.
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+$q, k$의 각 성분이 평균 0, 분산 1인 독립 난수라면 내적 $q \cdot k$의 분산은
+
+$$
+\text{Var}(q \cdot k) = \sum_{i=1}^{d_k} \text{Var}(q_i k_i) = d_k
+$$
+
+로 차원에 선형 비례한다. $\sqrt{d_k}$로 나누면 분산이 1로 돌아온다. 이 정규화가 없으면 softmax 입력이 커지면서 출력이 원-핫에 가까워지고, 야코비안
+
+$$
+\frac{\partial \text{softmax}(z)_i}{\partial z_j} = \text{softmax}(z)_i(\delta_{ij} - \text{softmax}(z)_j) \approx 0
+$$
+
+이 소멸한다 — 그래디언트가 죽는다.
+
+역전파도 같은 언어로 말한다. 행렬곱 $Y = XW$의 VJP는
+
+$$
+\bar{X} = \bar{Y} W^\top, \quad \bar{W} = X^\top \bar{Y}
+$$
+
+이고, Attention의 역방향은 $\bar{V} = A^\top \bar{O}$, $\bar{Q} = \bar{S} K / \sqrt{d_k}$, $\bar{K} = \bar{S}^\top Q / \sqrt{d_k}$로 전개된다. 리버스 모드 자동미분은 야코비안 $J$를 명시적으로 구성하지 않고 $J^\top \bar{y}$만 계산한다 — 파라미터 수 $\times 1$ 시간에 전체 그래디언트를 얻는 이유다.
+
+<Callout type="note" title="트레이드오프: 메모리 vs 계산">
+Attention backward는 $A \in \mathbb{R}^{S \times S}$를 저장해야 하므로 $O(S^2)$ 메모리가 필요하다. FlashAttention은 블록별 계산으로 $A$를 저장하지 않아 메모리를 줄이되, 재계산 비용이 추가된다. Gradient checkpointing은 이 원리의 일반화다 — $\sqrt{L}$개 체크포인트만 유지하면 메모리 $O(\sqrt{L} \cdot Bd)$, 재계산 비용 $O(L \cdot Bd)$.
+</Callout>
+
+## 정사영으로서의 정규화 — BatchNorm의 선형대수
+
+BatchNorm은 다음과 같이 정의된다.
+
+$$
+\hat{X}_{ij} = \frac{X_{ij} - \mu_j}{\sqrt{\sigma_j^2 + \epsilon}}, \quad Y_{ij} = \gamma_j \hat{X}_{ij} + \beta_j
+$$
+
+배치 벡터 $x \in \mathbb{R}^B$에 대해 정규화 연산을 기하학적으로 보면:
+
+1. $\mathbf{1}$-방향 성분 제거: $x \mapsto P_{\mathbf{1}^\perp} x$, 여기서 $P_{\mathbf{1}^\perp} = I - \frac{1}{B}\mathbf{1}\mathbf{1}^\top$
+2. 크기 표준화: 결과를 $\sqrt{B}$로 정규화
+
+$\hat{x}$는 항상 $\mathbf{1}^\perp$에 놓이며 노름이 $\sqrt{B}$다 — 즉 $(B{-}1)$차원 구 위의 점이다. $\gamma, \beta$는 이렇게 제거된 2개 자유도를 **특징별로 독립하여 복원**한다.
+
+역전파도 같은 구조를 반복한다. BN backward는
+
+$$
+\bar{X} = \frac{\gamma}{\sigma}\!\left(I - M_{\mathbf{1}} - M_{\hat{X}}\right)\bar{Y}
+$$
+
+형태로, 배치 축에서 $\mathbf{1}$ 방향과 $\hat{X}$ 방향을 **다시 정사영으로 빼낸다**. LayerNorm은 같은 연산을 특징 축에 적용한다는 점만 다르다 — 어느 축을 평균내는가의 차이다.
+
+## Lipschitz를 고정하라 — Spectral Normalization
+
+<Theorem kind="proposition" number="1" title="선형 함수의 Lipschitz 상수">
+$f(x) = Wx$에 대해 $\text{Lip}(f) = \sigma_{\max}(W) = \|W\|_2$.
+</Theorem>
+
+<Proof>
+$\|Wx - Wy\| = \|W(x-y)\| \le \|W\|_2 \|x-y\|$이므로 $\text{Lip}(f) \le \sigma_{\max}(W)$. 등호는 $x - y$를 최대 우특이벡터 방향으로 택하면 달성된다.
+</Proof>
+
+Spectral Normalization은 각 층의 가중치를 $W_{SN} = W / \sigma_{\max}(W)$로 치환해 망 전체를 1-Lipschitz로 만든다. $\sigma_{\max}$는 매 스텝 SVD 대신 **Power iteration** 한 번으로 $O(mn)$에 추정한다.
+
+$$
+v \leftarrow W^\top u / \|W^\top u\|, \quad u \leftarrow Wv / \|Wv\|, \quad \sigma \approx u^\top W v
+$$
+
+GAN에서 판별자가 1-Lipschitz를 만족하면 Kantorovich-Rubinstein 쌍대에 의해 Wasserstein-1 거리를 정확히 근사한다. Weight clipping이나 gradient penalty보다 **명시적이고 안정적**인 이유다.
+
+## 회전으로 위치를 인코딩하라 — RoPE
+
+Sinusoidal 방식은 위치 벡터를 임베딩에 **더한다**. RoPE는 다른 질문을 던진다: 쿼리와 키에 어떤 변환을 적용하면 내적이 **상대 위치만의 함수**가 되는가?
+
+답은 회전이다. $d/2$개의 주파수 $\theta_i = 10000^{-2i/d}$에 대해 블록 대각 회전 행렬을 정의하고,
+
+$$
+\langle R_m q,\, R_n k \rangle = q^\top R_m^\top R_n k = q^\top R_{n-m} k
+$$
+
+$R_m^\top R_n = R_{n-m}$이므로 내적은 상대 위치 $n - m$만의 함수가 된다. $R_m$은 직교행렬이므로 $\|R_m x\| = \|x\|$ — 쿼리·키의 노름은 위치에 무관하게 보존된다.
+
+주파수가 기하 수열을 이루므로 고주파 블록($i = 0$)은 주기 $2\pi$, 저주파 블록($i = d/2 - 1$)은 주기 $\sim 2\pi \times 10000$으로 다양한 시간 스케일을 동시에 커버한다. LLaMA, GPT-NeoX, Qwen이 RoPE를 채택한 이유다.
+
+<Aside label="긴 컨텍스트 확장">
+훈련 길이를 초과하는 추론 시 NTK-Aware Scaling은 고주파 블록은 그대로 두고 저주파 블록만 스케일해 extrapolation을 개선한다. YaRN은 여기에 temperature scaling을 더해 32K~100K 컨텍스트까지 확장한다.
+</Aside>
+
+## 랜덤한 행렬도 법칙을 따른다 — Random Matrix Theory
+
+$N \times N$ Wigner 행렬의 고유값을 $\sqrt{N}$으로 스케일하면, 성분 분포에 무관하게 경험적 분포가 다음 **반원 법칙**으로 수렴한다.
+
+$$
+\rho(\lambda) = \frac{1}{2\pi}\sqrt{4 - \lambda^2}, \quad \lambda \in [-2, 2]
+$$
+
+Sample 공분산 $\hat{\Sigma} = \frac{1}{n} XX^\top$ ($p/n \to c$)의 스펙트럼은 Marchenko-Pastur 분포를 따르며, 고유값 범위는 $\lambda_\pm = (1 \pm \sqrt{c})^2$다. $c$가 커질수록 스펙트럼이 0과 큰 값으로 양극화한다 — 데이터가 충분하지 않으면 공분산 추정이 심각하게 왜곡된다는 뜻이다.
+
+초기화 전략도 여기서 나온다. He 초기화 $W_{ij} \sim \mathcal{N}(0, 2/n_{\text{in}})$는 ReLU 네트워크에서 각 층의 출력 분산을 1로 유지해 Marchenko-Pastur 스펙트럼의 우측 edge를 고정한다. 훈련된 네트워크의 Hessian 스펙트럼은 0 근처의 벌크(MP 유사)와 소수의 큰 고유값 아웃라이어로 나뉜다 — 이 아웃라이어가 "학습된 방향"이며 flat minima 이론과 연결된다.
+
+## 정리
+
+- $\sqrt{d_k}$ 스케일링, BN의 정사영, SN의 Lipschitz 제약은 모두 **분산을 제어해 신호가 소멸하거나 폭발하지 않도록** 한다는 동일한 동기를 공유한다.
+- 리버스 모드 자동미분은 야코비안을 구성하지 않고 $J^\top \bar{y}$만 계산하는 선형대수 알고리즘이다.
+- RoPE는 직교군 $SO(2)^{d/2}$의 표현을 위치 인코딩에 활용해 내적이 상대 위치만의 함수가 되도록 설계한다.
+- Random Matrix Theory는 고차원 랜덤성 속에서 결정적인 스펙트럼 법칙을 발견하고, 이를 초기화·학습·일반화의 수학적 근거로 제공한다.
+
+7개 장을 관통하는 하나의 문장: **선형대수는 AI의 모국어이고, 그 문법은 분산의 보존이다**.
+
+<Reference
+  title="Attention Is All You Need"
+  authors="Vaswani et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
+/>
+
+<Reference
+  title="RoFormer: Enhanced Transformer with Rotary Position Embedding"
+  authors="Su et al."
+  year={2021}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2104.09864"
+/>
