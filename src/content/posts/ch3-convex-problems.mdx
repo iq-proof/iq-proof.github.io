@@ -1,0 +1,126 @@
+---
+title: "볼록 최적화는 왜 ML의 기반인가"
+description: "표준형의 전역 최솟값 보장부터 LP·QP·SDP 계층, 모델링 기법, DCP 자동 검증까지 — 볼록 최적화의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [convex-optimization, machine-learning, dcp, cvxpy, lasso]
+difficulty: advanced
+series:
+  slug: convex-optimization-deep-dive
+  title: Convex Optimization Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Logistic Regression은 왜 항상 수렴하는가? SVM은 왜 유일한 최적 분류 경계를 보장하는가? 반면 Neural Network은 왜 "운 좋게 잘 됐다"고밖에 말할 수 없는가? 이 질문들의 답은 모두 같은 곳에서 나온다 — **문제가 볼록인가 아닌가**.
+
+## 표준형과 전역 최솟값 보장
+
+볼록 최적화 문제의 표준형은 다음과 같다.
+
+$$
+\begin{align}
+\text{minimize} \quad & f_0(x) \\
+\text{subject to} \quad & f_i(x) \leq 0, \quad i = 1, \ldots, m \\
+& Ax = b
+\end{align}
+$$
+
+조건은 세 가지다. 목적함수 $f_0$가 볼록, 부등식 제약 $f_i$가 모두 볼록, 등식 제약이 반드시 **아핀형식** $Ax = b$여야 한다. 세 번째 조건이 가장 자주 간과된다. 비아핀 등식 제약 $h(x) = 0$은 가능 영역을 비볼록으로 만든다. 쌍곡선 $x_1 x_2 = 1$이 그 전형적 반례다.
+
+이 세 조건이 충족되면 가능 영역 $\mathcal{C}$는 자동으로 볼록 집합이 되고, 다음 정리가 성립한다.
+
+<Theorem kind="theorem" number="1" title="국소 최솟값 = 전역 최솟값">
+$x^*$가 볼록 최적화 문제의 국소 최솟값이면, $x^*$는 전역 최솟값이다.
+</Theorem>
+
+<Proof>
+귀류법으로 증명한다. $x^*$가 전역 최솟값이 아니라 가정하면, $\tilde{x} \in \mathcal{C}$가 존재해 $f_0(\tilde{x}) < f_0(x^*)$이다. 선분 $x(t) = (1-t)x^* + t\tilde{x}$, $t \in [0,1]$를 고려하자. 가능 영역이 볼록이므로 $x(t) \in \mathcal{C}$이고, 목적함수가 볼록이므로
+
+$$f_0(x(t)) \leq (1-t)f_0(x^*) + tf_0(\tilde{x}) < f_0(x^*)$$
+
+$t$가 충분히 작으면 $x(t) \in B(x^*, r)$이지만 $f_0(x(t)) < f_0(x^*)$이다. 이는 $x^*$가 국소 최솟값이라는 가정에 모순이다. $\square$
+</Proof>
+
+딥러닝이 어려운 이유는 정확히 이 정리가 성립하지 않기 때문이다. 비선형 활성화 함수는 가능 영역을 비볼록으로 만들고, 경사 하강은 국소 최솟값에 갇힌다.
+
+## 문제 계층: LP에서 SDP까지
+
+볼록 최적화 문제들 사이에는 포함 관계가 있다.
+
+```
+SDP ⊇ SOCP ⊇ QCQP ⊇ QP ⊇ LP
+```
+
+**LP(선형계획법)**는 목적함수와 제약이 모두 아핀이다. 최적해는 다면체의 꼭짓점 중 하나이고, Simplex 또는 내점법으로 다항시간에 풀린다.
+
+**QP(이차계획법)**는 목적함수가 이차($P \succeq 0$)이고 제약은 선형이다. SVM의 핵심 형태다.
+
+$$\min_{w,b,\xi} \frac{1}{2}\|w\|^2 + C\sum \xi_i \quad \text{s.t.} \quad y_i(w^T x_i + b) \geq 1 - \xi_i, \; \xi_i \geq 0$$
+
+**SOCP(이계원뿔 계획법)**는 노름 제약 $\|A_i x + b_i\|_2 \leq c_i^T x + d_i$를 다룬다. 불확실성 모델링에 강하다. 행렬 $A$에 오차 $\Delta A$가 있는 Robust LP는 자동으로 SOCP가 된다.
+
+**SDP(반정치 계획법)**는 행렬의 반정치성 $F(x) \succeq 0$을 제약으로 가진다. 표현력이 가장 높지만 계산 비용도 가장 크다($O(n^{3.5})$). 행렬 완성(핵 노름 최소화)이나 비볼록 문제의 SDP 완화가 여기에 속한다.
+
+<Callout type="note" title="트레이드오프">
+계층에서 위로 갈수록 표현력이 높아지지만 솔버 속도는 느려진다. 내 문제가 어느 계층에 속하는지 인식하는 것이 실용 최적화의 첫 단계다. SVM은 SDP로 풀 필요가 없고, 행렬 완성은 QP로 표현할 수 없다.
+</Callout>
+
+## 모델링: 비볼록을 볼록으로 재구성하는 기술
+
+실제 ML 문제는 깔끔한 표준형으로 주어지지 않는다. 절댓값, 최댓값, 스파시티 페널티 — 이것들을 표준 형태로 바꾸는 기술이 필요하다.
+
+**Epigraph Trick**: 비미분가능 함수 $\min_x f(x)$를 보조 변수 $t$로 처리한다.
+
+$$\min_{x, t} \; t \quad \text{s.t.} \quad f(x) \leq t$$
+
+Lasso의 $\|x\|_1$은 이 방식으로 $-t_i \leq x_i \leq t_i$라는 선형 제약으로 바뀐다.
+
+**볼록 완화**: 비볼록 목적을 볼록 상한으로 대체한다. 희소성 $\|x\|_0$을 직접 최소화하는 것은 NP-hard지만, $\|x\|_1$로 완화하면 볼록 QP가 된다. Compressed Sensing의 Basis Pursuit이 이 원리다. 행렬의 $\text{rank}$는 핵 노름 $\|X\|_*$으로 완화된다. 추천 시스템의 행렬 완성이 여기에 속한다.
+
+**Geometric Programming**: 멱함수(power law) 형태의 문제는 로그 변환 $y_i = \log x_i$로 볼록 문제가 된다. 단항식 $c \prod x_i^{a_i}$는 로그 공간에서 아핀이 되고, 다항식(포시노미얼)은 log-sum-exp로 변환된다. Log-sum-exp는 볼록함수이므로 전체 문제가 볼록 최적화로 바뀐다. 회로 설계의 게이트 사이징 문제가 이 형태다.
+
+## DCP: 볼록성의 자동 검증
+
+CVXPY의 핵심은 **DCP(Disciplined Convex Programming)**다. 수학적으로 볼록인 식을 작성하는 것만으로는 부족하다 — CVXPY가 볼록임을 *인식*할 수 있는 형태로 써야 한다.
+
+DCP는 각 atom의 곡률(convex, concave, affine)을 추적하고 조합 규칙을 재귀적으로 적용해 전체 식의 볼록성을 결정한다.
+
+핵심 조합 규칙은 다음과 같다.
+
+- convex + convex = convex
+- $c \geq 0$ × convex = convex
+- $c \leq 0$ × concave = convex  
+- 체인룰: $f$ 볼록, $g$ 단조증가이고 볼록 → $f \circ g$ 볼록
+
+```python
+x = cp.Variable(5)
+# norm(x,2) + sum(x**2) → convex + convex = convex ✓
+expr = cp.norm(x, 2) + cp.sum(x**2)
+
+# log(sum_squares(x)) → log(convex) → concave
+# minimize(concave)는 DCP 위반 ❌
+bad = cp.Problem(cp.Minimize(cp.log(cp.sum_squares(x))))
+print(bad.is_dcp())  # False
+```
+
+Lasso, Ridge, SVM, Logistic Regression, 포트폴리오 최적화 — 모두 `prob.is_dcp() == True`다. `is_dcp()`가 True이면 CVXPY는 문제를 자동으로 LP, QP, SOCP, SDP 중 적절한 계층으로 분류하고 전용 솔버로 전달한다.
+
+<Aside label="설계 철학">
+DCP는 "프로그래머가 볼록성을 증명하지 않아도 된다"는 목표로 설계됐다. 대신 프로그래머는 DCP 규칙에 맞는 표현을 찾아야 한다. 이 제약이 불편하게 느껴질 수 있지만, 그 대가로 전역 최솟값을 보장하는 알고리즘을 자동으로 얻는다.
+</Aside>
+
+## 정리
+
+- 볼록 최적화의 핵심은 단순하다 — 국소 최솟값이 전역 최솟값이다. 등식 제약이 아핀형식이어야 하는 이유도 여기서 나온다.
+- LP ⊂ QP ⊂ QCQP ⊂ SOCP ⊂ SDP 계층은 표현력과 계산 비용의 트레이드오프다. 문제의 구조를 인식하면 올바른 솔버를 선택할 수 있다.
+- 실제 문제는 Epigraph, 절댓값 선형화, L1 완화 같은 재구성 기법으로 표준 형태로 바꿀 수 있다.
+- DCP 규칙은 볼록성 검증을 자동화한다. `is_dcp() == True`는 전역 최솟값 보장의 필요조건이다.
+
+딥러닝이 어려운 이유는 이 체계 바깥에 있기 때문이다. 볼록 최적화를 이해하면, 그 바깥이 얼마나 복잡한 영역인지도 함께 보인다.

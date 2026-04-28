@@ -1,0 +1,134 @@
+---
+title: "볼록 함수의 세 가지 얼굴 — Jensen, Epigraph, Gradient"
+description: "볼록 함수를 정의하는 세 동치 조건부터 강볼록성·조건수·켤레 함수까지, 경사하강법의 수렴 보장이 어디서 오는지를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [convex-optimization, gradient-descent, hessian, conjugate-function]
+difficulty: advanced
+series:
+  slug: convex-optimization-deep-dive
+  title: Convex Optimization Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+볼록 함수에는 세 가지 등가 정의가 있다 — Jensen 부등식, Epigraph의 볼록성, 1차 조건. 수식은 달라 보이지만 같은 대상을 가리킨다. 왜 이렇게 여러 언어로 설명하는가? 그리고 이 중 어느 언어를 고르느냐가 실제 최적화 알고리즘의 수렴 보장 전체를 결정한다면?
+
+## 세 정의는 왜 동치인가
+
+첫 번째 언어는 **Jensen 부등식**이다.
+
+$$
+f(\lambda x + (1-\lambda)y) \leq \lambda f(x) + (1-\lambda)f(y), \quad \lambda \in [0,1]
+$$
+
+두 점을 이은 선분이 함수 그래프보다 위에 있다는 기하학적 직관이다. 두 번째 언어는 **Epigraph**다.
+
+$$
+\text{epi}(f) = \{(x, t) \in \mathbb{R}^n \times \mathbb{R} : f(x) \leq t\}
+$$
+
+$f$가 볼록이면 그 에피그래프는 볼록 집합이고, 역도 성립한다. 함수의 성질을 집합의 성질로 번역하는 다리다. 세 번째는 **1차 조건**이다.
+
+$$
+f(y) \geq f(x) + \nabla f(x)^T(y - x)
+$$
+
+$x$에서 그은 접선(1차 Taylor 근사)이 항상 함수의 하한을 제공한다. 이 세 조건이 동치임은 증명 가능하지만, 핵심은 동치라는 사실 자체다. 실제 계산에서는 1차 조건이 가장 유용하다 — 접선의 기울기만 알면 다른 모든 점의 함수값의 하한을 즉시 구할 수 있기 때문이다.
+
+<Aside label="볼록성의 귀결">
+볼록 함수에서는 국소 최솟값이 전역 최솟값이다. SVM이나 로지스틱 회귀의 손실함수가 볼록이면, 어디서 경사하강법을 시작하든 같은 해로 수렴한다.
+</Aside>
+
+## Hessian — 볼록성의 2차 언어
+
+미분 가능 함수라면 2차 조건이 추가된다.
+
+$$
+\nabla^2 f(x) \succeq 0 \quad \text{(양반정치, PSD)}
+$$
+
+모든 방향에서 곡률이 0 이상이라는 뜻이다. Log-Sum-Exp $f(x) = \log \sum_i e^{x_i}$를 예로 들면, $p_i = e^{x_i}/\sum_j e^{x_j}$ (softmax)라 할 때 Hessian은 다음과 같다.
+
+$$
+\nabla^2 f(x) = \text{diag}(p) - pp^T
+$$
+
+임의의 벡터 $v$에 대해:
+
+$$
+v^T \nabla^2 f(x) v = \sum_i p_i v_i^2 - \left(\sum_i p_i v_i\right)^2 \geq 0
+$$
+
+마지막 부등식은 Cauchy-Schwarz에서 나온다. Log-Sum-Exp는 볼록이고, 무한 번 미분 가능하며, Softmax 손실의 이론적 토대다.
+
+## 강볼록성과 조건수
+
+일반 볼록함수에서 한 발 더 나아가면 **$\mu$-강볼록(strongly convex)** 함수가 있다.
+
+$$
+f(y) \geq f(x) + \nabla f(x)^T(y-x) + \frac{\mu}{2}\|y-x\|^2
+$$
+
+접선 아래에 이차 하한이 추가된다. 이것이 중요한 이유는 경사하강법의 수렴 속도 때문이다.
+
+<Theorem kind="theorem" number="1" title="GD 수렴률">
+$f$가 $\mu$-강볼록이고 $L$-smooth일 때, 스텝 크기 $\alpha = 1/L$인 경사하강법은 다음 속도로 수렴한다.
+
+$$
+f(x^{(k)}) - f(x^*) \leq \left(1 - \frac{\mu}{L}\right)^k \bigl[f(x^{(0)}) - f(x^*)\bigr]
+$$
+</Theorem>
+
+<Proof>
+Descent Lemma($\alpha = 1/L$)에서 $f(x^+) \leq f(x) - \frac{1}{2L}\|\nabla f(x)\|^2$. 강볼록성에서 $\|\nabla f(x)\|^2 \geq 2\mu(f(x)-f(x^*))$이므로 $f(x^+) - f(x^*) \leq (1 - \mu/L)(f(x) - f(x^*))$. 귀납적으로 적용하면 증명이 완성된다.
+</Proof>
+
+수렴률을 결정하는 수는 $\kappa = L/\mu$ — **조건수**다. Ridge 회귀 $f(w) = \|Xw - y\|^2 + \lambda\|w\|^2$에서 Hessian은 $2X^TX + 2\lambda I$이고, 최소 고유값은 $2\lambda$, 최대 고유값은 $2\lambda_{\max}(X^TX) + 2\lambda$이므로 $\kappa = \lambda_{\max}(X^TX)/\lambda + 1$이다. $\lambda$를 키우면 조건수가 줄고, 수렴이 빨라지지만 정확도는 떨어진다. 이것이 정규화의 진짜 역할이다.
+
+## 볼록 연산의 안전 목록
+
+볼록성은 특정 연산 아래에서 보존된다. 이 규칙이 CVXPY 같은 볼록 최적화 라이브러리의 자동 검증(DCP) 기반이다.
+
+| 연산 | 조건 | 결과 |
+|:---|:---|:---|
+| 비음 가중합 $\sum w_i f_i$ | $w_i \geq 0$, $f_i$ 볼록 | 볼록 |
+| 포인트와이즈 상한 $\sup_\alpha f_\alpha$ | 각 $f_\alpha$ 볼록 | 볼록 |
+| 아핀 합성 $f(Ax + b)$ | $f$ 볼록 | 볼록 |
+| 스칼라 합성 $g(f(x))$ | $f$ 볼록, $g$ 볼록 증가 | 볼록 |
+
+Log-Sum-Exp가 볼록인 또 다른 증명 경로가 여기 있다. $g_p(x) = p^T x$ ($p \in \Delta_n$, 심플렉스 위의 점)는 선형 함수다. $\log \sum_i e^{x_i} = \sup_{p \in \Delta_n} p^T x$ 이므로, 선형 함수들의 상한 — 포인트와이즈 상한 규칙에 의해 즉시 볼록이다.
+
+<Callout type="note" title="트레이드오프">
+볼록 연산의 보존 규칙은 강력하지만 단방향이다. "곱"은 보존하지 않는다. 비음 볼록 함수 두 개의 곱이 볼록임을 보장하는 일반 정리는 없다. 신경망이 비볼록인 이유도 여기 있다 — 여러 층의 합성(composition)이 볼록성 보존 조건을 일반적으로 만족하지 않기 때문이다.
+</Callout>
+
+## 켤레 함수 — 기울기 언어로의 변환
+
+볼록 함수 이론의 가장 우아한 결과 중 하나는 **켤레 함수(conjugate function)**다.
+
+$$
+f^*(y) := \sup_x \left(y^T x - f(x)\right)
+$$
+
+$f^*$는 $f$를 "점들의 집합"이 아닌 "접선들의 집합"으로 다시 쓴 것이다. $y^T x - f(x)$는 $y$에 대해 선형이므로, 상한인 $f^*$는 항상 볼록이다 — $f$가 볼록이든 아니든.
+
+**Fenchel 부등식** $y^T x \leq f(x) + f^*(y)$는 항상 성립하고, 등호는 $y \in \partial f(x)$일 때 정확히 성립한다. 이것이 KKT 조건의 기하학적 토대다.
+
+닫히고 볼록인 $f$에 대해서는 $f^{**} = f$가 성립한다. Log-Sum-Exp와 음의 엔트로피 $-\sum p_i \log p_i$는 서로의 켤레 함수다 — 로지스틱 회귀의 손실함수와 확률 모델이 하나의 구조로 묶이는 이유다.
+
+## 정리
+
+- 볼록 함수의 세 정의(Jensen, Epigraph, 1차 조건)는 동치이며, 계산 맥락에 따라 골라 쓴다.
+- Hessian PSD ↔ 볼록, 최소 고유값 $\mu$ ↔ 강볼록성, 최대 고유값 $L$ ↔ Smoothness. 조건수 $\kappa = L/\mu$가 경사하강법의 수렴 속도를 결정한다.
+- 가중합, 상한, 아핀 합성은 볼록성을 보존한다. 이 규칙이 CVXPY DCP 검사기의 핵심이다.
+- 켤레 함수는 함수를 접선들의 집합으로 재해석하며, 쌍대 문제와 Proximal 알고리즘의 이론적 기반이 된다.
+
+다음 글에서는 이 함수 이론 위에 **제약 최적화 표준형**이 어떻게 세워지는지, 그리고 라그랑주 쌍대가 강볼록성 및 켤레 함수와 어떻게 연결되는지를 추적한다.

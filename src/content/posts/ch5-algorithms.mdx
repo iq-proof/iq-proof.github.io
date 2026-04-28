@@ -1,0 +1,148 @@
+---
+title: "경사하강법은 얼마나 빠른가 — 수렴 이론의 전체 지도"
+description: "L-smooth 볼록 함수의 O(1/k) 수렴부터 Nesterov 가속의 최적성, 뉴턴 방법의 이차 수렴, 분산 감소 기법의 선형 수렴까지 — 1차 최적화 이론의 핵심 정리를 하나의 흐름으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [convex-optimization, gradient-descent, nesterov, convergence, variance-reduction]
+difficulty: advanced
+series:
+  slug: convex-optimization-deep-dive
+  title: Convex Optimization Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+경사하강법은 현대 AI의 가장 기본적인 엔진이다. 그런데 "잘 수렴한다"는 직관 뒤에는 정확한 숫자가 있다. $O(1/k)$, $O(1/k^2)$, $(1 - \mu/L)^k$ — 이 수치들은 어디서 오는가? 그리고 왜 Nesterov 가속이 "더 이상 개선할 수 없는" 최적 알고리즘인가?
+
+## Descent Lemma — 모든 수렴 증명의 출발점
+
+경사하강법 수렴 이론의 첫 번째 벽돌은 **Descent Lemma**다. $f$가 L-smooth(그래디언트가 Lipschitz 연속)일 때, 학습률 $\eta = 1/L$로 한 스텝을 밟으면 함수값이 반드시 감소한다.
+
+$$
+f(x_{k+1}) \le f(x_k) - \frac{1}{2L}\|\nabla f(x_k)\|^2
+$$
+
+직관: $f$를 이차 포물면으로 위에서 눌러 근사하면, 그 근사 함수의 최솟값으로 이동하는 스텝 크기가 $1/L$이다. 이보다 크면 이차 근사 밖으로 나가 함수값이 오를 수 있다.
+
+이 부등식에서 볼록성을 추가하면 $O(1/k)$ 수렴이 나온다.
+
+<Theorem kind="theorem" number="1" title="L-smooth 볼록 수렴 (O(1/k))">
+$f$가 L-smooth이고 볼록이면, $\eta = 1/L$인 경사하강법은
+
+$$
+f(x_k) - f^* \le \frac{L\|x_0 - x^*\|^2}{2k}
+$$
+</Theorem>
+
+<Proof>
+Descent Lemma로부터 $\|x_{k+1} - x^*\|^2 \le \|x_k - x^*\|^2 - \frac{1}{L}(f(x_k) - f^*)$를 얻는다. 이를 $k$번 누적(telescoping)하면 $\sum_{i=0}^{k-1}(f(x_i) - f^*) \le L\|x_0 - x^*\|^2$. 함수값 수열이 단조 감소하므로 $k(f(x_k) - f^*) \le L\|x_0 - x^*\|^2$. □
+</Proof>
+
+강볼록성($\mu > 0$)이 추가되면 이 $O(1/k)$가 **지수 수렴**으로 도약한다. 매 스텝 오차가 $(1 - \mu/L)$ 배율로 줄어든다. 조건수 $\kappa = L/\mu$가 크면 이 인수가 1에 가까워져 수렴이 느려진다 — ill-conditioned 문제가 어려운 이유가 바로 여기 있다.
+
+## Nesterov 가속 — 1차 방법의 이론적 한계에 닿다
+
+볼록 함수에서 $O(1/k)$가 최선인가? 아니다. Nesterov(1983)는 **모멘텀 항 하나를 추가**해 $O(1/k^2)$를 달성했다.
+
+$$
+y_k = x_k + \frac{t_k - 1}{t_{k+1}}(x_k - x_{k-1}), \quad x_{k+1} = y_k - \frac{1}{L}\nabla f(y_k)
+$$
+
+여기서 $t_{k+1} = (1 + \sqrt{1 + 4t_k^2})/2$이고, 이 수열은 점근적으로 $t_k \sim k/2$로 성장한다. 핵심 통찰은 **현재 위치가 아닌 "예측 위치" $y_k$에서 그래디언트를 계산**한다는 것이다. Heavy Ball 모멘텀과의 차이가 바로 이 한 줄이고, 이것이 $O(1/k)$와 $O(1/k^2)$의 차이를 만든다.
+
+그렇다면 $O(1/k^2)$보다 더 빠른 1차 방법이 존재할 수 있는가?
+
+<Theorem kind="theorem" number="2" title="Nemirovski-Yudin 하한">
+L-smooth 볼록 함수 클래스에서, 모든 1차 알고리즘(그래디언트 정보만 사용)은
+
+$$
+\inf_{\text{alg}} \sup_{f} (f(x_k) - f^*) \ge \frac{3L\|x_0 - x^*\|^2}{32k^2}
+$$
+
+를 피할 수 없다.
+</Theorem>
+
+이 하한의 증명 아이디어는 **정보 전파 지연**이다. Tridiagonal 구조의 최악 함수를 설계하면, $k$번의 그래디언트 쿼리로는 최대 처음 $k$개 좌표에만 정보가 전파된다. 나머지 좌표에 대한 정보 부재가 $\Omega(1/k^2)$ 오차를 만든다.
+
+Nesterov 가속은 이 하한을 정확히 달성한다. 즉, **더 나은 1차 방법은 없다**. 더 빠른 수렴이 필요하다면 2차 정보(Hessian)가 필요하다.
+
+<Aside label="강볼록 하한">
+$\mu$-strongly convex L-smooth 함수에서 하한은 $(1 - \sqrt{\mu/L})^k$다. Nesterov는 이 경우에도 선형 수렴 인수를 $\sqrt{\kappa}$에만 의존하게 만들어 최적성을 달성한다. GD의 $\kappa$-의존성과 비교하면 조건수가 클수록 차이가 커진다.
+</Aside>
+
+## 뉴턴 방법 — 이차 수렴의 대가
+
+1차 방법의 한계를 넘으려면 Hessian $H = \nabla^2 f$를 활용해야 한다. 뉴턴 방법은 현재 위치에서 2차 테일러 근사를 최소화한다.
+
+$$
+x_{k+1} = x_k - [H(x_k)]^{-1} \nabla f(x_k)
+$$
+
+이 스텝은 이차형식에서는 단 한 번에 최솟값을 찾는다. 일반 함수에서는 최솟값 근방에서 **이차 수렴**을 달성한다 — 오차가 제곱되므로 한 자리씩이 아니라 두 자리씩 줄어든다.
+
+$$
+\|x_{k+1} - x^*\| \le \frac{L_H}{2m^2}\|x_k - x^*\|^2
+$$
+
+여기서 $L_H$는 Hessian의 Lipschitz 상수, $m$은 $H(x^*)$의 최소 고유값이다.
+
+<Callout type="warning" title="트레이드오프">
+이차 수렴은 강력하지만 **두 가지 대가**를 치른다. 첫째, Hessian 역행렬 계산은 $O(n^3)$이므로 대규모 신경망에는 적용 불가능하다. 둘째, 초기점이 최솟값에서 멀면 수렴 보장이 없다 — 감폭(damped) 뉴턴이나 백트래킹 라인 서치가 필요하다. 이 한계가 L-BFGS 같은 준뉴턴 근사 방법의 존재 이유다.
+</Callout>
+
+수렴 판정의 실용적 기준은 **Newton decrement** $\lambda(x) = \sqrt{\nabla f(x)^T H(x)^{-1} \nabla f(x)}$다. $\lambda(x) < 0.5$이면 이차 수렴 단계에 진입했다는 신호다.
+
+## SGD와 분산 감소 — 확률적 설정의 선형 수렴 회복
+
+신경망 학습은 $\min_x \frac{1}{n}\sum_{i=1}^n f_i(x)$ 형태의 합 최적화다. 전체 그래디언트 대신 하나의 $\nabla f_i$를 사용하는 SGD는 메모리 효율적이지만, 그래디언트 노이즈(분산 $\sigma^2$)가 수렴의 천장을 만든다.
+
+$$
+\mathbb{E}[f(x_k)] - f^* \le O\!\left(\frac{1}{\sqrt{k}}\right) + O(\sigma^2)
+$$
+
+두 번째 항이 문제다. 분산이 0이 아닌 한, SGD는 일정 오차 이하로 내려가지 않는다.
+
+SVRG(Stochastic Variance Reduced Gradient)는 이를 우회한다. 주기적으로 기준 그래디언트 $\tilde{g} = \nabla f(\tilde{x})$를 계산한 뒤, 매 스텝 보정된 그래디언트를 쓴다.
+
+$$
+v_k = \nabla f_i(x_k) - \nabla f_i(\tilde{x}) + \tilde{g}
+$$
+
+$\mathbb{E}_i[v_k] = \nabla f(x_k)$이므로 불편 추정량이고, $x_k \approx \tilde{x}$일 때 분산이 0에 가까워진다 — 수렴할수록 노이즈가 줄어드는 구조다. 결과적으로 strongly convex 설정에서 **결정론적 경사하강법과 같은 선형 수렴**을 회복한다.
+
+| 방법 | 수렴 속도 | 메모리 | 특이사항 |
+|:---|:---|:---|:---|
+| GD | $(1 - \mu/L)^k$ | $O(d)$ | 전체 그래디언트 필요 |
+| SGD | $O(1/\sqrt{k}) + O(\sigma^2)$ | $O(d)$ | 노이즈 하한 |
+| SVRG | $(1 - \mu/(5L))^k$ | $O(d)$ | 주기적 전체 그래디언트 |
+| SAGA | $(1 - \mu/(16nL))^k$ | $O(nd)$ | 모든 과거 그래디언트 저장 |
+
+## 정리
+
+- Descent Lemma($\eta = 1/L$) → 볼록 $O(1/k)$ → 강볼록 $(1-\mu/L)^k$: 모든 1차 수렴 증명의 공통 뼈대다.
+- Nesterov 가속은 $O(1/k^2)$를 달성하며, Nemirovski-Yudin 하한과 일치한다 — 이 이상의 1차 방법은 존재하지 않는다.
+- 뉴턴 방법은 최솟값 근방에서 이차 수렴하지만 $O(n^3)$ 비용이 따른다. 대규모 문제에서는 L-BFGS가 현실적 대안이다.
+- SGD의 $O(\sigma^2)$ 하한은 분산 감소 기법(SVRG, SAGA)으로 제거할 수 있으며, strongly convex 설정에서 선형 수렴을 회복한다.
+
+수렴 이론은 "이 알고리즘이 왜 이 학습률에서 잘 되는가"에 대한 사후 설명이 아니다. 이론이 먼저, 알고리즘이 그 다음이다.
+
+<Reference
+  title="A Method for Solving the Convex Programming Problem with Convergence Rate O(1/k²)"
+  authors="Nesterov, Y."
+  year={1983}
+  venue="Soviet Mathematics Doklady"
+  url="https://scholar.google.com/scholar?q=Nesterov+1983+convergence+rate+O(1/k2)"
+/>
+
+<Reference
+  title="Accelerating Stochastic Gradient Descent using Predictive Variance Reduction"
+  authors="Johnson, R. and Zhang, T."
+  year={2013}
+  venue="

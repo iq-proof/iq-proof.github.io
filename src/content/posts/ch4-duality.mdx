@@ -1,0 +1,140 @@
+---
+title: "Lagrangian 쌍대성은 왜 SVM을 가능하게 하는가"
+description: "Lagrangian에서 쌍대 함수를 정의하고, 약쌍대성과 강쌍대성의 차이, KKT 조건의 필요충분 역할, 그림자 가격의 경제 해석까지 — 쌍대 이론의 통일된 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [convex-optimization, lagrangian, kkt, svm, duality]
+difficulty: advanced
+series:
+  slug: convex-optimization-deep-dive
+  title: Convex Optimization Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+제약이 있는 최적화 문제를 보면 두 가지 선택이 있다 — 원 문제를 직접 풀거나, 쌍대 문제를 풀거나. SVM은 왜 쌍대를 선택했고, 그 덕분에 커널 트릭이 어떻게 가능해졌는가?
+
+## Lagrangian: 제약을 벌칙으로 흡수하기
+
+원 문제(primal)의 구조는 다음과 같다.
+
+$$
+\begin{aligned}
+&\text{minimize} \quad f_0(x) \\
+&\text{subject to} \quad f_i(x) \leq 0, \quad h_j(x) = 0
+\end{aligned}
+$$
+
+Lagrangian은 이 제약들을 벌칙 형태로 목적함수에 합산한다.
+
+$$
+L(x, \lambda, \nu) = f_0(x) + \sum_{i=1}^m \lambda_i f_i(x) + \sum_{j=1}^p \nu_j h_j(x)
+$$
+
+여기서 $\lambda_i \geq 0$은 부등식 제약에, $\nu_j \in \mathbb{R}$은 등식 제약에 대응하는 쌍대 변수다. **쌍대 함수** $g(\lambda, \nu) = \inf_x L(x, \lambda, \nu)$는 $x$에 대해 최솟값을 취한다. 고정된 $x$에서 $L$은 $(\lambda, \nu)$에 대해 아핀이므로, 이 아핀 함수들의 하한인 $g$는 항상 오목함수다 — 원 문제가 볼록이든 아니든.
+
+## 약쌍대성: 항상 성립하는 하한
+
+<Theorem kind="theorem" number="1" title="약쌍대성 (Weak Duality)">
+모든 원 문제에 대해 (볼록, 비볼록 상관없이) $d^* \leq p^*$ 가 성립한다. 여기서 $d^* = \sup_{\lambda \geq 0, \nu} g(\lambda, \nu)$이고 $p^*$는 원 문제의 최적값이다.
+</Theorem>
+
+<Proof>
+임의의 가능 해 $x$와 $\lambda \geq 0$에 대해, $f_i(x) \leq 0$이고 $h_j(x) = 0$이므로
+
+$$
+g(\lambda, \nu) \leq L(x, \lambda, \nu) = f_0(x) + \underbrace{\sum_i \lambda_i f_i(x)}_{\leq 0} + \underbrace{\sum_j \nu_j h_j(x)}_{= 0} \leq f_0(x)
+$$
+
+모든 가능한 $x$에 대해 성립하므로 $g(\lambda, \nu) \leq p^*$. 좌변을 최대화하면 $d^* \leq p^*$. $\square$
+</Proof>
+
+약쌍대성이 강력한 이유는 **볼록성을 요구하지 않는다**는 데 있다. 비볼록 문제에서도 쌍대 함수를 풀어 하한을 얻을 수 있고, 이 하한은 분기 한계(branch and bound) 알고리즘에서 탐색 공간 축소에 쓰인다. 단, $p^* - d^* > 0$이면 쌍대 문제만으로 원 문제의 정확한 해를 복원할 수 없다.
+
+## 강쌍대성과 Slater 조건
+
+$d^* = p^*$가 되려면 추가 조건이 필요하다. 볼록 문제에서 충분조건은 **Slater 조건**이다.
+
+**Slater 조건**: 부등식 제약을 *엄격히* 만족하는 내부점 $\tilde{x}$가 존재한다.
+
+$$
+f_i(\tilde{x}) < 0 \quad \forall i, \qquad h_j(\tilde{x}) = 0 \quad \forall j
+$$
+
+직관적으로는 "제약들이 너무 빡빡하게 모여 있지 않다"는 뜻이다. Slater 조건이 성립하면 분리 초평면 정리를 적용해 $d^* = p^*$를 증명할 수 있다 — 확장 집합 $A$와 이상적 목적함수 범위 집합 $B$가 서로 분리되고, 그 분리 초평면이 정확히 최적 쌍대 변수 $(\lambda^*, \nu^*)$가 된다.
+
+<Callout type="note" title="트레이드오프: 강쌍대성의 비용">
+Slater 조건은 충분조건이지만 필요조건은 아니다. 제약이 선형(아핀)이면 비엄격한 조건으로도 강쌍대성이 성립한다. 반면 Slater 조건을 위반하는 볼록 문제에서는 duality gap이 나타날 수 있다. 실제로 Slater 점을 명시적으로 찾기 어려운 경우도 있지만, SVM처럼 선형 분리 가능한 문제는 자연히 조건을 만족한다.
+</Callout>
+
+## KKT 조건: 최적성의 필요충분
+
+강쌍대성이 성립하는 볼록 문제에서, 최적해의 특성은 네 가지 **KKT 조건**으로 완전히 기술된다.
+
+1. **정류 조건** (stationarity): $\nabla f_0(x^*) + \sum_i \lambda_i^* \nabla f_i(x^*) + \sum_j \nu_j^* \nabla h_j(x^*) = 0$
+2. **원 가능성** (primal feasibility): $f_i(x^*) \leq 0$, $h_j(x^*) = 0$
+3. **쌍대 가능성** (dual feasibility): $\lambda_i^* \geq 0$
+4. **상보 느슨함** (complementary slackness): $\lambda_i^* f_i(x^*) = 0$
+
+볼록 문제에서 KKT는 **필요충분조건**이다. 비볼록 문제에서는 필요조건에 그친다 — KKT를 만족해도 전역 최적이 아닌 안장점일 수 있다. 상보 느슨함의 의미는 명확하다: $\lambda_i^* > 0$이면 제약이 활성(binding)이고, $f_i(x^*) < 0$이면 $\lambda_i^* = 0$이다. 비활성 제약은 최적해를 결정하는 데 아무 역할도 하지 않는다.
+
+## 쌍대 변수 = 그림자 가격 = SVM의 α
+
+강쌍대성이 성립하면 쌍대 변수는 구체적인 경제 의미를 갖는다. 파라미터화된 원 문제 $p(u, v)$에서 포락선 정리(envelope theorem)에 의해
+
+$$
+\frac{\partial p}{\partial u_i}\bigg|_{u=0} = -\lambda_i^*
+$$
+
+$\lambda_i^*$는 $i$번째 제약의 RHS를 1단위 완화할 때 최적값이 얼마나 개선되는가를 나타낸다. 이것이 **그림자 가격(shadow price)**이다. 활성 제약의 그림자 가격은 양수이고, 비활성 제약(여유 자원)의 그림자 가격은 0이다.
+
+이 해석이 SVM에서 α로 이어진다. Hard-margin SVM의 원 문제
+
+$$
+\min_{w,b} \frac{1}{2}\|w\|^2 \quad \text{s.t.} \quad y_i(w^\top x_i + b) \geq 1
+$$
+
+에 Lagrangian을 적용하고 $\partial L/\partial w = 0$, $\partial L/\partial b = 0$으로 정류 조건을 풀면
+
+$$
+w^* = \sum_{i=1}^n \alpha_i^* y_i x_i, \qquad \sum_{i=1}^n \alpha_i^* y_i = 0
+$$
+
+$w^*$를 Lagrangian에 대입하면 쌍대 문제가 도출된다.
+
+$$
+\max_\alpha \left[\sum_i \alpha_i - \frac{1}{2}\sum_{i,j} \alpha_i \alpha_j y_i y_j \, x_i^\top x_j\right], \qquad \alpha_i \geq 0, \quad \sum_i \alpha_i y_i = 0
+$$
+
+KKT 상보 느슨함에서 $\alpha_i^* > 0$이면 $y_i(w^{*\top} x_i + b^*) = 1$, 즉 마진 위에 정확히 놓인 점만 $w^*$ 계산에 기여한다 — 이것이 **support vector**다. 나머지는 $\alpha_i^* = 0$이므로 삭제해도 분류기가 변하지 않는다.
+
+쌍대 형식의 결정적 이점: 내적 $x_i^\top x_j$를 커널 $K(x_i, x_j)$로 교체해도 수식 구조가 변하지 않는다. 원 문제에서는 $d$차원의 $w$를 직접 구해야 하지만, 쌍대 문제에서는 $n$개의 $\alpha$만 최적화한다 — 특성 차원 $d$에 무관하게.
+
+<Aside label="통일된 구조">
+Lagrangian → 쌍대 함수 → 약쌍대성(항상) → Slater 조건 → 강쌍대성 → KKT 조건 → 그림자 가격 → SVM의 α. 이 챕터들은 별개의 주제가 아니라 하나의 사다리다. 각 단계는 이전 단계에서 추가 가정을 하나씩 붙여 더 강한 결론을 끌어낸다.
+</Aside>
+
+## 정리
+
+- **쌍대 함수** $g(\lambda, \nu) = \inf_x L(x, \lambda, \nu)$는 원 문제의 볼록성과 무관하게 항상 오목이다.
+- **약쌍대성** $d^* \leq p^*$는 모든 문제에서 성립하고, 비볼록 문제의 하한 계산에 쓰인다.
+- **Slater 조건**(엄격한 내부점 존재)은 볼록 문제에서 $d^* = p^*$ 강쌍대성의 충분조건이다.
+- **KKT 4조건**은 볼록 문제의 필요충분 최적성 조건이고, 상보 느슨함이 support vector를 정의한다.
+- **쌍대 변수는 그림자 가격**이다 — SVM에서는 각 표본의 분류기 기여도, 자원 배분에서는 제약의 한계 가치.
+
+쌍대 이론의 힘은 어렵게 보이는 원 문제를 더 다루기 쉬운 형태로 바꾸는 데 있지 않다. 원 문제의 구조를 다른 각도에서 볼 때 보이는 것들 — 어떤 제약이 binding인지, 어떤 표본이 결정적인지 — 을 수치로 꺼내 준다는 데 있다.
+
+<Reference
+  title="A Training Algorithm for Optimal Margin Classifiers"
+  authors="Boser, Guyon, Vapnik"
+  year={1992}
+  venue="COLT"
+  url="https://dl.acm.org/doi/10.1145/130385.130401"
+/>

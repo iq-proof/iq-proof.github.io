@@ -1,0 +1,122 @@
+---
+title: "볼록 집합이 최적화에 황금 티켓을 부여하는 이유"
+description: "선분 하나가 닫혀 있다는 조건이 어떻게 전역 최적 보장, 쌍대 이론, SVM, LP 꼭짓점 탐색까지 연결되는가를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [convex-optimization, convex-set, separating-hyperplane, extreme-point, svm]
+difficulty: advanced
+series:
+  slug: convex-optimization-deep-dive
+  title: Convex Optimization Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+볼록 최적화(convex optimization)의 모든 이론 — 전역 최적 보장, 강쌍대성, Simplex 방법, SVM의 유일해 — 은 하나의 기하적 조건에서 출발한다. "임의의 두 점을 잇는 선분이 집합 안에 있다." 왜 이 단순한 조건 하나가 그토록 강력한 결론들을 낳는가?
+
+## 선분이 닫혀 있다는 것의 의미
+
+집합 $C \subseteq \mathbb{R}^n$이 **볼록**이라는 것은 다음 조건 하나로 정의된다.
+
+$$
+\forall x, y \in C,\ \forall \lambda \in [0,1]:\ \lambda x + (1-\lambda)y \in C
+$$
+
+직관은 단순하다. 볼록 집합 안에 있는 두 점 사이를 직선으로 이어보면, 그 선분 전체가 집합 안에 머문다. 도넛이나 별 모양은 선분이 집합 밖을 뚫고 지나가므로 볼록이 아니다.
+
+이 정의에서 바로 따라오는 첫 번째 귀결은 **볼록 결합의 폐쇄성**이다. $k$개의 점 $x_1, \ldots, x_k \in C$와 $\theta_i \geq 0$, $\sum \theta_i = 1$에 대해 $\sum \theta_i x_i \in C$가 수학적 귀납법으로 성립한다. 볼록 집합은 "가중 평균에 닫혀 있다."
+
+실무에서 등장하는 볼록 집합들은 이 정의를 충족함을 직접 확인할 수 있다.
+
+| 집합 | 볼록 여부 | 핵심 이유 |
+|---|---|---|
+| 초평면 $\{a^\top x = b\}$ | ✓ | 아핀 집합 |
+| 반공간 $\{a^\top x \leq b\}$ | ✓ | 선형 부등식 |
+| 다면체 $\{Ax \preceq b,\ Cx = d\}$ | ✓ | 반공간의 교집합 |
+| 유클리드 볼 $\{\|x\| \leq r\}$ | ✓ | 삼각 부등식 |
+| PSD 콘 $\mathbb{S}^n_+$ | ✓ | 이차형식의 선형성 |
+
+Hard-margin SVM의 제약 집합 $\{w \mid y_i(w^\top x_i + b) \geq 1\}$은 반공간들의 교집합이므로 볼록 집합이다. 이것이 전역 최적 마진이 존재하는 이유다.
+
+## 볼록성을 보존하는 연산 — 복잡한 문제가 볼록으로 남는 방법
+
+볼록 집합이 등장하는 이유는 단순히 하나의 집합이 볼록이어서가 아니다. 볼록 집합은 여러 연산 아래서도 볼록성을 유지한다.
+
+**교집합**: $C_1, C_2$가 볼록이면 $C_1 \cap C_2$도 볼록이다. 임의의 개수의 교집합에서도 성립한다. 이것이 여러 제약을 동시에 가진 최적화 문제의 가능 영역이 볼록으로 유지되는 이유다 — 각 제약이 볼록 집합을 정의하면, 그 교집합도 볼록이다.
+
+**아핀 변환**: $f(x) = Ax + b$에 대해 $f(C)$와 $f^{-1}(D)$ 모두 볼록을 보존한다. 데이터 정규화 $x \mapsto (x - \mu)/\sigma$는 아핀 변환이므로, 전처리 후에도 볼록 문제로 유지된다.
+
+**Minkowski 합**: $C_1 + C_2 = \{x + y \mid x \in C_1, y \in C_2\}$도 볼록이다. 성분별로 볼록 결합이 합쳐지기 때문이다.
+
+반면 합집합 $C_1 \cup C_2$는 일반적으로 볼록을 파괴한다. $C_1 \subseteq C_2$ 또는 그 역의 포함 관계가 있을 때만 합집합이 볼록이다.
+
+<Callout type="note" title="왜 교집합은 보존되고 합집합은 파괴되는가">
+볼록성은 "선형 구조와 호환되는" 연산에 의해 보존된다. 두 조건을 동시에 만족하는 점들의 집합(교집합)은 여전히 선분에 닫혀 있다. 반면 "둘 중 하나"를 만족하는 합집합은 두 조각 사이에 구멍이 생길 수 있다.
+</Callout>
+
+앙상블 학습에서 $k$개 모델 예측의 가중 평균 $\sum \theta_i \hat{y}_i$는 볼록 포 $\text{conv}(\{\hat{y}_1, \ldots, \hat{y}_k\})$ 안에 있다. 손실 함수 $\ell$이 볼록이면 Jensen 부등식에 의해 앙상블의 손실이 개별 모델 손실의 평균 이하가 된다. 앙상블의 이론적 우월성은 볼록 집합의 성질이다.
+
+## 분리 초평면 — 볼록 집합을 가르는 울타리
+
+볼록 최적화 이론의 가장 강력한 기하 원리는 **분리 초평면 정리**다.
+
+<Theorem kind="theorem" number="1" title="분리 초평면 정리">
+$C_1, C_2 \subseteq \mathbb{R}^n$이 공집합이 아닌 볼록 집합이고 $C_1 \cap C_2 = \emptyset$이면, 두 집합을 분리하는 초평면 $\{a^\top x = b\}$가 존재한다:
+$$\forall x \in C_1:\ a^\top x \leq b, \quad \forall x \in C_2:\ a^\top x \geq b$$
+</Theorem>
+
+<Proof>
+Minkowski 차 $C = C_1 - C_2$를 정의하면 $C$는 볼록이고 $0 \notin C$이다. $0$과 $C$의 최근접 점 $z^* = \Pi_C(0)$이 존재하고, $a = -z^*$로 놓으면 임의의 $x \in C_1$, $y \in C_2$에 대해 $a^\top x \geq a^\top y + \|z^*\|^2 > a^\top y$가 성립한다. $b$를 두 집합의 중간값으로 잡으면 분리가 완성된다. $\square$
+</Proof>
+
+이 정리가 중요한 이유는 직접적인 응용이 세 가지나 되기 때문이다.
+
+**SVM의 유일해**: 두 클래스의 볼록 포가 서로소이면 분리 초평면이 존재한다. 목적함수 $\|w\|^2/2$가 강볼록이므로 최적 분리 초평면은 유일하다.
+
+**볼록 함수의 1차 조건**: 볼록 함수 $f$의 epigraph 경계에서 지지 초평면이 존재한다. 이것이 $f(y) \geq f(x) + \nabla f(x)^\top(y-x)$라는 1차 조건의 기하학적 의미이며, 미분불가능한 경우에는 subgradient의 존재 근거가 된다.
+
+**강쌍대성의 증명**: Slater 조건에서 강쌍대성을 증명할 때, primal 가능 집합과 "primal optimal보다 나은 영역"이 서로소 볼록 집합임을 확인한 뒤 분리 초평면 정리를 적용한다. 분리 초평면의 계수가 쌍대 변수 $(\lambda, \nu)$가 된다.
+
+## 볼록 콘 — 최적화 문제 클래스의 계층
+
+볼록 집합 중에서 "원점에서 방사되는" 특별한 구조, **볼록 콘**이 있다.
+
+$$\forall x_1, x_2 \in C,\ \forall \theta_1, \theta_2 \geq 0:\ \theta_1 x_1 + \theta_2 x_2 \in C$$
+
+비음수 직교체 $\mathbb{R}^n_+$, 이차 콘 $\{(x,t) \mid \|x\|_2 \leq t\}$, PSD 콘 $\mathbb{S}^n_+$ 모두 볼록 콘이며, 이 세 콘은 **쌍대 콘이 자기 자신**이라는 자기 쌍대(self-dual) 성질을 가진다.
+
+$$C^* = \{y \mid y^\top x \geq 0\ \forall x \in C\}$$
+
+이 계층 구조가 최적화 문제 클래스를 결정한다.
+
+$$\text{LP (선형)} \subset \text{SOCP (이차 콘)} \subset \text{SDP (PSD 콘)}$$
+
+SDP의 KKT 조건에서 쌍대 변수가 PSD 행렬이어야 하는 이유는 $\mathbb{S}^n_+$의 자기 쌍대성 때문이다. 강볼록 최적화의 이론적 분석이 단순해지는 이유도 여기에 있다.
+
+<Aside label="Robust Optimization과 이차 콘">
+불확실한 데이터 $a \in \{a_0 + Pu \mid \|u\| \leq 1\}$에 대해 안전한 결정을 하는 Robust LP는 이차 콘 조건 $a_0^\top x + \|P^\top x\|_2 \leq b$로 변환된다. 이것이 SOCP가 실무에서 자주 등장하는 이유다.
+</Aside>
+
+## 극점 — 최적해가 있는 곳
+
+볼록 집합의 이론에서 가장 실용적인 귀결은 **극점(extreme point)** 이다. 극점은 집합 안의 다른 두 점의 볼록 결합으로 표현할 수 없는 점이다. 다면체의 꼭짓점, 확률 단체의 one-hot 벡터, PSD 콘의 rank-1 행렬이 각각의 극점이다.
+
+<Theorem kind="theorem" number="2" title="LP 최적해는 꼭짓점에 있다">
+선형 목적함수 $c^\top x$를 다면체 위에서 최소화할 때, 최솟값이 달성된다면 꼭짓점(극점)에서 달성된다.
+</Theorem>
+
+증명 아이디어는 단순하다. 최적해가 극점이 아니라면 그것을 두 점의 볼록 결합으로 쓸 수 있고, 선형성에 의해 두 점 모두 같은 목적값을 가져야 한다. 이 논리를 반복하면 최적해 집합의 극점이 존재하고, 그것이 꼭짓점이다.
+
+**Krein-Milman 정리**는 이를 일반화한다: 공집합이 아닌 콤팩트 볼록 집합은 극점들의 볼록 포와 같다. 볼록 집합은 극점들만으로 완전히 결정된다.
+
+Softmax와 Attention의 연결도 여기서 나온다. 온도 파라미터 $T \to 0$ 극한에서 Softmax는 확률 단체의 극점 — one-hot 벡터 — 으로 수렴한다. Hard Attention이 "가장 관련 있는 토큰 하나만 선택"하는 것은 확률 단체의 극점에 도달하는 것이다.
+
+## 정리
+
+- 볼록 집합은 "선분에 닫혀
