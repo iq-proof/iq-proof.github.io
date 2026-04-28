@@ -1,0 +1,124 @@
+---
+title: "TRPO·PPO의 이론적 뿌리 — Performance Difference Lemma"
+description: "두 정책의 성능 차이를 advantage로 분해하는 PDL부터 surrogate objective, trust region bound, monotonic improvement 보장까지, advanced RL의 단일 이론 체계를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, policy-optimization, trpo, ppo, trust-region]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+TRPO와 PPO는 서로 다른 알고리즘처럼 보이지만, 동일한 이론의 두 구현이다. 그 이론의 출발점은 단 하나의 등식 — **Performance Difference Lemma (PDL)** — 이다. PDL에서 surrogate objective가 나오고, surrogate에서 trust region bound가 나오고, trust region bound에서 monotonic improvement 보장이 나온다. 이 체계를 이해하지 않으면, "PPO가 왜 잘 되는가"라는 질문에 "실험적으로 그렇더라" 이상의 답을 하기 어렵다.
+
+## 출발점: 두 정책의 성능 차이
+
+임의의 두 정책 $\pi, \pi'$에 대해 다음 등식이 성립한다.
+
+$$
+J(\pi') - J(\pi) = \frac{1}{1-\gamma}\, \mathbb{E}_{s \sim d^{\pi'},\, a \sim \pi'(\cdot \mid s)}\!\left[A^\pi(s, a)\right]
+$$
+
+여기서 $d^{\pi'}(s) = (1-\gamma)\sum_{t=0}^{\infty} \gamma^t \Pr(s_t = s \mid \pi', \rho_0)$는 새 정책의 discounted state distribution이고, $A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)$는 기존 정책의 advantage다.
+
+증명의 핵심은 telescoping sum이다. 새 정책 $\pi'$의 trajectory 위에서 $\sum_{t=0}^{\infty} \gamma^t(\gamma V^\pi(s_{t+1}) - V^\pi(s_t)) = -V^\pi(s_0)$가 성립하고, 이를 $J(\pi')$에 더하면 각 step의 Bellman 잔차가 advantage $A^\pi(s_t, a_t)$로 정확히 떨어진다. tower property로 $d^{\pi'}$를 뽑아내면 등식이 완성된다.
+
+PDL에서 곧바로 따르는 따름정리 하나가 policy iteration의 정당성을 설명한다: 모든 $s$에서 $\sum_a \pi'(a \mid s) A^\pi(s,a) \geq 0$이면 $J(\pi') \geq J(\pi)$. greedy policy improvement가 이 조건을 충족하므로 매 iteration이 non-decreasing이다.
+
+## 닭과 달걀 — $d^{\pi'}$의 문제
+
+PDL의 우변에는 $d^{\pi'}$, 즉 **최적화 대상인 새 정책의 state distribution**이 등장한다. 이것이 핵심적 문제다. 새 정책으로 rollout 해보기 전까지 $d^{\pi'}$를 알 수 없다.
+
+이 문제를 우회하는 방법은 $d^{\pi'} \to d^{\pi}$로 치환하는 것이다. 이렇게 만든 대리 목적 함수를 **surrogate objective**라 한다.
+
+$$
+L_\pi(\pi') := J(\pi) + \frac{1}{1-\gamma}\, \mathbb{E}_{s \sim d^\pi,\, a \sim \pi}\!\left[\frac{\pi'(a \mid s)}{\pi(a \mid s)} A^\pi(s, a)\right]
+$$
+
+현재 정책의 rollout 데이터만으로 평가 가능하다. importance ratio $r = \pi'/\pi$가 여기서 등장하고, 이것이 PPO의 $r_t(\theta)$다.
+
+<Theorem kind="proposition" number="1" title="Surrogate의 1차 일치">
+매끄러운 parameterization $\pi_\theta$ 하에서, $\theta = \theta_{\text{old}}$에서 $\nabla_\theta J$와 $\nabla_\theta L_{\pi_{\theta_{\text{old}}}}$는 같다.
+</Theorem>
+
+<Proof>
+$\theta = \theta_{\text{old}}$에서 importance ratio $r = 1$이므로 $L$의 gradient는 policy gradient theorem의 형태로 환원된다. 두 표현식은 $\nabla_\theta \log \pi_\theta \cdot A^\pi$의 기댓값으로 일치한다. $\square$
+</Proof>
+
+0차에서 $L_\pi(\pi) = J(\pi)$ (on-policy advantage의 기댓값이 0이므로), 1차에서 gradient가 같다. 2차부터는 다르다 — 이것이 trust region이 필요한 이유다.
+
+## Trust Region Bound
+
+$L$과 $J$의 차이를 정량화하면 다음 부등식이 나온다 (Schulman 2015).
+
+$$
+J(\pi') \geq L_\pi(\pi') - \frac{4\epsilon\gamma}{(1-\gamma)^2}\, D_{\text{KL}}^{\max}(\pi \| \pi')
+$$
+
+여기서 $\epsilon = \max_{s,a} |A^\pi(s,a)|$이고, $D_{\text{KL}}^{\max} = \max_s D_{\text{KL}}(\pi(\cdot|s) \| \pi'(\cdot|s))$다.
+
+증명은 세 도구의 조합이다. 먼저 두 정책의 state distribution 차이를 TV distance로 bound하고, advantage의 boundedness로 그 차이가 성능에 미치는 영향을 제한한다. 마지막으로 Pinsker inequality $\text{TV}(p,q) \leq \sqrt{D_{\text{KL}}(p\|q)/2}$로 TV를 KL로 변환한다.
+
+<Callout type="note" title="트레이드오프: max KL vs mean KL">
+이론은 max KL을 요구하지만 실전 코드는 모두 mean KL을 사용한다. max KL은 finite sample로 unbiased하게 추정할 수 없기 때문이다 (sup의 sample estimator는 biased). mean KL은 unbiased estimator가 있다. 실전 NN 정책에서 $\max / \text{mean}$ 비율은 대략 2–5배 — 큰 차이가 없으므로 mean을 쓰더라도 bound의 정신이 유지된다고 본다. 다만 이론적 monotonic improvement 보장은 약화된다.
+</Callout>
+
+상수 $C = 4\epsilon\gamma/(1-\gamma)^2$에서 $(1-\gamma)^2$ 분모가 중요하다. $\gamma \to 1$이면 $C \to \infty$다. long-horizon 문제에서 작은 KL도 누적 오차가 크기 때문에, trust region을 더 보수적으로 잡아야 한다.
+
+## Monotonic Improvement — MM Framework
+
+PDL, surrogate, trust region bound를 묶으면 **Minorization-Maximization (MM)** 알고리즘이 된다.
+
+$$
+M_{\pi_k}(\pi') := L_{\pi_k}(\pi') - C \cdot D_{\text{KL}}^{\max}(\pi_k \| \pi')
+$$
+
+$M_{\pi_k}$는 $J$의 lower bound이면서 $\pi' = \pi_k$에서 $J(\pi_k)$와 일치한다 (tight). $\pi_{k+1} = \arg\max_{\pi'} M_{\pi_k}(\pi')$로 업데이트하면:
+
+$$
+J(\pi_{k+1}) \;\geq\; M_{\pi_k}(\pi_{k+1}) \;\geq\; M_{\pi_k}(\pi_k) \;=\; J(\pi_k)
+$$
+
+세 부등식의 순서: (1) trust region bound, (2) $\pi_{k+1}$이 $M$의 maximizer, (3) 0차 일치. $J$가 위로 bounded이므로 $\{J(\pi_k)\}$는 단조 수렴한다.
+
+TRPO는 이 framework의 직접적 구현이다 — $\max_\theta L_{\theta_{\text{old}}}(\theta)$ subject to $\bar{D}_{\text{KL}} \leq \delta$. PPO는 KL 제약 대신 importance ratio clip으로 trust region을 암묵적으로 강제한다. 두 알고리즘 모두 동일한 이론 체계의 서로 다른 근사다.
+
+<Aside label="이론과 실전의 간극">
+Andrychowicz 2021은 PPO의 성능에 KL constraint 자체보다 advantage normalization, value clipping, learning rate schedule이 더 크게 기여한다고 보고했다. monotonic improvement 보장은 NN 환경에서 sample noise와 function approximation error로 정확히 성립하지 않는다. trust region 이론이 algorithm design의 방향을 제공한 것은 분명하나, 실전 안정성은 더 mundane한 engineering detail의 산물이기도 하다.
+</Aside>
+
+## 정리
+
+- PDL은 두 정책의 성능 차이를 $\frac{1}{1-\gamma}\mathbb{E}_{d^{\pi'}}[A^\pi]$로 분해한다. $d^{\pi'}$가 unknown이라는 사실이 모든 후속 이론의 동기다.
+- Surrogate $L_\pi(\pi')$는 $d^{\pi'} \to d^{\pi}$로 치환해 평가 가능하게 만든다. 현재 점에서 $J$와 0차·1차 일치, 2차부터 발산.
+- Trust region bound는 $J(\pi') \geq L_\pi(\pi') - C \cdot D_{\text{KL}}^{\max}$를 보장한다. KL이 작으면 surrogate의 ascent가 $J$의 ascent를 함의한다.
+- 세 요소를 MM framework으로 묶으면 매 iteration마다 $J(\pi_k)$가 단조 비감소임을 증명할 수 있다.
+- 이론은 worst-case bound를 제공하지만 실전 NN 환경에서는 항상 성립하지 않는다. 이 간극이 현재 RL 이론의 핵심 미해결 문제 중 하나다.
+
+다음 글에서는 TRPO가 이 체계를 어떻게 constrained optimization 문제로 풀고, conjugate gradient와 line search로 natural gradient를 근사하는지 추적한다.
+
+<Reference
+  title="Trust Region Policy Optimization"
+  authors="Schulman et al."
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1502.05477"
+/>
+
+<Reference
+  title="Approximately Optimal Approximate Reinforcement Learning"
+  authors="Kakade and Langford"
+  year={2002}
+  venue="ICML"
+  url="https://dl.acm.org/doi/10.5555/645531.656005"
+/>

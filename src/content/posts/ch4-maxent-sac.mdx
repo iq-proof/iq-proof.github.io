@@ -1,0 +1,174 @@
+---
+title: "SAC는 왜 동작하는가 — MaxEnt RL의 설계 철학"
+description: "엔트로피 보너스가 왜 자연스러운 exploration인가. Soft Bellman의 수렴 보장부터 KL projection, twin critics, auto-α까지 SAC의 모든 설계 결정을 하나의 프레임으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, maximum-entropy, sac, soft-bellman, auto-alpha]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+SAC(Soft Actor-Critic)는 MuJoCo 연속 제어의 표준이 됐다. 그런데 SAC의 각 부품 — twin critics, stochastic actor, auto-α — 은 왜 존재하는가? 이 질문을 따라가면 하나의 출발점으로 수렴한다. **Maximum Entropy RL**이라는 프레임워크다. SAC의 모든 설계 결정은 이 프레임워크의 직접적 귀결이다.
+
+## Maximum Entropy RL의 출발점
+
+Standard RL의 목적함수는 기댓값 누적 보상이다.
+
+$$
+J_{\text{std}}(\pi) = \mathbb{E}\!\left[\sum_t \gamma^t r(s_t, a_t)\right]
+$$
+
+이 목적함수의 최적 정책은 종종 결정론적(deterministic)이고 brittle하다. 하나의 최적 행동만 반복하므로 환경이 조금만 바뀌어도 실패하고, 학습 중 다른 전략을 시도하지 않는다.
+
+MaxEnt RL은 목적함수 자체를 바꾼다.
+
+$$
+J_{\text{maxent}}(\pi) = \mathbb{E}\!\left[\sum_t \gamma^t \big(r(s_t, a_t) + \alpha\, H(\pi(\cdot \mid s_t))\big)\right]
+$$
+
+엔트로피 보너스 $\alpha H(\pi)$가 추가됐다. $\alpha$는 temperature — 보상과 엔트로피의 균형을 결정한다. $\alpha \to 0$이면 standard RL로 돌아가고, $\alpha \to \infty$이면 uniform policy가 된다.
+
+<Aside label="물리적 직관">
+통계역학의 Boltzmann 분포 $p(s) \propto \exp(-E(s)/T)$와 동형이다. Temperature $T \to 0$이면 최저 에너지 상태만 차지하고, $T$가 크면 모든 상태를 고루 방문한다. MaxEnt RL의 optimal policy $\pi^*(a|s) \propto \exp(Q^*_{\text{soft}}(s,a)/\alpha)$는 정확히 이 형태다.
+</Aside>
+
+이 목적함수의 최적 정책이 Boltzmann form임을 라그랑지안으로 유도할 수 있다. 주어진 상태 $s$에서 $\sum_a \pi(a) = 1$ 제약 아래 $\sum_a \pi(a) Q(s,a) - \alpha \sum_a \pi(a) \log \pi(a)$를 최대화하면 정류 조건이
+
+$$
+\pi^*(a \mid s) \propto \exp(Q^*_{\text{soft}}(s, a) / \alpha)
+$$
+
+를 준다.
+
+## Soft Bellman — 엔트로피를 Bellman에 통합하는 방법
+
+문제가 하나 있다. 보강 보상 $\tilde{r} = r + \alpha H(\pi(\cdot|s))$는 정책에 의존한다. 이걸 표준 Bellman에 직접 대입하면 $Q$가 행동 $a$ 외에 정책의 엔트로피까지 의존하는 이상한 양이 된다.
+
+해결은 엔트로피를 $V$에만 포함시키는 것이다.
+
+$$
+V^\pi_{\text{soft}}(s) = \mathbb{E}_{a \sim \pi}[Q^\pi_{\text{soft}}(s, a)] + \alpha H(\pi(\cdot|s))
+$$
+
+$$
+Q^\pi_{\text{soft}}(s, a) = r(s, a) + \gamma \mathbb{E}_{s'}[V^\pi_{\text{soft}}(s')]
+$$
+
+$Q$의 형태는 표준 RL과 동일하다. 이 분리가 핵심이다 — $Q$가 표준 형태를 유지하므로 replay buffer, target network 같은 모든 Q-learning 기법을 그대로 쓸 수 있다.
+
+최적 soft V는 log-sum-exp로 닫힌 형태를 갖는다.
+
+$$
+V^*_{\text{soft}}(s) = \alpha \log \int \exp(Q^*_{\text{soft}}(s, a) / \alpha)\, da
+$$
+
+<Theorem kind="proposition" number="1" title="Soft Bellman Operator의 수렴">
+Soft Bellman operator $\mathcal{T}^*_{\text{soft}}$는 $\|\cdot\|_\infty$에서 $\gamma$-contraction이다.
+
+$$
+\|\mathcal{T}^*_{\text{soft}} Q_1 - \mathcal{T}^*_{\text{soft}} Q_2\|_\infty \leq \gamma \|Q_1 - Q_2\|_\infty
+$$
+</Theorem>
+
+<Proof>
+log-sum-exp $f(x) = \alpha \log \sum_i \exp(x_i/\alpha)$의 기울기가 softmax이므로 $\|\nabla f\|_1 = 1$, 즉 sup-norm에서 1-Lipschitz다. 따라서
+
+$$
+|\mathcal{T} Q_1 - \mathcal{T} Q_2|(s,a) \leq \gamma \mathbb{E}_{s'}\!\left[\|Q_1(s',\cdot) - Q_2(s',\cdot)\|_\infty\right] \leq \gamma \|Q_1 - Q_2\|_\infty
+$$
+
+Banach 고정점 정리에 의해 soft value iteration이 unique $Q^*_{\text{soft}}$로 기하급수적으로 수렴한다. $\square$
+</Proof>
+
+$\alpha \to 0$ 극한에서 log-sum-exp의 잘 알려진 성질에 의해 $V^*_{\text{soft}}(s) \to \max_a Q^*(s,a)$, 즉 표준 Bellman로 환원된다.
+
+## KL Projection — Soft Policy Improvement
+
+표준 policy iteration의 개선 단계는 $\pi_{\text{new}}(s) = \arg\max_a Q^{\pi_{\text{old}}}(s,a)$, 즉 greedy다. MaxEnt RL에서 이에 대응하는 연산은 KL projection이다.
+
+$$
+\pi_{\text{new}}(\cdot \mid s) = \arg\min_{\pi' \in \Pi} D_{\text{KL}}\!\left(\pi'(\cdot|s) \,\Big\|\, \frac{\exp(Q^{\pi_{\text{old}}}_{\text{soft}}(s,\cdot)/\alpha)}{Z(s)}\right)
+$$
+
+target distribution $\exp(Q/\alpha)/Z$에 가장 가까운 representable 분포를 선택한다. 분배함수 $Z(s)$가 $\pi'$와 무관하므로 KL은 다음 샘플 기반 손실로 단순화된다.
+
+$$
+J_\pi(\psi) = \mathbb{E}_{s, a \sim \pi_\psi}\!\left[\alpha \log \pi_\psi(a|s) - Q_\phi(s, a)\right]
+$$
+
+연속 행동공간에서 $a = \tanh(\mu_\psi(s) + \sigma_\psi(s) \cdot \epsilon)$, $\epsilon \sim \mathcal{N}(0, I)$로 reparameterize하면 이 손실을 역전파할 수 있다. REINFORCE의 score function estimator 대비 분산이 10–100배 낮아 학습이 안정된다.
+
+KL projection이 정확하면(target distribution이 representable family 안에 있으면) soft Q-value의 pointwise 단조 증가가 보장된다. NN 근사에서는 이 보장이 약화되지만, 실전에서 학습 곡선은 대체로 단조 상승한다.
+
+## SAC의 조립 — 이론의 귀결로서의 알고리즘
+
+SAC의 각 구성 요소가 어디서 왔는지 이제 명확하다.
+
+| 구성 요소 | 출처 |
+|---|---|
+| Stochastic actor | MaxEnt: 엔트로피 항이 확률적 정책을 요구 |
+| Replay buffer | Off-policy MaxEnt: 표준 Q 형태 유지 덕분에 IS ratio 불필요 |
+| Reparameterization | KL projection의 연속 행동 근사 |
+| Twin critics | TD3에서 차용 — Q 과대추정 방지 |
+| Target networks | DDPG에서 차용 — 학습 안정성 |
+
+critic의 target은 soft V의 샘플 기반 추정이다.
+
+$$
+y = r + \gamma\,\mathbb{E}_{a' \sim \pi}\!\left[\min_{i=1,2} Q_{\phi^-_i}(s', a') - \alpha \log \pi(a' \mid s')\right]
+$$
+
+$-\alpha \log \pi$항이 엔트로피를 target에 내장한다. 표준 Q-learning의 $\max$ 대신 stochastic policy에서 기댓값을 취한다는 점이 유일한 차이다.
+
+<Callout type="note" title="트레이드오프">
+SAC는 PPO 대비 샘플 효율이 ~5배 높다(HalfCheetah 기준 1M step에서 동등 성능). 그러나 replay buffer + twin critics + reparameterization의 구현 복잡도가 높고, discrete 행동공간에는 별도 변형(SAC-Discrete)이 필요하다. LLM RLHF에서 PPO가 표준으로 남은 이유다 — token이 discrete이고 long-context sequence 처리에 PPO의 단순한 배치 구조가 적합하다.
+</Callout>
+
+## Auto-α — 마지막 하이퍼파라미터의 제거
+
+SAC 2018의 한계는 $\alpha$가 환경마다 달라야 한다는 것이었다. HalfCheetah에선 0.1, Humanoid에선 0.05가 적절하다. SAC 2019는 이를 제약 조건 문제로 바꿨다.
+
+$$
+\max_\pi \mathbb{E}\!\left[\sum_t \gamma^t r_t\right] \quad \text{s.t.} \quad \mathbb{E}[-\log \pi(a|s)] \geq \bar{\mathcal{H}}
+$$
+
+"엔트로피가 최소 $\bar{\mathcal{H}}$ 이상"이라는 제약만 부과하고, $\alpha$는 이 제약의 라그랑주 승수로서 자동 조정된다. 이중 경사 하강(dual gradient descent)을 적용하면 업데이트 규칙이 나온다.
+
+$$
+\alpha \leftarrow \alpha - \eta_\alpha \bigl(\mathbb{E}[-\log \pi] - \bar{\mathcal{H}}\bigr)
+$$
+
+직관: 실제 엔트로피가 $\bar{\mathcal{H}}$보다 낮으면 $\alpha$를 키워 정책을 더 확률적으로 만들고, 높으면 $\alpha$를 줄여 보상을 우선한다. 평형은 $H(\pi^*) = \bar{\mathcal{H}}$다.
+
+default $\bar{\mathcal{H}} = -\dim(\mathcal{A})$는 tanh-squashed Gaussian policy의 전형적 엔트로피와 일치하는 휴리스틱이다. PyTorch 구현에서는 $\log \alpha$를 학습해 양수성을 보장한다.
+
+```python
+log_alpha = torch.zeros(1, requires_grad=True)
+alpha_optim = torch.optim.Adam([log_alpha], lr=3e-4)
+
+# α 업데이트
+_, log_pi = actor.sample(states)
+alpha_loss = -(log_alpha * (log_pi + target_entropy).detach()).mean()
+alpha_optim.zero_grad()
+alpha_loss.backward()
+alpha_optim.step()
+alpha = log_alpha.exp().item()
+```
+
+auto-α가 SAC의 가장 영향력 있는 기여라는 평가가 많다. 알고리즘 아이디어가 아무리 우수해도 하이퍼파라미터 민감도가 높으면 연구자만 쓴다. auto-α 이후 SAC는 default 설정으로 대부분 환경에서 reasonable하게 동작하는 production-ready 알고리즘이 됐다.
+
+## 정리
+
+- MaxEnt RL은 목적함수에 $\alpha H(\pi)$를 더한다. $\alpha \to 0$이면 표준 RL, $\alpha \to \infty$이면 uniform policy다.
+- Soft Bellman은 엔트로

@@ -1,0 +1,142 @@
+---
+title: "TRPO는 왜 KL을 step size로 쓰는가"
+description: "단조 개선 보장을 실전에서 구현하기 위한 TRPO의 constraint 형식화부터 Natural PG 환원, Conjugate Gradient, Line Search까지 — 하나의 철학이 네 단계로 펼쳐지는 과정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, trpo, natural-policy-gradient, trust-region, conjugate-gradient]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+정책 경사 알고리즘이 불안정한 근본 이유는 step size다. 너무 크면 정책이 무너지고, 너무 작으면 학습이 멈춘다. TRPO는 이 문제를 "step size를 KL divergence로 측정하라"는 단 하나의 아이디어로 풀어낸다. 그렇다면 왜 Euclidean 거리가 아닌 KL인가, 그리고 이 제약을 어떻게 실제로 계산하는가?
+
+## 왜 KL이 자연스러운 step size인가
+
+신경망 파라미터 $\theta$의 Euclidean 거리 $\|\Delta\theta\|_2$는 parameterization에 종속된다. 마지막 레이어의 weight를 2배로 늘리면 정책 분포가 크게 변하지만 Euclidean distance는 작을 수 있다. 반대로 첫 번째 레이어의 미세한 변화가 출력 분포에는 거의 영향을 주지 않을 수도 있다.
+
+KL divergence $\bar{D}_{\text{KL}}(\pi_{\theta_{\text{old}}} \| \pi_\theta)$는 이 문제에서 자유롭다. 정책 *분포 자체*의 변화를 측정하므로 parameterization에 독립적이다. 이것이 TRPO의 constraint 형식화다:
+
+$$
+\theta_{\text{new}} = \arg\max_\theta L_{\theta_{\text{old}}}(\theta) \quad \text{s.t.} \quad \bar{D}_{\text{KL}}(\theta_{\text{old}} \| \theta) \leq \delta
+$$
+
+여기서 $L_{\theta_{\text{old}}}(\theta)$는 importance sampling 가중치로 표현한 surrogate objective다.
+
+$$
+L_{\theta_{\text{old}}}(\theta) = \mathbb{E}_{s, a \sim \pi_{\text{old}}}\!\left[\frac{\pi_\theta(a \mid s)}{\pi_{\theta_{\text{old}}}(a \mid s)} A^{\pi_{\text{old}}}(s, a)\right]
+$$
+
+penalty 형식 $\max L - C \cdot D_{\text{KL}}$과 비교하면, constraint 형식은 $\delta$가 "매 step에서 허용되는 KL 예산"이라는 직관적 의미를 갖는다. penalty의 $C$는 $L$과 KL의 스케일 비율에 따라 달라지므로 설정이 까다롭다.
+
+<Callout type="note" title="트레이드오프">
+Constraint 형식은 $\delta$가 hyperparameter로서 직관적이고 매 step의 KL이 예측 가능하다는 장점이 있다. 단점은 표준 SGD로 직접 풀 수 없어 Lagrangian dual과 second-order 계산이 필요하다는 것이다. PPO는 이 비용을 피하기 위해 clipping으로 trust region을 근사한다.
+</Callout>
+
+## Natural Policy Gradient로의 환원
+
+TRPO를 직접 풀기 위해 $\Delta\theta = \theta - \theta_{\text{old}}$가 작다고 가정하고 Taylor 전개한다. KL의 0차·1차 항은 0이므로:
+
+$$
+\bar{D}_{\text{KL}}(\theta_{\text{old}} \| \theta) \approx \frac{1}{2} \Delta\theta^\top F(\theta_{\text{old}}) \Delta\theta
+$$
+
+여기서 $F$는 Fisher information matrix다:
+
+$$
+F(\theta) = \mathbb{E}_{s, a \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(a \mid s) \; \nabla_\theta \log \pi_\theta(a \mid s)^\top]
+$$
+
+<Theorem kind="theorem" number="1" title="TRPO Closed-form Update">
+Quadratic approximation 하에서 TRPO의 최적 업데이트는 다음과 같다:
+
+$$
+\Delta\theta^* = \sqrt{\frac{2\delta}{g^\top F^{-1} g}} \cdot F^{-1} g
+$$
+
+여기서 $g = \nabla_\theta L_{\theta_{\text{old}}}(\theta)\big|_{\theta_{\text{old}}}$.
+</Theorem>
+
+<Proof>
+Lagrangian $\mathcal{L} = g^\top \Delta\theta - \lambda(\frac{1}{2}\Delta\theta^\top F \Delta\theta - \delta)$의 정류 조건에서 $\Delta\theta = \lambda^{-1} F^{-1} g$. KL constraint가 binding될 때 $\frac{1}{2\lambda^2} g^\top F^{-1} g = \delta$이므로 $\lambda = \sqrt{g^\top F^{-1} g / 2\delta}$. 대입하면 closed-form이 나온다. $\square$
+</Proof>
+
+이 결과의 핵심은 **방향** $F^{-1}g$가 Kakade(2002)의 Natural Policy Gradient와 동일하다는 것이다. TRPO는 Natural PG에 "KL 예산으로부터 자동으로 결정되는 step size"를 더한 알고리즘이다. RL의 두 흐름인 trust region 방법과 natural gradient가 같은 수식으로 통합된다.
+
+## $F^{-1}g$를 어떻게 계산하는가
+
+문제는 $F \in \mathbb{R}^{d \times d}$의 명시적 계산이 불가능하다는 것이다. $d = 10^6$인 소형 신경망에서도 $F$를 저장하는 데 1TB가 필요하고, 역행렬 계산은 $O(d^3)$이다.
+
+**Conjugate Gradient(CG)**가 이를 우회한다. CG는 $Fx = g$를 $F$의 명시적 표현 없이 **$F$와 벡터의 곱 $Fv$**만으로 반복적으로 풀 수 있다. 그리고 $Fv$ 자체는 **Pearlmutter trick**으로 autograd만으로 계산된다:
+
+$$
+Fv = \nabla_\theta\!\left[(\nabla_\theta \bar{D}_{\text{KL}})^\top v\right]\bigg|_{\theta_{\text{old}}}
+$$
+
+두 번의 backward pass로 $Fv$를 얻는다. CG 10회 반복이면 충분한 이유는 신경망의 Fisher matrix가 사실상 낮은 effective rank를 가지기 때문이다 — 대부분의 고유값이 작고 소수만 지배적이므로 CG가 이 주요 방향들을 빠르게 수렴한다.
+
+```python
+def fisher_vec_prod(pi, pi_old, v, damping=0.1):
+    kl = mean_kl(pi_old, pi)
+    grads = torch.autograd.grad(kl, list(pi.parameters()), create_graph=True)
+    flat_grad = torch.cat([g.flatten() for g in grads])
+    inner = (flat_grad * v).sum()
+    Hv = torch.autograd.grad(inner, list(pi.parameters()))
+    return torch.cat([h.flatten() for h in Hv]) + damping * v
+```
+
+`damping * v` 항은 $F + \lambda I$ 정규화로, singular Fisher에 대한 수치적 안정성을 제공한다.
+
+## Line Search — 근사가 깨지는 곳을 막아라
+
+Closed-form update는 **quadratic KL 근사**에 기반한다. $\Delta\theta$가 크면 실제 KL이 근사값을 벗어날 수 있다. 그래서 TRPO는 후보 step $\Delta\theta_0$를 받아 backtracking으로 두 조건을 동시에 만족하는 가장 큰 step을 찾는다:
+
+1. $\bar{D}_{\text{KL}}(\pi_{\text{old}} \| \pi_{\text{new}}) \leq \delta$
+2. $L_{\theta_{\text{old}}}(\theta_{\text{new}}) > L_{\theta_{\text{old}}}(\theta_{\text{old}})$
+
+```
+for j = 0, 1, ..., 9:
+    Δθ_j = (0.5)^j · Δθ_0
+    if mean_KL(π_old, π_new) ≤ δ AND L(π_new) > L(π_old):
+        return θ_old + Δθ_j
+return θ_old   # fallback
+```
+
+<Aside label="왜 KL이 항상 δ 근처에 binding되는가">
+훈련 중 KL trajectory를 보면 거의 항상 $\delta = 0.01$ 직전에서 멈춘다. surrogate $L$이 증가할 여지가 있는 한 step을 키우는 것이 이득이고, KL 제약이 유일한 한계이기 때문이다. 이것이 "KL 예산을 다 쓰고 멈춘다"는 TRPO의 작동 방식이다.
+</Aside>
+
+## 정리
+
+- KL divergence는 parameterization에 독립적인 정책 거리 측도다. Euclidean 거리로는 같은 정책 변화가 서로 다른 크기로 측정된다.
+- TRPO의 최적 update 방향은 Natural Policy Gradient $F^{-1}g$와 동일하다. step size만 KL 예산 $\delta$로부터 자동 결정된다.
+- $F^{-1}g$의 직접 계산은 불가능하다. CG + Pearlmutter trick이 $O(d)$ 메모리와 $O(d \cdot N_{\text{iter}})$ 시간으로 이를 근사한다.
+- Line search는 quadratic 근사가 무너지는 큰 step을 막는 마지막 안전망이다.
+
+TRPO가 PPO에 의해 실전에서 대체된 것은 이 네 단계의 연산 비용 때문이다. 그러나 "KL을 예산으로 쓰는 trust region"이라는 설계 철학은 PPO의 clipping, SAC의 soft policy update, CPO의 안전 제약까지 이어진다. TRPO를 이해하는 것은 현대 policy optimization의 공통 언어를 배우는 것이다.
+
+<Reference
+  title="Trust Region Policy Optimization"
+  authors="Schulman et al."
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1502.05477"
+/>
+
+<Reference
+  title="A Natural Policy Gradient"
+  authors="Kakade, S."
+  year={2002}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/2001/file/4b86abe48d358ecf194c56c69108433e-Paper.pdf"
+/>

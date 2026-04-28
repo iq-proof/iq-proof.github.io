@@ -1,0 +1,130 @@
+---
+title: "TD3는 왜 DDPG보다 안정적인가"
+description: "Q-function 과대추정부터 학습 발산까지, DDPG의 세 가지 불안정성 원인과 TD3의 세 가지 수정이 어떻게 vicious cycle을 끊는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, td3, ddpg, q-learning, continuous-control]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DDPG는 연속 행동 공간에서 처음 성공한 딥 강화학습 알고리즘이다. 그러나 하이퍼파라미터에 극도로 민감하고, 학습이 쉽게 발산한다. Fujimoto 2018은 이 불안정성이 세 가지 구조적 결함에서 비롯된다는 것을 보였다. TD3의 세 가지 트릭은 정확히 그 세 가지 결함을 겨냥한다. 왜 그 트릭들이 필요한가?
+
+## Q-function 과대추정의 기원
+
+DDPG의 critic은 다음 타깃으로 학습한다.
+
+$$
+y = r + \gamma Q_{\phi^-}(s', \mu_{\theta^-}(s'))
+$$
+
+$\mu$가 $\arg\max Q$를 학습하는 actor이므로, 이는 사실상 $\max$ 연산과 동일하다. 문제는 Q 추정치에 노이즈 $\xi$가 있을 때 시작된다.
+
+$$
+\mathbb{E}[\max_a(Q^*(s', a) + \xi(s', a))] \geq \max_a Q^*(s', a)
+$$
+
+<Theorem kind="lemma" number="1" title="Max의 과대추정 (Hasselt 2010)">
+$\xi_i$가 평균 0의 i.i.d. 노이즈일 때, $\mathbb{E}[\max_i (Q_i + \xi_i)] \geq \max_i Q_i$.
+</Theorem>
+
+<Proof>
+$\max$는 볼록 함수이므로 Jensen 부등식에 의해 성립한다. 등호는 노이즈가 없을 때만.
+</Proof>
+
+더 심각한 문제는 부트스트래핑이다. 각 업데이트마다 bias가 추가되어 누적된다.
+
+$$
+\mathbb{E}[\hat{Q}^{(k+1)}] \geq \mathbb{E}[r] + \gamma \mathbb{E}[\max Q^{(k)}] + \gamma \cdot \text{Bias}(\max)
+$$
+
+반복이 거듭될수록 Q 추정치는 참값의 1.5–2배까지 불어난다. 과대추정된 Q를 쫓아 policy가 엉뚱한 행동을 학습하면, 그 행동의 타깃이 다시 잘못된 Q를 만든다. **vicious cycle**이다.
+
+## TD3의 첫 번째 수정: Clipped Double Q
+
+두 개의 독립적인 critic $Q_{\phi_1}, Q_{\phi_2}$를 두고, 타깃을 min으로 계산한다.
+
+$$
+\boxed{y = r + \gamma \min\!\big(Q_{\phi^-_1}(s', a'),\, Q_{\phi^-_2}(s', a')\big)}
+$$
+
+$Q_1, Q_2$의 노이즈가 독립이라면 둘 다 동시에 과대추정할 가능성은 낮다. 가우시안 노이즈 $\xi \sim \mathcal{N}(0, \sigma^2)$ 두 개의 min을 취하면 기댓값이 약 $-0.56\sigma$ 만큼 참값 아래로 내려간다. 과대추정 대신 **의도적 과소추정**이다.
+
+<Callout type="note" title="왜 과소추정이 더 안전한가">
+과대추정된 Q는 policy가 잘못된 행동을 최적으로 착각하게 만든다. 과소추정된 Q는 policy를 보수적으로 만들지만, 잘못된 방향으로 끌어가지는 않는다. "틀리더라도 조용히 틀리는" 쪽이 vicious cycle을 만들지 않는다.
+</Callout>
+
+두 critic의 독립성이 핵심이다. 초기화를 다르게 하고 학습 순서도 분리해야 한다. 상관관계가 높아질수록 min 효과는 사라지고 single critic과 동일해진다.
+
+## TD3의 두 번째 수정: Target Policy Smoothing
+
+DDPG의 deterministic policy는 Q function에 날카로운 피크가 있을 때 취약하다. 피크가 노이즈의 산물이어도 $\arg\max$는 그쪽으로 끌린다. TD3는 타깃 행동에 클리핑된 노이즈를 주입한다.
+
+$$
+a' = \mu_{\theta^-}(s') + \text{clip}(\epsilon, -c, c), \quad \epsilon \sim \mathcal{N}(0, \sigma^2)
+$$
+
+표준값은 $\sigma = 0.2$, $c = 0.5$다. 이 연산의 의미는 Q function의 **지역 평균**이다.
+
+$$
+\tilde{Q}(s, a) := \mathbb{E}_\epsilon[Q(s, a + \text{clip}(\epsilon, -c, c))]
+$$
+
+날카로운 피크를 Gaussian kernel로 희석하면 피크 높이가 낮아진다. Critic이 이 smoothed target으로 학습되면 자연스럽게 Lipschitz 상수가 줄어든다. SAC의 stochastic policy가 동일한 효과를 자동으로 얻는 것과 달리, TD3는 deterministic policy이므로 이 noise injection이 명시적으로 필요하다.
+
+## TD3의 세 번째 수정: Delayed Policy Update
+
+세 번째 불안정성 원인은 critic-policy 비대칭이다. Critic이 아직 수렴하지 않은 noisy Q로 policy를 업데이트하면, 잘못된 방향으로 학습된 policy가 다시 잘못된 데이터를 만든다.
+
+TD3의 처방은 단순하다. Critic은 매 환경 스텝마다 업데이트하고, policy는 $d = 2$ 스텝마다 한 번 업데이트한다.
+
+```
+Critic Q1, Q2: update at step 1, 2, 3, 4, 5, 6, ...
+Policy  μ    : update at step    2,    4,    6, ...
+Target nets  : Polyak at step    2,    4,    6, ...
+```
+
+두 번의 critic 업데이트 사이에 policy가 한 번 업데이트된다. Critic이 조금 더 안정된 상태에서 policy gradient를 계산한다는 것이 핵심이다. 이는 Borkar 1997의 two-time-scale stochastic approximation — critic을 빠른 과정, policy를 느린 과정으로 분리 — 의 실용적 근사다.
+
+<Aside label="세 트릭의 시너지">
+Fujimoto 2018의 ablation 결과, 각 트릭 단독으로는 약 1.3–2배 향상에 그쳤지만 세 트릭을 함께 쓰면 약 5배 향상이 나타났다. Clipped Double Q가 올바른 기준선을 만들고, Target Smoothing이 날카로운 피크를 제거하고, Delayed Update가 critic이 안정화될 시간을 준다 — 세 조건이 동시에 충족되어야 vicious cycle이 시작조차 하지 않는다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="TD3의 트레이드오프">
+**과소추정의 비용**: Clipped Double Q의 보수적 Q 추정은 탐험을 저해할 수 있다. 방문하지 않은 상태-행동 쌍의 Q가 낮게 추정되면 policy가 그쪽을 시도하지 않는다. 희소 보상 환경에서는 optimism-in-face-of-uncertainty가 더 적합할 수 있다.
+
+**결정론적 policy의 한계**: Target smoothing은 ad hoc 트릭이다. SAC은 stochastic policy 자체가 smoothing을 내장하고, entropy 항이 MaxEnt 프레임워크로 정당화된다. TD3의 $\sigma, c$는 환경마다 튜닝이 필요한 하이퍼파라미터다.
+
+**적용 범위**: MuJoCo 류의 dense reward + continuous control에서 강하다. 희소 보상, hard exploration, 고차원 이산 행동 공간에서는 다른 알고리즘이 적합하다.
+</Callout>
+
+현대 후속 연구는 이 트레이드오프를 다양하게 공략한다. REDQ(Chen 2021)는 critic을 10개로 늘려 과소추정의 강도를 높이면서 high UTD ratio로 sample efficiency를 확보한다. DroQ(Hiraoka 2022)는 단일 critic에 dropout을 적용해 앙상블 효과를 흉내 낸다.
+
+## 정리
+
+- DDPG의 불안정성은 무작위가 아니다. Max 연산의 과대추정 편향, 날카로운 Q 피크에 끌리는 deterministic policy, noisy critic으로 policy를 즉시 업데이트하는 비대칭이 세 가지 구조적 원인이다.
+- TD3의 세 트릭은 각각 하나의 원인을 겨냥한다. Clipped Double Q → 과대추정 차단, Target Smoothing → 날카로운 피크 제거, Delayed Update → critic 안정화 후 policy 업데이트.
+- 세 트릭의 효과는 독립적으로 더해지지 않는다. 함께 작동할 때 vicious cycle의 시작 자체를 막는 시너지가 나온다.
+
+알고리즘 설계는 결국 실패 모드의 공학이다. TD3가 가르쳐주는 것은 올바른 Q 추정법이 아니라, 잘못된 Q가 어떻게 전파되어 학습을 무너뜨리는지에 대한 해부다.
+
+<Reference
+  title="Addressing Function Approximation Error in Actor-Critic Methods"
+  authors="Fujimoto et al."
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1802.09477"
+/>

@@ -1,0 +1,157 @@
+---
+title: "On-policy와 Off-policy — RL 알고리즘 선택의 실제 기준"
+description: "Sample efficiency와 학습 안정성의 근본 긴장부터 분산 RL 아키텍처, Hybrid 알고리즘의 트레이드오프까지, 현대 RL 알고리즘 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, on-policy, off-policy, distributed-rl, mujoco]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RL 알고리즘을 선택할 때 가장 먼저 부딪히는 질문은 하나다 — "PPO를 쓸까, SAC를 쓸까?" 그런데 이 질문은 사실 더 근본적인 대립을 담고 있다. **학습 안정성**과 **sample efficiency** 사이의 긴장, 그리고 그 긴장을 해결하려는 다양한 시도들. 왜 이 두 가지를 동시에 갖기가 이렇게 어려운가?
+
+## On-policy와 Off-policy의 본질적 차이
+
+On-policy 알고리즘(PPO, TRPO)은 **현재 정책이 생성한 sample만** 학습에 쓴다. 매 업데이트 후 데이터를 버린다. Off-policy 알고리즘(SAC, TD3)은 **replay buffer에 쌓인 과거 데이터**를 재사용한다.
+
+이 단순한 차이가 sample efficiency의 5배 격차를 만든다. MuJoCo HalfCheetah에서 3000 reward에 도달하는 데 PPO는 약 3M step이 필요하고, SAC는 1M step이면 충분하다.
+
+그러나 off-policy의 sample efficiency는 공짜가 아니다. Replay buffer에서 꺼낸 데이터는 현재 정책이 아닌 **과거 정책이 수집한 것**이다. 이 불일치를 보정하려면 Importance Sampling(IS)이 필요하다.
+
+$$
+\mathbb{E}_\pi[g] = \mathbb{E}_\mu\!\left[\frac{\pi(a)}{\mu(a)} g\right]
+$$
+
+IS ratio $\pi/\mu$가 크면 분산이 폭증한다. 더 심각한 것은 trajectory 전체에 걸친 IS다 — T step짜리 경로에서 비율이 누적되면 분산이 $e^{T \cdot \text{const}}$으로 지수 증가한다("curse of horizon").
+
+SAC와 TD3가 이 문제를 우회하는 방식이 흥미롭다. Bellman 방정식을 쓰기 때문이다.
+
+$$
+Q(s, a) = r + \gamma \mathbb{E}_{a' \sim \pi}[Q(s', a')]
+$$
+
+단일 transition의 TD error만 계산하므로 trajectory-level IS가 불필요하다. 이것이 SAC/TD3의 off-policy가 PPO의 multi-epoch off-policy보다 훨씬 robust한 이유다.
+
+## Benchmark가 말하는 것
+
+OpenAI Spinning Up 기준 MuJoCo 5-seed 결과는 명확하다.
+
+| 환경 | TRPO | PPO | TD3 | SAC |
+|------|------|-----|-----|-----|
+| HalfCheetah | 1850 | 1670 | 9530 | 11960 |
+| Ant | 1860 | 1240 | 4570 | 5550 |
+| Humanoid | — | 540 | 5050 | 6160 |
+
+SAC ≥ TD3 > PPO > TRPO. 그러나 **stability 순위는 역전**된다.
+
+PPO는 seed 간 분산이 작다. SAC도 안정적이다. DDPG는 bimodal — 5개 seed 중 2개가 사실상 학습 실패 (reward 500~1500)하고 나머지 3개는 9000에 도달한다. 표준편차 약 4000. 이 불안정성 때문에 DDPG는 현대 실전에서 거의 쓰이지 않는다.
+
+<Callout type="note" title="트레이드오프">
+**On-policy**: 안정적이나 sample inefficient. PPO는 ε=0.2 기본값이 대부분의 환경에서 그냥 작동한다. **Off-policy**: sample efficient하나 hyperparameter sensitivity가 있다. SAC는 auto-α 덕분에 가장 robust한 off-policy지만, 그래도 replay buffer size와 network 구조에 민감하다. **결론**: "항상 best"인 알고리즘은 없다 — 환경의 env step 비용, action space, stability 요구가 선택을 결정한다.
+</Callout>
+
+## 분산 RL — 병렬화가 가져오는 것
+
+단일 머신 RL의 한계는 구조적이다. GPU는 env step 동안 놀고, 단일 환경에서는 trajectory의 다양성도 부족하다.
+
+Ape-X(Horgan 2018), IMPALA(Espeholt 2018), R2D2(Kapturowski 2019)는 모두 같은 핵심 아이디어를 공유한다 — **수백 개의 actor가 병렬로 데이터를 생성하고, 단일 learner가 GPU에서 업데이트**한다.
+
+```
+          Learner (GPU)
+         /             \
+gradient updates    model weights
+       /                  \
+      ↓                    ↑
+ Replay Buffer         (broadcast)
+      ↑                    ↓
+     data               actors
+       \               /
+         Actors (CPUs)
+         many parallel envs
+```
+
+N개의 actor가 있으면 wall-clock 시간이 이론적으로 N배 빨라진다. AlphaGo, AlphaStar, OpenAI Five의 대규모 성공이 이 프레임워크 위에 세워졌다.
+
+그런데 여기서 새로운 문제가 생긴다. Actor의 정책과 learner의 정책 사이에 **lag**이 생긴다. Actor가 오래된 가중치로 데이터를 수집하는 동안 learner는 계속 업데이트한다.
+
+IMPALA의 V-trace가 이를 해결한다.
+
+$$
+v_t = V(s_t) + \sum_{k=t}^{t+n-1} \gamma^{k-t}\!\left(\prod_{i=t}^{k-1} c_i\right) \rho_k \delta^V_k
+$$
+
+여기서 $\rho_k = \min(\bar\rho, \pi/\mu)$, $c_k = \min(\bar c, \pi/\mu)$. 두 개의 truncation이 분리된 역할을 한다 — $\rho_k$는 각 step의 TD error 기여를 보정하고, $c_k$의 곱셈은 미래 TD error의 역전파를 제어한다. $\bar\rho \to \infty$로 가면 순수 IS라 분산이 폭증하고, $\bar c = 0$이면 1-step return으로 퇴화한다. 이 두 parameter의 균형이 분산 RL의 off-policy correction을 만든다.
+
+<Aside label="Scale vs Algorithm">
+AlphaStar는 18,000 years에 상당하는 학습 시간을 압축했다. "이게 알고리즘의 성과인가, scale의 성과인가?"라는 질문이 종종 제기된다. 현실은 둘의 시너지다 — league learning 같은 algorithmic innovation 없이는 scale만으로 불가능했고, distributed RL framework 없이는 league learning도 실현 불가능했다.
+</Aside>
+
+## Hybrid 알고리즘 — 양쪽의 장점은 가능한가
+
+On-policy의 안정성과 off-policy의 효율성을 동시에 갖겠다는 시도가 hybrid 알고리즘이다.
+
+ACER(Wang 2017)는 PPO 스타일의 clipped IS objective에 replay buffer를 결합한다. Retrace estimator로 off-policy correction을 수행하면서 trust region을 유지한다. PPO보다 sample efficient하지만 SAC에는 미치지 못한다 — clipped IS의 variance 제한이 결국 효율의 상한을 만든다.
+
+SAC-Discrete(Christodoulou 2019)는 다른 방향의 hybrid다. SAC의 continuous action 가정을 제거한다. 핵심은 discrete action에서 모든 action의 Q값을 직접 계산할 수 있다는 점이다.
+
+$$
+L_\pi = \mathbb{E}_{s \sim \mathcal{D}}\!\left[\sum_a \pi_\psi(a|s)\big(\alpha \log \pi_\psi(a|s) - Q_\phi(s, a)\big)\right]
+$$
+
+Continuous SAC에서는 이 기댓값이 적분이라 reparameterization trick이 필요하다. Discrete에서는 합산이므로 closed-form이다. Atari 18개 action을 모두 열거하면 된다.
+
+<Theorem kind="proposition" number="1" title="No Universal Best">
+어떤 단일 RL 알고리즘도 모든 환경 클래스에서 동시에 최적일 수 없다. Discrete action, sparse reward, real robot, LLM RLHF — 각 domain에서 우세한 알고리즘 클래스가 다르다.
+</Theorem>
+
+그렇다면 선택 기준은 무엇인가. 실용적 decision tree는 다음과 같다.
+
+```
+Action space?
+├─ Discrete → PPO 또는 DQN/Rainbow
+└─ Continuous
+   ├─ env step이 비싼가? (real robot) → SAC, TD3
+   ├─ stability critical → PPO 또는 TD3
+   └─ sample efficiency critical → SAC ★
+
+LLM RLHF → PPO (생태계 + 안정성)
+Offline RL → CQL, TD3+BC
+```
+
+왜 PPO가 LLM RLHF의 표준이 됐는가는 흥미로운 질문이다. SAC가 MuJoCo에서 더 좋은데. 이유는 단순하다 — hyperparameter robustness, implementation simplicity, 그리고 distributed training 호환성. SB3, CleanRL, RLlib이 모두 PPO를 first-class로 지원한다. 성능보다 engineering ecosystem이 알고리즘의 생존을 결정한다.
+
+## 정리
+
+- On-policy(PPO)는 안정적이나 sample inefficient하고, off-policy(SAC, TD3)는 efficient하나 distribution shift가 취약점이다. 이 긴장은 Importance Sampling의 분산 문제에서 온다.
+- MuJoCo 기준 SAC ≥ TD3 > PPO > TRPO > DDPG지만, 이 ranking은 discrete action, sparse reward, real robot 환경에서 역전될 수 있다.
+- 분산 RL(Ape-X, IMPALA, R2D2)은 wall-clock을 극적으로 단축하지만, actor-learner lag라는 새로운 off-policy 문제를 만든다. V-trace의 dual truncation이 이 해결책이다.
+- Hybrid 알고리즘(ACER, SAC-Discrete, MPO)은 양쪽의 장점을 노리지만, 보통 특정 niche에서만 우세하다. Universal hybrid는 없다.
+
+RL 알고리즘 선택은 이론적 우월성보다 **환경의 물리적 조건과 engineering 현실**이 결정한다.
+
+<Reference
+  title="Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor"
+  authors="Haarnoja et al."
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1801.01290"
+/>
+
+<Reference
+  title="IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures"
+  authors="Espeholt et al."
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1802.01561"
+/>

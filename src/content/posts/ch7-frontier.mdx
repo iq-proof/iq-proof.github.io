@@ -1,0 +1,137 @@
+---
+title: "Offline RL부터 LLM 정렬까지 — 현대 RL의 공통 철학"
+description: "OOD 문제를 pessimism으로 해결하는 CQL, BC 정규화를 쓰는 TD3+BC, 상상 롤아웃으로 샘플 효율을 높이는 Dreamer, 그리고 RLHF·DPO가 공유하는 하나의 원칙을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [reinforcement-learning, offline-rl, rlhf, dpo, model-based-rl]
+difficulty: advanced
+series:
+  slug: advanced-rl-deep-dive
+  title: Advanced Rl Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+현대 RL의 최전선 — Offline RL, Model-Based RL, Meta-RL, RLHF — 은 서로 다른 문제를 푸는 것처럼 보인다. 그러나 이 챕터들을 가로지르면 하나의 원칙이 반복된다. **"에이전트가 경험하지 않은 영역에서 잘못된 확신을 갖지 않도록 어떻게 제어하는가."** 왜 이 단순한 질문 하나가 CQL의 수식부터 DPO의 closed-form 유도까지를 같은 언어로 묶어주는가?
+
+## Distribution Shift — 모든 문제의 뿌리
+
+표준 Q-learning이 offline 데이터셋에서 발산하는 이유는 단순하다. 데이터셋 $\mathcal{D}$에 없는 행동 $a$에 대해 $Q(s, a)$는 신경망의 외삽(extrapolation)에 의존한다. 이 외삽값이 부풀어 오르면 정책이 그 행동을 선호하고, 새로운 데이터 없이는 수정이 불가능하다.
+
+이것이 **distribution shift**의 핵심이다. 학습 정책 $\pi^*$가 행동 정책 $\pi_\beta$에서 멀어질수록 위험이 커진다. 측도로는 다음처럼 쓴다.
+
+$$
+\text{Shift} := D_{\text{KL}}(\pi^* \| \pi_\beta)
+$$
+
+이 양이 커질수록 데이터셋은 현재 정책에 대해 점점 쓸모없어진다. Online RL은 새 샘플로 자기 수정이 가능하지만, Offline RL에는 그 메커니즘이 없다.
+
+## Pessimism — CQL과 TD3+BC의 답
+
+CQL(Kumar 2020)은 OOD 행동의 Q값을 **명시적으로 낮추는** penalty를 손실에 추가한다.
+
+$$
+L_{\text{CQL}}(\phi) = \alpha \cdot \mathbb{E}_{s \sim \mathcal{D}}\!\left[\log \sum_a \exp(Q_\phi(s, a)) - \mathbb{E}_{a \sim \mathcal{D}}[Q_\phi(s, a)]\right] + L_{\text{Bellman}}
+$$
+
+첫 항은 데이터셋 밖의 행동(soft-max over all actions)을 끌어내리고, 두 번째 항은 데이터셋 행동의 Q를 끌어올린다. 결과적으로 Q함수가 in-distribution에서는 표준 Bellman을, OOD에서는 하한(lower bound)을 학습한다.
+
+TD3+BC(Fujimoto 2021)는 다른 언어를 쓰지만 같은 직관이다. 정책을 데이터셋 행동 근처에 머물게 강제하는 behavior cloning 항을 actor 손실에 붙인다.
+
+$$
+L_\pi = -\lambda \mathbb{E}_\mathcal{D}[Q_{\phi_1}(s, \pi(s))] + \mathbb{E}_\mathcal{D}[(\pi(s) - a)^2]
+$$
+
+$\lambda = \alpha / \bar{|Q|}$로 두 항의 크기를 자동 조정한다. Distribution shift bound는 $D_{\text{KL}}(\pi \| \pi_\beta) \leq O(1/\lambda)$로 제어된다.
+
+<Callout type="note" title="트레이드오프: Conservatism의 양날">
+$\alpha$(CQL) 또는 $\lambda$(TD3+BC)가 너무 크면 정책이 behavior cloning에 수렴해 RL의 이점이 사라진다. 너무 작으면 OOD 과대추정이 재발한다. D4RL 벤치마크에서 두 알고리즘 모두 medium-quality 데이터셋에서 BC 대비 10–20점 우위를 보이지만, 최적 $\alpha$는 데이터 품질에 크게 의존한다.
+</Callout>
+
+## World Model — 상상으로 샘플 효율을 높이다
+
+Model-Based RL의 접근은 다르다. 환경과의 상호작용 자체를 줄이기 위해 **dynamics를 학습하고 상상 롤아웃을 생성**한다.
+
+Dreamer(Hafner 2019)의 RSSM은 잠재 상태를 결정론적 부분 $h_t$(GRU)와 확률론적 부분 $z_t$로 분리한다. 학습 목표는 ELBO다.
+
+$$
+\mathcal{L} = \mathbb{E}[\log p(o_t | s_t)] - D_{\text{KL}}(q(z_t | h_t, o_t) \| p(z_t | h_t)) + \log p(r_t | s_t)
+$$
+
+한 번의 실제 환경 스텝은 수십 번의 잠재 공간 롤아웃으로 증폭된다. 그러나 학습된 모델의 오차가 롤아웃 내내 누적된다는 근본적인 제약이 있다. $T$-스텝 오차는 최선의 경우 $O(T \cdot \epsilon)$, 최악의 경우 지수적으로 증가한다. 이것이 Dreamer의 imagination horizon을 15스텝 내외로 제한하는 이유다.
+
+MuZero(Schrittwieser 2020)는 reconstruction 없이 reward·value·policy loss만으로 잠재 표현을 학습한다. RL의 목표가 보상 최대화이므로, 관측 예측은 불필요한 우회다. Atari 100k 벤치마크에서 MuZero가 ~1000%, SAC이 ~200% 수준인 것은 이 철학의 실증이다.
+
+## Meta-RL과 ICL — 분포 학습의 확장
+
+Meta-RL은 distribution shift 문제를 다른 축에서 바라본다. 단일 태스크 전문가가 아니라 **태스크 분포에서 빠르게 적응하는 초기화**를 학습한다.
+
+MAML(Finn 2017)의 외부 루프 목표는 다음과 같다.
+
+$$
+\min_\theta \sum_{\mathcal{T}_i \sim P(\mathcal{T})} \mathcal{L}_{\mathcal{T}_i}^{\text{test}}(\theta - \alpha \nabla_\theta \mathcal{L}_{\mathcal{T}_i}^{\text{train}}(\theta))
+$$
+
+이 $\theta$는 "어느 태스크에서든 몇 스텝의 그래디언트로 좋은 성능에 도달할 수 있는 출발점"이다. RL²(Duan 2016)는 같은 아이디어를 LSTM의 hidden state에 암묵적으로 구현한다 — 에피소드에 걸쳐 hidden state가 태스크 identity를 인코딩한다.
+
+<Aside label="LLM의 in-context learning">
+GPT 계열의 in-context learning은 RL²의 언어 모델 버전이다. 사전학습이 meta-training, 프롬프트의 예시들이 태스크 specification, 자기회귀 생성이 adaptation이다. 그래디언트 업데이트 없이 컨텍스트만으로 새 태스크에 적응하는 구조가 정확히 대응된다.
+</Aside>
+
+## RLHF와 DPO — 같은 최적점, 다른 경로
+
+RLHF(Ouyang 2022)는 RL 언어로 LLM 정렬 문제를 푼다. PPO의 보상은 다음과 같다.
+
+$$
+R_{\text{RLHF}}(x, y) = r_\phi(x, y) - \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{SFT}}(y|x)}
+$$
+
+$r_\phi$는 Bradley-Terry 모델로 학습된 보상 함수, $\beta$ KL 항은 SFT 모델에서 너무 멀어지지 않도록 제어한다. Offline RL의 BC 정규화와 구조가 동일하다.
+
+DPO(Rafailov 2023)는 이 KL-제약 최적화의 closed-form 해를 역산해 보상 모델을 우회한다.
+
+<Theorem kind="theorem" number="1" title="DPO Equivalence (Rafailov 2023)">
+KL-제약 보상 최대화의 최적 정책은 $\pi^*(y|x) \propto \pi_{\text{SFT}}(y|x) \exp(r(x,y)/\beta)$이다. 이를 Bradley-Terry 선호 확률에 대입하면 $\log Z(x)$가 소거되어 다음 손실로 환원된다.
+
+$$
+L_{\text{DPO}}(\theta) = -\mathbb{E}\!\left[\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{SFT}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{SFT}}(y_l|x)}\right)\right]
+$$
+</Theorem>
+
+<Proof>
+RLHF 최적 정책 $\pi^*$로부터 $r(x,y) = \beta \log(\pi^*/\pi_{\text{SFT}}) + \beta \log Z(x)$를 유도한다. 선호 쌍 $(y_w, y_l)$는 같은 $x$를 공유하므로 $r(y_w) - r(y_l)$에서 $\beta \log Z(x)$가 상쇄된다. 남은 항을 Bradley-Terry 손실에 대입하면 DPO 형태를 얻는다. 따라서 DPO의 최솟값은 RLHF PPO 단계의 결과와 동일한 최적점이다. $\square$
+</Proof>
+
+## 정리
+
+네 챕터를 관통하는 원칙은 하나다 — **경험하지 않은 영역에서의 과신을 제어하라**.
+
+- Offline RL(CQL, TD3+BC)은 OOD Q값을 pessimism 또는 BC 정규화로 억제한다.
+- Model-Based RL(Dreamer, MuZero)은 학습된 dynamics로 샘플을 증폭하되, 누적 오차를 제한하기 위해 horizon을 통제한다.
+- Meta-RL(MAML, RL²)은 태스크 분포를 통해 일반화 가능한 초기화를 학습하고, LLM의 in-context learning으로 이어진다.
+- RLHF·DPO는 KL 패널티로 정책이 SFT 모델에서 과도하게 이탈하지 않도록 제어하고, DPO는 그 구조를 이용해 보상 모델을 제거한다.
+
+RL의 미래는 model-free와 model-based의 이분법이 아니라, 이 원칙을 얼마나 우아하게 구현하느냐에 달려 있다.
+
+<Reference
+  title="Conservative Q-Learning for Offline Reinforcement Learning"
+  authors="Kumar et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.04779"
+/>
+
+<Reference
+  title="Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+  authors="Rafailov et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.18290"
+/>
