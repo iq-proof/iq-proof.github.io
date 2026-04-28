@@ -1,0 +1,128 @@
+---
+title: "CNN의 설계 철학은 어디서 왔는가"
+description: "귀납적 편향의 근거부터 적대적 취약성, 스펙트럼 편향, Vision Transformer와의 수렴까지 — CNN의 모든 설계 결정이 공유하는 하나의 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [cnn, inductive-bias, adversarial, spectral-bias, vision-transformer]
+difficulty: advanced
+series:
+  slug: cnn-deep-dive
+  title: Cnn Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+CNN은 왜 작동하는가? "이미지에 잘 맞기 때문"이라는 답은 반만 맞다. 더 정확히 말하면, CNN의 모든 설계 결정 — 작은 커널, 공유 가중치, 풀링, 계층적 깊이 — 은 하나의 철학에서 비롯된다. **구조적 가정으로 데이터 부족을 보상하라**. 그리고 바로 이 철학이 CNN의 강점인 동시에 취약성의 뿌리다. 어떻게 같은 원리가 강점과 한계를 동시에 만드는가?
+
+## 귀납적 편향: 구조적 가정의 정체
+
+CNN의 귀납적 편향(inductive bias)은 세 가지다.
+
+**Translation equivariance**: 입력이 이동하면 출력도 동등하게 이동한다.
+
+$$f(T_\delta x) = T_\delta f(x)$$
+
+이는 convolution의 정의에서 자동으로 따라온다. 같은 필터를 모든 위치에 공유하기 때문이다.
+
+**Locality**: 위치 $(i,j)$의 출력은 반경 $\text{RF}_\ell$ 내의 픽셀에만 의존한다. 3×3 커널은 그 바깥을 보지 않는다.
+
+**Hierarchy**: 얕은 층은 edge와 corner를, 깊은 층은 이들의 조합인 의미론적 특징을 학습한다. pooling과 stride가 이 계층을 구현한다.
+
+이 세 가지 가정이 왜 중요한가? 가정 없이 함수 공간 전체를 탐색하면 sample complexity가 지수적으로 증가한다. CNN은 가정으로 탐색 공간을 줄인다. Dosovitskiy et al.(2021)의 실험이 이를 정확히 보여준다 — ImageNet-1k(약 120만 장)에서 ResNet-50은 ViT-B를 앞서고, JFT-300M(약 3억 장)에서는 ViT-B가 ResNet-50을 4%p 이상 앞선다. 데이터가 충분하면 가정이 불필요해지고, 오히려 유연성이 이긴다.
+
+<Callout type="note" title="트레이드오프: 편향과 분산">
+강한 귀납적 편향은 작은 데이터에서 낮은 generalization error를 보장하지만, 큰 데이터에서는 approximation error가 ceiling을 만든다. "CNN이 좋다"는 말은 항상 데이터 규모를 전제로 해야 한다.
+</Callout>
+
+## 취약성: 같은 구조가 뚫리는 이유
+
+CNN이 translation equivariance와 locality로 효율을 얻는다면, adversarial example은 그 반대편을 공격한다. Szegedy et al.(2014)의 발견은 단순하다 — 지각 불가능한 perturbation으로 CNN을 완전히 속일 수 있다.
+
+FGSM(Fast Gradient Sign Method)은 가장 단순한 공격이다.
+
+$$x' = x + \epsilon \cdot \text{sign}(\nabla_x L(\theta, x, y))$$
+
+왜 이게 효과적인가? 1차 Taylor 근사에서, loss 증가량은 다음과 같이 쓸 수 있다.
+
+$$\Delta L \approx \nabla_x L^\top \delta = \epsilon \sum_i |(\nabla_x L)_i| = \epsilon \|\nabla_x L\|_1$$
+
+$d$차원에서 $\|\nabla_x L\|_1 \approx d \cdot \|\nabla_x L\|_\infty$이므로, **차원이 높을수록 아주 작은 $\epsilon$으로도 큰 loss 증가**가 가능하다. 고차원 이미지($d = 224 \times 224 \times 3 \approx 150\text{K}$)에서 CNN은 이 선형 취약성을 고스란히 가진다.
+
+<Theorem kind="proposition" number="1" title="Robustness-Accuracy Trade-off">
+$\epsilon$-robust 모델을 학습할 때, 달성 가능한 표준 정확도와 적대적 정확도의 합은 상수로 bound된다.
+</Theorem>
+
+<Proof>
+Tsipras et al.(2019)에 따르면, robust decision boundary는 클래스 간 margin을 $2\epsilon$ 이상으로 확보해야 한다. 고차원에서 모든 클래스 쌍이 이 margin을 동시에 만족할 수 없으므로, robustness를 높일수록 세밀한 구분 능력이 줄어든다. 결과적으로, ResNet-50의 표준 정확도 76%는 adversarial training으로 65%까지 낮아지고, 그 대가로 $\ell_\infty$ $\epsilon=8/255$에 대한 robust 정확도를 약 50%까지 올릴 수 있다.
+</Proof>
+
+adversarial vulnerability는 CNN의 버그가 아니다. locality와 선형 연산에 의존하는 구조가 필연적으로 노출하는 면이다.
+
+## 스펙트럼 편향: CNN이 못 보는 주파수
+
+취약성의 또 다른 얼굴은 스펙트럼 편향(spectral bias)이다. Rahaman et al.(2019)의 발견 — 신경망은 저주파 성분을 먼저, 고주파 성분을 나중에 학습한다.
+
+Neural Tangent Kernel(NTK) 분석에서, 주파수 $k$의 수렴 시간은 다음과 같이 특성화된다.
+
+$$\tau(k) \propto \frac{1}{\lambda_k}, \quad \lambda_k \propto \frac{1}{k^2}$$
+
+따라서 $\tau(k) \propto k^2$. 주파수 10의 성분은 주파수 1의 성분보다 100배 오래 걸린다.
+
+CNN은 이 편향을 구조적으로 강화한다. 3×3 커널의 Fourier 응답은 고주파에서 급격히 감소한다.
+
+$$|\hat{K}(\omega)| \propto \frac{1}{1 + \alpha|\omega|^2}$$
+
+locality가 곧 저주파 편향이다. edge와 object shape(저주파)는 잘 배우고, texture와 fine detail(고주파)은 상대적으로 약하다 — 이것이 adversarial perturbation(고주파 노이즈)에 취약한 이유와 연결된다.
+
+NeRF(Mildenhall et al., 2021)는 이 편향을 정면으로 해결한다. Fourier positional encoding을 사전에 주입해 NTK를 균등화한다.
+
+$$\gamma(x) = [\sin(2^0 \pi x), \cos(2^0 \pi x), \ldots, \sin(2^{L-1} \pi x), \cos(2^{L-1} \pi x)]$$
+
+이 encoding 후에는 $\lambda_k \approx \text{const}$가 되어 모든 주파수가 비슷한 속도로 수렴한다.
+
+## CNN과 Transformer의 수렴
+
+Vision Transformer(ViT)는 처음에 "CNN을 대체한다"는 서사로 등장했다. 그러나 이분법은 잘못되었다.
+
+ViT의 patch embedding은 stride-16 convolution과 수학적으로 동등하다.
+
+$$\text{PatchEmbed}(x) = \text{Conv2d}(x;\, k=16,\, s=16,\, C_\text{out}=D)$$
+
+ViT도 첫 층에서는 CNN처럼 작동한다. 차이는 그 다음이다. CNN은 3×3 커널로 receptive field를 점진적으로 넓히지만, self-attention은 첫 층부터 모든 patch를 직접 연결한다. 이는 locality 없이 global reasoning을 가능하게 하지만, 작은 데이터에서는 이 유연성이 과적합으로 이어진다.
+
+최근 모델들은 이 둘을 절충한다. Swin Transformer(Liu et al., 2021)는 window-based attention으로 locality를 회복하고, shifted windows로 window 간 연결을 확보한다. ConvNeXt(Liu et al., 2022)는 반대 방향에서 출발한다 — CNN에 LayerNorm, GELU, depthwise separable convolution을 적용해 Transformer 수준의 성능을 달성한다. 같은 파라미터 규모(~89M)에서 ConvNeXt-B는 Swin-B와 거의 동등한 ImageNet top-1 정확도를 보인다.
+
+<Aside label="설계 철학">
+최고 성능 vision 모델들이 공통으로 채택하는 것은 CNN의 계층적 구조다. ViT도, Swin도, ConvNeXt도 모두 stage를 거듭하며 spatial resolution을 줄인다. "CNN의 계층성"은 경험적 기법이 아니라 정보 처리의 원리였다.
+</Aside>
+
+## 정리
+
+- CNN의 translation equivariance, locality, hierarchy는 데이터 부족을 구조적 가정으로 보상하는 메커니즘이다. 데이터가 충분하면 이 가정의 필요성은 줄어든다.
+- Adversarial vulnerability는 CNN의 선형성과 고차원 특성이 결합한 결과다. Robustness를 높이면 표준 정확도가 희생된다 — 이 trade-off는 이론적으로 피할 수 없다.
+- Spectral bias는 CNN의 locality와 같은 뿌리를 가진다. 저주파를 먼저 학습하는 편향은 구조(kernel 크기)와 학습 과정(NTK eigenvalue) 모두에서 비롯된다.
+- CNN과 Transformer의 이분법은 더 이상 유효하지 않다. 최고 성능 모델들은 CNN의 계층성과 Transformer의 유연성을 함께 쓴다.
+
+귀납적 편향은 공짜 점심이 아니다. 가정이 클수록 적은 데이터로 더 빠르게 배우지만, 가정이 틀린 곳에서는 더 크게 실패한다.
+
+<Reference
+  title="An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"
+  authors="Dosovitskiy et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2010.11929"
+/>
+<Reference
+  title="On the Spectral Bias of Neural Networks"
+  authors="Rahaman et al."
+  year={2019}
+  venue="ICML"
+  url="https://arxiv.org/abs/1806.08734"
+/>

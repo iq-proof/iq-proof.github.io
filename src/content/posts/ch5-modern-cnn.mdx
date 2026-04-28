@@ -1,0 +1,122 @@
+---
+title: "CNN 아키텍처 설계의 통일된 논리: 무엇이 성능을 결정하는가"
+description: "VGG의 depth 실험부터 NAS의 자동 탐색까지, 현대 CNN 아키텍처 설계를 관통하는 하나의 원리 — 표현력과 효율성의 균형 — 를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [cnn, architecture, efficientnet, convnext, nas]
+difficulty: intermediate
+series:
+  slug: cnn-deep-dive
+  title: Cnn Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+VGG는 깊이가 정확도를 결정한다는 것을 보여줬다. GoogLeNet은 같은 목표를 34배 적은 파라미터로 달성했다. EfficientNet은 세 가지 차원을 균형 있게 조합했고, ConvNeXt는 Transformer의 설계 원리를 CNN에 역수입해 둘의 격차를 허물었다. 그리고 NAS는 이 모든 탐색을 자동화했다. 이 다섯 챕터는 서로 다른 이야기처럼 보이지만, 하나의 질문을 반복한다 — **CNN의 성능은 무엇이 결정하는가?**
+
+## 깊이의 발견과 그 대가
+
+VGG (Simonyan & Zisserman, 2014)는 간단한 실험을 했다. $3 \times 3$ 필터를 깊이 방향으로 쌓으면 더 큰 필터와 같은 수용 영역(receptive field)을 얻을 수 있다. $n$개의 $3 \times 3$ 필터를 stride 1로 쌓으면 수용 영역은 다음과 같다.
+
+$$RF_n = 1 + 2n$$
+
+19층 VGG는 $RF_{19} = 39$를 달성하면서도, 파라미터 수는 $5 \times 5$ 단일 필터 대비 28% 절감한다. 더 중요한 것은 비선형성이 두 배로 늘어난다는 점이다. 깊이는 단순한 층의 개수가 아니라 모델이 근사할 수 있는 함수 복잡도를 결정한다.
+
+그러나 VGG는 한계도 드러냈다. 138M 파라미터, 15.5B FLOPs. 그리고 무엇보다 — plain CNN을 19층 이상으로 쌓으면 **훈련 손실 자체가 올라간다**. gradient vanishing이 깊은 층을 사실상 무력화하기 때문이다. 깊이가 표현력을 높이지만, 최적화 비용이 이득을 상쇄하는 지점이 존재한다.
+
+## 효율성의 재발견: 1×1 convolution
+
+GoogLeNet (Szegedy et al., 2014)은 완전히 다른 방향에서 출발했다. 자연 이미지에는 다양한 크기의 객체가 공존한다. 고정된 필터 크기는 하나의 스케일만 포착한다. Inception 모듈은 $1 \times 1$, $3 \times 3$, $5 \times 5$, MaxPool 경로를 병렬로 운영한다.
+
+핵심은 $1 \times 1$ convolution이다. 공간 정보를 유지하면서 채널 축만 변환한다. 각 위치에서 채널 벡터에 선형 변환을 적용하는 것이므로, 차원 축소 용도로 쓰이면 후속 $3 \times 3$ conv의 입력 채널을 대폭 줄인다.
+
+<Callout type="note" title="Bottleneck의 효과">
+입력 채널 256에서 바로 $3 \times 3$ conv를 적용하면 $256 \times 256 \times 9 = 589{,}824$개 파라미터가 필요하다. $1 \times 1$으로 64채널로 축소한 뒤 $3 \times 3$을 적용하면 $256 \times 64 + 64 \times 256 \times 9 = 155{,}648$개 — **73% 절감**. 이것이 GoogLeNet이 VGG 대비 34배 적은 파라미터(4M)로 경쟁력 있는 정확도를 달성한 원리다.
+</Callout>
+
+## 세 가지 차원의 균형: Compound Scaling
+
+VGG는 깊이만 늘렸고, 이후 연구들은 채널 수(width)나 입력 해상도(resolution)를 늘렸다. EfficientNet (Tan & Le, 2019)은 이 세 가지를 동시에 다룬 최초의 체계적 시도다.
+
+CNN의 FLOPs는 다음에 비례한다.
+
+$$\text{FLOPs} \propto d \times w^2 \times r^2$$
+
+depth는 선형, width와 resolution은 제곱으로 FLOPs에 기여한다. 일정 예산 $2^\phi$ 안에서 세 차원을 균형 있게 늘리려면 다음 제약을 만족해야 한다.
+
+$$\alpha \cdot \beta^2 \cdot \gamma^2 \approx 2$$
+
+여기서 $d = \alpha^\phi$, $w = \beta^\phi$, $r = \gamma^\phi$. Grid search로 찾은 최적값은 $\alpha = 1.2$, $\beta = 1.1$, $\gamma = 1.15$. 이 비율로 $\phi = 0$부터 7까지 확장한 것이 EfficientNet-B0~B7이다.
+
+<Aside label="Diminishing return">
+B0 → B1은 +2.7%, B6 → B7은 +0.5%. 스케일링이 깊어질수록 정확도 향상이 둔화된다. FLOPs 증가는 선형이 아니지만 정확도 증가는 로그에 가깝다 — 이것이 Pareto frontier의 기울기가 완만해지는 이유다.
+</Aside>
+
+## Transformer에서 배워온 것들
+
+2021년 Vision Transformer(ViT)가 등장했고, 많은 이가 "CNN의 시대가 끝났다"고 말했다. ConvNeXt (Liu et al., 2022)는 이 주장을 정면으로 검토했다.
+
+핵심 질문은 간단하다. **동일한 훈련 조건에서 비교하면 어떤가?** ResNet을 modern training(300 epoch, AdamW, augmentation)으로 훈련하면 기존 대비 5% 가까이 올라간다. ConvNeXt는 여기서 다섯 가지를 추가로 개선했다.
+
+1. Stage ratio를 Transformer 방식(3:3:9:3)으로 조정
+2. $3 \times 3$ → depthwise $7 \times 7$ (receptive field 확대)
+3. BatchNorm → LayerNorm
+4. ReLU → GELU
+5. 표준 bottleneck → inverted bottleneck (확대 후 압축)
+
+결과는 명확했다. ConvNeXt-T (29M) 82.1% vs Swin-T (29M) 81.3% — 동일 규모에서 CNN이 Transformer보다 높다. 이 실험이 말하는 것은 "CNN이 더 좋다"가 아니라, **아키텍처보다 설계 원리가 성능을 결정한다**는 것이다.
+
+depthwise $7 \times 7$ convolution이 왜 효율적인지는 수치로 확인된다. 표준 $7 \times 7$ conv는 채널당 커널을 모두 학습하지만, depthwise는 채널 간 상호작용 없이 공간 정보만 처리한다.
+
+$$\frac{\text{FLOPs}_{\text{depthwise}}}{\text{FLOPs}_{\text{standard}}} = \frac{K^2 + C_{\text{out}}}{K^2 \times C_{\text{out}}} \approx \frac{1}{C_{\text{out}}}$$
+
+$C_{\text{out}} = 256$이면 파라미터가 99.6% 줄어든다. 정확히 이것이 Transformer의 attention이 "넓게 보면서 효율적인" 이유와 같은 논리다.
+
+## 탐색의 자동화와 그 한계
+
+이 모든 아키텍처 설계 결정을 자동화할 수 있는가? NAS(Neural Architecture Search)가 그 시도다.
+
+NASNet (Zoph et al., 2017)은 RNN 컨트롤러가 아키텍처를 샘플링하고, 자식 네트워크의 검증 정확도를 보상으로 정책을 갱신한다. 정확하지만 500 GPU-day가 필요하다. DARTS (Liu et al., 2019)는 이산 선택 문제를 연속 완화로 바꾼다.
+
+$$\bar{o}(x) = \sum_{i} \text{softmax}(\alpha)_i \cdot o_i(x)$$
+
+모든 연산을 동시에 유지하고, 아키텍처 파라미터 $\alpha$와 가중치 $w$를 교대로 최적화한다. 탐색 비용이 4 GPU-day로 줄어든다. RegNet (Radosavovic et al., 2020)은 더 나아가 설계 공간 자체를 체계화한다 — 324개 설정을 무작위 샘플링해도 고성능 모델을 찾을 수 있다는 것을 보여줬다.
+
+<Callout type="note" title="트레이드오프">
+NAS는 탐색 공간으로 정의된 범위 안에서만 탐색한다. 공간 밖의 혁신(예: attention 자체)은 찾지 못한다. DARTS는 빠르지만 훈련 중에는 모든 연산을 메모리에 올려야 한다. RegNet이 무작위 탐색으로도 통한다는 사실은, 설계 원리가 충분히 이해되면 자동 탐색의 필요성이 줄어든다는 역설을 보여준다.
+</Callout>
+
+## 정리
+
+다섯 챕터를 관통하는 것은 결국 하나의 원리다 — **표현력과 효율성의 균형, 그리고 그것을 결정하는 것은 아키텍처 자체보다 설계 원리다**.
+
+- VGG는 depth가 표현력을 결정한다는 것을 보였지만, 최적화 한계도 함께 드러냈다.
+- GoogLeNet은 $1 \times 1$ conv로 파라미터를 34배 줄이면서도 multi-scale 표현을 유지했다.
+- EfficientNet은 depth, width, resolution 세 차원의 균형이 단일 차원 확장보다 효율적임을 증명했다.
+- ConvNeXt는 훈련 조건과 설계 원리가 동등하면 CNN도 Transformer에 뒤지지 않음을 보였다.
+- NAS는 이 탐색을 자동화했고, RegNet은 그 결과를 이론으로 환원했다.
+
+아키텍처 논쟁은 "CNN이냐 Transformer냐"가 아니라, 어떤 설계 원리가 어떤 조건에서 최적인가의 문제다.
+
+<Reference
+  title="EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks"
+  authors="Tan, M. & Le, Q. V."
+  year={2019}
+  venue="ICML"
+  url="https://arxiv.org/abs/1905.11946"
+/>
+
+<Reference
+  title="A ConvNet for the 2020s"
+  authors="Liu, Z. et al."
+  year={2022}
+  venue="CVPR"
+  url="https://arxiv.org/abs/2201.03545"
+/>

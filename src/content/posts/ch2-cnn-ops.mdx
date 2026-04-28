@@ -1,0 +1,111 @@
+---
+title: "CNN 설계의 다섯 가지 선택은 하나의 문제에서 나온다"
+description: "Convolution의 forward/backward 수학부터 depthwise separable의 텐서 분해까지, CNN이 '어디서 무엇을 볼 것인가'를 결정하는 방식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [cnn, convolution, receptive-field, depthwise-separable, pooling]
+difficulty: advanced
+series:
+  slug: cnn-deep-dive
+  title: Cnn Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+CNN을 구성하는 선택들 — 커널 크기, 패딩 전략, 풀링 방식, 스트라이드, 채널 분리 — 은 표면적으로 서로 독립적으로 보인다. 하지만 이 장들을 함께 읽으면 하나의 공통 질문이 드러난다: **"이 레이어는 입력의 어떤 영역을, 어떤 비용으로, 얼마나 선택적으로 볼 것인가?"** 이 질문에 대한 서로 다른 답이 각각의 설계 결정을 낳는다.
+
+## Convolution이 정의하는 것
+
+Multi-channel convolution의 forward는 다음과 같다.
+
+$$
+Y[c_o, i, j] = \sum_{c_i,\, m,\, n} K[c_o, c_i, m, n] \cdot X[c_i,\, i \cdot s + m - p,\, j \cdot s + n - p] + b[c_o]
+$$
+
+수식이 말하는 것은 단순하다. 출력의 각 위치는 입력의 **국소 영역** 전체를 모든 입력 채널에 걸쳐 가중합한 결과다. 같은 커널 $K$가 이미지 전체에 반복 적용된다 — 이것이 weight sharing이고, 이것이 translation invariance의 원천이다.
+
+backward는 이 구조의 필연적 귀결이다.
+
+$$
+\frac{\partial L}{\partial X[c_i, h, w]} = \sum_{c_o,\, m,\, n} K[c_o, c_i, m, n] \cdot \frac{\partial L}{\partial Y[c_o, h - m + p, w - n + p]}
+$$
+
+<Theorem kind="proposition" number="1" title="Backward Pass의 Convolution 표현">
+$\partial L / \partial X$는 $\partial L / \partial Y$와 **flipped kernel** $K^{\text{flip}}$의 full-mode convolution으로 표현된다. $\partial L / \partial K$는 $X$와 $\partial L / \partial Y$의 valid convolution으로 표현된다.
+</Theorem>
+
+<Proof>
+Forward에서 $X[c_i, h, w]$는 출력 위치 $(i', j')$에서 $i' \cdot s + m - p = h$, $j' \cdot s + n - p = w$인 모든 $(m, n)$을 통해 나타난다. Chain rule을 적용하면, 이를 kernel 인덱스 방향으로 합산하는 식은 $K[c_o, c_i, K_h - 1 - m, K_w - 1 - n]$을 사용한 convolution과 동일한 형태가 된다. 이것이 flipped kernel이다. $\square$
+</Proof>
+
+이 대칭성은 단순히 수학적 아름다움이 아니다. transposed convolution(Ch4)이 정확히 이 backward 구조를 forward로 재사용하고, im2col이 이 전체 연산을 행렬 곱셈으로 펼칠 수 있는 이유가 여기서 나온다.
+
+## Pooling이 정의하는 것
+
+Convolution이 "무엇을 볼 것인가"를 정의한다면, pooling은 "얼마나 선택적으로 요약할 것인가"를 결정한다.
+
+Max pooling은 receptive region 내 최댓값만 취한다.
+
+$$
+Y[c, i, j] = \max_{0 \leq m, n < p} X[c,\; i \cdot s + m,\; j \cdot s + n]
+$$
+
+Backward에서는 argmax 위치로만 gradient가 흐른다. 나머지 위치의 gradient는 0이다. Average pooling은 반대다 — 모든 위치에 $1/p^2$의 균일한 gradient를 돌려준다.
+
+<Callout type="note" title="트레이드오프">
+Max pooling은 강한 활성화에만 집중하므로 noise에 강하지만 gradient가 sparse해진다. Average pooling은 gradient 흐름이 균일하지만 weak activation도 출력에 영향을 준다. 최근 EfficientNet 계열은 Global Average Pooling으로 spatial 정보 전체를 하나의 벡터로 압축한다.
+</Callout>
+
+Stride $s$인 pooling이 다음 레이어의 receptive field를 $s$배 곱셈적으로 확대한다는 사실은 이 설계의 핵심 동기다. 5개 레이어를 쌓으면 receptive field는 $2^5 = 32$배가 된다. 깊은 CNN이 전역 패턴을 인식할 수 있는 이유다.
+
+## Padding과 Dilation이 정의하는 것
+
+커널이 $3 \times 3$이면 경계 픽셀은 완전한 receptive field를 가질 수 없다. Padding은 이 경계 처리 문제에 대한 선택이다.
+
+Zero padding은 경계를 0으로 채운다. 1D 신호 $x = [1, 1, 1]$에 zero padding을 적용하면 출력 경계가 내부보다 낮아진다 — "dark halo" artifact다. Reflection padding은 경계를 이미지 내용으로 대칭 반사시켜 이 discontinuity를 제거한다. 의료 영상이나 텍스처 합성에서 reflection padding이 선호되는 이유다.
+
+'Same' convolution의 패딩 공식 $p = (K - 1)/2$는 출력 크기를 입력과 동일하게 유지하기 위한 필요조건이다. $K$가 홀수일 때만 정수 padding이 가능하다 — 이것이 CNN에서 $3 \times 3$, $5 \times 5$ 같은 홀수 커널이 지배적인 이유다.
+
+Dilated (atrous) convolution은 다른 방식으로 receptive field 문제에 답한다.
+
+$$
+(I *_d K)[i] = \sum_{m=0}^{K-1} K[m] \cdot I[i + d \cdot m]
+$$
+
+Dilation rate $d$를 사용하면 공간 해상도를 그대로 유지하면서 receptive field를 $K + (K-1)(d-1)$로 확장한다. WaveNet은 $d_l = 2^{l-1}$의 exponential dilation을 30층 쌓아 $2^{30}$개 샘플(약 1분 오디오)에 달하는 receptive field를 단일 출력이 바라보게 만든다. Stride가 해상도를 포기하는 대신 receptive field를 얻는다면, dilation은 해상도를 지키면서 receptive field를 얻는 전략이다.
+
+## Depthwise Separable이 정의하는 것
+
+Standard $3 \times 3$ convolution의 FLOPs는 $K^2 C_\text{in} C_\text{out} H W$다. $C_\text{in} = 64$, $C_\text{out} = 128$이면 $73{,}728 \cdot HW$. 모바일 기기에서는 감당하기 어렵다.
+
+Depthwise separable convolution은 이 연산을 두 단계로 분해한다. Depthwise는 각 채널을 독립적으로 $K \times K$ convolution하고, pointwise는 $1 \times 1$으로 채널을 혼합한다. FLOPs는 $(K^2 C_\text{in} + C_\text{in} C_\text{out}) HW$로 줄어든다.
+
+감소 비율은 다음과 같다.
+
+$$
+r = \frac{1}{C_\text{out}} + \frac{1}{K^2}
+$$
+
+$C_\text{out} = 128$, $K = 3$이면 $r \approx 0.119$ — 약 **8.4배 감소**다. 이 수식이 말하는 것은 명확하다. 출력 채널이 많을수록, 커널이 클수록 분리의 이득이 커진다.
+
+<Aside label="텐서 분해 관점">
+Depthwise separable은 단순한 속도 최적화가 아니다. Standard convolution kernel $K \in \mathbb{R}^{C_\text{out} \times C_\text{in} \times K_h \times K_w}$를 공간 차원과 채널 차원으로 분리하는 **저랭크 텐서 분해**다. Spatial pattern 추출과 channel mixing이 독립적으로 학습 가능하다고 가정하는 귀납적 편향이다. ConvNeXt가 $7 \times 7$ depthwise를 블록 중심에 놓은 것은 이 가정을 transformer의 구조적 통찰과 결합한 결과다.
+</Aside>
+
+## 정리
+
+다섯 개의 챕터는 결국 하나의 질문에 대한 다섯 가지 답이다 — "이 레이어는 무엇을, 어느 범위에서, 어떤 비용으로 볼 것인가."
+
+- **Convolution forward/backward**: weight sharing이 translation invariance를 낳고, backward는 flipped kernel의 convolution이다.
+- **Pooling**: max는 선택적으로, average는 균일하게 요약한다. 둘 다 stride마다 receptive field를 곱셈적으로 확대한다.
+- **Padding**: zero padding은 경계 artifact를 낳는다. Reflection이 더 자연스럽지만 비용이 있다. 'Same' convolution은 $K$가 홀수일 때만 깔끔하다.
+- **Stride/Dilation/Transposed**: Stride는 해상도를 포기하고 RF를 얻는다. Dilation은 해상도를 지키며 RF를 얻는다. Transposed는 backward를 forward로 재해석해 upsampling한다.
+- **Depthwise separable**: 공간과 채널을 분리해 $8 \times$ 이상의 FLOPs 감소를 얻는다. MobileNet에서 ConvNeXt까지 이어지는 설계 원리다.
+
+다음 글에서는 이론적 receptive field와 실효 receptive field가 왜 다른지, 그리고 그 차이가 실제 feature detection에 어떤 영향을 주는지 추적한다.

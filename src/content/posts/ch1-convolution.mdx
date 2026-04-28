@@ -1,0 +1,148 @@
+---
+title: "CNN의 수학적 토대 — Convolution부터 Frequency까지"
+description: "Discrete convolution의 정의와 cross-correlation의 차이부터, Translation equivariance의 군론적 증명, Toeplitz 행렬 표현, 그리고 Spectral bias까지 CNN의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [cnn, convolution, equivariance, fourier, group-theory]
+difficulty: advanced
+series:
+  slug: cnn-deep-dive
+  title: Cnn Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+CNN의 각 설계 결정 — 커널 공유, 깊은 레이어 쌓기, 풀링 삽입 — 은 직관이 아니라 수학에서 나온다. 그 수학의 출발점은 단순하다: **convolution이란 무엇인가**. 그리고 그 정의 하나에서 equivariance, 군론, 행렬 대수, 주파수 분석이 전부 뻗어 나온다. CNN의 다섯 챕터를 관통하는 하나의 질문은 이것이다 — 왜 이 연산이 시각 인식에서 작동하는가?
+
+## Convolution과 Cross-Correlation — 이름이 다른 같은 것
+
+2D 이미지 $I$와 커널 $K$에 대한 수학적 convolution은 다음과 같다.
+
+$$
+(I * K)[i, j] = \sum_{m,n} I[i - m,\; j - n]\; K[m, n]
+$$
+
+핵심은 인덱스의 부호다. $I[i - m, j - n]$은 커널을 **뒤집어서(flip)** 이미지에 얹는다. 물리학과 신호 처리에서 이 flip은 인과성을 표현한다.
+
+그런데 PyTorch의 `F.conv2d`와 TensorFlow의 `tf.nn.conv2d`는 flip이 없다.
+
+$$
+(I \star \theta)[i, j] = \sum_{m,n} I[i + m,\; j + n]\; \theta[m, n]
+$$
+
+이것은 convolution이 아니라 **cross-correlation**이다. 두 연산의 관계는 다음과 같다.
+
+$$
+I * K = I \star K^{\text{flip}}, \quad K^{\text{flip}}[m,n] = K[h-1-m,\; w-1-n]
+$$
+
+실제 구현이 cross-correlation을 쓰는 이유는 단순하다. 학습 가능한 가중치 $\theta$는 어차피 초기화 없이 최적화된다. 따라서 $K^{\text{flip}}$을 직접 학습하는 것과 $K$를 학습하는 것은 모델 용량이 동일하다. Flip을 빼면 구현이 간단해지고, 학습 결과는 달라지지 않는다.
+
+<Callout type="note" title="경계 처리의 선택">
+유한한 이미지에서 커널이 경계를 벗어날 때 처리 방법이 결과에 영향을 준다. Zero padding은 경계를 0으로 채워 계산이 간단하지만 edge 근처에서 bias가 생긴다. Reflect padding은 경계에서 반사되어 더 자연스러운 경계 조건을 만들고, Replicate padding은 경계값을 복제한다. 이미지 특성과 태스크에 따라 선택이 달라진다.
+</Callout>
+
+Convolution이 **선형 연산**이라는 사실도 중요하다.
+
+$$
+\text{Conv}(\alpha x + \beta y, w) = \alpha\,\text{Conv}(x, w) + \beta\,\text{Conv}(y, w)
+$$
+
+이 선형성 덕분에 backpropagation에서 gradient가 다시 convolution 형태를 유지하고, chain rule이 깔끔하게 적용된다.
+
+## Translation Equivariance — 군론의 언어로
+
+CNN이 강력한 이유로 자주 언급되는 것이 **translation equivariance**다. 고양이가 이미지 어디에 있든 같은 feature가 감지된다. 그런데 이것을 군론의 언어로 정확히 표현하면 무엇인가?
+
+평행이동 $T_a$를 다음과 같이 정의한다: $T_a I[i,j] := I[i - a_1,\; j - a_2]$, where $a = (a_1, a_2) \in \mathbb{Z}^2$.
+
+<Theorem kind="theorem" number="1" title="Convolution의 Translation Equivariance">
+임의의 이미지 $I$, 커널 $K$, 평행이동 벡터 $a \in \mathbb{Z}^2$에 대해:
+
+$$T_a(I * K) = (T_a I) * K$$
+</Theorem>
+
+<Proof>
+좌변을 전개하면:
+
+$$T_a(I * K)[i,j] = (I * K)[i - a_1,\; j - a_2] = \sum_{m,n} I[i - a_1 - m,\; j - a_2 - n]\; K[m,n]$$
+
+우변을 전개하면:
+
+$$(T_a I * K)[i,j] = \sum_{m,n} (T_a I)[i - m,\; j - n]\; K[m,n] = \sum_{m,n} I[i - m - a_1,\; j - n - a_2]\; K[m,n]$$
+
+좌변 = 우변. $\square$
+</Proof>
+
+Equivariance와 invariance는 다르다. 함수 $\phi$가 **equivariant**하면 $\phi(g \cdot x) = g \cdot \phi(x)$ — 입력의 변환이 출력에 그대로 전파된다. **Invariant**하면 $\phi(g \cdot x) = \phi(x)$ — 출력이 변환에 무관하다. Conv layer는 equivariant하고, Global Average Pooling은 invariant하다. 분류 문제에서 최종 출력은 invariant해야 하므로, CNN 구조는 자연스럽게 "앞부분 equivariant + 뒷부분 invariant"로 설계된다.
+
+Equivariance는 합성에 닫혀 있다. Conv layer 여러 개를 쌓아도, 그 사이에 ReLU 같은 pointwise activation을 끼워도 전체 네트워크는 여전히 equivariant하다. $\sigma(T_a I)[i,j] = \sigma(I[i - a_1, j - a_2]) = T_a(\sigma(I))[i,j]$이기 때문이다.
+
+## Group Equivariant CNN — 회전까지 확장
+
+표준 CNN은 translation에만 equivariant하다. 회전된 이미지를 넣으면 feature map이 달라진다. 의료 영상에서 종양의 방향은 무의미하고, 위성 이미지에서 건물의 방향도 마찬가지다.
+
+Cohen & Welling(2016)의 **Group Equivariant CNN (G-CNN)**은 이 한계를 깬다. 핵심 아이디어는 feature map에 group index를 추가하는 것이다.
+
+$$y[i, j, g] = \sum_{m,n} \sum_{h \in G} x[i+m,\; j+n,\; h] \cdot w[m, n, h, g]$$
+
+$g \in G$는 "어느 방향에서의 활성화인지"를 나타낸다. 90도 회전 group $G = \mathbb{Z}_4$를 쓰면, 각 spatial location마다 4개의 방향별 feature가 계산된다. 이 커널 $w[m,n,h,g]$는 **circulant matrix** 구조를 가지며, group 공리를 만족하면 자동으로 rotation equivariance가 보장된다.
+
+<Aside label="어떤 그룹을 선택할까">
+데이터의 진정한 symmetry를 이해하고 그에 맞는 group을 선택해야 한다. 텍스트나 숫자 인식에서 rotation equivariance는 오히려 해롭다 — "6"과 "9"는 180도 회전 관계지만 의미가 다르다. Group equivariance는 도구이지 항상 옳은 선택이 아니다.
+</Aside>
+
+Group size $|G|$가 커질수록 파라미터가 늘어나지만, group structure를 활용한 weight sharing으로 기본 커널 하나에서 $|G|$개의 회전 버전을 자동 생성하면 실제 파라미터 수는 표준 CNN과 같게 유지할 수 있다.
+
+## Toeplitz 행렬과 주파수 영역
+
+Convolution은 선형이므로 행렬-벡터 곱으로 표현할 수 있다. 길이 $N$ 신호 $x$와 길이 $K$ 필터 $h$의 convolution은:
+
+$$y = T_h\, x$$
+
+여기서 $T_h$는 **Toeplitz matrix** — 각 대각선의 값이 상수인 행렬이다. 경계를 wrap-around로 처리하면(circular convolution) 이 행렬은 **circulant matrix**가 된다.
+
+Circulant matrix의 결정적 성질이 있다.
+
+<Theorem kind="theorem" number="2" title="Circulant Matrix의 Eigen분해">
+Circulant matrix $C = \text{Circ}(c_0, \ldots, c_{n-1})$는 DFT matrix $F$로 대각화된다:
+
+$$C = F^* \Lambda F$$
+
+여기서 $\Lambda = \text{diag}(\hat{c}_0, \ldots, \hat{c}_{n-1})$이고 $\hat{c}_k$는 DFT 계수다.
+</Theorem>
+
+이것이 **Convolution Theorem**의 핵심이다.
+
+$$\mathcal{F}(x *_c h)[k] = \mathcal{F}(x)[k] \cdot \mathcal{F}(h)[k]$$
+
+시간/공간 영역의 convolution은 주파수 영역에서 element-wise 곱셈이 된다. 이 사실로부터 두 가지 실용적 결론이 나온다.
+
+첫째, 계산 복잡도다. Direct convolution은 $O(N \cdot K)$이지만 FFT 기반은 $O((N+K)\log(N+K))$다. 필터 길이 $K > 15$ 정도부터 FFT가 이론적으로 유리하다. 하지만 현실의 CNN은 대부분 $3 \times 3$ 또는 $5 \times 5$ 커널을 쓰므로, GPU에서 최적화된 Direct GEMM이 더 빠르다.
+
+둘째, 필터를 주파수 응답으로 해석할 수 있다. Sobel edge detector는 수평 방향의 high-pass filter다. Blur 커널은 low-pass filter다. 각 학습된 CNN 필터도 동일하게 frequency response로 시각화할 수 있다.
+
+## 트레이드오프
+
+<Callout type="note" title="설계 결정의 트레이드오프">
+**Convolution vs Cross-correlation**: CNN 구현은 cross-correlation을 쓰지만 equivariance 증명은 그대로 유효하다. 대신 논문의 수학적 정의와 구현의 gap을 인식해야 한다.
+
+**Translation-only vs Group equivariance**: 표준 CNN은 가볍고 빠르다. G-CNN은 rotation symmetry가 있는 데이터에서 더 적은 데이터로 더 높은 성능을 낸다. Group size 증가는 메모리와 연산량을 선형으로 늘린다.
+
+**Direct vs FFT convolution**: 소형 커널에서는 Direct가 빠르고 구현이 단순하다. 대형 커널이나 신호 처리 태스크에서는 FFT가 점근적으로 유리하다.
+
+**Spectral bias**: 신경망은 자연스럽게 저주파를 먼저 학습한다(Rahaman et al., 2019). 자연 이미지의 power spectrum이 $1/f^2$ 분포를 따르므로 이는 데이터와 모델이 정렬된 결과지만, 고주파 세부를 학습하려면 더 많은 반복이 필요하다.
+</Callout>
+
+## 정리
+
+- CNN의 "convolution"은 수학적으로는 cross-correlation이다. 학습 가능한 가중치 관점에서 두 연산은 모델 용량이 동일하다.
+- Translation equivariance는 군론의 언어로 $T_a(I * K) = (T_a I) * K$로 정확히 표현된다. Equivariance는 합성에 닫혀 있어, 깊은 네트워크 전체에 보존된다.
+- Convolution은 Toeplitz 행렬-벡터 곱이다. Circular convolution은 DFT로 대각화되어 주파수
