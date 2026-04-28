@@ -1,0 +1,144 @@
+---
+title: "Graphical Model 학습은 왜 이렇게 어려운가"
+description: "BN의 count-based MLE부터 MRF의 partition function 문제, EM의 ELBO 보장, Structure Learning의 NP-hardness, 그리고 GNN·Transformer까지 — classical PGM 학습의 통일된 수학적 계보를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [graphical-models, mle, em-algorithm, gnn, transformer]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Bayesian Network에서 파라미터를 학습하는 것은 놀랍도록 쉽다 — 그냥 세면 된다. 반면 Markov Random Field의 MLE gradient에는 partition function이 끼어들어, 계산이 원리적으로 intractable해진다. 이 대칭성의 파괴가 현대 생성 모델 알고리즘 대부분의 출발점이다. 왜 BN은 쉽고 MRF는 어려운가, 그리고 그 어려움을 우회한 방법들이 어떻게 GNN과 Transformer까지 이어지는가?
+
+## BN MLE — 세는 것으로 충분한 이유
+
+Complete data가 주어진 Bayesian Network의 log-likelihood는 노드별로 분해된다.
+
+$$\ell_{\text{BN}}(\theta) = \sum_i \sum_v \log p(x^{(i)}_v \mid x^{(i)}_{\text{pa}(v)}; \theta_v)$$
+
+각 CPT $\theta_v$가 독립적으로 최적화되므로, Lagrangian을 풀면 닫힌 형태의 해가 나온다.
+
+$$\hat\theta_{v \mid u, k} = \frac{N_{v,u,k}}{N_{u,\cdot}}$$
+
+단순한 빈도 비율이다. 이 구조가 성립하는 이유는 DAG의 인수분해 덕분에 파라미터 간 결합이 없기 때문이다. 각 CPT는 자신의 부모 설정에서만 독립적으로 카운트를 수집하면 된다.
+
+<Theorem kind="theorem" number="1" title="BN MLE Closed Form">
+Complete data, discrete categorical, Dirichlet prior(또는 uniform)를 가정할 때 BN의 MLE는 count-based closed form이다: $\hat\theta_{v,u,k} = N_{v,u,k} / N_{u,\cdot}$.
+</Theorem>
+
+<Proof>
+$\sum_k \theta_{v,u,k} = 1$ 제약 아래 log-likelihood $\ell_v = \sum_{u,k} N_{v,u,k} \log \theta_{v,u,k}$를 Lagrangian으로 풀면, $\theta_{v,u,k} = N_{v,u,k} / \lambda_u$이고 $\sum_k$로 합산하면 $\lambda_u = N_{u,\cdot}$. $\square$
+</Proof>
+
+## MRF — partition function이라는 장벽
+
+Log-linear MRF $p(x; \theta) \propto \exp(\theta^T f(x))$의 log-likelihood gradient는 다음 구조를 가진다.
+
+$$\nabla_{\theta_k} \ell = \underbrace{\sum_i f_k(x^{(i)})}_{\text{empirical count}} - N \underbrace{\mathbb{E}_{p(x;\theta)}[f_k]}_{\text{expected count}}$$
+
+경험적 카운트는 데이터에서 바로 계산된다. 문제는 두 번째 항이다. $\mathbb{E}_p[f_k]$를 계산하려면 partition function $Z(\theta) = \sum_x \exp(\theta^T f(x))$ 위에서 적분해야 하는데, 이 합산은 일반적으로 지수 크기의 상태 공간을 순회한다.
+
+이 intractability가 세 가지 우회 전략을 낳는다.
+
+**Contrastive Divergence** (Hinton 2002): 데이터에서 짧은 Gibbs chain을 돌려 $\mathbb{E}_p[f]$를 근사한다. $k=1$ 스텝만으로도 RBM 학습이 실용적으로 동작했고, 이것이 Deep Belief Network을 통한 딥러닝 시대를 열었다.
+
+**Pseudo-likelihood** (Besag 1975): $p(x)$ 대신 $\prod_i p(x_i \mid x_{-i})$를 최대화한다. 각 조건부는 Markov blanket만 필요하므로 tractable하고, $N \to \infty$에서 true parameter로 수렴함이 보장된다.
+
+**Score Matching** (Hyvärinen 2005): partition function을 완전히 피한다. Score function $\nabla_x \log p(x;\theta)$를 매칭하는데, $\log Z$는 $x$에 무관하므로 $\nabla_x$ 후 사라진다.
+
+$$J_{\text{SM}}(\theta) = \mathbb{E}_{p_{\text{data}}}\!\left[\frac{1}{2}\|\nabla_x \log p(x;\theta)\|^2 + \operatorname{tr}(\nabla_x^2 \log p(x;\theta))\right]$$
+
+이 마지막 방법이 Score-SDE, DDPM, Stable Diffusion의 수학적 토대다.
+
+## EM — latent variable의 보편적 처방
+
+Complete data MLE가 닫힌 형태라도, latent variable이 있으면 $\log \sum_z p(x, z \mid \theta)$의 log-sum 형태가 닫힌 해를 막는다. EM은 이를 ELBO의 coordinate ascent로 재구성한다.
+
+$$\log p(x \mid \theta) = \underbrace{\mathbb{E}_q[\log p(x,z \mid \theta)] - \mathbb{E}_q[\log q]}_{\text{ELBO}} + \text{KL}(q \| p(z \mid x, \theta))$$
+
+- **E-step**: $q^{(t)}(z) = p(z \mid x, \theta^{(t)})$로 설정하면 KL이 0이 되어 ELBO = log-likelihood.
+- **M-step**: $\theta^{(t+1)} = \arg\max_\theta \mathbb{E}_{q^{(t)}}[\log p(x,z \mid \theta)]$로 ELBO를 올린다.
+
+두 스텝 모두 log-likelihood를 단조 증가시키므로 수렴이 보장된다. GMM, HMM (Baum-Welch), LDA (variational EM) — 이 모두가 같은 framework의 특수 경우다.
+
+<Callout type="note" title="트레이드오프">
+EM은 **local optimum만 보장**한다. GMM에서 $K$가 커질수록 local minima가 늘어나 random initialization을 여러 번 해야 한다. 반면 각 iteration이 log-likelihood를 단조 증가시킨다는 보장은 실용적으로 매우 강력하다 — SGD에는 없는 성질이다.
+</Callout>
+
+LDA (Blei-Ng-Jordan 2003)는 EM의 계층적 Bayesian 적용의 교과서적 예다. Dirichlet-multinomial conjugacy 덕분에 $\theta, \phi$를 analytically integrate out한 뒤 topic assignment $z$만 Gibbs sampling하는 Collapsed Gibbs (Griffiths-Steyvers 2004)가 가능하다. 이는 Rao-Blackwell 정리에 의해 full Gibbs보다 분산이 낮다.
+
+## Structure Learning — NP-hard의 한계와 우회
+
+파라미터가 아니라 DAG 구조 자체를 데이터에서 학습하는 문제는 훨씬 어렵다.
+
+$$\hat{\mathcal{G}} = \arg\max_{\mathcal{G}} \operatorname{BIC}(\mathcal{G}, D)$$
+
+Chickering 1996은 이 문제가 NP-complete임을 증명했다. DAG space는 노드 수에 초지수적으로 크고, acyclicity 제약이 greedy search를 복잡하게 만든다.
+
+한 가지 완전히 polynomial-time solvable한 경우가 있다 — Chow-Liu tree (1968).
+
+$$\arg\max_T \sum_{(u,v) \in T} I(X_u; X_v) = \text{MST with MI weights}$$
+
+Pairwise mutual information을 계산한 뒤 Maximum Spanning Tree를 구하면 tree-restricted MLE의 exact 해가 나온다. MI 계산 $O(n^2 N)$, Kruskal 알고리즘 $O(n^2 \log n)$ — 전체가 polynomial이다.
+
+NOTEARS (Zheng et al. 2018)는 NP-hard 조합 최적화를 연속 최적화로 변환했다. 핵심은 DAG acyclicity의 미분 가능한 특성화다.
+
+$$h(W) = \operatorname{tr}(e^{W \circ W}) - n = 0 \iff W \text{ is acyclic}$$
+
+$e^M$의 $(i,i)$ 원소가 모든 길이의 closed walk 가중합임을 이용하면, $h(W) = 0$이 cycle 없음과 동치임을 알 수 있다. 이 제약이 미분 가능하므로 augmented Lagrangian으로 gradient descent가 가능해진다.
+
+## GNN과 Transformer — learned message passing으로의 수렴
+
+Classical BP는 fixed message function을 사용한다. GNN (Gilmer et al. 2017)의 MPNN framework는 이를 학습된 함수로 대체한다.
+
+$$h_v^{(t+1)} = U_t\!\left(h_v^{(t)},\; \operatorname{AGG}_{u \in N(v)} M_t(h_u^{(t)}, h_v^{(t)}, e_{uv})\right)$$
+
+$M_t$, $U_t$가 MLP로 대체된 것을 제외하면 구조가 sum-product BP와 동일하다. BP의 fixed semantics를 task-specific loss로 학습하는 것으로 볼 수 있다.
+
+Transformer self-attention은 complete graph 위의 GNN이다.
+
+$$h_v' = \sum_u \alpha_{uv} W_V h_u, \quad \alpha_{uv} = \operatorname{softmax}\!\left(\frac{(W_Q h_v)^\top (W_K h_u)}{\sqrt{d}}\right)$$
+
+모든 노드 쌍이 연결되고, edge weight $\alpha_{uv}$가 softmax-normalized attention으로 학습된다. "모든 토큰이 모든 토큰에 메시지를 보내는 GNN"이다.
+
+<Aside label="계보">
+HMM (generative chain, exact BP) → CRF (discriminative, conditional BP) → Neural CRF (learned unary, still chain) → GNN (arbitrary graph, learned message) → Transformer (complete graph, learned soft edge). 각 단계는 **더 flexible한 structure + learnable components**를 얻는 대신 **exactness와 probabilistic semantics**를 희석시킨다.
+</Aside>
+
+그러나 GNN도 한계가 있다. Deep GCN에서 over-smoothing이 발생한다.
+
+$$\|h_v^{(T)} - h_u^{(T)}\| \to 0 \quad \text{as } T \to \infty$$
+
+전파 행렬 $\tilde{P}$의 두 번째 고유값 $\lambda_2 < 1$이므로 $\tilde{P}^T$의 rank가 1로 수렴하고 모든 노드 표현이 동일해진다. Residual connection (JK-Net, GCNII)이 이를 완화한다.
+
+## 정리
+
+- BN MLE는 DAG 인수분해 덕분에 count-based closed form이다. MRF MLE는 partition function 때문에 intractable하다.
+- 이 intractability의 세 가지 우회 — CD, pseudo-likelihood, score matching — 가 각각 RBM/EBM, structured prediction, score-based 생성 모델의 수학적 토대다.
+- EM은 latent variable 모델 학습의 보편적 framework로, ELBO의 단조 증가를 보장한다. 단 local optimum이다.
+- Structure learning은 일반적으로 NP-hard이지만 tree-restricted에서는 Chow-Liu가 polynomial-time exact 해를 준다. NOTEARS는 acyclicity를 미분 가능한 제약으로 변환했다.
+- GNN은 learned message passing으로 BP를 일반화하고, Transformer는 그 complete-graph 극한이다.
+
+"Classical PGM의 intractability"는 피해야 할 문제가 아니라 현대 알고리즘 설계의 나침반이었다.
+
+<Reference
+  title="A Fast Learning Algorithm for Deep Belief Nets"
+  authors="Hinton, Osindero, Teh"
+  year={2006}
+  venue="Neural Computation"
+  url="https://www.cs.toronto.edu/~hinton/absps/fastnc.pdf"
+/>
+
+<Reference
+  title="Estimation of Non-Normalized Statistical Models by Score Matching

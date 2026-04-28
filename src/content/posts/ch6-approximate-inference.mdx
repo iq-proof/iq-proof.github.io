@@ -1,0 +1,138 @@
+---
+title: "Variational Inference의 다섯 얼굴"
+description: "Mean-field ELBO 유도부터 Bethe 자유에너지, EP의 moment matching, Gibbs sampling의 Markov blanket, Particle Filter의 중요도 가중치까지 — approximate inference의 통일된 틀을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [variational-inference, graphical-models, mcmc, approximate-inference, elbo]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Bayesian inference의 핵심 장벽은 하나다 — posterior $p(z | x)$를 계산하려면 $\int p(x, z)\,dz$가 닫힌 형태여야 하는데, 대부분의 실제 모델에서 이 적분은 intractable하다. 이 한계를 우회하는 방법이 여럿 개발되었고, 각각 서로 다른 철학에서 출발한다. 이 챕터에서 다루는 다섯 가지 — Mean-Field VI, Bethe 자유에너지, EP, Gibbs Sampling, Particle Filter, RJMCMC — 는 사실 하나의 질문의 변주다. **"다루기 어려운 분포를 어떻게 근사할 것인가?"**
+
+## 모든 근사 추론의 출발점: ELBO
+
+Mean-Field VI는 가장 단순한 답을 제시한다. $p(z | x)$를 직접 구하는 대신, 분해 가능한 분포 $q(z) = \prod_i q_i(z_i)$ 중에서 $p(z | x)$에 가장 가까운 것을 찾는다. "가깝다"의 기준은 KL divergence다.
+
+이 접근의 핵심 항등식은 다음과 같다.
+
+$$
+\log p(x) = \underbrace{\mathbb{E}_q[\log p(x, z) - \log q(z)]}_{\text{ELBO}(q)} + \underbrace{\text{KL}(q(z) \,\|\, p(z | x))}_{\geq\, 0}
+$$
+
+$\log p(x)$는 데이터가 고정되면 상수다. KL이 0 이상이므로 ELBO $\leq \log p(x)$ — ELBO는 evidence의 하한(lower bound)이다. KL을 최소화하는 것과 ELBO를 최대화하는 것은 완전히 등가다.
+
+Coordinate Ascent VI(CAVI)는 이 ELBO를 한 번에 하나씩 $q_j$에 대해 최적화한다. 나머지 $q_{-j}$를 고정하면 최적해는 다음과 같다.
+
+$$
+q_j^*(z_j) \propto \exp\!\left(\mathbb{E}_{q_{-j}}[\log p(x, z)]\right)
+$$
+
+<Theorem kind="proposition" number="1" title="CAVI의 단조 수렴">
+CAVI의 각 업데이트는 ELBO를 감소시키지 않는다. ELBO는 $\log p(x)$에 의해 위로 유계되어 있으므로, 반복은 ELBO의 지역 극대로 수렴한다.
+</Theorem>
+
+<Proof>
+각 좌표 업데이트 $q_j \leftarrow q_j^*$는 해당 $q_j$에 대해 ELBO를 최대화하는 선택이므로 $\text{ELBO}(q_{-j}, q_j^*) \geq \text{ELBO}(q_{-j}, q_j^{\text{old}})$가 성립한다. 모든 좌표를 순환하면 ELBO는 단조 증가하고, 위로 유계이므로 수렴한다.
+</Proof>
+
+Mean-field의 결정적 한계는 **분산 과소추정**이다. 실제 posterior에 상관관계가 있을 때, $q(z) = \prod_i q_i(z_i)$라는 독립 가정이 posterior의 모양을 찌그러뜨린다. 이것은 버그가 아니라 factorization 가정의 직접적 귀결이다.
+
+## Bethe 자유에너지: 구조를 보존하는 근사
+
+Mean-field가 변수 간 상관을 완전히 무시한다면, Bethe 자유에너지는 **국소 쌍별 상관**을 보존한다. Yedidia-Freeman-Weiss(2003)는 Loopy Belief Propagation의 fixed point가 정확히 Bethe 자유에너지의 정류점임을 증명했다.
+
+$$
+F_{\text{Bethe}} = \sum_f \text{KL}(b_f \,\|\, \phi_f) - \sum_v (d_v - 1) H(b_v)
+$$
+
+여기서 $b_f$는 factor 위의 pseudo-marginal, $b_v$는 variable 위의 pseudo-marginal, $d_v$는 해당 변수의 degree다.
+
+Tree 구조 factor graph에서는 엔트로피의 chain rule을 반복 적용하면 이 공식이 정확히 성립한다 — Bethe는 tree에서 exact다. Loopy graph에서는 cycle이 엔트로피를 이중 계산하게 만들어 근사가 된다.
+
+<Callout type="note" title="트레이드오프">
+Loopy BP / Bethe는 Mean-field보다 정확하지만 non-convex다. 복수의 fixed point가 존재할 수 있고, damping 없이는 발산할 수 있다. Tree-Reweighted BP(TRW-BP, Wainwright et al. 2005)는 spanning tree 앙상블을 활용해 log Z의 볼록 상한을 제공하며 수렴이 보장된다.
+</Callout>
+
+LDPC 디코딩이 Loopy BP로 잘 작동하는 이유가 여기 있다 — 코드가 설계 단계에서부터 짧은 cycle이 없는(large-girth) 그래프 구조를 갖도록 만들어지기 때문이다.
+
+## EP: forward KL과 moment matching
+
+Mean-Field(reverse KL)는 mode-seeking이다 — $q$가 $p$의 한 peak에 집중한다. Expectation Propagation(EP, Minka 2001)은 반대 방향, **forward KL**의 관점에서 각 factor를 근사한다.
+
+EP의 알고리즘은 세 단계로 구성된다. Factor $f_i$를 제거한 **cavity distribution** $q_{-i} = q / \tilde{f}_i$를 구하고, cavity와 실제 factor의 곱인 **tilted distribution** $\tilde{q} \propto q_{-i} \cdot f_i$를 계산한 후, exponential family 위에서 $\text{KL}(\tilde{q} \| q)$를 최소화해 **moment matching**으로 $\tilde{f}_i$를 업데이트한다.
+
+Gaussian family에서 moment matching은 평균과 공분산을 일치시키는 것과 같다. 이 성질이 GP Classification과 TrueSkill 같은 시스템에서 EP를 표준으로 만들었다.
+
+<Aside label="KL 방향의 의미">
+Reverse KL($q \| p$)은 $p(z) \approx 0$인 영역에 $q$ mass를 놓으면 $\infty$가 된다 — $q$가 $p$의 support 내에 머문다. Forward KL($p \| q$)은 $p(z) > 0$인 모든 영역을 $q$가 cover해야 한다. 전자는 과소신뢰(underestimate uncertainty), 후자는 과대포괄(overestimate spread)의 경향이 있다.
+</Aside>
+
+## Gibbs Sampling: Markov blanket이 가능하게 하는 것
+
+위의 세 방법이 모두 변분적(variational) 접근이라면, Gibbs Sampling은 정확한 posterior로 점근적으로 수렴하는 **MCMC** 방법이다.
+
+핵심 원리: joint $p(x_1, \ldots, x_n)$에서 샘플링하기 어렵지만, conditional $p(x_i | x_{-i})$는 Markov blanket의 국소 정보만으로 계산된다.
+
+$$x_i^{(t)} \sim p(x_i | x_{\text{MB}(i)}^{(t)})$$
+
+MRF에서 Markov blanket은 이웃 노드, BN에서는 부모 + 자식 + 공동부모(co-parents)다. LDA의 collapsed Gibbs sampler가 실용적인 이유가 여기 있다 — topic 할당 변수 $z$에 대해 $\theta, \phi$를 해석적으로 적분 소거(Dirichlet conjugacy)한 후 샘플링하면, 각 단계의 계산이 count 연산으로 환원된다.
+
+Gibbs의 수렴은 detailed balance로 보장되지만, **mixing time**이 문제다. Ising 모델의 임계 온도 근방에서 mixing time은 $O(L^2)$로 느려진다 — 상관관계가 강할수록 chain이 state space를 천천히 탐색한다.
+
+## Particle Filter와 RJMCMC: 구조가 미지일 때
+
+비선형·비Gaussian 상태공간 모델에서 Kalman filter는 통하지 않는다. Particle Filter는 posterior를 가중 샘플의 집합으로 표현한다.
+
+$$p(z_t | x_{1:t}) \approx \sum_{i=1}^N w_t^{(i)} \delta(z_t - z_t^{(i)})$$
+
+Bootstrap filter에서 가중치 업데이트는 관측 우도만으로 이루어진다.
+
+$$w_t^{(i)} \propto w_{t-1}^{(i)} \cdot p(x_t | z_t^{(i)})$$
+
+시간이 지남에 따라 가중치가 소수 입자에 집중되는 **degeneracy**가 발생한다. Effective Sample Size(ESS)가 $N/2$ 아래로 떨어지면 현재 가중 분포에서 복원추출(resampling)해 균일 가중치를 복원한다. 수렴 속도는 $O(1/\sqrt{N})$이지만, 상태 차원이 증가하면 필요한 입자 수가 지수적으로 늘어나는 **차원의 저주**가 있다.
+
+RJMCMC(Green 1995)는 한 걸음 더 나아간다 — 모델의 **차원 자체가 미지**일 때. Gaussian mixture의 component 수 $K$, 변화점(change-point)의 개수를 posterior에서 직접 추론한다. 차원이 다른 상태 공간 사이를 이동하려면 **보조 변수** $u$를 도입해 차원을 맞추고 Jacobian으로 detailed balance를 복원한다.
+
+$$\alpha = \min\!\left(1,\, \frac{p(x')\, q(v | x')}{p(x)\, q(u | x)}\cdot |\mathcal{J}|\right)$$
+
+현대적 대안인 Dirichlet Process Mixture가 더 많이 쓰이지만, RJMCMC는 명시적 parametric 모델과 Bayes factor 추정이 필요한 경우 여전히 유효하다.
+
+## 정리
+
+다섯 방법은 같은 intractability를 서로 다른 절충으로 해결한다.
+
+- **Mean-Field VI**: 독립 가정으로 tractability 확보 → 분산 과소추정, mode-seeking.
+- **Bethe / Loopy BP**: 국소 쌍별 상관 보존 → non-convex, tree에서만 exact.
+- **EP**: forward KL의 moment matching → mode-averaging, 발산 위험.
+- **Gibbs Sampling**: 점근적으로 정확 → mixing time이 상관구조에 민감.
+- **Particle Filter / RJMCMC**: 비선형·비Gaussian·변차원 → 차원의 저주.
+
+이 중 어느 하나가 "최선"이 아니다 — 모델 구조, 계산 예산, 요구 정확도에 따라 선택이 달라진다. 다음 챕터에서는 이 추론 방법들이 graphical model의 **학습(learning)** 문제와 어떻게 결합되는지 추적한다.
+
+<Reference
+  title="Understanding Belief Propagation and Its Generalizations"
+  authors="Yedidia, Freeman, Weiss"
+  year={2003}
+  venue="Exploring Artificial Intelligence in the New Millennium"
+  url="https://www.merl.com/publications/docs/TR2001-22.pdf"
+/>
+
+<Reference
+  title="Expectation Propagation for Approximate Bayesian Inference"
+  authors="Minka, T.P."
+  year={2001}
+  venue="UAI"
+  url="https://arxiv.org/abs/1301.2294"
+/>

@@ -1,0 +1,112 @@
+---
+title: "Belief Propagation은 왜 하나의 알고리즘인가"
+description: "Factor graph의 bipartite 구조부터 Loopy BP와 Bethe 자유에너지의 등가성까지, 메시지 패싱이 어떻게 PGM 추론을 통합하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [belief-propagation, factor-graph, pgm, message-passing, variational-inference]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+HMM의 Forward-Backward, Kalman filter, Viterbi, LDPC 디코딩, CRF 추론 — 이것들은 서로 다른 알고리즘처럼 보인다. 그런데 이 모두가 **하나의 메시지 패싱 규칙**의 인스턴스라면? Factor graph와 Sum-Product algorithm이 그 통일된 언어다. 왜 이 언어가 필요하고, 루프가 있는 그래프에서 무엇이 달라지는가?
+
+## Factor Graph: BN과 MRF를 하나로
+
+Bayesian Network와 Markov Random Field는 인수분해의 방향이 다르다. BN은 DAG 위의 조건부분포 $\prod_v p(x_v | x_{\text{pa}(v)})$, MRF는 undirected clique potential $\prod_C \phi_C(x_C)$. Factor graph는 이 둘을 **bipartite graph 하나**로 흡수한다.
+
+$$p(x) = \frac{1}{Z} \prod_{f \in F} \phi_f(x_{N(f)})$$
+
+Variable node(원)와 factor node(사각형)가 각 $\phi_f$의 argument에 따라 연결된다. BN의 CPT $p(x_v | x_{\text{pa}(v)})$는 factor $\phi_v$로 직접 번역되며 $Z = 1$이 자동 보장된다. MRF의 clique potential은 그 clique의 variables를 이웃으로 하는 factor node가 된다.
+
+```
+BN: A → B → C  →  [φ_A] ── A ── [φ_AB] ── B ── [φ_BC] ── C
+```
+
+Factor graph가 MRF보다 표현력이 높은 이유가 여기 있다. Triangle MRF $A - B - C$는 maximal clique $\{A, B, C\}$ 하나의 3-variable factor로만 표현되지만, factor graph는 3개의 pairwise factor $\phi_{AB}, \phi_{BC}, \phi_{CA}$를 명시적으로 구분한다. 파라미터 수, 계산 복잡도, 학습 가능성이 모두 다른 두 구조를 MRF는 구분하지 못한다.
+
+## Sum-Product: Distributive Law로 지수를 다항으로
+
+$n$개 변수에서 $x_1$의 주변확률을 brute force로 계산하면 $2^{n-1}$번의 합산이 필요하다. Sum-Product algorithm의 핵심 아이디어는 합산의 순서를 바꾸는 것이다.
+
+Chain $[\phi_A] - A - [\phi_{AB}] - B - [\phi_{BC}] - C$에서:
+
+$$p(A) \propto \phi_A(A) \sum_B \phi_{AB}(A, B) \underbrace{\sum_C \phi_{BC}(B, C)}_{\mu_{C \to B}(B)}$$
+
+$\sum_C \phi_{BC}(B, C)$를 먼저 계산해 메시지 $\mu_{C \to B}$로 저장한다. 이 메시지를 재사용하면 $p(A), p(B), p(C)$ 모두를 $O(d^2 |E|)$에 계산할 수 있다 — brute force $O(d^n)$ 대비 지수적 절약.
+
+두 종류의 메시지가 bipartite 구조를 따라 전파된다.
+
+$$\mu_{x \to f}(x) = \prod_{f' \in N(x) \setminus \{f\}} \mu_{f' \to x}(x)$$
+
+$$\mu_{f \to x}(x) = \sum_{x_{N(f) \setminus \{x\}}} \phi_f(x_{N(f)}) \prod_{x' \in N(f) \setminus \{x\}} \mu_{x' \to f}(x')$$
+
+<Theorem kind="theorem" number="1" title="Tree에서 Sum-Product의 정확성">
+Tree factor graph에서 sum-product으로 계산된 belief $b(x) = \prod_{f \in N(x)} \mu_{f \to x}(x)$는 정확한 주변확률과 비례한다.
+</Theorem>
+
+<Proof>
+귀납법. Subtree $T_f$에서 $\mu_{f \to x}(x) = \sum_{x_{T_f} \setminus x} \prod_{g \in T_f} \phi_g(x_{N(g)})$임을 subtree 크기에 대해 귀납적으로 보인다. Base case: leaf factor는 정의에 의해 성립. Inductive step: $f$의 이웃 variables $y$들의 subtree가 서로 disjoint하므로 $\sum$과 $\prod$을 교환할 수 있고, 귀납 가정을 적용하면 성립한다. Root variable의 belief를 계산하면 전체 결합분포를 $x$ 이외의 변수에 대해 합산한 것과 같다.
+</Proof>
+
+Tree에서 메시지 패싱은 inward + outward의 2 pass로 완료되며, 복잡도는 $O(\sum_f d^{|N(f)|})$다.
+
+## Max-Product: 같은 알고리즘, 다른 Semiring
+
+Sum-Product에서 $\sum$을 $\max$로 교체하면 MAP inference가 된다. 이 교체가 단순히 기계적이 아닌 이유는 $(\max, \times)$가 $(+, \times)$와 같은 **semiring 구조**를 공유하기 때문이다. Distributive law $a \cdot \max(b, c) = \max(ab, ac)$ ($a \geq 0$)가 Sum-Product의 correctness 증명을 그대로 Max-Product에 이어지게 한다.
+
+Log space에서는 $(\mathbb{R}, \max, +, -\infty, 0)$ — tropical semiring. 이 관점에서 HMM의 Viterbi, CRF sequence decoding, shortest path 알고리즘은 모두 같은 메시지 패싱의 semiring-parameterized 버전이다.
+
+MAP argmax 복원에는 forward pass에서 argmax pointer $\psi_f(x) := \arg\max_{x_{N(f) \setminus x}} \phi_f \prod \mu$를 저장한 뒤 root에서 backtracking한다. 주의할 점: 각 변수의 max-marginal argmax를 독립적으로 고르면 global argmax가 아닐 수 있다. 반드시 backtracking으로 consistent configuration을 복원해야 한다.
+
+## Junction Tree와 Treewidth
+
+루프가 있는 그래프에서 BP를 그대로 돌리면 메시지가 순환해 정확한 주변확률을 보장받지 못한다. Junction Tree algorithm은 이 문제를 **loopy graph를 tree로 변환**해 해결한다.
+
+세 단계로 이루어진다. 첫째, BN이면 Moralization으로 undirected graph로 변환한다. 둘째, **Triangulation** — 길이 $\geq 4$인 cycle에 chord를 추가해 chordal graph로 만든다. 셋째, maximal clique들을 node로 하는 **clique tree**를 구성하되 **Running Intersection Property(RIP)**를 만족해야 한다.
+
+> RIP: 두 clique $C_i, C_j$가 변수 $v$를 공유하면, $C_i$와 $C_j$ 사이 경로의 모든 clique도 $v$를 포함한다.
+
+RIP는 graph가 chordal임과 동치이며(Blair-Peyton 1993), separator $S_{ij} = C_i \cap C_j$를 통해 정보가 올바르게 전파되게 하는 핵심 조건이다. Junction Tree의 복잡도는 $O(n \cdot d^{\omega + 1})$, 여기서 **treewidth** $\omega$는 가능한 triangulation 중 최대 clique 크기에서 1을 뺀 최솟값이다.
+
+<Aside label="Treewidth의 함의">
+$100 \times 100$ 이미지 MRF의 treewidth는 100. Junction Tree 비용은 $d^{100}$ 규모 — exact inference가 구조적으로 불가능하다. 이것이 이미지 분할에서 variational approximation이 필수인 이유다. 최적 triangulation을 찾는 것 자체도 NP-hard이므로 실전에서는 min-fill 휴리스틱을 사용한다.
+</Aside>
+
+## Loopy BP와 Bethe 자유에너지
+
+루프가 있는 그래프에 BP를 그냥 돌리는 Loopy BP는 수렴 보장이 없고 결과는 근사다. 그런데 LDPC 디코딩, turbo code에서 Shannon limit에 근접하는 성능을 보인다. 1990년대까지 이는 미스터리였다.
+
+Yedidia–Freeman–Weiss(2003)가 이를 해명했다. Tree에서 결합 entropy는 clique entropy와 separator entropy의 차로 정확히 분해된다:
+
+$$H(X) = \sum_C H(X_C) - \sum_v (d_v - 1) H(X_v)$$
+
+Loopy graph에 이 공식을 그대로 적용한 것이 **Bethe entropy 근사**이고, 이를 기반으로 한 Bethe 자유에너지의 stationary point가 정확히 Loopy BP의 fixed point와 동치임을 보였다. 이는 Loopy BP를 "경험적 휴리스틱"에서 "원칙적 variational method"로 격상시켰다.
+
+<Theorem kind="theorem" number="2" title="Loopy BP ↔ Bethe 자유에너지 (Yedidia–Freeman–Weiss 2003)">
+임의의 factor graph에서 Loopy BP의 fixed point는 local consistency 제약 하의 Bethe 자유에너지 $F_{\text{Bethe}}$의 stationary point와 동치다.
+</Theorem>
+
+<Proof>
+Pseudo-marginals $\{b_f, b_v\}$에 대해 $F_{\text{Bethe}}$를 local consistency 제약 하에서 최소화하는 Lagrangian을 세운다. $\partial \mathcal{L}/\partial b_f = 0$과 $\partial \mathcal{L}/\partial b_v = 0$의 정류점 조건을 풀면 Lagrange multiplier $\lambda_{f,v}$가 BP 메시지 $\mu_{f \to v} \propto \exp(-\lambda_{f,v})$와 정확히 대응됨을 보일 수 있다. 따라서 BP fixed point 방정식이 Bethe 자유에너지의 정류점 조건과 동일하다.
+</Proof>
+
+Loopy BP가 수렴하지 못하는 이유도 여기서 나온다. Bethe 자유에너지는 일반적으로 non-convex이며(Heskes 2004: tree에서만 convex), 강한 coupling에서 여러 stationary point가 생겨 BP가 그 사이를 진동한다. Damping $\mu_{\text{new}} = (1-\alpha)\mu_{\text{updated}} + \alpha \mu_{\text{old}}$은 step size 제어에 해당하고, Tree-Reweighted BP(TRW-BP, Wainwright et al. 2005)는 random spanning tree의 평균으로 $\log Z$의 convex upper bound를 제공한다.
+
+<Callout type="note" title="트레이드오프">
+Sum-Product(tree): 정확, $O(d^2 |E|)$. Junction Tree(loopy, small treewidth): 정확, $O(n \cdot d^{\omega+1})$, 최적 triangulation은 NP-hard. Loopy BP: 근사, 수렴 보장 없음, 대규모 그래프에서 유일한 실용적 선택. Mean-field(VAE)는 Bethe보다 더 거친 근사 — 모든 edge를 제거하고 독립을 가정한다. Mean-field ⊂ Bethe ⊂ Kikuchi ⊂ Exact 순으로 정밀도가 높아진다.
+</Callout>
+
+## 정리
+
+- Factor graph는 BN의 CPT와 MRF의 clique potential을 동일한 bipartite 구조로 통합한다. MRF보다 세분화된 인수분해 구조를 명시적으로 표현할 수 있다.
+- Sum-Product은 distributive law를 이용해 지수 합산을 다항 시간 메시지 패싱으로 변환한다.

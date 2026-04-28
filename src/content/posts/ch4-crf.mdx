@@ -1,0 +1,121 @@
+---
+title: "CRF는 왜 HMM보다 강한가"
+description: "discriminative 모델링의 핵심 원리부터 Neural CRF의 end-to-end 학습까지, CRF가 구조화 예측의 표준이 된 이유를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [crf, structured-prediction, bilstm, sequence-labeling, graphical-models]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+HMM은 $p(x, y)$를 모델링하고, CRF는 $p(y | x)$를 직접 모델링한다. 이 한 줄의 차이가 NER, POS tagging, 이미지 분할의 SOTA를 바꿨다. 왜 $p(x)$를 포기하는 것이 오히려 더 강력한 모델을 만드는가?
+
+## 두 패러다임의 분기점
+
+HMM은 관측값 $x$에 대한 분포를 가정한다. $p(x | y) = \prod_t p(x_t | y_t)$ — 각 관측이 현재 상태에만 의존한다는 Markov 가정이 깔린다. 덕분에 파라미터가 적고 데이터가 부족해도 안정적으로 수렴하지만, feature engineering에서 치명적인 제약이 생긴다. "현재 단어의 접미사"와 "현재 단어" 두 feature를 동시에 쓰면 $p(x | y)$에서 중복 계산 문제가 발생한다. 접미사는 단어의 결정론적 함수이므로 joint distribution 정규화가 무너진다.
+
+CRF는 이 문제를 근본에서 잘라낸다. $p(x)$를 모델링하지 않으므로 $x$의 임의 함수를 feature로 쓸 수 있다. 미래 context, 외부 사전, 정규표현식 매칭 — 무엇이든 feature function $f_k(y, x)$에 담을 수 있다.
+
+$$p(y | x; w) = \frac{1}{Z(x; w)} \exp\left(\sum_k w_k f_k(y, x)\right)$$
+
+Partition function $Z(x) = \sum_y \exp(\sum_k w_k f_k(y, x))$가 각 $x$마다 독립적으로 계산된다는 것이 핵심이다. HMM의 정규화 상수는 $x$와 $y$ 모두에 대한 합이지만, CRF의 $Z(x)$는 $y$에 대한 합만 필요하다.
+
+## Log-Linear 구조와 학습의 보장
+
+CRF는 $y$에 대한 exponential family 분포다. 이 사실에서 학습의 핵심 성질이 따라온다.
+
+<Theorem kind="proposition" number="1" title="CRF Log-Likelihood의 오목성">
+CRF log-likelihood $\ell(w) = \sum_i \log p(y^{(i)} | x^{(i)}; w)$는 $w$에 대해 오목(concave)하다.
+</Theorem>
+
+<Proof>
+$\log p(y | x; w) = \sum_k w_k f_k(y, x) - \log Z(x; w)$. 첫 항은 $w$에 대한 선형 함수다. $\log Z(x; w) = \log \sum_y \exp(\sum_k w_k f_k(y, x))$는 log-sum-exp이므로 $w$에 대해 볼록(convex)하다. 선형 함수에서 볼록 함수를 빼면 오목이다. 데이터 전체의 합도 오목성을 유지한다. $\square$
+</Proof>
+
+오목성은 단순한 수학적 성질이 아니다. **전역 최적해가 유일하게 존재**하고, L-BFGS나 gradient ascent로 반드시 찾을 수 있다. HMM을 EM으로 학습할 때 반드시 마주치는 지역 최적해 문제가 discriminative training에서는 사라진다.
+
+학습의 gradient는 직관적인 형태를 갖는다.
+
+$$\frac{\partial \ell}{\partial w_k} = \underbrace{\sum_i \sum_t f_k(y^{(i)}, x^{(i)})}_{\text{empirical count}} - \underbrace{\sum_i \mathbb{E}_{p(y | x^{(i)}; w)}\left[\sum_t f_k\right]}_{\text{expected count}}$$
+
+MLE 수렴 조건은 empirical feature count = expected feature count, 즉 **moment matching**이다. 학습된 모델이 데이터의 feature 통계를 정확히 재현할 때 수렴한다.
+
+## Linear-Chain CRF의 추론
+
+NLP에서 가장 많이 쓰이는 형태는 linear-chain CRF다. Feature가 인접 쌍에만 의존한다.
+
+$$p(y | x; w) = \frac{1}{Z(x)} \exp\left(\sum_{t=1}^T \phi(y_{t-1}, y_t, x, t)\right)$$
+
+$Z(x)$ 계산은 HMM의 forward algorithm과 구조적으로 동일하다.
+
+$$\alpha_t(j) = \sum_i \alpha_{t-1}(i) \cdot \exp(\phi(i, j, x, t)), \quad Z(x) = \sum_j \alpha_T(j)$$
+
+복잡도는 $O(K^2 T)$다. Marginal $p(y_{t-1} = i, y_t = j | x)$는 forward-backward로 계산하고, 이를 통해 gradient의 expected count 항을 구한다. Decoding은 Viterbi max-product로 최적 sequence를 찾는다.
+
+<Callout type="note" title="트레이드오프">
+Linear-chain CRF는 exact inference가 가능한 가장 실용적인 형태다. 하지만 skip-chain CRF(원거리 의존성)나 grid CRF(이미지)는 graph에 cycle이 생겨 exact inference가 intractable해진다. Treewidth $\omega$의 그래프에서 복잡도는 $O(K^{\omega+1} \cdot |V|)$ — 이미지의 $256 \times 256$ grid에서 treewidth가 $256$이 되면 사실상 불가능하다. Mean-field 근사나 graph cut으로 우회한다.
+</Callout>
+
+General graph에서도 특수한 구조는 exact inference를 허용한다. 의존 파싱의 non-projective spanning tree는 Kirchhoff Laplacian matrix의 행렬식으로 partition function을 $O(n^3)$에 계산할 수 있다(Matrix-Tree Theorem). 이미지 분할의 $\alpha$-expansion은 Potts model에서 factor-2 근사를 보장한다.
+
+## Neural Feature Extractor의 결합
+
+전통적 CRF의 한계는 feature engineering이었다. 언어마다, task마다 전문가가 feature를 설계해야 했다. BiLSTM-CRF(Huang et al. 2015)는 이 병목을 neural encoder로 대체한다.
+
+```
+      y_1     y_2     y_3    ...    y_T
+       |       |       |             |
+      [CRF: transition matrix T[i,j]]
+       |       |       |             |
+      e_1     e_2     e_3           e_T     ← emission logit = W·h_t
+       |       |       |             |
+      [BiLSTM: forward + backward context]
+       |       |       |             |
+      x_1     x_2     x_3           x_T
+```
+
+Loss는 $\mathcal{L} = -\log p(y^{\text{gold}} | x)$로, CRF layer와 BiLSTM 파라미터가 single computational graph에서 함께 학습된다. Emission gradient가 LSTM으로 역전파되는 형태다.
+
+$$\frac{\partial \mathcal{L}}{\partial e_t(j)} = p(y_t = j | x) - \mathbb{1}[y^{\text{gold}}_t = j]$$
+
+BERT 위에 CRF layer를 얹은 구조도 동일하다. CoNLL-2003 NER에서 BERT-large + softmax가 F1 ≈ 92.8인데, CRF layer 추가로 약 +0.2 F1을 얻는다. 이득이 크지 않아 보이지만, **low-resource나 noisy data에서는 +1~2 F1**까지 벌어진다. CRF layer의 transition matrix가 structural prior로 작동하기 때문이다 — "B-PER 다음에 I-LOC는 불가능"을 transition weight로 학습한다.
+
+<Aside label="왜 BERT에도 CRF가 남아있나">
+BERT의 self-attention은 context-dependent한 implicit transition을 학습한다. 하지만 token-level softmax는 각 position을 독립적으로 예측한다. CRF layer는 sequence-level log-likelihood로 학습하고, Viterbi로 전역 일관성 있는 sequence를 찾는다. Feature extractor가 강해질수록 이득은 줄지만, hard structural constraint(valid tag sequence 강제)는 여전히 명시적 CRF가 더 자연스럽게 표현한다.
+</Aside>
+
+## 정리
+
+- CRF는 $p(x)$를 포기하는 대신 $x$의 임의 feature를 사용할 자유를 얻는다 — discriminative 모델링의 핵심 교환.
+- Log-likelihood는 오목하므로 전역 최적해가 유일하고, gradient = empirical count − expected count라는 moment matching이 수렴 조건이다.
+- Linear-chain inference는 $O(K^2 T)$ forward-backward로 exact하지만, 일반 그래프는 treewidth에 따라 approximate inference로 전환한다.
+- Neural CRF는 feature engineering을 neural encoder로 대체하고, CRF layer는 sequence-level structural consistency를 담당한다.
+
+"discriminative가 asymptotically 우수하지만 generative는 low-data에서 먼저 수렴한다"(Ng & Jordan 2002)는 결과는 CRF와 HMM의 실용적 선택 기준을 정확히 요약한다.
+
+<Reference
+  title="Conditional Random Fields: Probabilistic Models for Segmenting and Labeling Sequence Data"
+  authors="Lafferty, McCallum, Pereira"
+  year={2001}
+  venue="ICML"
+  url="https://repository.upenn.edu/cgi/viewcontent.cgi?article=1162&context=cis_papers"
+/>
+
+<Reference
+  title="Bidirectional LSTM-CRF Models for Sequence Labeling"
+  authors="Huang, Xu, Yu"
+  year={2015}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1508.01991"
+/>

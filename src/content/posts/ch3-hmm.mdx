@@ -1,0 +1,150 @@
+---
+title: "HMM에서 Mamba까지 — 시계열 모델의 하나의 뼈대"
+description: "Hidden Markov Model의 세 가지 문제부터 Kalman Filter, Baum-Welch EM, Viterbi까지, 모든 시계열 추론이 factor graph 위의 메시지 패싱으로 통일되는 과정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [hmm, factor-graph, kalman-filter, viterbi, state-space-model]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Hidden Markov Model, Forward-Backward, Viterbi, Baum-Welch, Kalman Filter — 이 이름들은 서로 다른 교과서에 따로 등장하지만 하나의 공통 구조를 공유한다. 모두 **chain factor graph 위의 메시지 패싱**이다. 이 통일성을 놓치면 각 알고리즘을 따로 외우게 된다. 왜 `sum`을 `max`로 바꾸면 Viterbi가 되고, Gaussian을 집어넣으면 Kalman Filter가 되는가?
+
+## chain factor graph로서의 HMM
+
+HMM은 두 가정으로 정의된다. Transition Markov ($z_{t+1} \perp z_{1:t-1} \mid z_t$)와 output independence ($x_t \perp \{z_{-t}, x_{-t}\} \mid z_t$). 이 두 가정을 결합분포로 쓰면
+
+$$
+p(z_{1:T}, x_{1:T}) = \pi_{z_1} \prod_{t=2}^T A_{z_{t-1}, z_t} \prod_{t=1}^T B_{z_t, x_t}
+$$
+
+이 인수분해가 정확히 chain factor graph다. 변수 노드 $z_1, \ldots, z_T, x_1, \ldots, x_T$, factor 노드는 초기분포 $f_\pi$, 전이 $f_t(z_{t-1}, z_t) = A_{z_{t-1}, z_t}$, 방출 $g_t(z_t, x_t) = B_{z_t, x_t}$. $x_t$가 관측되면 $g_t$는 $z_t$만의 함수 $\tilde{g}_t(z_t) = B_{z_t, \hat{x}_t}$로 축소된다.
+
+이 factor graph는 **tree**다. $x_t$는 leaf이고 transition은 chain으로만 연결되므로 cycle이 없다. Tree에서 sum-product는 exact하다 — 이것이 HMM 추론이 정확히 풀리는 이유다.
+
+## Forward-Backward = sum-product
+
+Forward variable $\alpha_t(z_t) := p(z_t, x_{1:t})$와 Backward variable $\beta_t(z_t) := p(x_{t+1:T} \mid z_t)$는 각각 factor graph의 왼쪽→오른쪽, 오른쪽→왼쪽 메시지다.
+
+$$
+\alpha_t(z_t) = B_{z_t, x_t} \sum_{z_{t-1}} \alpha_{t-1}(z_{t-1}) A_{z_{t-1}, z_t}
+$$
+
+$$
+\beta_t(z_t) = \sum_{z_{t+1}} A_{z_t, z_{t+1}} B_{z_{t+1}, x_{t+1}} \beta_{t+1}(z_{t+1})
+$$
+
+Posterior marginal은 두 메시지의 곱이다.
+
+$$
+p(z_t \mid x_{1:T}) \propto \alpha_t(z_t)\, \beta_t(z_t)
+$$
+
+<Theorem kind="proposition" number="1" title="Forward-Backward = Sum-Product on HMM factor graph">
+HMM factor graph의 sum-product 메시지를 계산하면 Forward variable $\alpha_t$와 Backward variable $\beta_t$와 일치한다.
+</Theorem>
+
+<Proof>
+$z_t$의 왼쪽 이웃 factor $f_t$에서 오는 sum-product 메시지:
+
+$$\mu_{f_t \to z_t}(z_t) = \sum_{z_{t-1}} A_{z_{t-1}, z_t} \cdot \mu_{z_{t-1} \to f_t}(z_{t-1})$$
+
+$z_t$의 belief는 왼쪽 메시지 · emission · 오른쪽 메시지의 곱. 이때 $\alpha_t(z_t) = B_{z_t, x_t} \cdot \mu_{f_t \to z_t}(z_t)$, $\beta_t(z_t) = \mu_{f_{t+1} \to z_t}(z_t)$로 놓으면 Forward-Backward의 recursion과 정확히 일치한다. $\square$
+</Proof>
+
+복잡도는 $O(N^2 T)$. Brute force $O(N^T)$에서 Markov 가정이 exponential을 polynomial로 만든다. 수치 안정성을 위해서는 scaled 또는 log-space 구현이 필수다 — 비정규화 $\alpha_T$는 $T = 100$ 이상에서 machine epsilon 이하로 내려간다.
+
+## Viterbi = max-product
+
+sum을 max로 바꾸면 Viterbi가 된다. $\delta_t(z_t) := \max_{z_{1:t-1}} p(z_{1:t-1}, z_t, x_{1:t})$로 정의하면
+
+$$
+\delta_t(z_t) = B_{z_t, x_t} \cdot \max_{z_{t-1}} \left[\delta_{t-1}(z_{t-1})\, A_{z_{t-1}, z_t}\right]
+$$
+
+argmax pointer $\psi_t(z_t) = \arg\max_{z_{t-1}} [\delta_{t-1}(z_{t-1}) A_{z_{t-1}, z_t}]$를 저장하고 역추적하면 MAP sequence가 복원된다. 이것은 $(\max, \times)$ semiring, log-space에서는 $(\max, +)$ tropical semiring에서의 BP다.
+
+<Callout type="note" title="Viterbi vs. marginal MAP">
+Viterbi가 돌려주는 MAP sequence와 각 시점의 marginal MAP $\arg\max_{z_t} p(z_t \mid x)$는 다를 수 있다. Marginal MAP은 각 시점 locally 최적이지만 전역적으로 consistent하지 않다. Viterbi는 global consistent sequence를 보장한다.
+</Callout>
+
+코드 한 줄의 차이가 전혀 다른 의미를 만들어낸다.
+
+```python
+# Forward (sum-product)
+alpha[t] = (alpha[t-1] @ A) * B[:, obs[t]]
+
+# Viterbi (max-product)
+delta[t, j] = (delta[t-1] * A[:, j]).max() * B[j, obs[t]]
+psi[t, j]   = (delta[t-1] * A[:, j]).argmax()
+```
+
+## Baum-Welch = EM
+
+$z$가 관측되지 않으면 MLE는 $\log \sum_z p(x, z \mid \theta)$를 직접 최대화해야 한다. $\log \sum$은 analytic하지 않다. EM은 이를 우회한다.
+
+**E-step**: $\theta^{(k)}$에서 Forward-Backward를 돌려 posterior $\gamma_t(i) = p(z_t = i \mid x, \theta^{(k)})$와 pairwise posterior $\xi_t(i, j) = p(z_t = i, z_{t+1} = j \mid x, \theta^{(k)})$를 계산한다.
+
+**M-step**: posterior로 weighted된 count로 파라미터를 갱신한다.
+
+$$
+A_{ij}^{\text{new}} = \frac{\sum_t \xi_t(i,j)}{\sum_t \gamma_t(i)}, \qquad B_{ik}^{\text{new}} = \frac{\sum_{t:\, x_t = k} \gamma_t(i)}{\sum_t \gamma_t(i)}
+$$
+
+ELBO 분해 $\log p(x \mid \theta) = \text{ELBO}(\theta, q) + \text{KL}(q \| p(z \mid x, \theta))$에서, E-step은 KL을 0으로 만들고 M-step은 ELBO를 증가시킨다. 따라서 log-likelihood는 단조 증가가 보장된다. 이것이 VAE, diffusion model training이 공유하는 ELBO 최대화 패턴의 원형이다.
+
+## Kalman Filter = Gaussian Forward
+
+HMM의 state가 discrete에서 continuous $\mathbb{R}^n$으로 바뀌고 dynamics가 linear Gaussian이 되면 Linear Dynamical System이 된다.
+
+$$
+z_t = F z_{t-1} + w_t,\quad w_t \sim \mathcal{N}(0, Q)
+$$
+$$
+x_t = H z_t + v_t,\quad v_t \sim \mathcal{N}(0, R)
+$$
+
+이제 Forward algorithm의 $\alpha_t$는 Gaussian이다. Gaussian의 합성과 조건부는 Gaussian을 유지하므로 (Gaussian conjugacy), 각 step에서 mean과 covariance만 전파하면 exact posterior가 된다. 이것이 Kalman Filter다.
+
+**Predict**: $\hat{z}_{t|t-1} = F \hat{z}_{t-1|t-1}$, $P_{t|t-1} = F P_{t-1|t-1} F^T + Q$
+
+**Update**: $K_t = P_{t|t-1} H^T (H P_{t|t-1} H^T + R)^{-1}$, $\hat{z}_{t|t} = \hat{z}_{t|t-1} + K_t(x_t - H\hat{z}_{t|t-1})$
+
+Kalman Gain $K_t$는 prediction noise와 measurement noise의 비율에 따른 optimal weighting이다. $R \to \infty$이면 $K_t \to 0$으로 관측을 무시하고, $Q \to \infty$이면 prediction을 무시하고 관측만 믿는다.
+
+RTS Smoother (Rauch-Tung-Striebel)는 Forward-Backward의 Gaussian 버전이다 — forward pass 후 역방향으로 $J_t = P_{t|t} F^T P_{t+1|t}^{-1}$를 이용해 미래 정보를 반영한다.
+
+<Aside label="S4와 Mamba로의 계보">
+$h'(t) = Ah(t) + Bu(t)$의 연속 ODE를 ZOH discretization하면 $\bar{A} = e^{A\Delta}$, $\bar{B} = A^{-1}(e^{A\Delta}-I)B$로 이산 LDS가 된다. S4는 여기에 HiPPO 이론으로 $A$를 설계해 long-range memory를 확보하고, Mamba는 $\Delta$를 input-dependent하게 만들어 selective state space를 구현한다. HMM → LDS → S4 → Mamba는 하나의 계보다.
+</Aside>
+
+## 트레이드오프
+
+| 모델 | State | Inference | 복잡도 | 한계 |
+|---|---|---|---|---|
+| HMM | Discrete | Exact (tree BP) | $O(N^2 T)$ | First-order Markov, discrete state |
+| LDS / Kalman | Continuous Gaussian | Exact (conjugacy) | $O(n^3 T)$ | Linear, Gaussian 가정 |
+| Particle Filter | Continuous, non-parametric | Approximate (Monte Carlo) | $O(PT)$ | Variance, particle collapse |
+| Transformer | — | Exact self-attention | $O(T^2 d)$ | Quadratic, no Markov |
+
+HMM과 Transformer는 sequence model의 양 극단이다. HMM은 Markov 가정으로 tree 구조를 확보해 exact inference를 $O(N^2 T)$에 하지만 long-range dependency를 놓친다. Transformer는 Markov 가정 없이 모든 이전 position에 접근하지만 factor graph가 더 이상 tree가 아니어서 exact inference가 지수적이다 — attention 자체가 softmax로 구현된 approximate marginal이다.
+
+<Callout type="warning" title="Viterbi의 MAP ≠ 각 시점의 posterior argmax">
+같은 모델에서도 무엇을 최적화하느냐에 따라 답이 달라진다. 전역 MAP sequence가 필요하면 Viterbi, 각 시점의 posterior marginal이 필요하면 Forward-Backward. Beam search는 Viterbi의 approximate 버전 ($k$-best partial path 유지)으로, NMT에서 Markov 가정 없는 Transformer에 exact Viterbi가 불가능하기 때문에 사용한다.
+</Callout>
+
+## 정리
+
+- HMM의 factor graph는 tree다. Tree에서 sum-product는 exact하고, 그것이 Forward-Backward다.
+- sum → max 치환 하나로 Forward-Backward가 Viterbi가 된다. Semiring 교체가 알고리즘을 교체한다.

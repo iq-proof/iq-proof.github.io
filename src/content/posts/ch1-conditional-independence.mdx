@@ -1,0 +1,134 @@
+---
+title: "그래프 모델의 언어 — 조건부 독립에서 Moralization까지"
+description: "조건부 독립의 대수 구조부터 Bayesian Network 인수분해, d-separation, Hammersley–Clifford 정리, 그리고 BN–MRF 변환의 표현력 한계까지, 확률 그래프 모델의 핵심 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [graphical-models, conditional-independence, bayesian-network, markov-random-field, d-separation]
+difficulty: advanced
+series:
+  slug: graphical-models-deep-dive
+  title: Graphical Models Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+확률 그래프 모델은 결국 하나의 질문으로 귀결된다 — **어떤 변수가 다른 변수를 알고 나면 쓸모없어지는가?** Naive Bayes의 feature 독립 가정, HMM의 Markov 가정, VAE의 mean-field approximation — 이 모든 것이 "조건부 독립"을 모델링 자유도로 사용한다. 그 자유도를 그래프 구조로 번역하는 과정에서 무엇이 보존되고, 무엇이 손실되는가?
+
+## 조건부 독립의 세 얼굴
+
+$X \perp\!\!\!\perp Y \mid Z$는 세 가지 동치 방식으로 서술된다.
+
+$$
+P(X, Y \mid Z) = P(X \mid Z)\,P(Y \mid Z)
+$$
+
+$$
+P(X \mid Y, Z) = P(X \mid Z)
+$$
+
+$$
+P(X, Y, Z) = g(X, Z)\,h(Y, Z)
+$$
+
+세 번째 인수분해 형태가 핵심이다. 결합분포가 두 함수의 곱으로 쪼개질 수 있다면, 그 경계가 곧 조건부 독립의 경계다. 이것이 그래프 모델 전체의 기초 문법이다.
+
+조건부 독립은 비단조적이다. **주변 독립이 조건부 독립을 함의하지 않고, 반대도 마찬가지다.** 기온($Z$)이 아이스크림 판매($X$)와 익사 사고($Y$) 모두를 올리면 $X$와 $Y$는 상관이 있지만 $Z$를 알면 독립이 된다. 반대로 천재($X$)와 인맥($Y$)은 주변적으로 독립이지만 합격($Z$, collider)을 조건으로 걸면 음의 상관이 생긴다. 이 **explaining away** 현상이 d-separation 전체의 출발점이다.
+
+## Semi-graphoid 공리 — 독립의 대수
+
+모든 확률분포의 조건부 독립 집합은 네 공리를 만족한다.
+
+| 공리 | 서술 |
+|------|------|
+| **Symmetry** | $X \perp\!\!\!\perp Y \mid Z \Rightarrow Y \perp\!\!\!\perp X \mid Z$ |
+| **Decomposition** | $X \perp\!\!\!\perp (Y, W) \mid Z \Rightarrow X \perp\!\!\!\perp Y \mid Z$ |
+| **Weak Union** | $X \perp\!\!\!\perp (Y, W) \mid Z \Rightarrow X \perp\!\!\!\perp Y \mid (Z, W)$ |
+| **Contraction** | $X \perp\!\!\!\perp Y \mid Z,\; X \perp\!\!\!\perp W \mid (Y,Z) \Rightarrow X \perp\!\!\!\perp (Y,W) \mid Z$ |
+
+Weak Union의 직관은 강력하다 — "더 많이 알아도 독립은 유지된다." Contraction은 반대 방향: 두 번에 나눠 확인한 독립을 하나로 합친다. 이 공리계는 그래프 구조의 대수적 기반이지만, 완전하지 않다. **모든 유효한 CI 관계를 도출하지 못하는 경우가 존재한다** (Studený 1989) — 그래프 모델은 이 불완전성을 그래프 구조로 우회하는 영리한 선택이다.
+
+다섯 번째 공리인 **Intersection** — $X \perp\!\!\!\perp Y \mid (Z,W)$와 $X \perp\!\!\!\perp W \mid (Z,Y)$가 동시에 성립하면 $X \perp\!\!\!\perp (Y,W) \mid Z$ — 은 **positive density($P > 0$)에서만 성립**한다. 0 확률 사건이 있으면 축퇴(degeneration)가 이 공리를 깨뜨린다.
+
+## Bayesian Network — DAG가 하는 일
+
+임의의 결합분포는 chain rule로 항상 쓸 수 있다.
+
+$$
+p(x_1, \ldots, x_n) = \prod_{i=1}^{n} p(x_i \mid x_1, \ldots, x_{i-1})
+$$
+
+이 표현의 문제는 파라미터 수다. $n$개의 이진 변수라면 마지막 항만 $2^{n-1}$개의 파라미터가 필요하다. Bayesian Network는 각 변수 $x_i$에 대해 **local Markov property**를 가정한다 — parents만 주어지면 다른 비후손과 무관.
+
+$$
+p(x) = \prod_{v \in V} p(x_v \mid x_{\text{pa}(v)})
+$$
+
+이 인수분해의 유효성은 topological order를 따라 역순으로 marginalize하면 각 항이 1로 소거됨으로 증명된다. 그리고 이 인수분해 $\iff$ local Markov property는 동치다.
+
+<Theorem kind="proposition" number="1" title="인수분해 ⟺ Local Markov">
+분포 $P$가 DAG $\mathcal{G}$에 대해
+
+$$p(x) = \prod_v p(x_v \mid x_{\text{pa}(v)})$$
+
+를 만족할 필요충분조건은, 모든 $v$에 대해 $X_v \perp\!\!\!\perp X_{\text{nd}(v) \setminus \text{pa}(v)} \mid X_{\text{pa}(v)}$가 성립하는 것이다.
+</Theorem>
+
+<Proof>
+($\Rightarrow$) Chain rule과 topological order에 의해 $p(x_{v_i} \mid x_{v_1}, \ldots, x_{v_{i-1}}) = p(x_{v_i} \mid x_{\text{pa}(v_i)})$. 분자·분모를 분리하면 $X_{v_i}$가 $U := \{v_1, \ldots, v_{i-1}\} \setminus \text{pa}(v_i) \subseteq \text{nd}(v_i)$와 CI.
+
+($\Leftarrow$) Local Markov를 chain rule에 대입하면 $p(x_{v_i} \mid x_{v_1}, \ldots, x_{v_{i-1}}) = p(x_{v_i} \mid x_{\text{pa}(v_i)})$가 되어 곱 형태가 복원된다. $\square$
+</Proof>
+
+파라미터 감소는 실질적이다. 37개 변수의 ALARM network는 $2^{37}$이 아닌 약 750개 파라미터로 결합분포를 표현한다.
+
+## d-Separation — 그래프로 CI를 판정하다
+
+DAG의 임의의 undirected path 위에서 내부 꼭짓점 $W$의 역할은 세 가지다.
+
+| 패턴 | $W \notin Z$ | $W \in Z$ |
+|------|-------------|----------|
+| Chain $X \to W \to Y$ | open | **blocked** |
+| Fork $X \leftarrow W \to Y$ | open | **blocked** |
+| Collider $X \to W \leftarrow Y$ | **blocked** | open (explaining away) |
+
+Chain과 Fork는 $W$를 조건으로 걸면 경로를 막는다. Collider는 반대 — $W$를 모르면 막혀 있고, 알면 열린다. 모든 undirected path가 막히면 $X$와 $Y$가 $Z$에 의해 **d-separated**이고, 이는 CI를 함의한다.
+
+<Callout type="note" title="Soundness와 Completeness">
+**Soundness** (Verma–Pearl 1988): d-sep되면 CI가 성립한다. **Completeness** (Meek 1995): faithfulness 가정 하에 역도 성립한다 — d-sep되지 않은 쌍에 대해 CI가 성립하는 분포는 파라미터 공간에서 measure zero다. 즉 generic하게 d-separation이 CI를 완전히 특징짓는다.
+</Callout>
+
+Collider의 explaining away가 왜 수학적 필연인지는 직접 계산으로 확인된다. Collider $X \to W \leftarrow Y$에서 $p(x, y, w) = p(x)p(y)p(w \mid x, y)$이므로 주변화하면 $p(x, y) = p(x)p(y)$ — 주변 독립. 그러나 $p(x, y \mid w) = p(x)p(y)p(w \mid x, y)/p(w)$는 일반적으로 인수분해되지 않는다.
+
+## Markov Random Field와 Hammersley–Clifford
+
+인과 방향이 없는 대칭적 상호작용 — Ising 모델의 스핀, 이미지 픽셀 간 smoothness, 사회 네트워크의 친구 관계 — 에는 undirected graph가 자연스럽다. MRF의 결합분포는 maximal clique $C$의 potential $\phi_C$의 곱으로 쓴다.
+
+$$
+p(x) = \frac{1}{Z}\prod_{C \in \mathcal{C}} \phi_C(x_C)
+$$
+
+**Hammersley–Clifford 정리**는 이 인수분해와 Markov property가 동치임을 보장한다 — **positive density 조건 하에서**. 증명의 핵심은 Möbius inversion이다. $H(x) := \log p(x)/p(\mathbf{0})$으로 정의하면 $H(x) = \sum_{S \subseteq V} H_S(x)$로 분해되고, non-edge $(u,v)$의 pairwise Markov가 $S$가 clique가 아닌 경우 $H_S \equiv 0$을 강제한다. 결국 $H(x) = \sum_{C \text{ clique}} H_C(x_C)$이고 $\phi_C := \exp(H_C)$으로 놓으면 Gibbs 형태가 복원된다.
+
+Positive density 없이는 이 정리가 성립하지 않는다. Moussouris(1974)의 반례 — Markov property를 만족하지만 clique potential 형태로 쓸 수 없는 분포 — 가 존재한다.
+
+MRF의 근본 계산 난제는 partition function이다.
+
+$$
+Z = \sum_x \prod_C \phi_C(x_C)
+$$
+
+이 합 계산은 **#P-hard**다. #SAT reduction으로 증명된다 — 각 CNF 절에 potential을 할당하면 $Z$가 만족하는 assignment의 수가 된다. BN의 ancestral sampling과 달리 MRF의 inference는 일반적으로 intractable하며, MCMC나 variational inference가 필요하다.
+
+<Callout type="note" title="트레이드오프: BN vs MRF">
+BN은 ancestral sampling이 쉽고 정규화가 자동이며 인과 방향을 표현한다. 대신 v-structure의 unconditional independence라는 특수한 CI 패턴이 필요하다. MRF는 대칭 상호작용에 자연스럽고 pairwise Markov가 직관적이다. 대신 $Z$가 intractable하고, BN의 v-structure CI를 표현하지 못한다. **4-cycle MRF의 두 대칭 CI — $A \perp\!\!\!\perp C \mid B,D$와 $B \perp\!\!\!\perp D \mid A,C$ — 는 어떤 DAG도 동시에 표현할 수 없다.** 반대로 v-structure의 $A \perp\!\!\!\perp B$는 어떤 MRF도 표현할 수 없다. 두 형식의 표현력은 서로 다른 방향으로 불완전하다.
+</Callout>
+
+## 정리
+
+- $X \perp\!\!\!\perp Y \mid Z$는 세 동치 서술을 가지며, 인수분해 형태 $P(X,Y,Z) = g(X,Z)h(Y,Z)$가 그래프 인수분해의 원형이다.
+- Semi-graphoid 공리는 그래프 CI 구조의 대수적 기반이지만 완전하지 않다 — 그래프는 이 한계를 구조로 우회한다
