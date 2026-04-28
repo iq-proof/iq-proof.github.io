@@ -1,0 +1,170 @@
+---
+title: "RNN 학습은 왜 이렇게 설계되었는가"
+description: "Unrolled graph에서 BPTT 유도, truncated BPTT의 메모리 절약, 복잡도 분석, RTRL까지 — RNN 학습 알고리즘의 통일된 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [rnn, bptt, gradient, sequence-modeling, computational-graph]
+difficulty: advanced
+series:
+  slug: rnn-lstm-deep-dive
+  title: Rnn Lstm Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RNN은 본질적으로 cyclic 구조다 — $h_t = f(h_{t-1}, x_t)$가 자기 자신을 참조한다. 그런데 학습은 acyclic DAG 위의 chain rule을 요구한다. 이 모순을 어떻게 해결하는가? 그리고 그 해결책이 메모리 한계, 병렬성 부재, online 학습 불가라는 RNN의 세 가지 근본 제약을 어떻게 만들어내는가?
+
+## Unrolling — cyclic을 acyclic으로
+
+해결책은 단순하다. 시간축으로 펼쳐서 DAG로 만든다.
+
+```
+Cyclic (RNN cell):          Unrolled (DAG):
+
+   ┌──────────┐         x₁→[cell]→h₁→[cell]→h₂→[cell]→h₃
+   x → [cell] →h                  │       │       │
+       └──┘                       y₁      y₂      y₃
+       self-loop         (모든 cell이 같은 W_hh, W_xh 공유)
+```
+
+Unrolling 후 각 $h_t$는 DAG의 distinct 노드가 된다. $h_t = f(h_{t-1}, x_t)$가 명시적 edge다. 이제 chain rule이 잘 정의된다.
+
+핵심은 **shared weight**다. 모든 cell이 동일한 $W_{hh}$를 사용하므로, backward 시 gradient는 각 time step의 기여를 합산한다.
+
+$$
+\frac{\partial L}{\partial W_{hh}} = \sum_{t=1}^{T} \left.\frac{\partial L}{\partial W_{hh}}\right|_{\text{step } t}
+$$
+
+PyTorch autograd가 동일 variable의 multiple usage를 자동 합산하는 이유가 여기 있다. Unrolled graph의 topology가 합산을 강제한다.
+
+## BPTT — 유도하면 보이는 것
+
+BPTT(Backpropagation Through Time)는 unrolled graph 위의 표준 backprop이다. 이름만 다를 뿐이다.
+
+delta(backward signal) $\delta_t = \partial L / \partial h_t$를 정의하면 recursive form이 나온다.
+
+$$
+\delta_t = \frac{\partial L_t}{\partial h_t} + J_{t+1}^\top \delta_{t+1}, \quad J_t = \mathrm{diag}(\tanh'(z_t))\, W_{hh}
+$$
+
+$h_t$는 두 경로로 loss에 기여한다 — 즉각적인 $L_t$, 그리고 $h_{t+1}$을 통한 모든 미래 loss. 그 합이 $\delta_t$다.
+
+weight gradient는 이 delta의 합산이다.
+
+$$
+\frac{\partial L}{\partial W_{hh}} = \sum_{t=1}^{T} (\delta_t \odot \tanh'(z_t))\, h_{t-1}^\top
+$$
+
+<Theorem kind="proposition" number="1" title="Jacobian 곱 누적">
+$L_t$의 $W_{hh}$에 대한 gradient는 시간을 거슬러 올라가는 모든 path의 합이다.
+
+$$
+\frac{\partial L_t}{\partial W_{hh}} = \sum_{k=1}^{t} \left(\prod_{j=k+1}^{t} J_j^\top\right) \frac{\partial L_t}{\partial h_t}\, h_{k-1}^\top \tanh'(z_k)
+$$
+</Theorem>
+
+<Proof>
+$L_t \leftarrow h_t \leftarrow h_{t-1} \leftarrow \cdots \leftarrow h_k \leftarrow W_{hh}$의 모든 path에 chain rule을 적용하면, 각 path가 Jacobian 곱 $\prod_{j=k+1}^{t} J_j$를 생성한다. Shared weight이므로 모든 $k$에 대해 합산한다. $\square$
+</Proof>
+
+이 Jacobian 곱 $\prod J_j$가 vanishing/exploding gradient의 핵심 항이다. spectral radius $\rho(\prod J_j) < 1$이면 long-range gradient가 exponential decay한다.
+
+## Truncated BPTT — 편향을 감수하는 이유
+
+Full BPTT는 정확하지만 두 가지 문제가 있다. 메모리가 $O(TH)$이고, sequence가 끝나야 update할 수 있다.
+
+Truncated BPTT($k$)는 단순하다. 매 $k$ step마다 backward를 실행하고, hidden state를 `detach()`로 끊고, 다음 chunk를 forward한다.
+
+```python
+h = h.detach()  # gradient flow 차단 — 이전 chunk는 무시
+
+logits, h = model(x_chunk, h)
+loss.backward()
+```
+
+메모리는 $O(kH)$로 줄고, 매 $k$ step마다 update가 발생한다. 대가는 bias다 — $k$ step 이전의 long-range gradient를 무시한다.
+
+<Callout type="note" title="트레이드오프">
+Bias의 크기는 $O(\rho^k)$ — spectral radius $\rho < 1$이면 $k$에 대해 exponentially 감소한다. Karpathy의 char-RNN이 $k = 25$를 선택한 이유가 여기 있다. Plain RNN에서 $\rho < 1$이면 25 step 이후의 gradient는 어차피 작다. LSTM에서는 effective $\rho$가 1에 가까워지므로 더 큰 $k$가 의미를 갖는다.
+
+| $k$ | Memory | Bias | Typical use |
+|------|--------|------|-------------|
+| 25 | 작음 | 작음 | Char-RNN (Karpathy) |
+| 35 | 중간 | 매우 작음 | PyTorch LM tutorial |
+| $T$ (full) | $O(TH)$ | 0 | 짧은 sequence |
+</Callout>
+
+## 복잡도 — 병렬성이 없는 구조
+
+BPTT의 시간 복잡도는 $O(TH^2)$, 메모리는 $O(TH)$다. 이 수치 자체보다 중요한 것은 **sequential dependency**다.
+
+```
+t=0 → t=1 → t=2 → ... → t=T
+ │     │     │           │
+ 한 step이 끝나야 다음 step 시작 가능
+```
+
+batch 차원은 GPU에서 병렬화된다. sequence 차원은 본질적으로 sequential이다. GPU의 수천 개 core가 다음 step을 기다리며 대기한다.
+
+Gradient checkpointing(Chen 2016)은 메모리와 시간을 tradeoff한다. $\sqrt{T}$개의 checkpoint만 보존하고, backward 시 각 segment를 forward 재실행한다.
+
+$$
+s^* = \sqrt{T} \implies M = O(\sqrt{T} H), \quad T_{\text{cost}} = O(TH^2 \cdot 1.5)
+$$
+
+메모리는 $\sqrt{T}$배 절약, 시간은 약 1.5배 증가다. $T = 10000$이면 메모리 100배 절약이 가능하다.
+
+<Aside label="설계 철학">
+RNN의 sequential 한계는 non-linear recurrence에서 온다. Linear recurrence $h_t = Ah_{t-1} + Bx_t$는 closed-form이 존재하므로 parallel scan으로 $O(\log T)$ depth로 계산 가능하다. Mamba(Gu & Dao 2023)의 selective SSM이 이 통찰의 귀결이다 — linear recurrence를 유지하면서 input-dependent gating을 추가한다.
+</Aside>
+
+## RTRL — forward로 같은 gradient를
+
+RTRL(Williams & Zipser 1989)은 BPTT와 동일한 gradient를 forward-mode AD로 계산한다.
+
+핵심은 sensitivity matrix $S_t = \partial h_t / \partial \theta$를 forward와 함께 propagate하는 것이다.
+
+$$
+S_t = J_t S_{t-1} + \frac{\partial f}{\partial \theta}\bigg|_{\text{partial}}
+$$
+
+매 step $t$에서 $\partial L_t / \partial \theta = (\partial L_t / \partial h_t) \cdot S_t$를 즉시 계산해 update한다. sequence가 끝날 때까지 기다리지 않는다.
+
+대가는 $O(H^4)$의 per-step 복잡도다. $S_t \in \mathbb{R}^{H \times |\theta|}$이고 $|\theta| = O(H^2)$이므로, $S_t$의 update에 $O(H^4)$이 필요하다. BPTT의 $O(H^2)$와 비교하면 $H^2$배 더 느리다.
+
+UORO(Tallec & Ollivier 2017)는 이를 rank-1 random projection으로 근사한다. $S_t \approx u_t v_t^\top$으로 표현하면 per-step 복잡도가 $O(H^2)$로 줄고, expectation은 unbiased로 유지된다.
+
+## 정리
+
+다섯 챕터의 핵심을 한 문장으로 압축하면: **RNN 학습의 모든 설계 결정은 "cyclic 구조를 acyclic으로 펼치는 대가"를 어떻게 치를 것인가의 선택이다.**
+
+- Unrolling은 DAG를 만들어 chain rule을 가능하게 하지만, $O(TH)$ 메모리를 요구한다.
+- Shared weight의 gradient 합산은 BPTT를 standard backprop으로 환원시키지만, Jacobian 곱의 누적이 vanishing/exploding을 만든다.
+- Truncated BPTT는 메모리를 $O(kH)$로 줄이지만, long-range gradient를 희생한다. Bias는 $O(\rho^k)$로 exponentially 감소한다.
+- Sequential dependency는 GPU 병렬성을 막는다. 이것이 Transformer의 동기다.
+- RTRL은 online update를 가능하게 하지만 $O(H^4)$ 비용을 치른다. UORO가 이를 $O(H^2)$로 근사한다.
+
+다음 글에서는 Jacobian 곱 $\prod J_j$의 spectral 분석으로 vanishing/exploding gradient의 정확한 조건을 추적한다.
+
+<Reference
+  title="Training Recurrent Networks Online without Backtracking"
+  authors="Tallec & Ollivier"
+  year={2017}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1507.07680"
+/>
+
+<Reference
+  title="Training Neural Networks with Very Little Memory"
+  authors="Chen et al."
+  year={2016}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1604.06174"
+/>

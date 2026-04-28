@@ -1,0 +1,151 @@
+---
+title: "RNN의 네 가지 진화 — BiRNN, Stacked, NTM, ESN"
+description: "양방향 컨텍스트부터 외부 메모리, 랜덤 리저보어까지 RNN 아키텍처 확장의 공통 철학과 각 설계 결정의 트레이드오프를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [rnn, lstm, bilstm, ntm, reservoir-computing]
+difficulty: advanced
+series:
+  slug: rnn-lstm-deep-dive
+  title: Rnn Lstm Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+단일 레이어 단방향 LSTM은 언제나 충분하지 않다. NER 태거는 미래 토큰을 봐야 하고, NMT 인코더는 계층적 표현이 필요하고, 알고리즘 학습 태스크는 외부 메모리가 있어야 일반화된다. 이 네 챕터의 변형들은 제각각 다른 문제를 공략하는 것처럼 보이지만, 사실 하나의 질문에 서로 다른 답을 내놓고 있다 — **RNN의 병목은 어디에 있고, 어떻게 뚫는가?**
+
+## 병목 #1 — 단방향 컨텍스트
+
+시퀀스 레이블링에서 각 토큰의 레이블은 과거뿐 아니라 미래에도 의존한다. "He saw her duck"에서 "duck"이 명사인지 동사인지는 뒤에 오는 단어를 봐야 결정된다. 단방향 RNN은 이 정보를 원천 차단한다.
+
+Bidirectional RNN(Schuster & Paliwal 1997)의 해법은 간단하다. Forward와 backward 두 RNN을 병렬로 돌리고, 각 위치에서 hidden state를 concatenate한다.
+
+$$
+h_t = [\overrightarrow{h}_t;\, \overleftarrow{h}_t] \in \mathbb{R}^{2H}
+$$
+
+$$
+\overrightarrow{h}_t = f(\overrightarrow{h}_{t-1}, x_t), \quad \overleftarrow{h}_t = f(\overleftarrow{h}_{t+1}, x_t)
+$$
+
+$h_t$는 이론적으로 $x_{1:T}$ 전체의 정보를 담는다. $\overrightarrow{h}_t$가 $x_{1:t}$를, $\overleftarrow{h}_t$가 $x_{t:T}$를 커버하기 때문이다. NER에서 BiLSTM-CRF(Lample 2016)가 CoNLL-2003 SOTA를 달성한 것은 이 양방향 컨텍스트가 개체명 경계 모호성을 해소하기 때문이다.
+
+<Callout type="warning" title="스트리밍 불가">
+Backward RNN은 전체 시퀀스가 있어야 시작할 수 있다. 실시간 음성 인식 같은 온라인 설정에서 BiRNN은 시퀀스 길이만큼의 레이턴시가 발생한다. 배치 처리에서만 사용 가능한 구조다.
+</Callout>
+
+## 병목 #2 — 단층 표현력
+
+단일 레이어 RNN의 한 hidden state가 단어 수준부터 문장 수준까지 모든 추상화를 동시에 처리한다. Stacked RNN은 레이어를 쌓아 계층적 표현을 명시적으로 분리한다.
+
+$$
+h_t^{(l)} = f^{(l)}(h_{t-1}^{(l)},\, h_t^{(l-1)}), \quad h_t^{(0)} = x_t
+$$
+
+Google NMT(Wu 2016)의 8-레이어 LSTM이 WMT'14 SOTA를 달성한 원리가 여기에 있다. 하위 레이어가 어휘·문법 패턴을, 상위 레이어가 의미·화용론적 구조를 학습한다.
+
+그러나 깊이가 새로운 문제를 만든다. 시간 축(horizontal)의 vanishing은 LSTM의 CEC가 완화하지만, 레이어 축(vertical)의 vanishing은 별도로 해결해야 한다.
+
+$$
+\frac{\partial h_t^{(L)}}{\partial h_t^{(1)}} = \prod_{l=2}^{L} \frac{\partial h_t^{(l)}}{\partial h_t^{(l-1)}}
+$$
+
+$L$개 Jacobian의 곱셈이다. Residual connection이 해법이다.
+
+$$
+h_t^{(l)} = h_t^{(l-1)} + f^{(l)}(\ldots) \quad \Rightarrow \quad \frac{\partial h_t^{(l)}}{\partial h_t^{(l-1)}} = I + \frac{\partial f^{(l)}}{\partial h_t^{(l-1)}}
+$$
+
+$f^{(l)}$이 작을 때 gradient가 $I$에 수렴해 소멸하지 않는다. Google NMT가 8레이어에서도 안정적으로 학습된 이유가 이 vertical residual이다.
+
+<Aside label="두 축의 vanishing">
+Stacked RNN에서 gradient는 시간 방향($T$ 곱셈)과 깊이 방향($L$ 곱셈) 모두를 통과한다. Spectral radius $\rho = 0.5$, $T = 50$, $L = 8$이면 결합 감쇠는 $0.5^{58} \approx 10^{-17}$ 수준이다. LSTM의 CEC가 시간 축을, residual이 깊이 축을 담당해야 안정적인 훈련이 가능하다.
+</Aside>
+
+## 병목 #3 — 유한한 내부 메모리
+
+LSTM의 hidden $H$ 차원이 시퀀스 전체 이력을 압축한다. 시퀀스가 길어질수록 정보 손실이 커지고, 특정 위치의 내용을 직접 꺼내는 랜덤 액세스가 불가능하다.
+
+Neural Turing Machine(Graves 2014)은 외부 메모리 $M \in \mathbb{R}^{N \times d}$를 도입해 이 병목을 우회한다. LSTM 컨트롤러가 query를 생성하면, content-based addressing으로 메모리를 읽고 쓴다.
+
+$$
+w_i^{(c)} = \frac{\exp(\beta \cdot \cos(k, M_i))}{\sum_j \exp(\beta \cdot \cos(k, M_j))}
+$$
+
+$$
+r_t = \sum_i w_i M_i, \qquad M_i \leftarrow M_i \odot (1 - w_i e_t) + w_i a_t
+$$
+
+Erase + add의 2단계 write는 차원별 선택적 업데이트를 가능하게 한다. 단순 overwrite가 $w_i = 0.5$일 때 기존 정보를 무조건 절반 날리는 것과 달리, erase vector $e$가 "어떤 차원을 지울지"를 별도로 제어한다. LSTM의 forget gate + input gate 분리와 같은 정신이다.
+
+<Theorem kind="proposition" number="1" title="NTM Memory Capacity">
+$N \times d$ 외부 메모리는 $N \cdot d$개의 float을 저장하며, 동일 용량의 LSTM hidden($H = N \cdot d$)과 달리 content-based random access를 지원한다.
+</Theorem>
+
+Graves 2014의 copy task 실험에서 LSTM이 30 토큰까지 일반화할 때 NTM은 100 토큰 이상에서도 작동했다. 알고리즘 구조(복사, 정렬, 연상 기억)를 학습하는 태스크에서 내부 메모리의 한계가 드러난다.
+
+## 병목 #4 — BPTT의 비용
+
+표준 RNN 훈련의 숨겨진 비용은 BPTT다. 수백 에포크에 걸친 $O(E \cdot T \cdot H^2)$ 계산이다. Echo State Network(Jaeger 2001)는 이 전제를 뒤집는다.
+
+$$
+h_t = (1-\alpha)h_{t-1} + \alpha\tanh(W_{hh}h_{t-1} + W_{xh}x_t)
+$$
+
+$W_{hh}$와 $W_{xh}$는 랜덤으로 고정하고, 출력층 $W_{out}$만 학습한다. 학습은 ridge regression 단 한 번이다.
+
+$$
+W_{out} = (H^\top H + \lambda I)^{-1} H^\top Y^*
+$$
+
+비용은 $O(TN^2 + N^3)$, 에포크 반복 없음. Mackey-Glass 카오스 시계열 예측 실험에서 ESN이 LSTM 대비 수십 배 빠른 학습 시간에 경쟁적인 MSE를 달성한다.
+
+안정성은 **Echo State Property(ESP)**가 보장한다.
+
+$$
+\rho(W_{hh}) < 1 \implies \|h_t - h_t'\| \to 0 \quad (t \to \infty)
+$$
+
+서로 다른 초기 상태에서 시작한 두 trajectory가 동일 input 하에 수렴한다. Spectral radius가 1 미만이면 tanh의 Lipschitz 조건과 결합해 초기 조건이 지수적으로 소멸한다.
+
+<Callout type="note" title="트레이드오프">
+랜덤 리저보어는 task-specific 표현을 학습하지 못한다. NLP와 CV에서 LSTM이 압도적으로 우월한 이유다. ESN의 강점은 실시간 제어, 카오스 시계열, 엣지 AI처럼 학습 속도와 온라인 업데이트가 중요한 영역에 국한된다.
+</Callout>
+
+## 같은 아이디어, 다른 구현
+
+네 변형 모두 결국 Transformer에 흡수됐다. BiRNN의 양방향 컨텍스트는 BERT의 masked self-attention으로, Stacked RNN의 계층 구조는 multi-layer transformer로, NTM의 content-based read는 scaled dot-product attention으로, ESN의 frozen backbone + trainable head는 fine-tuning 패러다임으로 이어진다.
+
+그러나 각 아이디어가 만든 질문은 여전히 유효하다 — 미래 컨텍스트가 필요한가, 계층적 표현이 필요한가, 외부 메모리가 필요한가, BPTT 없이 학습할 수 있는가. 이 질문에 어떻게 답하느냐가 아키텍처를 결정한다.
+
+## 정리
+
+- BiRNN은 $h_t = [\overrightarrow{h}_t; \overleftarrow{h}_t]$로 양방향 컨텍스트를 포착하지만, 전체 시퀀스가 필요해 스트리밍에 부적합하다.
+- Stacked RNN은 계층적 표현력을 얻지만, 수직 방향의 vanishing을 residual connection으로 별도 해결해야 한다.
+- NTM은 외부 메모리 + differentiable addressing으로 알고리즘 학습 능력을 확장하고, 이 아이디어는 Transformer의 self-attention으로 계승됐다.
+- ESN은 BPTT를 linear regression으로 대체해 훈련 비용을 극단적으로 낮추지만, task-specific 표현 학습을 포기한다.
+
+다음 글에서는 이 모든 변형의 병목을 구조적으로 우회한 seq2seq + attention 메커니즘을 추적한다.
+
+<Reference
+  title="Neural Turing Machines"
+  authors="Graves, Wayne, Danihelka"
+  year={2014}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1410.5401"
+/>
+
+<Reference
+  title="Neural Architectures for Named Entity Recognition"
+  authors="Lample, Ballesteros, Subramanian, Kawakami, Dyer"
+  year={2016}
+  venue="NAACL"
+  url="https://arxiv.org/abs/1603.01360"
+/>
