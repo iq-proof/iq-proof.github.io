@@ -1,0 +1,166 @@
+---
+title: "지수족은 왜 분포 공간의 아핀 부분다양체인가"
+description: "로그밀도의 선형성에서 출발해 쌍대평탄(dually flat) 구조까지, 지수족이 정보기하의 중심이 되는 이유를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, exponential-family, fisher-information, dually-flat]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+정규분포, 베르누이, 포아송, 디리클레 — 통계학에서 중요한 거의 모든 분포가 지수족(exponential family)에 속한다. 이것은 우연이 아니다. 지수족은 "주어진 모멘트 제약 하에서 최대 엔트로피를 갖는 분포"로 자연스럽게 튀어나오며, 기하학적으로는 **분포 공간에서 아핀(affine) 부분다양체**를 이룬다. 이 아핀 구조가 MLE의 볼록성, Fisher 정보의 해석적 계산, EM 알고리즘의 수렴 보장을 동시에 설명한다. 왜 로그밀도의 선형성 하나가 이토록 많은 것을 만들어내는가?
+
+## 로그 공간에서의 아핀 구조
+
+지수족의 정의는 단순하다.
+
+$$
+p(x \mid \theta) = \exp\!\bigl(\theta^T T(x) - \psi(\theta)\bigr) h(x)
+$$
+
+여기서 $T(x)$는 충분통계량, $\theta$는 canonical(정준) 파라미터, $\psi(\theta) = \log \int \exp(\theta^T T) h \, d\nu$는 로그-분배함수(cumulant function)다.
+
+이 정의에서 핵심은 한 가지다. $x$를 고정하고 $\theta$의 함수로 보면, **로그밀도가 $\theta$의 아핀 함수**다.
+
+$$
+\log p(x \mid \theta) = \underbrace{\theta^T T(x)}_{\theta\text{의 아핀항}} - \underbrace{\psi(\theta)}_{\theta\text{의 볼록항}} + \underbrace{\log h(x)}_{\theta\text{와 무관}}
+$$
+
+이 구조가 말하는 바는 명확하다. 로그 공간에서 지수족은 $T_1(x), \dots, T_d(x)$를 기저로 하는 $d$차원 아핀 부분공간이다. Amari가 이 구조를 **e-flat**("exponentially flat")이라 부른 이유가 바로 여기에 있다.
+
+베르누이 분포로 맛보기를 하면 이해가 빠르다. $p(x \mid p) = p^x(1-p)^{1-x}$의 로그를 전개하면 canonical 파라미터 $\theta = \log\frac{p}{1-p}$ (logit)가 자연스럽게 등장하고, cumulant function은 $\psi(\theta) = \log(1 + e^\theta)$가 된다. Logistic 회귀의 sigmoid가 곧 $\nabla\psi(\theta) = \mathbb{E}[X]$라는 사실은 이 구조의 직접적 귀결이다.
+
+## Cumulant Function이 모든 것을 담는다
+
+지수족의 놀라운 성질은 cumulant function $\psi(\theta)$ 하나가 분포의 모든 모멘트 정보를 담고 있다는 점이다.
+
+$$
+\nabla\psi(\theta) = \mathbb{E}_\theta[T(X)], \qquad \nabla^2\psi(\theta) = \operatorname{Cov}_\theta[T(X)] = F(\theta)
+$$
+
+1차 미분은 충분통계량의 기댓값, 2차 미분은 공분산 — 그리고 그 공분산이 **Fisher 정보 행렬**과 정확히 일치한다. 이것이 단일 등식 $F = \nabla^2\psi$다.
+
+<Theorem kind="theorem" number="1" title="Fisher = Hessian of ψ">
+Regular minimal 지수족에서 $\psi$는 엄격 볼록(strictly convex)이며, Fisher 정보 행렬은
+
+$$
+F_{ij}(\theta) = \partial_i\partial_j\psi(\theta) = \operatorname{Cov}_\theta[T_i, T_j]
+$$
+
+를 만족한다. 특히 $\psi$의 엄격 볼록성은 $F \succ 0$을 보장한다.
+</Theorem>
+
+<Proof>
+Score 함수 $\partial_i \log p = T_i - \partial_i\psi = T_i - \mathbb{E}[T_i]$임을 확인하면,
+
+$$
+F_{ij} = \mathbb{E}[(T_i - \mathbb{E}T_i)(T_j - \mathbb{E}T_j)] = \operatorname{Cov}[T_i, T_j] = \partial_i\partial_j\psi
+$$
+
+엄격 볼록성은 minimal 조건(T의 아핀 독립성)에서 Hölder 부등식의 등호 조건을 이용해 증명한다.
+</Proof>
+
+이 등식은 MLE의 전역 수렴도 설명한다. $n$개 관측의 로그우도
+
+$$
+\ell(\theta) = \theta^T \sum T(x_i) - n\psi(\theta)
+$$
+
+를 최대화하면 $\nabla\psi(\hat\theta) = \frac{1}{n}\sum T(x_i)$, 즉 **모델의 기대 충분통계량 = 관측 충분통계량**이라는 모멘트 매칭 조건이 나온다. 볼록 최적화이므로 해가 유일하다. Energy-Based Model의 gradient
+
+$$
+\nabla_\theta \log p_\theta(x) = T(x) - \nabla\psi(\theta) = T(x) - \mathbb{E}_{p_\theta}[T]
+$$
+
+즉 "관측 통계 − 모델 통계"도 같은 등식의 귀결이다.
+
+## Legendre 변환과 두 좌표의 쌍대성
+
+$\psi$가 엄격 볼록이므로 Legendre 변환이 잘 정의된다.
+
+$$
+\psi^*(\eta) = \sup_\theta\bigl(\theta^T\eta - \psi(\theta)\bigr)
+$$
+
+$\nabla\psi(\theta) = \eta$의 역사상이 $\nabla\psi^*(\eta) = \theta$이며, 두 함수는 Fenchel-Young 등식 $\psi(\theta) + \psi^*(\eta) = \theta^T\eta$로 엮인다.
+
+이로부터 두 좌표계가 생겨난다. **Canonical 파라미터** $\theta$는 로그우도의 아핀항 계수로 최적화에 유리하고, **Expectation 파라미터** $\eta = \mathbb{E}_\theta[T(X)]$는 관측 가능한 기댓값으로 추정에 유리하다. 두 좌표계의 Fisher 행렬은 서로 역행렬이다.
+
+$$
+F^*(\eta) = \nabla^2\psi^*(\eta) = F(\theta)^{-1}
+$$
+
+<Callout type="note" title="트레이드오프: 어떤 좌표를 써야 하는가">
+$\theta$ 좌표에서 로그우도는 볼록 — MLE와 SGD에 최적. $\eta$ 좌표에서 KL divergence의 기울기는 유클리드 구조를 가짐 — Variational Inference와 Mirror Descent에 최적. Natural Gradient $F^{-1}g$는 $\theta$에서의 연산이지만 $\eta$-공간의 유클리드 gradient와 수치적으로 동치다. 두 좌표가 모두 필요한 이유가 여기 있다.
+</Callout>
+
+Legendre 변환을 통해 KL divergence도 단일한 대수 표현을 얻는다.
+
+$$
+\operatorname{KL}(p_{\theta_1} \| p_{\theta_2}) = \psi(\theta_2) + \psi^*(\eta_1) - \theta_2^T\eta_1
+$$
+
+한 분포는 $\theta$, 다른 분포는 $\eta$로 표현되는 이 "혼합 좌표 표현"이 Pythagoras 정리의 정확한 출처다.
+
+## 쌍대 아핀 연결과 e/m-Connection
+
+같은 리만 계량 위에 여러 아핀 연결이 가능하다. 지수족에는 두 개의 자연스러운 flat 연결이 있다. **e-connection** $\nabla^{(e)}$는 $\theta$ 좌표에서 크리스토펠 기호가 0이어서 $\theta$-직선이 측지선이 되고, **m-connection** $\nabla^{(m)}$은 $\eta$ 좌표에서 크리스토펠 기호가 0이어서 $\eta$-직선이 측지선이 된다.
+
+두 연결 모두 torsion-free이지만 metric-compatible이 아니다. 그러나 Fisher 계량에 대해 **쌍대(dual)** 관계를 만족한다.
+
+$$
+X g(Y, Z) = g\!\left(\nabla^{(e)}_X Y,\, Z\right) + g\!\left(Y,\, \nabla^{(m)}_X Z\right)
+$$
+
+이 관계가 "쌍대평탄(dually flat)"의 심장이다. 두 연결의 평균
+
+$$
+\nabla^{(0)} = \tfrac{1}{2}\!\left(\nabla^{(e)} + \nabla^{(m)}\right)
+$$
+
+이 Fisher 계량의 Levi-Civita 연결과 일치한다는 사실도 이 쌍대성의 귀결이다.
+
+<Aside label="Amari-Chentsov 텐서">
+두 연결의 차이는 $\psi$의 3차 미분 $\kappa_{ijk} = \partial_i\partial_j\partial_k\psi = \mathbb{E}[(T_i - \eta_i)(T_j - \eta_j)(T_k - \eta_k)]$로 주어진다. 이것이 분포의 왜도(skewness) 텐서이자 Amari-Chentsov 텐서의 출발점이다. $\alpha$-connection이 $\alpha = \pm 1$에서만 flat한 이유도 이 텐서의 소거 조건에서 나온다.
+</Aside>
+
+## Generalized Pythagoras와 쌍대평탄의 응용
+
+쌍대평탄 구조가 낳는 가장 강력한 결과는 일반화 Pythagoras 정리다.
+
+<Theorem kind="theorem" number="2" title="Generalized Pythagoras (Amari)">
+쌍대평탄 다양체에서 세 분포 $P, Q, R$이 $P$-$Q$를 m-측지선으로, $Q$-$R$을 e-측지선으로 연결하고 두 측지선이 $Q$에서 직교
+
+$$
+(\theta_R - \theta_Q)^T(\eta_P - \eta_Q) = 0
+$$
+
+를 만족하면, $D(P \| R) = D(P \| Q) + D(Q \| R)$이 정확히 성립한다.
+</Theorem>
+
+<Proof>
+Canonical divergence 정의와 Legendre 등식 $\psi(\theta_Q) + \psi^*(\eta_Q) = \theta_Q^T\eta_Q$를 이용해 전개하면
+
+$$
+D(P\|R) - D(P\|Q) - D(Q\|R) = -(\theta_R - \theta_Q)^T(\eta_P - \eta_Q)
+$$
+
+직교 조건에서 우변이 0이 되어 등호가 성립한다.
+</Proof>
+
+이 정리는 AI 학습 알고리즘 전반에 걸쳐 구체적 귀결을 만든다. EM 알고리즘의 E-step은 m-projection, M-step은 e-projection이며 두 projection의 교대가 KL을 단조 감소시키는 이유가 Pythagoras다. Variational Inference에서 mean-field family가 e-flat 부분다양체를 이루고, ELBO 최대화가 그 위로의 e-projection으로 해석된다. Natural Gradient $F^{-1}g$가 parameterization-invariant한 이유도 $\eta$ 좌표에서 Fisher 행렬이 역행렬로 바뀌어 유클리드 gradient와 동치가 되는 쌍대성의 귀결이다.
+
+## 정리
+
+- 지수족의 본질은 **로그밀도가 $T(x)$의 선형 결합**이라는 것이다. 이 e-flat 구조가 MLE 볼록성과 유일성을 보장한다.
+-

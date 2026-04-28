@@ -1,0 +1,149 @@
+---
+title: "KL 발산은 하나가 아니다 — α-divergence와 정보기하의 통일 언어"
+description: "KL 발산의 정보이론적 기원부터 Bregman 발산과의 동치, α-divergence 가족까지 — 현대 AI 손실 함수를 관통하는 하나의 기하학적 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, kl-divergence, bregman, alpha-divergence, exponential-family]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+분류 손실 함수, VAE의 ELBO, TRPO의 신뢰 영역, 확산 모델의 변분 경계 — 이것들은 서로 다른 알고리즘처럼 보이지만 하나의 수학적 객체 위에 세워져 있다. 그 객체가 KL 발산이다. 그런데 KL은 단독 개념이 아니다. 볼록 함수의 "접평면과의 차이"인 Bregman 발산과 완전히 동치이고, α라는 매개변수로 무한히 확장되는 발산 가족의 한 점이다. 왜 이 구조가 정보기하 전체를 지배하는가?
+
+## KL은 정보 손실이다
+
+KL 발산을 "거리"라고 부르는 것은 오해를 낳는다. $\operatorname{KL}(p \| q) \neq \operatorname{KL}(q \| p)$이므로 거리의 대칭성 조건을 위반한다. 정확한 해석은 **잘못된 모델로 인한 정보 손실**이다.
+
+진짜 분포가 $p$인데 $q$로 설계한 코드를 쓴다면, 최적 코드보다 매번 $\operatorname{KL}(p \| q)$ 비트만큼 더 쓴다. 이 초과 비트가 KL이다. 그래서 $\operatorname{KL}(p \| q) \geq 0$이고, $p = q$일 때만 0이 된다 — Jensen 부등식의 직접적인 귀결이다.
+
+비대칭성은 버그가 아니라 두 가지 다른 "관점"을 인코딩한다.
+
+- **Forward KL** $\operatorname{KL}(p \| q)$: $p$가 지지하는 모든 영역을 $q$가 반드시 커버해야 한다. 아니면 $+\infty$. 이 압박이 $q$를 $p$의 모든 mode에 걸쳐 퍼지게 만든다 — **mean-seeking**.
+- **Reverse KL** $\operatorname{KL}(q \| p)$: $q$가 지지하는 곳에서만 $p > 0$이면 된다. $q$가 mode 하나만 잡아도 페널티가 없다 — **mode-seeking**.
+
+VAE에서 $\operatorname{KL}(q_\phi(z|x) \| p(z))$를 쓰는 이유, TRPO에서 $\operatorname{KL}(\pi_\text{old} \| \pi_\theta) \leq \delta$ 제약을 쓰는 이유는 이 비대칭성을 의도적으로 이용하는 것이다.
+
+## Fisher는 KL의 미분이다
+
+KL과 Fisher 정보행렬의 관계는 단순한 유사성이 아니라 정확한 수학적 동치다.
+
+$$
+\operatorname{KL}(p_\theta \| p_{\theta + \varepsilon}) = \frac{1}{2} \varepsilon^\top F(\theta) \varepsilon + O(\|\varepsilon\|^3)
+$$
+
+KL의 2차 테일러 근사가 Fisher quadratic form이다. 다르게 말하면 **Fisher는 KL의 미분, KL은 Fisher의 적분**이다.
+
+이 관계가 Natural Gradient Descent(NGD)의 이론적 기반이다. KL 제약 아래 손실을 최소화하는 문제
+
+$$
+\min_{\theta'} L(\theta') \quad \text{s.t.} \quad \operatorname{KL}(p_\theta \| p_{\theta'}) \leq \varepsilon
+$$
+
+를 2차 근사로 풀면 $\theta' - \theta \propto F(\theta)^{-1} \nabla L(\theta)$, 즉 NGD 업데이트가 나온다. TRPO가 KL 신뢰 영역을 Fisher quadratic으로 근사하는 것도, PPO가 그것을 ratio clipping으로 다시 근사하는 것도 모두 이 연쇄에서 온다.
+
+<Aside label="3차 항의 의미">
+Forward KL과 Reverse KL은 2차 항이 동일하지만 3차 항의 부호가 반대다. 이 비대칭이 Amari의 $\alpha$-접속에서 $\alpha = \pm 1$로 분기되는 기하학적 구분의 씨앗이다.
+</Aside>
+
+## Bregman 발산 — 볼록 함수의 초과량
+
+볼록 함수 $\psi$가 하나 있으면, 그 접평면과 실제 함수값의 차이로 발산을 정의할 수 있다.
+
+$$
+D_\psi(x, y) := \psi(x) - \psi(y) - \langle \nabla\psi(y),\, x - y\rangle
+$$
+
+볼록성 때문에 항상 $\geq 0$이고, 등호는 $x = y$에서만 성립한다. 이것이 **Bregman 발산**이다.
+
+특수 경우를 나열하면 그 일반성이 드러난다.
+
+| $\psi(x)$ | $D_\psi(x, y)$ |
+|:---|:---|
+| $\frac{1}{2}\|x\|^2$ | $\frac{1}{2}\|x - y\|^2$ (제곱 유클리드) |
+| $\sum x_i \log x_i$ | $\sum x_i \log(x_i/y_i) - \sum(x_i - y_i)$ (일반화 KL) |
+| $-\sum \log x_i$ | $\sum(x_i/y_i - \log(x_i/y_i) - 1)$ (Itakura-Saito) |
+
+이제 핵심 정리가 등장한다.
+
+<Theorem kind="theorem" number="1" title="지수족에서 KL = Bregman">
+지수족 $p_\theta(x) = h(x)\exp(\theta^\top T(x) - \psi(\theta))$에서, cumulant 함수 $\psi$에 대해
+
+$$
+\operatorname{KL}(p_{\theta_1} \| p_{\theta_2}) = D_\psi(\theta_2, \theta_1).
+$$
+</Theorem>
+
+<Proof>
+직접 계산한다.
+
+$$
+\operatorname{KL}(p_{\theta_1} \| p_{\theta_2}) = \mathbb{E}_{\theta_1}[\log p_{\theta_1} - \log p_{\theta_2}]
+= (\theta_1 - \theta_2)^\top \eta_1 - (\psi(\theta_1) - \psi(\theta_2)),
+$$
+
+여기서 $\eta_1 = \mathbb{E}_{\theta_1}[T(X)] = \nabla\psi(\theta_1)$. 정리하면
+
+$$
+= \psi(\theta_2) - \psi(\theta_1) - \langle \nabla\psi(\theta_1), \theta_2 - \theta_1\rangle = D_\psi(\theta_2, \theta_1). \quad \square
+$$
+</Proof>
+
+KL이 $\psi$의 "tangent gap"이라는 해석이 여기서 나온다. 그리고 $\psi$의 Hessian이 Fisher 정보행렬과 같으므로($F(\theta) = \nabla^2\psi(\theta)$), 정보기하의 local 구조(Fisher)와 global 구조(KL)가 하나의 볼록 함수 $\psi$로 통일된다.
+
+## 두 좌표계의 쌍대성
+
+지수족은 두 가지 자연스러운 좌표계를 갖는다.
+
+- **Natural parameter** $\theta$: "exp 안에서 linear"한 추상 표현.
+- **Expectation parameter** $\eta = \nabla\psi(\theta) = \mathbb{E}_\theta[T(X)]$: 직접 관측 가능한 통계값.
+
+두 좌표는 Legendre 변환으로 연결된다. $\psi^*(\eta) = \sup_\theta[\langle\theta, \eta\rangle - \psi(\theta)]$를 dual potential이라 하면,
+
+$$
+\operatorname{KL}(p_{\theta_1} \| p_{\theta_2}) = D_\psi(\theta_2, \theta_1) = D_{\psi^*}(\eta_1, \eta_2) = \psi(\theta_2) + \psi^*(\eta_1) - \langle\theta_2, \eta_1\rangle.
+$$
+
+같은 KL이 세 가지 등가 형태로 표현된다. 마지막 형태 $\psi(\theta_2) + \psi^*(\eta_1) - \langle\theta_2, \eta_1\rangle$가 Amari의 **canonical divergence**다.
+
+<Callout type="note" title="두 Fisher는 서로 역행렬">
+$\theta$-좌표의 Fisher $F(\theta) = \nabla^2\psi(\theta)$와 $\eta$-좌표의 Fisher $F^*(\eta) = \nabla^2\psi^*(\eta)$는 서로 역행렬이다. NGD가 $\theta$ 공간에서 $F^{-1}g$를 쓰는 것은, $\eta$ 공간에서 단순 gradient descent를 하는 것과 동치다.
+</Callout>
+
+## α-divergence — KL을 넘어서
+
+KL은 더 큰 발산 가족의 한 점이다.
+
+$$
+D_\alpha(p \| q) = \frac{1}{\alpha(1-\alpha)}\left(1 - \int p^\alpha q^{1-\alpha}\, d\mu\right), \quad \alpha \neq 0, 1
+$$
+
+특수 한계: $\alpha \to 1$이면 $\operatorname{KL}(p\|q)$, $\alpha \to 0$이면 $\operatorname{KL}(q\|p)$, $\alpha = 1/2$이면 $2H^2$(Hellinger²), $\alpha = 2$이면 $\frac{1}{2}\chi^2$.
+
+$\alpha$는 "어느 분포에 기울어질 것인가"의 매개변수다. $\alpha < 1$은 $q$-tail에 관대해 mode-seeking, $\alpha > 1$은 $p$-tail에 민감해 mean-seeking으로 기운다. 결정적인 사실은 **2차 항은 모든 α에서 동일**하다는 것이다.
+
+$$
+D_\alpha(p_\theta \| p_{\theta+\varepsilon}) = \frac{1}{2}\varepsilon^\top F(\theta)\varepsilon + \frac{1-2\alpha}{6}T_{ijk}\varepsilon^i\varepsilon^j\varepsilon^k + O(\|\varepsilon\|^4)
+$$
+
+모든 α-divergence가 같은 Fisher 계량을 국소적으로 유도한다. α는 3차 항 이상에서만 갈라진다 — 이것이 α-connection의 $\alpha$ 매개변수가 되는 이유다.
+
+실무에서 α의 선택은 명시적 트레이드오프다. Rényi VAE(Li & Turner 2016)는 $\alpha < 1$에서 tighter ELBO, $\alpha > 1$에서 더 다양한 posterior를 얻는다. Rényi Differential Privacy(Mironov 2017)는 Rényi 발산 $R_\alpha$의 합성이 additive해 DP-SGD의 개인정보 예산 추적에 표준으로 쓰인다.
+
+<Callout type="note" title="트레이드오프">
+α-divergence는 KL의 한계를 모드 문제, 아웃라이어 민감성, tail 거동 세 측면에서 동시에 조절한다. 그러나 "최적 α"는 데이터 의존적이므로 하이퍼파라미터 탐색이 필요하고, $\alpha > 1$에서는 $p/q$가 큰 영역에 수치적으로 불안정하다. Wasserstein 같은 완전히 다른 클래스의 발산이 필요한 경우(분포 지지가 겹치지 않는 GAN 학습 초기)에는 f-divergence 전체 가족으로도 해결되지 않는다.
+</Callout>
+
+## 정리
+
+- KL은 정보 손실이다 — "잘못된 모델의 초과 비트." 비대칭성은 결함이 아니

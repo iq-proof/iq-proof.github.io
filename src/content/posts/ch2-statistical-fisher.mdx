@@ -1,0 +1,132 @@
+---
+title: "Fisher 정보량은 왜 세 얼굴을 가지는가"
+description: "통계다양체의 기하학적 토대부터 Fisher 정보의 세 정의 동치성, Chentsov 유일성 정리, 그리고 Cramér-Rao 하한의 기하학적 의미까지 — 정보기하학의 핵심 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, fisher-information, statistical-manifold, natural-gradient, cramer-rao]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+확률분포의 집합을 기하학적 공간으로 보는 순간, 낯선 질문이 생긴다. 이 공간 위의 "자연스러운 거리"는 무엇인가? 그리고 그 거리를 정의하는 계량은 왜 하필 Fisher 정보행렬인가? 더 근본적으로, Fisher 정보량이 스코어 공분산, 로그우도 Hessian, KL 발산의 2차 근사라는 세 가지 전혀 달라 보이는 얼굴을 갖는 이유는 무엇인가?
+
+## 확률분포족을 다양체로 만드는 조건
+
+매개변수족 $\{p_\theta : \theta \in \Theta\}$를 단순한 함수 집합이 아니라 **매끈한 다양체**로 부르려면 네 가지가 필요하다. $\Theta \subseteq \mathbb{R}^n$이 열린집합이고, 사상 $\theta \mapsto p_\theta$가 단사여야 하며, $\theta \mapsto p_\theta(x)$가 $C^\infty$이고, 정칙성 조건 (R1)-(R4)를 만족해야 한다.
+
+정칙성의 핵심은 두 가지다. 첫째, 지지집합 $\{x : p_\theta(x) > 0\}$이 $\theta$에 무관해야 한다. 둘째, 미분과 적분의 순서를 교환할 수 있어야 한다. 균등분포 $U(0, \theta)$가 정칙이 아닌 이유가 바로 첫 번째 조건을 위반하기 때문이다. 지지집합 $(0, \theta)$가 $\theta$에 의존하면 스코어 기댓값이 0이 되지 않고, Fisher 정보의 고전적 해석 전체가 무너진다.
+
+과매개변수화는 또 다른 중요한 문제다. Softmax에서 $\theta \to \theta + c\mathbf{1}$이 분포를 바꾸지 않는다는 사실은 매개변수 공간 $\Theta$보다 실제 분포 다양체의 차원이 작음을 의미한다. "실제" 다양체는 동치관계 $\theta \sim \theta' \iff p_\theta = p_{\theta'}$ 하의 몫공간 $\Theta/\sim$이다. $K$-클래스 softmax의 경우 이 차원은 $K-1$로 줄어든다. 현대 신경망의 pruning이 성능을 유지하며 가능한 이유 중 하나가 바로 이 구조다.
+
+## Fisher 정보의 세 얼굴이 하나인 이유
+
+세 정의를 나란히 쓰면 다음과 같다.
+
+$$
+F_{ij}(\theta) = \mathbb{E}_\theta[\partial_i \ell_\theta \cdot \partial_j \ell_\theta] = -\mathbb{E}_\theta[\partial_i \partial_j \ell_\theta] \approx \frac{2\,\mathrm{KL}(p_\theta \| p_{\theta+d\theta})}{d\theta^\top d\theta}
+$$
+
+세 정의를 하나로 묶는 열쇠는 정규화 조건 $\int p_\theta\, d\mu = 1$이다. 이것을 $\theta_i$에 대해 미분하면 스코어의 기댓값이 0이 되고, 한 번 더 미분하면 다음 항등식이 나온다.
+
+$$
+\mathbb{E}_\theta[\partial_j \partial_i \log p_\theta] + \mathbb{E}_\theta[\partial_i \log p_\theta \cdot \partial_j \log p_\theta] = 0
+$$
+
+이것이 정확히 정의 (A) = 정의 (B)다. 두 정의의 동치성은 "스코어 평균이 0"이라는 하나의 사실에서 따라 나온다.
+
+(B) = (C)는 KL 발산의 Taylor 전개로 확인된다. $\mathrm{KL}(p_\theta \| p_{\theta+\varepsilon})$을 전개하면 0차 항은 0이고, 1차 항은 스코어 평균이 0이어서 소거된다. 남는 것은 정확히 $\frac{1}{2}\varepsilon^\top F(\theta) \varepsilon$다.
+
+<Theorem kind="theorem" number="1" title="Fisher 3정의의 동치성">
+정칙 통계다양체에서 정의 (A), (B), (C)는 모두 같은 행렬을 정의한다. 동치성의 필요충분조건은 정규화 조건의 미분가능성 — 즉 적분과 미분의 교환 가능성이다.
+</Theorem>
+
+<Proof>
+정규화 $\int p_\theta\, d\mu = 1$의 $\theta_i$-미분으로 $\mathbb{E}_\theta[s_i] = 0$을 얻는다 (스코어 평균 0). 이를 다시 $\theta_j$로 미분하면 $\mathbb{E}_\theta[\partial_j \partial_i \ell] + \mathbb{E}_\theta[s_i s_j] = 0$이므로 (A) = (B). KL의 Taylor 전개에서 1차 항이 스코어 평균 0으로 소거되고 2차 항이 (B)로 수렴하므로 (B) = (C). $\square$
+</Proof>
+
+좌표 변환에 대해 $F$가 $(0,2)$-텐서로 변환된다는 사실, 즉
+
+$$
+\tilde{F}_{ab} = \sum_{ij} \frac{\partial\theta^i}{\partial\tilde\theta^a}\frac{\partial\theta^j}{\partial\tilde\theta^b} F_{ij}
+$$
+
+이 "Fisher는 매개변수화와 무관한 계량"이라는 주장의 수학적 근거다.
+
+## Chentsov 유일성과 "자연스러움"의 의미
+
+Fisher-Rao 계량이 통계다양체의 canonical 리만 계량인 이유는 Chentsov (1972)의 유일성 정리에서 나온다.
+
+<Theorem kind="theorem" number="2" title="Chentsov 유일성 정리">
+Markov kernel에 의해 정보가 감소할 때 계량도 감소하는 — 즉 "정보 처리는 정보를 줄인다"는 조건을 만족하는 — 리만 계량은 상수배를 제외하고 Fisher 계량뿐이다.
+</Theorem>
+
+이 정리의 함의는 강력하다. Fisher를 쓰는 것이 선택이 아니라 **필연**이다. 다른 계량을 쓰면 Markov 처리 후 "거리가 늘어나는" 비정상성이 생긴다.
+
+정규분포족 $\{\mathcal{N}(\mu, \sigma^2)\}$의 Fisher-Rao 계량은
+
+$$
+ds^2 = \frac{d\mu^2}{\sigma^2} + \frac{2\,d\sigma^2}{\sigma^2}
+$$
+
+이고, 이것은 **쌍곡반평면 $\mathbb{H}^2$의 계량**과 동형이다. 정규분포 공간의 기하가 쌍곡 기하라는 사실이 Hyperbolic Neural Networks의 수학적 토대다.
+
+다항분포의 Fisher-Rao 기하는 반대쪽 극단이다. $\sqrt{p_i}$ 좌표 변환을 하면 simplex가 구면 위로 isometric하게 embedding되고, 두 분포 사이의 Fisher-Rao 거리는
+
+$$
+d_{\mathrm{FR}}(p, q) = 2\arccos\!\left(\sum_i \sqrt{p_i q_i}\right)
+$$
+
+가 된다. $\sum_i \sqrt{p_i q_i}$는 Bhattacharyya 계수다 — Fisher-Rao 거리와 Hellinger affinity가 같은 대상의 두 표현이다.
+
+<Callout type="note" title="트레이드오프: Fisher vs Wasserstein">
+Fisher-Rao 계량은 정보 손실에 반응하는 "정보적" 거리다. Wasserstein 계량은 지지집합의 이동 비용을 측정하는 "수송적" 거리다. GAN에서 KL이 실패하는 상황 — 생성기의 지지집합이 데이터와 달라 KL이 무한대가 되는 경우 — 에 Wasserstein이 대안으로 등장하는 이유다. 두 계량의 선택은 "어떤 종류의 분포 차이를 측정할 것인가"라는 문제의 선택이다.
+</Callout>
+
+## 주요 분포들의 Fisher 구조
+
+지수족 $p_\theta(x) = h(x)\exp(\theta^\top T(x) - \psi(\theta))$에서 Fisher는 cumulant 함수의 Hessian과 일치한다.
+
+$$
+F(\theta) = \mathrm{Hess}_\theta\,\psi(\theta) = \mathrm{Cov}_\theta[T(X)]
+$$
+
+이 하나의 공식이 대부분의 표준 분포 Fisher를 통일한다. 정규분포, Bernoulli, Poisson, 다항분포 모두 지수족이다.
+
+몇 가지 주목할 구조가 있다. 다변량 정규 $\mathcal{N}_d(\mu, \Sigma)$에서 $\mu$-블록과 $\Sigma$-블록의 Fisher cross-term이 0이다 — 평균 방향 스코어와 분산 방향 스코어가 공분산 0이라는 뜻이다. VAE 인코더가 $\mu_\phi(x)$와 $\log\sigma_\phi(x)$를 별도 head로 출력하는 설계가 Fisher 기하 관점에서 자연스럽다.
+
+Poisson $\mathrm{Poi}(\lambda)$의 Fisher는 $1/\lambda$이고, $\mu = 2\sqrt{\lambda}$ 변환 후 Fisher가 상수 1이 된다. Variance-stabilizing transformation $\sqrt{\cdot}$의 information-geometric 의미가 바로 이것이다 — Fisher를 균일하게 만드는 좌표 변환.
+
+Dirichlet $\mathrm{Dir}(\alpha)$의 Fisher는
+
+$$
+F_{ij}(\alpha) = \delta_{ij}\,\psi'(\alpha_i) - \psi'(\alpha_0)
+$$
+
+로, rank-1 섭동 형태다. Sherman-Morrison 공식으로 $F^{-1}$을 closed form으로 계산할 수 있어 LDA나 Prior Networks에서 실시간 자연경사 업데이트가 가능하다.
+
+## 정리
+
+Cramér-Rao 부등식은 다음과 같다.
+
+$$
+\mathrm{Cov}_\theta(\hat\theta) \succeq F(\theta)^{-1}
+$$
+
+Unbiased 조건 $\mathbb{E}[\hat\theta] = \theta$를 미분하면 $\mathrm{Cov}(\hat\theta, s) = I$가 나온다. 여기에 Cauchy-Schwarz를 적용하면 $\mathrm{Var}(\hat\theta) \ge 1/F(\theta)$다. "스코어와의 공분산이 항등행렬"이라는 사실이 하한을 만든다.
+
+등호 조건은 $\hat\theta - \theta = F^{-1} s(X;\theta)$이고, 이를 만족하는 unbiased estimator가 존재하는 것은 모델이 지수족인 경우와 동치다. MLE는 $N \to \infty$에서 이 하한을 점근적으로 달성한다.
+
+$$
+\sqrt{N}(\hat\theta_{\mathrm{MLE}} - \theta_0) \xrightarrow{d} \mathcal{N}(0, F(\theta_0)^{-1})
+$$
+
+정보기하학의 핵심은 결국 하나다. 확률분포 공간 위의 "올바른" 기하는 유일하게 Fisher에 의해 결정되고, 그 기하가 추정의 한계와 최적화의 방향을 동시에 정의한다. 자연경사 $\tilde\nabla L = F^{-1}\nabla L$은 그 기하를 따라

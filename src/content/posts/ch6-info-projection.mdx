@@ -1,0 +1,146 @@
+---
+title: "KL divergence 최소화는 왜 두 개의 다른 연산인가"
+description: "e-projection과 m-projection의 비대칭성에서 출발해 EM 알고리즘, Variational Inference, MaxEnt까지, KL 기하학의 통일 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, kl-divergence, em-algorithm, variational-inference, projection]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+$D(p \| q)$를 최소화할 때, 어느 인자를 고정하고 어느 쪽을 움직이느냐에 따라 전혀 다른 기하학적 연산이 탄생한다. 이 비대칭성은 단순한 수식 트릭이 아니다. EM 알고리즘의 E-step과 M-step이 왜 다른지, Variational Inference가 왜 mode-seeking인지, Maximum Entropy 원리가 왜 exponential family를 낳는지 — 이 모든 질문이 하나의 답으로 수렴한다. KL divergence를 최소화하는 두 가지 방향, e-projection과 m-projection이란 무엇인가?
+
+## 두 projection의 정의
+
+분포 다양체 $\mathcal{S}$ 위의 부분다양체 $M$에 대해 두 projection을 정의한다.
+
+**m-projection**: $q \in \mathcal{S}$를 고정하고, $M$ 위에서 $p$를 움직여 $D(p \| q)$를 최소화한다.
+
+$$
+\Pi_M^{(m)}(q) = \arg\min_{p \in M} D(p \| q)
+$$
+
+**e-projection**: $p \in \mathcal{S}$를 고정하고, $M$ 위에서 $q$를 움직여 $D(p \| q)$를 최소화한다.
+
+$$
+\Pi_M^{(e)}(p) = \arg\min_{q \in M} D(p \| q)
+$$
+
+이름의 유래는 **어떤 geodesic으로 내려가느냐**에 있다. e-geodesic은 $\theta$ (natural parameter) 좌표에서 직선, 즉 $p_t \propto p_0^{1-t} p_1^t$로 정의된다. m-geodesic은 $\eta$ (expectation) 좌표에서 직선, 즉 $p_t = (1-t)p_0 + t p_1$ (혼합)이다.
+
+"m-flat 다양체에 투영할 때는 e-geodesic으로, e-flat 다양체에 투영할 때는 m-geodesic으로 내려간다." 이 교차 쌍대성이 핵심이다.
+
+<Theorem kind="theorem" number="1" title="일반화 Pythagoras 정리 (Amari 2000)">
+$M$이 e-flat이고 $\hat{q} = \Pi_M^{(e)}(p)$면, 모든 $q \in M$에 대해 다음이 성립한다.
+
+$$
+D(p \| q) = D(p \| \hat{q}) + D(\hat{q} \| q)
+$$
+</Theorem>
+
+<Proof>
+$\hat{q}$는 $p$의 e-projection이므로, $p$에서 $\hat{q}$로의 m-geodesic이 $M$에 수직이다. $M$이 e-flat이므로 $\hat{q}$와 $q$를 잇는 경로는 e-geodesic이다. Canonical divergence 공식 $D(p \| q) = \psi(\theta_q) + \psi^*(\eta_p) - \theta_q^T \eta_p$로 전개하면, 수직성 조건 $(\eta_p - \eta_{\hat{q}})^T v = 0$이 교차 항을 소거하고 등식이 성립한다.
+</Proof>
+
+## EM 알고리즘: 두 projection의 교대
+
+잠재변수 모델 $p(x, z | \theta)$에서 MLE를 직접 구하기 어려운 이유는 $\log \int p(x, z | \theta) dz$ 때문이다. EM은 보조분포 $q(z)$를 도입해 ELBO를 분해한다.
+
+$$
+\log p(x|\theta) = \underbrace{\mathbb{E}_q[\log p(x,z|\theta) - \log q(z)]}_{\mathcal{L}(q, \theta)} + \text{KL}(q \| p(z|x,\theta))
+$$
+
+이 분해를 기하학적으로 읽으면 다음과 같다 (Csiszár & Tusnády 1984).
+
+- **E-step**: $q$를 움직여 $\text{KL}(q \| p(z|x,\theta^{(t)}))$를 최소화. 해는 $q^{(t+1)} = p(z|x, \theta^{(t)})$. 이는 "데이터 공간 $\mathcal{D}$에서 현재 모델 점으로의 **m-projection**"이다.
+
+- **M-step**: $\theta$를 움직여 $D(q^{(t+1)} \| p_\theta)$를 최소화. 이는 "모델 다양체 $\mathcal{M}$ 위에서 $q^{(t+1)}$의 **e-projection**"이다.
+
+두 projection의 교대는 ELBO를 단조 증가시킨다. Pythagoras 정리가 이 수렴을 분해한다.
+
+$$
+D(q^{(t+1)} \| p_{\theta^{(t)}}) = D(q^{(t+1)} \| p_{\theta^{(t+1)}}) + D(p_{\theta^{(t+1)}} \| p_{\theta^{(t)}})
+$$
+
+두 번째 항이 매 iteration의 KL 감소량이다. E-step 후 $\text{KL} = 0$이 되고, M-step이 ELBO를 올리므로 $\log p(x|\theta^{(t+1)}) \geq \log p(x|\theta^{(t)})$가 보장된다.
+
+<Aside label="GMM의 경우">
+Gaussian Mixture에서 E-step은 soft assignment $\gamma_{ik}$를 계산한다. 이는 m-projection에 해당한다. M-step의 $\mu_k, \Sigma_k$ 업데이트는 Gaussian manifold에서의 e-projection (moment matching), $\pi_k$ 업데이트는 simplex 위의 m-projection이다. Mixture weight $\pi$가 $\eta$ 좌표에서 affine이라는 사실이 simplex를 m-flat으로 만든다.
+</Aside>
+
+## Variational Inference: reverse KL의 기하
+
+VI는 사후분포 $p(\theta|x)$를 variational family $\mathcal{Q}$ 안에서 근사한다.
+
+$$
+q^* = \arg\min_{q \in \mathcal{Q}} \text{KL}(q \| p(\theta|x))
+$$
+
+이것은 **reverse KL**의 최소화다. $D(q \| p)$에서는 $q$가 $p$의 zero 영역을 밟으면 $\text{KL} \to \infty$가 된다. 따라서 $q$는 $p$의 support 안에 갇히도록 수렴한다.
+
+<Callout type="warning" title="Mode-seeking vs Mean-seeking">
+**Reverse KL** $\min_q D(q\|p)$: $q$는 $p$가 0인 곳을 피한다 → 단일 mode에 집중 (mode-seeking). 다모드 분포에서 VI는 한 mode를 선택한다.
+
+**Forward KL** $\min_q D(p\|q)$: $p$가 있는 곳에 $q$도 있어야 한다 → 모든 mode를 포괄 (mean-seeking). MLE가 이 방향이다.
+</Callout>
+
+Mean-field family $\mathcal{Q}_\text{MF} = \{q : q(\theta) = \prod_i q_i(\theta_i)\}$는 exp family 가정 하에서 자연 파라미터 $\theta$ 좌표에서 cross-term 없는 affine 부분공간, 즉 **e-flat 부분다양체**다. 이 구조가 CAVI (Coordinate Ascent VI)의 closed-form 업데이트를 낳는다.
+
+$$
+q_j^*(\theta_j) \propto \exp\left(\mathbb{E}_{q_{-j}}[\log p(x, \theta)]\right)
+$$
+
+그러나 e-flat이 주는 선물에는 대가가 따른다. 상관된 사후분포에서 mean-field는 variance를 과소추정한다. 예를 들어 $\rho = 0.8$의 2D Gaussian posterior에서 mean-field 해의 표준편차는 이론값의 $\sqrt{1 - \rho^2} \approx 0.6$배에 불과하다.
+
+## MaxEnt: e-projection으로서의 엔트로피 최대화
+
+Jaynes의 최대 엔트로피 원리를 정식화하면 다음과 같다. 제약 $\mathbb{E}_p[T_i] = \mu_i$ 하에서 $H(p)$를 최대화하라. 일반화된 형태(MinRelEnt)는 prior $p_0$에 대해 $D(p \| p_0)$를 최소화하는 문제다.
+
+Lagrangian 풀면 해는 항상 exponential family 형태다.
+
+$$
+p^*(x) = \frac{p_0(x) \exp\!\left(\sum_i \lambda_i T_i(x)\right)}{Z(\lambda)}
+$$
+
+기하학적으로 이것은 무엇인가? 제약 집합 $\mathcal{C} = \{p : \mathbb{E}_p[T_i] = \mu_i\}$는 $\eta$ (expectation) 좌표에서 affine 초평면들의 교집합, 즉 **m-flat 부분다양체**다. $p^*$는 $p_0$의 **e-projection onto $\mathcal{C}$**다 (Csiszár 1975).
+
+$$
+p^* = \Pi_\mathcal{C}^{(e)}(p_0)
+$$
+
+Pythagoras 정리가 여기서도 성립한다. 임의 $p \in \mathcal{C}$에 대해 $D(p \| p_0) = D(p \| p^*) + D(p^* \| p_0)$. 이것이 MaxEnt 해의 유일성 증명이기도 하다. "주어진 정보 이상을 주장하지 말라"는 Jaynes의 원칙은 "prior에서 제약 다양체로의 e-projection"이라는 기하학적 문장과 정확히 동치다.
+
+Gaussian이 "mean과 variance만 알 때 최대 엔트로피 분포"인 이유, softmax가 "범주형에서 moment 제약 MaxEnt"인 이유가 여기서 나온다. MaxEnt, exp family, e-projection은 **같은 현상의 세 얼굴**이다.
+
+## 트레이드오프
+
+<Callout type="note" title="두 projection의 트레이드오프">
+**m-projection** ($\arg\min_p D(p \| q)$): mean-seeking. $q$의 모든 mass를 커버하려 한다. MLE, forward KL minimization이 여기에 속한다.
+
+**e-projection** ($\arg\min_q D(p \| q)$): mode-seeking. 단일 모드에 집중한다. VI (reverse KL), MaxEnt의 해가 여기에 속한다.
+
+어느 쪽이 "옳은가"의 문제가 아니다. mode-finding이 목적이면 e-projection이 적합하고, 분포 전체를 커버해야 하면 m-projection이 적합하다. Pythagoras 정리는 **e-flat 다양체에서만** 정확하게 성립한다는 점도 트레이드오프다 — mean-field VI의 CAVI가 closed-form인 이유도, variance underestimation이 발생하는 이유도 e-flatness에서 온다.
+</Callout>
+
+## 정리
+
+- KL divergence $D(p \| q)$에서 $p$를 움직이면 m-projection, $q$를 움직이면 e-projection이다. 이 비대칭성이 통계 추론 전체를 관통한다.
+- EM의 E-step은 m-projection, M-step은 e-projection이다. Pythagoras 정리가 매 iteration의 ELBO 증가를 분해한다.
+- VI의 reverse KL은 e-flat 다양체로의 projection이며, mode-seeking과 variance underestimation은 이 구조의 필연적 귀결이다.
+- MaxEnt 해는 prior의 e-projection onto m-flat 제약 다양체다. Gaussian, softmax, Boltzmann 분포가 모두 이 원리에서 나온다.
+
+수식의 비대칭 하나가 기계학습 추론의 절반을 설명한다.
+
+<Reference
+  title

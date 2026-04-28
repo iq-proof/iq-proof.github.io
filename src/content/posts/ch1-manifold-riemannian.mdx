@@ -1,0 +1,117 @@
+---
+title: "분포 공간이 휘어진 이유 — 정보기하의 기초"
+description: "확률분포족을 다양체로 보는 발상부터 Fisher-Rao 측지선, Levi-Civita 연결의 유일성까지, 정보기하의 기하학적 토대를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, manifold, fisher-rao, riemannian-metric, connection]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+확률분포 공간에서 "두 분포 사이의 거리"를 말할 때, 우리는 암묵적으로 어떤 기하를 가정하고 있다. 정규분포 $\mathcal{N}(0, 1)$과 $\mathcal{N}(0, 2)$의 거리가 $\mathcal{N}(0, 0.1)$과 $\mathcal{N}(0, 0.2)$의 거리와 같을까? 유클리드 거리는 둘 다 1과 0.1로 전혀 다르다고 말하지만, Fisher-Rao 계량은 **둘 다 0.98로 같다**고 말한다. 왜 분포 공간은 평탄하지 않은가?
+
+## 분포를 점으로 보기 위해
+
+확률분포 $p_\theta$를 매개변수 공간 $\Theta$ 위의 점으로 보는 것은 직관적으로 자연스럽다. 하지만 이 "점들이 이루는 공간"이 어떤 구조를 갖는지는 자명하지 않다.
+
+Softmax 출력 $\{p \in \mathbb{R}^K : p_i \geq 0, \sum p_i = 1\}$은 $(K-1)$-심플렉스다. 벡터공간이 아니므로 두 점의 단순 평균이 반드시 심플렉스 안에 머무르지 않는다. 공분산 행렬 공간 $\text{Sym}_+^d$는 SPD 다양체다. $(\Sigma_1 + \Sigma_2)/2$를 단순 평균하면 양정치성이 깨질 수 있다. 정규분포족 $\{\mathcal{N}(\mu, \sigma^2) : \sigma > 0\}$은 상반평면 $\{(\mu, \sigma) : \sigma > 0\}$ 위의 점들이고, Fisher 계량은 이 공간에 쌍곡기하를 준다.
+
+이 공간들을 다루는 언어가 **매끈한 다양체(smooth manifold)**다. 다양체는 전역 좌표계 하나를 포기하는 대신, **국소 좌표계(차트)의 모음**으로 공간을 덮는다. 차트가 겹치는 영역에서 좌표 변환(전이함수)이 $C^\infty$이면, 미분이 좌표계 선택에 무관해진다.
+
+<Callout type="note" title="통계다양체의 조건">
+분포족 $\mathcal{P} = \{p_\theta : \theta \in \Theta\}$가 통계다양체가 되려면, $\Theta$가 $\mathbb{R}^n$의 열린집합이고, $\theta \mapsto p_\theta$가 단사이며, $p_\theta(x)$가 $\theta$에 대해 $C^\infty$이어야 한다. 이때 $\Theta$가 전역 차트가 되어 $\mathcal{P}$는 $n$차원 매끈한 다양체 구조를 갖는다.
+</Callout>
+
+단, $\sigma \to 0$에서 Fisher 정보가 발산하거나 심플렉스의 경계($p_i = 0$)에서 Fisher가 특이해지는 지점들은 다양체에서 제외해야 한다. "분포를 점으로 본다"는 것이 엄밀하려면, 이 가장자리 처리가 선행되어야 한다.
+
+## 접공간과 스코어 함수
+
+다양체 위의 각 점 $p_\theta$에는 **접공간** $T_{p_\theta}\mathcal{P}$가 붙어 있다. 이것은 "그 점에서 뻗어나가는 방향들의 집합"이다. 접벡터를 정의하는 방법은 세 가지가 있고, 셋 다 동치다.
+
+$$T_p M = \{[\gamma]\}_{\text{곡선 속도}} = \{\text{derivations at } p\} = \mathbb{R}^n / \text{coord-equiv} \cong \mathbb{R}^n$$
+
+통계다양체에서 이 접공간은 구체적인 해석을 갖는다. 좌표기저 $\partial/\partial\theta^i$는 스코어 함수
+
+$$s_i(x;\theta) = \frac{\partial \log p_\theta(x)}{\partial \theta^i}$$
+
+에 대응한다. 접벡터 $X = X^i \partial_i$는 $L^2$ 함수 $X^i s_i$가 된다. 스코어가 $\mathbb{E}_\theta[s_i] = 0$을 만족한다는 사실은 미분-적분 교환으로 즉시 따라온다.
+
+<Theorem kind="proposition" number="1" title="스코어 함수들은 접공간의 표현">
+통계다양체 $\mathcal{P}$의 점 $p_\theta$에서, 사상 $\partial/\partial\theta^i \mapsto s_i(\cdot;\theta)$는 단사 선형사상이며, 상은 $\{s \in L^2(p_\theta) : \mathbb{E}_\theta[s] = 0\}$의 유한차원 부분공간이다.
+</Theorem>
+
+<Proof>
+$\mathbb{E}_\theta[s_i] = \int p_\theta \frac{\partial \log p_\theta}{\partial \theta^i} dx = \frac{\partial}{\partial \theta^i} \int p_\theta\, dx = 0$. 단사성은 $s_i$들의 $L^2$-선형독립에서 나온다 — 이것은 Fisher 정보 행렬이 양정치인 조건과 동치다.
+</Proof>
+
+이 접공간 표현이 다음 장의 Fisher 계량으로 직접 이어진다. $g_{ij} = \mathbb{E}[s_i s_j]$는 정확히 $L^2$-내적의 제한이다.
+
+## 점마다 다른 자 — 리만 계량
+
+리만 계량은 **각 점의 접공간에 내적을 부여**하는 구조다. 유클리드에서는 "모든 점에서 같은 자"를 쓰지만, 분포 공간에서는 점마다 자의 길이가 달라야 한다.
+
+통계다양체의 자연스러운 계량은 **Fisher-Rao 계량**이다.
+
+$$g_{ij}(\theta) := \mathbb{E}_\theta\!\left[\frac{\partial \log p_\theta}{\partial \theta^i} \cdot \frac{\partial \log p_\theta}{\partial \theta^j}\right]$$
+
+정규분포 $\mathcal{N}(\mu, \sigma^2)$의 경우 이 행렬은 $\text{diag}(1/\sigma^2, 2/\sigma^2)$이다. 선소는
+
+$$ds^2 = \frac{d\mu^2}{\sigma^2} + \frac{2\,d\sigma^2}{\sigma^2}$$
+
+$\tilde\sigma = \sigma\sqrt{2}$로 치환하면 이것이 **상반평면 쌍곡계량의 2배**임을 확인할 수 있다. 정규분포족은 곡률이 $-1/2$인 쌍곡공간이다.
+
+이 계량이 말하는 것은 명확하다. $\sigma = 0.1$에서 평균을 0.01 이동하는 것과 $\sigma = 10$에서 평균을 10 이동하는 것이 **같은 정보량**을 담는다. 유클리드 거리는 둘을 0.01 대 10으로 천 배 다르게 보지만, Fisher-Rao는 같다고 본다. 어느 쪽이 통계적으로 자연스러운가는 자명하다.
+
+두 점을 잇는 최단 경로인 **측지선**은 Euler-Lagrange 방정식의 해로 주어진다.
+
+$$\ddot\gamma^k + \Gamma^k_{ij}(\gamma)\,\dot\gamma^i \dot\gamma^j = 0$$
+
+여기서 $\Gamma^k_{ij} = \frac{1}{2}g^{k\ell}(\partial_i g_{j\ell} + \partial_j g_{i\ell} - \partial_\ell g_{ij})$는 Christoffel 기호다. 정규분포 다양체에서 수치 풀이하면 측지선들이 유클리드 직선이 아닌 쌍곡면의 곡선임을 볼 수 있다.
+
+## 연결 — 서로 다른 점의 접공간을 이어주기
+
+리만 계량을 주면 자동으로 따라오는 것이 있다. **Levi-Civita 연결** $\nabla$는 벡터장의 공변미분을 정의한다.
+
+$$\nabla_X Y: \text{ 3공리 만족} \iff \Gamma^k_{ij}\text{으로 국소적 결정}$$
+
+Christoffel 기호 자체는 텐서가 아니다. 좌표 변환 하에서 2차 미분 항
+
+$$\widetilde\Gamma^k_{ij} = \frac{\partial \widetilde\theta^k}{\partial \theta^\ell} \cdot \frac{\partial \theta^m}{\partial \widetilde\theta^i} \cdot \frac{\partial \theta^n}{\partial \widetilde\theta^j} \cdot \Gamma^\ell_{mn} + \frac{\partial \widetilde\theta^k}{\partial \theta^\ell} \cdot \frac{\partial^2 \theta^\ell}{\partial \widetilde\theta^i \partial \widetilde\theta^j}$$
+
+이 추가로 나온다. 그럼에도 $\nabla_X Y$가 텐서가 되는 것은 $\partial_i Y^k$의 변환에서 생기는 2차 항과 Christoffel의 2차 항이 정확히 상쇄되기 때문이다.
+
+<Theorem kind="theorem" number="2" title="Levi-Civita 연결의 유일성 (Koszul 공식)">
+리만 다양체 $(M, g)$ 위에 계량 호환($\nabla g = 0$)이고 torsion-free($\Gamma^k_{ij} = \Gamma^k_{ji}$)인 연결이 유일하게 존재한다.
+</Theorem>
+
+<Proof>
+계량 호환 조건을 세 좌표 순열로 쓴 뒤 $(1)+(2)-(3)$을 취하고 torsion-free를 적용하면
+
+$$2g_{\ell k}\Gamma^\ell_{ij} = \partial_i g_{jk} + \partial_j g_{ik} - \partial_k g_{ij}$$
+
+가 된다. 양변에 $g^{km}$을 곱하면 $\Gamma^m_{ij}$가 유일하게 결정된다.
+</Proof>
+
+<Callout type="note" title="트레이드오프 — Levi-Civita vs 정보기하의 연결">
+Levi-Civita 연결은 리만기하의 "자연스러운 선택"이다. 계량 호환 + torsion-free가 유일성을 강제한다. 하지만 정보기하에서는 이 유일성을 포기하고 **두 연결의 쌍**을 도입한다. e-연결 $\nabla^{(e)}$은 exponential 좌표에서, m-연결 $\nabla^{(m)}$은 mixture 좌표에서 각각 $\Gamma = 0$이 되도록 정의된다. 두 연결은 계량을 분담해
+
+$$X\,g(Y, Z) = g(\nabla^{(e)}_X Y, Z) + g(Y, \nabla^{(m)}_X Z)$$
+
+를 만족한다. Levi-Civita는 $\alpha = 0$, 즉 두 연결의 평균이다. 이 쌍대 구조가 exponential family에서 **KL divergence의 Pythagorean 정리**를 가능하게 한다.
+</Callout>
+
+## 정리
+
+- 확률분포족은 매개변수 공간을 전역 차트로 갖는 매끈한 다양체다. 심플렉스 경계, $\sigma \to 0$ 등 특이점은 제외해야 한다.
+- 통계다양체의 접벡터는 스코어 함수 $\partial
