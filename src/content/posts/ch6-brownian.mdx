@@ -1,0 +1,158 @@
+---
+title: "브라운 운동은 왜 이토 적분을 강제하는가"
+description: "연속이지만 어디서도 미분불가능한 브라운 운동의 4가지 공리부터 이차변분 $(dB)^2 = dt$까지, SDE 이론의 필연성을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [brownian-motion, stochastic-calculus, diffusion-models, sde, quadratic-variation]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+브라운 운동(BM)은 연속이다. 그런데 어떤 점에서도 미분이 존재하지 않는다. 이 역설이 단순한 수학적 기이함이 아니라, DDPM·Score-SDE·Langevin dynamics 전체를 떠받치는 이토 적분의 존재 이유다. 왜 네 가지 공리의 조합이 이 역설을 낳고, 그 역설이 어떻게 SDE 이론 전체를 강제하는가?
+
+## 네 공리가 만드는 유일한 과정
+
+표준 BM $\{B_t\}_{t \geq 0}$는 네 공리로 정의된다.
+
+- **(B1)** $B_0 = 0$
+- **(B2)** 독립증분: 겹치지 않는 구간의 증분이 서로 독립
+- **(B3)** $B_t - B_s \sim \mathcal{N}(0, t-s)$ for $s < t$
+- **(B4)** 경로 $t \mapsto B_t(\omega)$가 거의 확실히 연속
+
+이 네 공리의 조합이 BM을 **유일하게** 결정한다. (B2)+(B3)만으로는 경로의 연속성이 보장되지 않으므로 (B4)를 명시적으로 요구하거나, Kolmogorov 연속성 정리로 유도해야 한다.
+
+공분산 구조는 공리에서 직접 따라온다. $s \leq t$에 대해 $B_t = B_s + (B_t - B_s)$이고 독립증분으로 $B_s \perp (B_t - B_s)$이므로
+
+$$
+\mathbb{E}[B_s B_t] = \mathbb{E}[B_s^2] + \mathbb{E}[B_s]\mathbb{E}[B_t - B_s] = s.
+$$
+
+대칭성으로 $\mathbb{E}[B_s B_t] = \min(s, t)$. BM은 이 커널을 가진 Gaussian process다.
+
+자기유사성도 공리의 귀결이다. $X_t := c^{-1/2} B_{ct}$로 정의하면 네 공리를 모두 만족하므로
+
+$$
+\{c^{-1/2} B_{ct}\}_{t \geq 0} \stackrel{d}{=} \{B_t\}_{t \geq 0}.
+$$
+
+스케일링 지수 $1/2$가 이후 Hölder 지수·이차변분·Hausdorff 차원 전부를 지배한다.
+
+## 존재성: Lévy의 Haar 기저 구성
+
+공리의 무모순성은 명시적 구성으로 증명한다. $L^2[0,1]$의 Haar orthonormal basis $\{h_{n,k}\}$와 이를 적분한 Schauder tent 함수 $\Phi_{n,k} = \int_0^t h_{n,k}(s)\,ds$를 도입한다. iid $\mathcal{N}(0,1)$ 계수 $\xi_0, \xi_{n,k}$로
+
+$$
+B_t := \xi_0 t + \sum_{n=0}^\infty \sum_{k=0}^{2^n - 1} \xi_{n,k}\,\Phi_{n,k}(t).
+$$
+
+Parseval 항등식이 공분산 $\min(s,t)$를 보장하고, Gaussian의 지수 꼬리 감쇠가 Borel-Cantelli를 통해 급수의 균등 수렴을 준다.
+
+$$
+\sup_t |Z_n(t)| \leq C\,n^{1/2}\,2^{-n/2}, \quad \sum_n n^{1/2} 2^{-n/2} < \infty.
+$$
+
+균등 수렴의 극한은 연속 함수다. 이것이 경로 연속성 (B4)의 수학적 뿌리다. Lévy 구성은 wavelet 기반 시뮬레이션, Gaussian process의 Karhunen-Loève 전개, fractional BM 구성 전부의 원형이기도 하다.
+
+## CLT의 경로 버전: Donsker 불변원리
+
+iid $\xi_k$, $\mathbb{E}\xi=0$, $\text{Var}\,\xi=1$의 random walk $S_n = \sum_{k=1}^n \xi_k$를 rescale하면
+
+$$
+X^{(n)}(t) := \frac{1}{\sqrt{n}} S_{\lfloor nt \rfloor} \xrightarrow{d} B_t \quad \text{in } C[0,1].
+$$
+
+증명의 두 축은 유한차원 분포의 수렴(다변량 CLT)과 tightness(Kolmogorov continuity로 4차 moment 통제)다. Prokhorov 정리가 이 둘을 묶어 $C[0,1]$에서의 약수렴을 준다.
+
+핵심은 **불변원리(invariance principle)**다. $\xi_k$의 구체적 분포가 무엇이든 극한은 항상 같은 BM이다. 이 universality가 DDPM → Score-SDE 이행의 수학적 근거다. DDPM의 이산 Markov chain이 step 수 $T \to \infty$에서 VP-SDE로 수렴하는 것, ResNet이 Neural ODE의 극한인 것, SGD가 Langevin SDE의 극한인 것 모두 Donsker 원리의 instance다.
+
+<Callout type="note" title="트레이드오프">
+Donsker는 정성적 수렴(분포)만 보장한다. 수렴 속도는 별도다. DDIM·DPM-Solver 같은 fast sampler가 필요한 이유가 여기 있다 — 이산화 오차가 작은 step 수에서 무시할 수 없기 때문이다.
+</Callout>
+
+## 비미분 가능성과 이차변분의 대조
+
+Paley-Wiener-Zygmund 정리: BM 경로는 거의 확실히 어디에서도 미분 불가능하다.
+
+직관은 단순하다. 증분 $(B_t - B_{t_0})/(t - t_0) \sim \mathcal{N}(0, 1/(t-t_0))$의 분산이 $t \to t_0$에서 발산한다. Lévy의 연속성 모듈러스가 이를 정량화한다.
+
+$$
+\limsup_{t \to 0^+} \frac{B_t}{\sqrt{2t\log\log(1/t)}} = 1 \quad \text{a.s.}
+$$
+
+$1/2$-Hölder bound $C\sqrt{t}$를 log 인자가 초과하므로 BM은 정확히 $1/2 - \epsilon$ Hölder지 $1/2$ Hölder가 아니다. 경로의 Hausdorff 차원은 $3/2$다.
+
+비미분 가능성의 양적 귀결이 이차변분이다. partition $\pi$에 대해
+
+$$
+[B]_t^\pi := \sum_i (B_{t_{i+1}} - B_{t_i})^2.
+$$
+
+<Theorem kind="theorem" number="1" title="이차변분의 $L^2$ 수렴">
+$|\pi| \to 0$일 때 $[B]_t^\pi \to t$ in $L^2$.
+</Theorem>
+
+<Proof>
+$\mathbb{E}[(B_{t_{i+1}} - B_{t_i})^2] = t_{i+1} - t_i$이므로 $\mathbb{E}[[B]_t^\pi] = t$. 독립증분과 Gaussian의 4차 모멘트 공식 $\text{Var}(Z^2) = 2\sigma^4$을 적용하면
+
+$$
+\text{Var}([B]_t^\pi) = 2\sum_i (t_{i+1} - t_i)^2 \leq 2|\pi| \cdot t \to 0.
+$$
+
+따라서 $\mathbb{E}[([B]_t^\pi - t)^2] \to 0$. $\square$
+</Proof>
+
+smooth 함수의 이차변분은 0이다. BM의 이차변분이 양의 결정론적 값 $t$로 수렴한다는 것이 non-smoothness의 정확한 양적 표현이다. 1차변분은 $\infty$로 발산하고 2차변분은 $t$로 수렴한다는 이 대조가 BM의 고유한 스케일링 질서다.
+
+이차변분의 귀결이 **$(dB)^2 = dt$** 라는 치환이다. 이토 공식
+
+$$
+df(B_t) = f'(B_t)\,dB_t + \frac{1}{2}f''(B_t)\,dt
+$$
+
+의 두 번째 항은 Taylor 전개에서 $(\Delta B)^2$을 $\Delta t$로 치환한 결과다. BM이 유한변동이라면 이 항은 사라진다. BM이 유한변동이 아니기 때문에 이 항이 살아남고, 그래서 이토 공식은 고전 미적분과 다르다.
+
+## 반사원리: 최대값과 첫 도달시각
+
+BM의 강한 Markov 속성이 반사원리를 준다.
+
+<Theorem kind="theorem" number="2" title="반사원리">
+$a > 0$에 대해 $\mathbb{P}(\max_{s \leq t} B_s \geq a) = 2\mathbb{P}(B_t \geq a)$.
+</Theorem>
+
+<Proof>
+$\{M_t \geq a\} = \{\tau_a \leq t\}$로 분해한다. $\tau_a$ 이후 경로를 $a$에 대해 반사한 $\tilde{B}$도 표준 BM이다(강한 Markov). $\{M_t \geq a, B_t < a\}$는 반사 경로에서 $\{\tilde{B}_t > a\}$에 해당하므로
+
+$$
+\mathbb{P}(M_t \geq a) = \mathbb{P}(B_t \geq a) + \mathbb{P}(B_t > a) = 2\mathbb{P}(B_t \geq a). \quad \square
+$$
+</Proof>
+
+첫 도달시각 $\tau_a = \inf\{t : B_t = a\}$의 밀도는 반사원리에서 직접 유도된다.
+
+$$
+f_{\tau_a}(t) = \frac{a}{\sqrt{2\pi t^3}}\,e^{-a^2/(2t)}, \quad t > 0.
+$$
+
+이는 Lévy 분포다. $\mathbb{E}[\tau_a] = \infty$ — heavy tail. BM은 언젠가 반드시 $a$에 도달하지만 평균 도달 시간은 무한하다.
+
+<Aside label="AI 연결">
+Brownian bridge의 상한 $\sup_{t \in [0,1]} B^0_t$의 분포 $\mathbb{P}(\sup B^0 \geq a) = e^{-2a^2}$가 Kolmogorov-Smirnov 검정의 임계값을 준다. 반사원리가 통계 검정과 barrier option 가격 결정, RL의 에피소드 종료 분포를 동시에 관통한다.
+</Aside>
+
+## 정리
+
+- BM은 네 공리 — $B_0=0$, 독립증분, $\mathcal{N}(0,t-s)$ 증분, 연속 경로 — 가 결정하는 유일한 Gaussian process다. 공분산 $\min(s,t)$와 자기유사성 지수 $1/2$가 모든 성질의 근원이다.
+- Lévy의 Haar 기저 구성은 BM의 존재성을 보증하며, Gaussian 꼬리의 지수 감쇠가 급수의 균등 수렴을 강제한다.
+- Donsker 불변원리는 분포 무관의 universality를 확립한다. DDPM → Score-SDE, ResNet → Neural ODE, SGD → Langevin SDE가 모두 이 연속 극한의 사례다.
+- BM 경로는 어디서도 미분 불가능하고 무한변동을 가진다. 이차변분은 결정론적 $t$로 수렴한다. 이 구조가 $(dB)^2 = dt$를

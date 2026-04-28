@@ -1,0 +1,154 @@
+---
+title: "MCMC는 왜 복잡한 분포에서도 작동하는가"
+description: "정규화 상수 없이도 샘플링이 가능한 이유부터 Gibbs·HMC의 설계 철학과 수렴 진단까지, MCMC 프레임워크의 핵심 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mcmc, bayesian, hamiltonian, markov-chain, sampling]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+베이지안 추론에서 posterior $p(\theta | D)$를 계산하려면 evidence $p(D) = \int p(D|\theta)p(\theta)d\theta$가 필요하다. 그런데 이 적분은 대부분의 실제 모델에서 계산 불가능하다. MCMC는 이 막힌 문제를 우회한다 — 분포를 "알 필요 없이" 그 분포에서 샘플을 뽑는 방법이 있는가?
+
+## 핵심 아이디어: 정상분포로서의 설계
+
+MCMC의 출발점은 단순하다. $\pi(x) \propto \tilde\pi(x)$에서 직접 샘플링이 어려우면, $\pi$를 **정상분포로 갖는 Markov chain을 설계**하고 오래 시뮬레이션한다. 에르고딕 정리가 그 유효성을 보장한다.
+
+$$
+\hat{f}_n = \frac{1}{n} \sum_{k=1}^n f(X_k) \xrightarrow{\text{a.s.}} \mathbb{E}_\pi[f]
+$$
+
+기약·비주기·양재귀 체인이면 초기 분포와 무관하게 이 수렴이 성립한다. 설계의 충분조건은 **detailed balance**다.
+
+$$
+\pi(x) P(x, y) = \pi(y) P(y, x) \quad \forall x, y
+$$
+
+이 조건을 만족하는 transition kernel을 구성하면 $\pi$는 자동으로 정상분포가 된다. 핵심은 정규화 상수 $Z = \int \tilde\pi(x)dx$를 몰라도 된다는 것이다 — ratio $\tilde\pi(y)/\tilde\pi(x)$에서 $Z$가 약분되기 때문이다.
+
+## Metropolis-Hastings: Detailed Balance의 체계적 구현
+
+MH 알고리즘은 이 원칙을 명시적으로 구현한다. 임의의 proposal $q(y|x)$에 대해 acceptance probability를 다음과 같이 설정한다.
+
+$$
+\alpha(x, y) = \min\left(1,\, \frac{\tilde\pi(y)\, q(x|y)}{\tilde\pi(x)\, q(y|x)}\right)
+$$
+
+<Theorem kind="proposition" number="1" title="MH Detailed Balance">
+위 $\alpha$로 정의된 transition kernel $P(x, dy) = q(y|x)\alpha(x,y)dy + r(x)\delta_x(dy)$는 $\pi$에 대해 detailed balance를 만족한다.
+</Theorem>
+
+<Proof>
+$x \neq y$에서, WLOG $\pi(x)q(y|x) \geq \pi(y)q(x|y)$이면 $\alpha(x,y) = \pi(y)q(x|y)/(\pi(x)q(y|x))$, $\alpha(y,x) = 1$. 그러면
+
+$$\pi(x)q(y|x)\alpha(x,y) = \pi(y)q(x|y) = \pi(y)q(x|y)\cdot 1 = \pi(y)q(x|y)\alpha(y,x). \quad \square$$
+</Proof>
+
+$\min(1, \cdot)$의 선택이 핵심이다 — detailed balance를 만족시키는 **최대** acceptance probability이므로, 알고리즘의 효율을 최대화한다. 더 작은 $\alpha' \leq \alpha$도 수학적으로는 valid하지만 불필요하게 비효율적이다.
+
+Random-walk MH ($q(y|x) = q(x|y)$)에서는 $\alpha = \min(1, \pi(y)/\pi(x))$로 단순화되고, Gibbs sampler는 MH의 특수 경우로 acceptance가 항상 1이다.
+
+## Gibbs Sampler와 HMC: 구조를 활용하는 방법들
+
+Gibbs sampler는 조건부 분포 $\pi(x_i | x_{-i})$가 tractable할 때 강력하다. 각 좌표를 순차적으로 해당 조건부에서 정확히 샘플링하면, MH acceptance가 자동으로 1이 된다.
+
+```python
+# 2D Gaussian Gibbs (ρ = 0.8)
+def gibbs_2d_gaussian(n_iter, rho=0.8):
+    x = np.zeros(2)
+    for _ in range(n_iter):
+        x[0] = rng.normal(rho * x[1], np.sqrt(1 - rho**2))
+        x[1] = rng.normal(rho * x[0], np.sqrt(1 - rho**2))
+    return x
+```
+
+그러나 correlation이 높아질수록 Gibbs의 mixing은 급격히 느려진다. 2D Gaussian에서 spectral gap은 $1 - \rho^2$로, $\rho = 0.99$이면 mixing time이 수천 step 이상으로 증가한다.
+
+**Hamiltonian Monte Carlo(HMC)**는 gradient 정보를 활용해 이 한계를 돌파한다. Potential energy $U(x) = -\log\pi(x)$와 보조 momentum $p \sim \mathcal{N}(0, M)$을 도입하여 Hamiltonian $H(x,p) = U(x) + \frac{1}{2}p^TM^{-1}p$를 정의한다. Joint $\pi(x,p) \propto e^{-H(x,p)}$에서 $p$를 marginalize하면 원하는 $\pi(x)$가 나온다.
+
+Leapfrog integrator로 Hamilton 방정식을 수치 적분한 뒤 MH acceptance로 보정한다.
+
+$$
+\alpha = \min\left(1,\, e^{H(x,p) - H(x',p')}\right)
+$$
+
+Leapfrog의 **symplectic** 성질 — Jacobian 행렬식이 정확히 1 — 이 이 단순한 acceptance 형태를 가능하게 한다. 비-symplectic integrator(예: Euler)에서는 Jacobian correction이 추가로 필요하고, 장기적으로 Hamiltonian이 drift한다.
+
+<Callout type="note" title="스케일링 비교">
+Random-walk MH는 $d$차원에서 optimal step size $\sigma \propto d^{-1/2}$, mixing time $O(d)$. HMC는 gradient 활용으로 $\eta \propto d^{-1/4}$, mixing time $O(d^{1/4})$. 1000차원에서 약 5배, 100만 차원에서 약 30배 차이다 (Beskos 2013).
+</Callout>
+
+## 트레이드오프와 실전 선택
+
+각 알고리즘은 명확한 가정과 한계를 지닌다.
+
+**MH(Random-walk)**: 어디에나 적용 가능하지만 고차원에서 slow. Optimal acceptance rate ~0.234(고차원), ~0.44(1차원).
+
+**Gibbs**: Tractable conditional이 있으면 구현이 간단하고 효율적이다. LDA, RBM, MRF의 표준 sampler. 그러나 high-correlation 변수에서 mixing이 기하급수적으로 느려진다.
+
+**HMC/NUTS**: 현대 Bayesian inference의 표준(Stan, PyMC, NumPyro). Gradient 필요 → 미분 가능한 target에만 적용. Discrete parameter에는 직접 사용 불가.
+
+**SG-HMC(Chen 2014)**: Mini-batch gradient + Langevin noise로 대규모 BNN에 적용. Per-iteration cost $O(|B| \cdot L)$으로 데이터 크기 독립. 단 mini-batch noise로 인한 bias가 존재한다.
+
+<Aside label="에너지 기반 모델과의 연결">
+$p(x) \propto e^{-E_\theta(x)}$에서 정규화 상수 $Z$는 신경망 $E_\theta$가 바뀔 때마다 달라져 계산 불가능하다. MCMC는 $Z$ 없이 샘플을 생성하는 유일한 일반적 방법이다. Score-based 생성 모델의 Langevin sampling과 Diffusion model의 reverse process는 연속시간 MCMC(Langevin SDE)의 이산화로 볼 수 있다.
+</Aside>
+
+## 수렴 진단: 결과를 믿기 전에
+
+MCMC가 정상분포로 수렴했는지는 알고리즘이 스스로 알려주지 않는다. 두 가지 표준 진단이 있다.
+
+**Gelman-Rubin $\hat{R}$**: 서로 다른 초기점에서 $m$개의 chain을 병렬 실행하여 within-chain variance $W$와 between-chain variance $B$를 비교한다.
+
+$$
+\hat{R} = \sqrt{\hat{V}/W}, \quad \hat{V} = \frac{n-1}{n}W + \frac{1}{n}B
+$$
+
+수렴하면 $\hat{R} \to 1$. 현대 기준은 $\hat{R} < 1.01$(Vehtari 2021). 과거 기준 $\hat{R} < 1.1$은 너무 느슨하다.
+
+**Effective Sample Size(ESS)**: 자기상관이 있는 $n$개 샘플이 실효적으로 iid 몇 개에 해당하는가.
+
+$$
+\text{ESS} = \frac{n}{1 + 2\sum_{k \geq 1} \rho_k} = \frac{n}{\tau_{\text{int}}}
+$$
+
+ESS $< 400$이면 posterior 추정 신뢰도가 낮다. Trace plot에서 "hairy caterpillar" 패턴이 보이지 않으면 mixing이 부족하다는 시각적 신호다.
+
+$\hat{R} \approx 1$이어도 수렴하지 않을 수 있다 — 모든 chain이 같은 local mode에 갇혀 있으면 chain 간 variance가 작아 $\hat{R}$이 낮게 나온다. Over-dispersed initialization(서로 다른 mode 근처에서 시작)이 필수다.
+
+## 정리
+
+- MCMC의 핵심은 "$\pi$를 정상분포로 갖는 Markov chain 설계 + 에르고딕 정리"다. 정규화 상수 $Z$는 acceptance ratio에서 약분된다.
+- MH acceptance $\min(1, \tilde\pi(y)q(x|y)/(\tilde\pi(x)q(y|x)))$는 detailed balance를 만족시키는 최대 acceptance probability다.
+- Gibbs는 MH의 특수 경우($\alpha \equiv 1$). High-correlation에서 block updates 또는 reparameterization이 필요하다.
+- HMC는 gradient로 $O(d) \to O(d^{1/4})$ scaling 개선. Leapfrog의 symplectic 성질이 핵심.
+- 수렴 진단($\hat{R} < 1.01$, ESS $> 400$) 없이 MCMC 결과를 신뢰해선 안 된다.
+
+MCMC는 알고리즘이 아니라 프레임워크다 — "적분 불가능한 분포에서의 추론"이라는 문제를 "체인 설계"라는 문제로 바꾸는 수학적 전략. 현대 Bayesian AI, Energy-Based Model, Score-based 생성 모델의 이론적 뿌리가 모두 여기에 있다.
+
+<Reference
+  title="Equation of State Calculations by Fast Computing Machines"
+  authors="Metropolis et al."
+  year={1953}
+  venue="Journal of Chemical Physics"
+  url="https://doi.org/10.1063/1.1699114"
+/>
+
+<Reference
+  title="No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian Monte Carlo"
+  authors="Hoffman and Gelman"
+  year={2014}
+  venue="JMLR"
+  url="https://jmlr.org/papers/v15/hoffman14a.html"
+/>

@@ -1,0 +1,131 @@
+---
+title: "마르코프 체인의 네 가지 얼굴 — 전이행렬에서 에르고딕 정리까지"
+description: "마르코프 성질의 수학적 정의부터 상태 분류, Perron-Frobenius 정리, 수렴률의 스펙트럴 해석, Detailed Balance, 에르고딕 정리까지 — MCMC와 강화학습의 이론적 토대를 한 줄기로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [markov-chain, stationary-distribution, mcmc, spectral-gap, ergodic]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+마르코프 체인을 처음 배울 때 흔히 전이행렬 하나를 소개받고 "확률 행합이 1인 행렬"로 이해한 채 끝낸다. 그러나 그 행렬 하나 뒤에는 상태의 재귀성과 주기, Perron-Frobenius 정리, 스펙트럴 갭, Detailed Balance, 그리고 에르고딕 정리라는 완전한 이론 체계가 숨어 있다. 이 체계를 한 줄기로 따라가면 MCMC가 왜 수렴하는지, 강화학습의 Bellman 방정식이 왜 성립하는지, PageRank가 왜 유일하게 결정되는지가 하나의 논리로 연결된다. 이 모든 결론의 공통 전제는 무엇인가?
+
+## 마르코프 성질 — 현재가 미래를 요약한다
+
+이산시간 과정 $\{X_n\}$이 **마르코프**라는 것은 다음 한 줄이다.
+
+$$
+\mathbb{P}(X_{n+1} \in A \mid \mathcal{F}_n) = \mathbb{P}(X_{n+1} \in A \mid X_n) \quad \text{a.s.}
+$$
+
+과거 전체의 정보가 현재 상태 $X_n$ 하나로 요약된다. 이 성질이 있어야 미래 예측이 **1-step 전이 kernel**로 환원된다. 시간동질 체인에서 그 kernel이 전이행렬 $P$이고, $n$-step 전이는 $P^n$의 $(i,j)$ 성분이다.
+
+Chapman-Kolmogorov 항등식 $P^{(n+m)} = P^n P^m$은 이 구조의 직접적 귀결이다. 마르코프 성질과 tower property를 결합하면 한 줄 증명으로 나온다. 이산 마르코프 체인은 정지시각에서 재시작해도 마르코프 — 즉 **강한 마르코프 성질**을 자동으로 만족한다. 연속시간에서는 별도의 정칙성 조건이 필요하지만, 이산시간에서는 공짜로 얻는다.
+
+<Aside label="강화학습과의 연결">
+MDP의 Bellman 방정식 $V(s) = \max_a [r + \gamma \sum_{s'} P(s'|s,a) V(s')]$는 마르코프 성질이 "과거를 현재에 요약"하기 때문에 성립한다. 이 성질이 없으면 Q-learning도 Policy Gradient도 정당화할 수 없다.
+</Aside>
+
+## 상태의 분류 — 체인의 구조를 읽는 언어
+
+전이행렬을 알면 각 상태가 어떤 성질을 갖는지 분류할 수 있다.
+
+상태 $i$가 **재귀**(recurrent)이면 $\mathbb{P}_i(N_i = \infty) = 1$ — 출발점으로 무한히 돌아온다. **일시**(transient)이면 유한 번만 돌아온다. 판별 기준은 깔끔하다.
+
+<Theorem kind="theorem" number="1" title="재귀/일시 판별">
+
+$$
+i \text{ 재귀} \iff \sum_{n \geq 0} P_{ii}^{(n)} = \infty, \qquad i \text{ 일시} \iff \sum_{n \geq 0} P_{ii}^{(n)} < \infty.
+$$
+
+</Theorem>
+
+<Proof>
+$\mathbb{E}_i[N_i] = \sum_n P_{ii}^{(n)}$. 재귀이면 $p = \mathbb{P}_i(T_i < \infty) = 1$이므로 강한 마르코프 성질로 $N_i = \infty$ a.s., 기댓값 무한. 일시이면 $p < 1$이고 $\mathbb{E}_i[N_i] = p/(1-p) < \infty$. $\square$
+</Proof>
+
+재귀성과 주기는 모두 **클래스 성질** — 상호통신($i \leftrightarrow j$)하는 상태들 사이에서 같은 값을 공유한다. 체인이 **기약**(irreducible)이면 모든 상태가 하나의 상호통신 클래스를 이루고, 유한상태 기약 체인은 자동으로 **양재귀**(positive recurrent) — 평균 재방문 시간이 유한하다.
+
+상태의 **주기** $d_i = \gcd\{n : P_{ii}^{(n)} > 0\}$가 1이면 **비주기**(aperiodic). 2-state flip-flop 체인처럼 주기 2인 체인은 $P^n$이 두 상태 사이를 진동하며 정상분포로 수렴하지 못한다.
+
+<Callout type="warning" title="MCMC의 체크리스트">
+Metropolis-Hastings·Gibbs sampler의 수렴 보장은 체인이 **기약·비주기·양재귀**임을 요구한다. 하나라도 깨지면 수렴 보장이 사라진다. ε-greedy 탐색이나 PageRank의 dumping factor는 본질적으로 "체인을 기약으로 만드는" 장치다.
+</Callout>
+
+## 정상분포와 Perron-Frobenius
+
+정상분포 $\pi$는 $\pi P = \pi$를 만족하는 확률벡터다 — 이 분포에서 시작하면 모든 시각에서 같은 분포가 유지된다. $P\mathbf{1} = \mathbf{1}$에서 고유값 1은 항상 존재한다. 문제는 유일성과 비음성이다.
+
+<Theorem kind="theorem" number="2" title="Perron-Frobenius (확률행렬 버전)">
+$P$가 기약 확률행렬이면: (1) 고유값 1이 단순(multiplicity 1), (2) 대응 좌고유벡터 $\pi$의 모든 성분이 양수, (3) 기약·비주기이면 다른 모든 고유값 $|\lambda_k| < 1$.
+</Theorem>
+
+<Proof>
+존재성은 Brouwer 고정점 정리 — $\pi \mapsto \pi P$가 simplex를 simplex로 보내는 연속 사상. 유일성: $\pi_1, \pi_2$가 두 정상분포라 하면 $\pi = \pi_1 - \pi_2$는 $\pi P = \pi$이고 $\sum \pi_i = 0$. $\pi = \pi^+ - \pi^-$로 분리하면 각각 불변측도가 되는데, 기약성 아래 서로 disjoint support의 불변측도는 존재할 수 없다. 따라서 $\pi = 0$. 비주기 아래 $|\lambda| = 1$인 고유값이 1뿐임은 최대 성분 논법으로 보인다. $\square$
+</Proof>
+
+양재귀 + 기약에서 정상분포는 **재방문 시간의 역수**로 해석된다: $\pi_i = 1/\mathbb{E}_i[T_i]$. 이 공식이 정상분포의 확률론적 의미를 가장 직접적으로 드러낸다.
+
+## 수렴률 — 제2고유값이 지배한다
+
+$P$가 diagonalizable하면 스펙트럴 분해는 다음과 같다.
+
+$$
+P = \mathbf{1}\pi^\top + \sum_{k \geq 2} \lambda_k v_k u_k^\top, \qquad P^n = \mathbf{1}\pi^\top + \sum_{k \geq 2} \lambda_k^n v_k u_k^\top.
+$$
+
+비주기 기약이면 $|\lambda_k| < 1$ for $k \geq 2$이므로 $P^n \to \mathbf{1}\pi^\top$. 수렴률은 **제2고유값** $|\lambda_2|$가 결정한다.
+
+$$
+\|\mu_n - \pi\|_{TV} \leq C \cdot |\lambda_2|^n.
+$$
+
+**스펙트럴 갭** $\gamma = 1 - |\lambda_2|$이 클수록 빠르게 수렴하고, mixing time은
+
+$$
+t_{\text{mix}}(\epsilon) = O\!\left(\frac{1}{\gamma} \log \frac{1}{\epsilon}\right)
+$$
+
+으로 스펙트럴 갭에 반비례한다. PageRank의 power iteration이 약 100번 반복으로 수렴하는 이유는 dumping factor $\alpha = 0.85$가 $|\lambda_2|$를 0.85로 고정하기 때문이다. 강화학습의 value iteration 수렴률이 discount factor $\gamma$에 의존하는 것도 같은 구조다.
+
+<Callout type="note" title="트레이드오프 — 스펙트럴 갭과 고차원의 저주">
+유한상태에서 스펙트럴 갭은 구체적으로 계산 가능하고 mixing time이 로그 스케일로 결정된다. 그러나 고차원에서는 $|\lambda_2| \to 1$이 흔하여 mixing time이 지수적으로 커진다. 이를 극복하기 위해 gradient 정보를 활용하는 HMC나 Langevin dynamics가 등장한다 — 스펙트럴 갭을 키우는 공학적 장치다.
+</Callout>
+
+## Detailed Balance와 에르고딕 정리
+
+정상분포를 보장하는 가장 강력한 충분조건이 **Detailed Balance**다.
+
+$$
+\pi_i P_{ij} = \pi_j P_{ji}, \quad \forall i, j.
+$$
+
+증명은 한 줄이다: $(\pi P)_j = \sum_i \pi_i P_{ij} = \sum_i \pi_j P_{ji} = \pi_j$. 이 조건은 정상분포의 필요조건이 아니다 — 3-state 순환 체인 $0 \to 1 \to 2 \to 0$은 균등분포를 정상으로 갖지만 Detailed Balance는 깨진다. 그러나 Detailed Balance를 만족하는 **Reversible** 체인의 전이연산자는 $\ell^2(\pi)$ 위에서 **self-adjoint** — 모든 고유값이 실수이고 고유벡터가 직교한다. Metropolis-Hastings의 acceptance ratio $\alpha = \min(1, \pi(y)q(x|y)/\pi(x)q(y|x))$는 이 조건을 설계 목표로 역산한 공식이다.
+
+기약·양재귀 체인에서 시간평균은 공간평균으로 수렴한다.
+
+$$
+\frac{1}{n}\sum_{k=1}^n f(X_k) \to \mathbb{E}_\pi[f] \quad \text{a.s.}
+$$
+
+증명의 핵심 아이디어는 재생적 분해(regenerative decomposition)다. 재방문 시각들 사이의 cycle 조각들이 강한 마르코프 성질로 iid가 되고, iid SLLN을 적용하면 된다. CLT 버전도 성립한다: $\sqrt{n}(\bar{f}_n - \mathbb{E}_\pi f) \xrightarrow{d} \mathcal{N}(0, \sigma_f^2)$. Reversible 체인에서 asymptotic variance는 스펙트럴 분해로 표현된다.
+
+$$
+\sigma_f^2 = \sum_k c_k^2 \frac{1 + \lambda_k}{1 - \lambda_k}.
+$$
+
+$\lambda_k \to 1$이면 분모가 0에 가까워져 $\sigma_f^2 \to \infty$ — 스펙트럴 갭이 작은 체인은 추정 오차가 크다. MCMC의 ESS(Effective Sample Size)가 스펙트럴 갭에 비례하는 이유가 여기 있다.
+
+## 정리
+
+- 마르코프 성질

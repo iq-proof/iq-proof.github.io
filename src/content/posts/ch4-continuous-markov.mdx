@@ -1,0 +1,139 @@
+---
+title: "연속시간 마르코프 체인의 통일 원리 — Q-matrix에서 정상분포까지"
+description: "CTMC의 infinitesimal generator Q-matrix부터 Kolmogorov 방정식, detailed balance, Birth-Death 과정까지 — 단 하나의 구조적 원리가 어떻게 모든 결과를 만들어내는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [markov-chain, ctmc, q-matrix, stochastic-processes, detailed-balance]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+연속시간 마르코프 체인(CTMC)은 이산 MC의 시간 축을 실수선으로 확장한다. 그런데 이 확장은 단순한 일반화가 아니다 — "무한히 짧은 시간 동안 무슨 일이 일어나는가"라는 질문이 모든 구조를 결정한다. 그 답이 **Q-matrix**(생성기)이고, 이 하나의 행렬에서 전이확률의 시간 진화, 정상분포, 수렴 속도가 전부 나온다. 어떻게 그것이 가능한가?
+
+## infinitesimal 정보로 모든 것을 결정하다
+
+CTMC의 전이확률 $P(t) = (P_{ij}(t))$는 연속 시간의 함수다. 이 전체를 기술하는 대신, generator $Q$는 **초기 미분 정보**만 담는다.
+
+$$
+Q_{ij} := \lim_{h \to 0^+} \frac{P_{ij}(h) - \delta_{ij}}{h}
+$$
+
+$Q$는 세 가지 성질을 만족한다: 비대각 원소 $q_{ij} \geq 0$, 대각 $q_{ii} \leq 0$, 그리고 **행합 0** $\sum_j q_{ij} = 0$. 행합 0은 확률 보존의 직접적 표현이다 — 상태 $i$에서 탈출하는 총 확률 흐름이 0이어야 한다.
+
+$q_i := -q_{ii}$는 상태 $i$의 **탈출률**이다. 이 탈출률이 holding time의 분포를 결정한다. CTMC의 Markov 성질은 "미래가 현재에만 의존한다"는 것이고, "현재"에는 얼마나 오래 머물렀는지 정보가 없다. 따라서 holding time 분포는 **age-free**, 즉 메모리리스여야 한다. 메모리리스 연속 분포는 오직 지수분포뿐이다.
+
+<Theorem kind="theorem" number="1" title="Holding time의 필연성">
+CTMC에서 상태 $i$의 holding time은 반드시 $\text{Exp}(q_i)$를 따른다.
+</Theorem>
+
+<Proof>
+Markov 성질로부터 holding time $T_1$은 메모리리스다. 연속 분포에서 메모리리스 ⟺ 지수분포. Rate 결정: $\mathbb{P}(T_1 > h) = P_{ii}(h) = 1 - q_i h + o(h)$가 $\text{Exp}(q_i)$의 생존함수와 일치한다. $\square$
+</Proof>
+
+이로써 CTMC는 두 가지로 완전히 분해된다 — **jump chain** (어느 상태로 뛸 것인가, 전이확률 $q_{ij}/q_i$) 와 **holding time** (얼마나 머물 것인가, $\text{Exp}(q_i)$). 그리고 $Q$ 하나가 두 정보를 모두 담는다.
+
+유한 상태 CTMC에서 전이확률 행렬의 전체 시간 진화는 다음 **행렬지수**로 닫힌다.
+
+$$
+P(t) = e^{tQ} := \sum_{n \geq 0} \frac{(tQ)^n}{n!}
+$$
+
+"속도장"이 있으면 궤적이 결정된다는 ODE의 논리 — $Q$가 CTMC의 속도장이다.
+
+## 두 개의 방정식, 하나의 해
+
+$P(t) = e^{tQ}$는 두 행렬 ODE를 동시에 만족한다.
+
+$$
+P'(t) = P(t)Q \quad \text{(Forward)}, \qquad P'(t) = QP(t) \quad \text{(Backward)}
+$$
+
+두 방정식은 해석이 다르다. Forward는 "현재 분포에서 한 step 더 미래로" — 초기분포 $\mu_0$의 시간 진화 $\dot{\mu}_t = \mu_t Q$로 이어진다. Backward는 "관찰 함수의 기댓값이 초기 조건에 따라 어떻게 변하는가" — $u(t,i) := \mathbb{E}_i[f(X_t)]$에 대해 $\dot{u} = Qu$를 만족한다.
+
+그런데 왜 두 방정식의 해가 같은가? $e^{tQ}$는 자기 자신의 생성기와 교환하기 때문이다.
+
+$$
+e^{tQ} \cdot Q = Q \cdot e^{tQ}
+$$
+
+급수 $\sum (tQ)^n/n!$의 각 항이 $Q$와 교환한다. 이 교환성이 "왼쪽에서 $Q$ 곱"과 "오른쪽에서 $Q$ 곱"을 동등하게 만든다. Markov semigroup의 특수성 — 같은 생성기에서 나온 $P(t)$들은 서로 교환한다.
+
+<Callout type="note" title="비동질 CTMC에서의 한계">
+$Q(t)$가 시간에 따라 변하면 $Q(s)$와 $Q(t)$가 일반적으로 교환하지 않는다. 이때 $P(t) \neq \exp(\int_0^t Q(s)ds)$이며 time-ordered exponential이 필요하다. Forward와 Backward 방정식의 해가 달라진다.
+</Callout>
+
+Forward 방정식의 고정점이 정상분포다. $\dot{\mu}_t = 0$ ⟺ $\mu_t Q = 0$, 따라서 **$\pi Q = 0$** (행벡터 $\pi$는 $Q$의 left-null vector).
+
+## Detailed Balance — 정상분포의 충분조건
+
+$\pi Q = 0$은 각 상태에서 "들어오는 확률 흐름 = 나가는 확률 흐름"의 **global balance**다. 이보다 강한 조건이 **detailed balance**다.
+
+$$
+\pi_i q_{ij} = \pi_j q_{ji} \quad \forall i \neq j
+$$
+
+모든 쌍 $(i,j)$에서 흐름이 균형이면, 합산해도 균형이다 — detailed balance ⟹ global balance ⟹ $\pi Q = 0$.
+
+<Theorem kind="theorem" number="2" title="Reversibility와 Self-adjoint">
+$(\pi, Q)$가 detailed balance를 만족한다 ⟺ $Q$가 $\ell^2(\pi)$에서 self-adjoint이다.
+</Theorem>
+
+<Proof>
+$\langle Qf, g\rangle_\pi = \sum_{i,j} \pi_i q_{ij} f(j) g(i)$. Detailed balance $\pi_i q_{ij} = \pi_j q_{ji}$를 대입하면 $= \sum_{i,j} \pi_j q_{ji} f(j) g(i) = \langle f, Qg\rangle_\pi$. $\square$
+</Proof>
+
+Self-adjoint는 실고유값과 직교 고유함수를 보장한다. Q의 고유값은 모두 $\leq 0$ (기약이면 0 제외 strict), 따라서 spectral gap $\gamma = \min_{\lambda \neq 0} |\lambda|$가 수렴 속도를 결정한다.
+
+$$
+\|\mu_t - \pi\|_{TV} \leq C e^{-\gamma t}
+$$
+
+이산 MC의 $|\lambda_2|^n$ 수렴이 연속 버전에서 $e^{-\gamma t}$로 이어진다. 이 analogy는 우연이 아니다 — $Q = (P - I)/h$의 극한으로, 이산의 $\lambda_2$와 연속의 $\gamma = -\log|\lambda_2|/h$가 대응한다.
+
+## Birth-Death — Detailed Balance의 자동 보장
+
+Birth-Death 과정은 상태 $\{0,1,2,\ldots\}$에서 $n \leftrightarrow n \pm 1$로만 이동하는 CTMC다.
+
+$$
+Q_{n,n+1} = \lambda_n, \quad Q_{n,n-1} = \mu_n, \quad Q_{nn} = -(\lambda_n + \mu_n)
+$$
+
+1D nearest-neighbor 구조는 cycle이 없다. Cycle 없음 ⟹ detailed balance가 자동이다 — 정상분포가 존재하면 reversible임이 보장된다. 정상분포는 DB 조건 $\pi_n \lambda_n = \pi_{n+1} \mu_{n+1}$을 반복 적용해 닫힌 형태로 얻는다.
+
+$$
+\pi_n = \pi_0 \prod_{k=1}^n \frac{\lambda_{k-1}}{\mu_k}, \quad \pi_0 = \left(1 + \sum_{n \geq 1} \prod_{k=1}^n \frac{\lambda_{k-1}}{\mu_k}\right)^{-1}
+$$
+
+정상분포 존재 ⟺ 이 급수의 수렴이다. M/M/1의 경우 $\lambda_n = \lambda$, $\mu_n = \mu$이면 $\pi_n = (1-\rho)\rho^n$ ($\rho = \lambda/\mu$), 수렴 조건은 $\rho < 1$이다. M/M/c는 $\mu_n = \min(n,c)\mu$로, Erlang-C 분포가 나온다.
+
+<Aside label="비선형 capacity benefit">
+M/M/c에서 서버 수 $c$를 2배로 늘리면 대기시간은 2배가 아니라 수십~수백 배 감소할 수 있다. $\rho = \lambda/(c\mu)$가 절반이 되면서 Erlang-C $C(c, c\rho)$가 sub-exponentially 감소하기 때문이다. 이것이 over-provisioning의 p99 latency에 대한 비선형 효과의 수학적 근거다.
+</Aside>
+
+## 트레이드오프
+
+이 프레임워크가 강력한 만큼 가정도 명확하다.
+
+**유한 탈출률 가정**: $q_i < \infty$가 필요하다. 무한 탈출률이 허용되면 유한 시간 안에 무한 번 jump하는 **explosion** 문제가 생긴다. 가산 무한 상태공간에서는 $\sum \prod \lambda/\mu$의 수렴 여부가 정상분포 존재를 결정하며, 이는 유한 상태에서 자명한 것과 다르다.
+
+**이산 상태 한계**: 연속 상태 공간으로 가면 $Q$는 행렬이 아닌 미분 연산자가 된다. Forward 방정식은 Fokker-Planck PDE, Backward는 Kolmogorov Backward PDE로 이어진다. CTMC는 이 연속 세계의 이산 전조다 — SDE의 drift/diffusion은 CTMC generator의 연속 버전이다.
+
+**시간 동질성 한계**: $Q(t)$가 시간 변화하면 교환성이 무너지고 행렬지수 계산이 복잡해진다. Score-based diffusion model의 VP-SDE ($\beta(t)$가 시간 변화)가 정확히 이 경우다.
+
+**계산 비용**: $N \times N$ 행렬지수는 $O(N^3)$. 상태 공간이 크면 ($N \sim 10^6$) Krylov subspace 근사가 필요하다.
+
+## 정리
+
+- Q-matrix는 CTMC의 infinitesimal dynamics를 완전히 encoding한다. $q_i$가 holding time의 $\text{Exp}$ rate이고, $q_{ij}/q_i$가 jump chain의 전이확률이다.
+- Forward 방정식 $\dot{\mu} = \mu Q$는 분포 진화, Backward $\dot{u} = Qu$는 기댓값 진화를 기술한다. 유한 상태에서 해는 $P(t) = e^{tQ}$로 통일된다.
+- Detailed balance $\pi_i q_{ij} = \pi_j q_{ji}$는 reversibility와 동치이며, $Q$가 $\

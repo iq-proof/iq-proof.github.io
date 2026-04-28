@@ -1,0 +1,141 @@
+---
+title: "Poisson 과정은 왜 세 가지 얼굴을 가지는가"
+description: "카운트·간격·infinitesimal이라는 세 정의의 동치성부터 복합 Poisson의 특성함수, Little의 법칙을 통한 LLM inference 용량 설계까지, Poisson 과정의 통일된 구조를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [poisson-process, stochastic-processes, queueing-theory, temporal-point-process]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Poisson 과정에는 세 가지 정의가 있다. 구간별 카운트가 Poisson 분포를 따른다는 **카운트 관점**, 이벤트 간 간격이 iid 지수분포라는 **간격 관점**, 짧은 시간 $h$ 동안 이벤트 확률이 $\lambda h$에 비례한다는 **infinitesimal 관점**. 셋은 동치다. 그런데 왜 이 사실이 자명하지 않은가? 그리고 이 동치성이 결합·분할·점프 확장·큐잉 이론 전반을 어떻게 하나의 구조로 꿰뚫는가?
+
+## 동치성의 핵심: 지수분포의 메모리리스
+
+세 정의를 연결하는 열쇠는 지수분포의 **메모리리스** 성질이다.
+
+$$
+\mathbb{P}(T > s + t \mid T > s) = \mathbb{P}(T > t)
+$$
+
+"이미 $s$만큼 기다렸다"는 정보가 앞으로의 대기시간 분포를 전혀 바꾸지 않는다. 이 성질은 지수분포에만 있다. 생존함수 $g(t) = \mathbb{P}(T > t)$가 Cauchy 함수방정식 $g(s+t) = g(s)g(t)$를 만족하면, 우연속 단조감소 조건 하에서 $g(t) = e^{-\lambda t}$가 유일한 해이기 때문이다.
+
+<Theorem kind="theorem" number="1" title="지수분포의 메모리리스 유일성">
+양의 연속 확률변수 $T$에 대해 다음은 동치다.
+
+1. $T \sim \text{Exp}(\lambda)$
+2. $\mathbb{P}(T > s+t \mid T > s) = \mathbb{P}(T > t)$ for all $s, t \geq 0$
+</Theorem>
+
+<Proof>
+$(1 \Rightarrow 2)$: $\mathbb{P}(T > s+t \mid T > s) = e^{-\lambda(s+t)}/e^{-\lambda s} = e^{-\lambda t}$.
+
+$(2 \Rightarrow 1)$: $g(t) = \mathbb{P}(T > t)$로 놓으면 가정에서 $g(s+t) = g(s)g(t)$. $g$가 우연속 비증가이면 $g(t) = e^{-\lambda t}$가 유일한 해. $g > 0$이므로 $\lambda > 0$. $\square$
+</Proof>
+
+메모리리스에서 B ⇒ A 방향이 따라온다. 간격이 iid 지수이면 각 시점에서 "다음 이벤트까지의 시간"이 과거 이력과 독립된다. 그 결과 서로소 구간의 카운트가 독립이 되고, 분포는 Poisson이 된다. 반대로 A ⇒ B 방향은 $\{T_1 > t\} = \{N_t = 0\}$이고 $\mathbb{P}(N_t = 0) = e^{-\lambda t}$임을 관찰하는 것으로 시작한다. C ⇔ A는 Taylor 전개로 확인된다.
+
+$$
+\mathbb{P}(N_{t+h} - N_t = 1) = \lambda h e^{-\lambda h} = \lambda h + o(h)
+$$
+
+세 정의가 닫힌 순환을 이룬다는 것이 Poisson 과정의 첫 번째 구조적 사실이다.
+
+## 합과 분할에 닫혀 있음
+
+Poisson 과정이 강력한 이유는 연산에 닫혀 있기 때문이다.
+
+**합(Superposition)**: 독립 Poisson 과정 둘을 합치면 그 합도 Poisson이다. rate는 더해진다. 특성함수로 확인하면 간단하다.
+
+$$
+\phi_{N^{(1)}_t + N^{(2)}_t}(u) = e^{\lambda_1 t(e^{iu}-1)} \cdot e^{\lambda_2 t(e^{iu}-1)} = e^{(\lambda_1+\lambda_2)t(e^{iu}-1)}
+$$
+
+**분할(Thinning)**: 각 이벤트를 확률 $p$로 독립적으로 유지하면, 유지된 이벤트는 rate $p\lambda$의 Poisson 과정이다. 제거된 이벤트는 rate $(1-p)\lambda$의 독립 Poisson 과정이다. 두 thinned 과정은 서로 독립이다.
+
+이 두 성질은 **비균질 Poisson**으로 자연스럽게 확장된다. rate $\lambda(t)$가 시간에 따라 변하면 cumulative intensity $\Lambda(t) = \int_0^t \lambda(s)\,ds$가 모든 정보를 요약한다. 비균질 Poisson $N_t$와 rate 1의 균질 Poisson $\tilde{N}$은 시간 변환으로 연결된다.
+
+$$
+N_t \stackrel{d}{=} \tilde{N}_{\Lambda(t)}
+$$
+
+이 관계가 **Lewis-Shedler 알고리즘**의 기초다. $\lambda(t) \leq \lambda^*$인 상한을 잡고 rate $\lambda^*$의 균질 Poisson을 시뮬레이션한 뒤, 각 이벤트를 확률 $\lambda(t)/\lambda^*$로 accept한다. Neural TPP 모델의 생성 과정이 정확히 이 구조를 따른다.
+
+<Callout type="note" title="트레이드오프: 독립성 가정">
+Superposition과 thinning의 결과는 독립성을 전제한다. 이벤트 스트림 사이에 자기흥분(self-excitation)이 있으면 — 하나의 이벤트가 다른 이벤트 확률을 높이면 — Poisson 구조가 깨진다. 이 경우 Hawkes process가 적절한 확장이다. Poisson은 "이벤트 간 상호작용 없음"이라는 가정의 수학적 표현이다.
+</Callout>
+
+## 복합 Poisson: Lévy 과정으로의 확장
+
+각 이벤트에 단순 카운트 대신 랜덤 크기 $Z_k$를 부여하면 **복합 Poisson 과정**이 된다.
+
+$$
+Y_t = \sum_{k=1}^{N_t} Z_k
+$$
+
+평균과 분산은 Wald 항등식으로 깔끔하게 계산된다.
+
+$$
+\mathbb{E}[Y_t] = \lambda t \,\mathbb{E}[Z], \qquad \text{Var}(Y_t) = \lambda t \,\mathbb{E}[Z^2]
+$$
+
+분산 공식의 $\mathbb{E}[Z^2]$ 항은 $\text{Var}(Z) + (\mathbb{E}[Z])^2$를 합친 결과로, Poisson의 $\text{Var}(N_t) = \mathbb{E}[N_t]$ 성질이 결합해 단일 term으로 정리된다.
+
+특성함수는 더 우아하다.
+
+$$
+\phi_{Y_t}(u) = \mathbb{E}\!\left[(\phi_Z(u))^{N_t}\right] = \sum_{n \geq 0} \frac{(\lambda t)^n e^{-\lambda t}}{n!} \phi_Z(u)^n = \exp\!\left(\lambda t\,(\phi_Z(u) - 1)\right)
+$$
+
+이 형태 $e^{t\Psi(u)}$가 **Lévy 과정**의 서명이다. $\Psi(u) = \lambda(\phi_Z(u) - 1)$이 Lévy exponent이고, 대응하는 Lévy measure는 $\nu = \lambda F_Z$ — 유한 전체 질량을 갖는 측도다. 브라운 운동이 Lévy measure가 없는 연속 Lévy 과정이라면, 복합 Poisson은 유한 활동도(finite activity)의 불연속 Lévy 과정이다. Merton의 점프-확산 모델이나 Neural SDE with jumps가 이 구조 위에 세워진다.
+
+## 큐잉 이론: Little의 법칙과 ρ의 폭발
+
+Poisson 도착 과정은 큐잉 이론으로 곧바로 이어진다. **M/M/1 큐**는 Poisson 도착(rate $\lambda$), 지수 서비스(rate $\mu$), 서버 1대의 시스템이다. 상태 수 $n$에 대한 detailed balance 조건
+
+$$
+\pi_n \cdot \lambda = \pi_{n+1} \cdot \mu
+$$
+
+을 풀면 정상분포가 기하분포로 나온다.
+
+$$
+\pi_n = (1-\rho)\rho^n, \qquad \rho = \lambda/\mu
+$$
+
+$\rho < 1$일 때만 정상분포가 존재한다. 평균 고객 수는 $L = \rho/(1-\rho)$이며 $\rho \to 1$에서 발산한다. $\rho = 0.9$면 $L = 9$, $\rho = 0.95$면 $L = 19$ — **utilization의 미세한 증가가 latency를 폭발**시킨다.
+
+이 관계를 가장 일반적으로 표현한 것이 **Little의 법칙**이다.
+
+$$
+L = \lambda W
+$$
+
+$L$은 시스템 내 평균 고객 수, $W$는 평균 체류시간이다. 이 등식이 놀라운 이유는 Poisson 가정도, 지수 서비스 가정도, 서버 수 가정도 필요 없기 때문이다. 정상성과 유한 평균만 있으면 된다. 증명의 핵심은 $\int_0^T X_t\,dt = \sum_i W_i$라는 경로 항등식이다 — 각 고객이 체류하는 동안 "단위 시간씩" 기여한다.
+
+<Aside label="LLM serving에의 적용">
+LLM API 요청이 rate $\lambda = 0.8$/sec로 도착하고 서비스 rate $\mu = 1$/sec라면 $\rho = 0.8$, $W = 1/(\mu - \lambda) = 5$초. Little의 법칙으로 $L = 0.8 \times 5 = 4$. GPU 서버를 추가해 $\rho$를 0.7로 낮추면 $W$는 약 3초로 줄어든다. Capacity planning의 언어가 큐잉 방정식이다.
+</Aside>
+
+## 정리
+
+- Poisson 과정의 세 정의(카운트/간격/infinitesimal)는 동치이며, 지수분포의 메모리리스가 이 동치성을 떠받친다.
+- Poisson 과정은 합(superposition)과 분할(thinning)에 닫혀 있다. 비균질 확장은 cumulative intensity $\Lambda(t)$와 시간 변환으로 균질 과정으로 환원된다.
+- 복합 Poisson은 유한 활동도 Lévy 과정의 대표 사례다. 특성함수 $\exp(\lambda t(\phi_Z(u)-1))$가 평균·분산·CLT를 한 구조로 묶는다.
+- M/M/1의 $\pi_n = (1-\rho)\rho^n$과 Little의 법칙 $L = \lambda W$는 Poisson 도착이 실시간 서비스 시스템에서 어떻게 latency를 결정하는지의 수학적 언어다.
+
+Poisson 과정을 이해한다는 것은 "이벤트가 독립적으로 발생한다"는 가정이 어떤 구조를 만들어내는지 — 그리고 그 가정이 깨지는 순간(Hawkes, Cox process) 어디로 가야 하는지 — 를 아는 것이다.
+
+<Reference
+  title="The Neural Hawkes Process: A Neurally Self-Mod

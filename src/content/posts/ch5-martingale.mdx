@@ -1,0 +1,112 @@
+---
+title: "마팅게일은 왜 현대 AI 이론의 언어인가"
+description: "공정한 게임의 수학적 추상인 마팅게일이 SGD 수렴, RL 정책 평가, bandit 탐색-활용 균형까지 어떻게 하나의 언어로 연결되는가."
+pubDate: 2026-04-28
+category: ai
+tags: [martingale, stochastic-processes, online-learning, sgd, concentration]
+difficulty: advanced
+series:
+  slug: stochastic-processes-deep-dive
+  title: Stochastic Processes Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+마팅게일은 도박꾼의 자산이 "공정한 게임"에서 움직이는 방식을 포착하는 확률 과정이다. 그런데 이 19세기 도박 이론의 언어가 SGD 수렴 증명, UCB 밴딧 알고리즘, RL의 TD error 분석에 등장한다. 왜 이 하나의 정의가 현대 ML 이론 전반을 관통하는가?
+
+## 하나의 정의, 세 개의 조건
+
+마팅게일 $\{X_n\}$의 정의는 단 세 조건으로 끝난다.
+
+$$
+\mathbb{E}[X_{n+1} \mid \mathcal{F}_n] = X_n \quad \text{a.s.}
+$$
+
+Adapted (현재 정보에 measurable), Integrable ($\mathbb{E}|X_n| < \infty$), 그리고 저 등식. "다음 단계의 조건부 기댓값이 현재 값과 같다"는 것이 전부다.
+
+여기서 sub/super 마팅게일이 파생된다. $\mathbb{E}[X_{n+1} \mid \mathcal{F}_n] \geq X_n$이면 submartingale("유리한 게임"), $\leq X_n$이면 supermartingale("불리한 게임")이다. 관습이 반직관적으로 보이지만, Jensen 부등식이 이 구분을 자연스럽게 만든다. $X$가 마팅게일이고 $\varphi$가 convex이면:
+
+$$
+\varphi(X_n) = \varphi(\mathbb{E}[X_{n+1} \mid \mathcal{F}_n]) \leq \mathbb{E}[\varphi(X_{n+1}) \mid \mathcal{F}_n].
+$$
+
+따라서 $X^2$, $|X|$, $e^X$는 모두 submartingale이다. 이 사실 하나가 분산 분석, Doob 분해, 이차변분의 출발점을 동시에 제공한다.
+
+## 수렴: Upcrossing이 유한해야 한다
+
+$L^1$-bounded 마팅게일이 왜 a.s. 수렴하는가? Doob의 답은 우아하다: **upcrossing 횟수가 유한해야 수렴한다**.
+
+구간 $[a, b]$의 upcrossing $U_n(a, b)$는 과정이 $a$ 이하에서 $b$ 이상으로 올라간 횟수다. Doob의 upcrossing 부등식:
+
+$$
+(b - a)\,\mathbb{E}[U_n(a, b)] \leq \mathbb{E}[(X_n - a)^+].
+$$
+
+$\sup_n \mathbb{E}|X_n| < \infty$이면 우변이 유계 → 모든 유리수 구간 $[a, b]$에서 $U_\infty(a, b) < \infty$ a.s. → $\liminf X_n = \limsup X_n$ a.s. → 수렴.
+
+<Theorem kind="theorem" number="1" title="Doob 수렴 정리">
+$\{X_n\}$이 $\sup_n \mathbb{E}|X_n| < \infty$인 submartingale이면, $X_n \to X_\infty$ a.s.이고 $\mathbb{E}|X_\infty| < \infty$이다.
+</Theorem>
+
+특히 음이 아닌 supermartingale은 자동으로 $L^1$-bounded이므로 항상 수렴한다. Robbins-Monro 확률적 근사와 Q-learning 수렴 증명에서 이 정리가 반복적으로 호출되는 이유다. SGD에서 $V_n = \|\theta_n - \theta^*\|^2$가 supermartingale 구조를 형성하도록 학습률 스케줄 $\sum \alpha_n = \infty$, $\sum \alpha_n^2 < \infty$을 요구하는 것은 이 정리의 조건을 만족시키기 위해서다.
+
+## Optional Stopping: 멈춰도 공정한가
+
+마팅게일이 "공정한 게임"이라면, 정지시각 $\tau$에서 멈춰도 공정성이 유지되는가? 일반적으로는 아니다.
+
+Simple random walk $S_n$에서 $\tau = \inf\{n : S_n = 10\}$을 잡으면, $\tau$는 a.s. 유한하지만 $\mathbb{E}[S_\tau] = 10 \neq 0 = \mathbb{E}[S_0]$이다. "결국 10에 도달하지만 평균 도달 시간이 무한"인 까닭에 공정성이 깨진다.
+
+세 충분조건 중 하나가 있으면 $\mathbb{E}[X_\tau] = \mathbb{E}[X_0]$가 성립한다: (1) $\tau \leq N$ (bounded stopping), (2) $|X_n| \leq C$ (bounded process), (3) uniformly integrable. Gambler's ruin은 조건 (2)로 단 두 줄에 해결된다. $S_\tau \in \{0, N\}$이고 OST를 적용하면 $\mathbb{E}[S_\tau] = N \cdot P_x(N) = x$, 따라서 $P_x = x/N$. Wald의 항등식 $\mathbb{E}[S_\tau] = \mu \mathbb{E}[\tau]$도 같은 구조다.
+
+<Callout type="note" title="트레이드오프">
+OST 조건이 실패하면 stopping 자체가 bias를 만든다. 순차 A/B 테스트의 early stopping에서 estimate가 과대평가되는 이유가 여기 있다 — $\tau$가 유리한 초기 데이터에 의해 결정되므로 $\bar{X}_\tau$가 unbiased하지 않다.
+</Callout>
+
+## Doob 분해와 이차변분: $(dM)^2 = d\langle M \rangle$
+
+임의의 adapted integrable 과정은 유일하게 $X_n = X_0 + M_n + A_n$으로 분해된다. $M$은 martingale, $A$는 predictable이다. $A_n = \sum_{k=1}^n \mathbb{E}[X_k - X_{k-1} \mid \mathcal{F}_{k-1}]$가 "알 수 있는 drift"이고, $M$이 "불확실한 요동"이다.
+
+Square-integrable martingale $M$에 대해 $M^2$은 submartingale이므로 Doob 분해를 적용하면:
+
+$$
+M_n^2 - M_0^2 = N_n + \langle M \rangle_n,
+$$
+
+$N$은 martingale, $\langle M \rangle_n = \sum_{k=1}^n \mathbb{E}[(\Delta M_k)^2 \mid \mathcal{F}_{k-1}]$는 **이차변분** — "conditional variance의 누적"이다. 따라서 $M_n^2 - \langle M \rangle_n$이 martingale이 된다.
+
+이 이산 결과의 연속 한계가 BM의 $\langle B \rangle_t = t$이고, 이것이 이토 공식에서 $(dB)^2 = dt$로 나타난다. SGD의 gradient noise variance 누적 분석, 금융의 realized volatility 추정, Neural SDE의 diffusion coefficient 학습이 모두 이 구조 위에 선다.
+
+## Azuma-Hoeffding: 의존적 노이즈에서의 집중 부등식
+
+Hoeffding 부등식은 독립 확률변수의 합에 대한 tail bound다. ML에서 문제는 대부분 **순차적이고 의존적**이다 — 각 단계의 노이즈가 이전 선택에 의존한다. Azuma-Hoeffding은 이 경우를 다룬다.
+
+$\{M_n\}$이 martingale이고 $|M_k - M_{k-1}| \leq c_k$ a.s.이면:
+
+$$
+\mathbb{P}(M_n - M_0 \geq t) \leq \exp\!\left(-\frac{t^2}{2\sum_{k=1}^n c_k^2}\right).
+$$
+
+증명의 핵심은 조건부 MGF bound $\mathbb{E}[e^{\lambda(M_k - M_{k-1})} \mid \mathcal{F}_{k-1}] \leq e^{\lambda^2 c_k^2/2}$이다 (Hoeffding's lemma). 독립 가정 없이 martingale difference만으로 같은 형태의 집중이 성립한다.
+
+응용의 지형은 넓다. Online Gradient Descent의 regret bound $O(GD\sqrt{T})$에서 stochastic noise 항을 Azuma로 bound한다. UCB 밴딧의 confidence interval $\sqrt{2\log t / n_i(t)}$가 Azuma에서 나오고, 이 bound가 suboptimal arm을 $O(\log T / \Delta_i^2)$회로 제한해 $O(\log T)$ regret을 만든다. TD(0) learning의 수렴 분석에서 TD error $\delta_t$가 optimum에서 martingale difference sequence를 형성한다는 사실 — $\mathbb{E}[\delta_t^* \mid \mathcal{F}_t] = 0$ — 이 unbiased update와 수렴률 분석의 기반이다.
+
+<Aside label="직관">
+Azuma는 "의존적 노이즈도 독립 노이즈만큼 집중된다"는 정리다. ML 이론이 순차적 의존 구조(SGD, bandit, RL)를 다루면서도 $O(\sqrt{T})$ 보장을 줄 수 있는 이유가 여기 있다.
+</Aside>
+
+## 정리
+
+- 마팅게일 $\mathbb{E}[X_{n+1} \mid \mathcal{F}_n] = X_n$은 "공정한 게임"의 추상이자 적응적 시스템의 언어다.
+- Doob 수렴 정리는 $L^1$-bounded 마팅게일의 a.s. 수렴을 보장하며, SGD와 Q-learning의 수렴 증명이 이 위에 선다.
+- Optional Stopping은 "정지해도 공정성이 유지되는 조건"을 명시하며, 조건 실패가 sequential testing의 early stopping bias를 만든다.
+- Doob 분해의 이차변분 $\langle M \rangle_n$은 이산 $(dM)^2 = d\langle M \rangle$이며, 연속시간 BM의 $(dB)^2 = dt$로 이어진다.
+- Azuma-Hoeffding은 의존적 순차 노이즈에 대한 집중 부등식으로, bandit UCB, OGD regret, RL PAC bound의 공통 수학 도구다.
+
+도박 이론에서 출발한 하나의 조건부 기댓값 등식이 현대 ML 이론 전반을 하나의 언어로 묶는다.
