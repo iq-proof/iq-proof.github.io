@@ -1,0 +1,150 @@
+---
+title: "신경망이 함수공간에서 조밀한 이유 — Universal Approximation부터 PINN까지"
+description: "Stone-Weierstrass 정리의 조밀성 조건부터 NTK의 무한폭 극한, Neural Operator의 함수 매핑, PINN의 Sobolev 수렴까지, 함수해석학이 현대 AI의 이론적 토대를 어떻게 구성하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [functional-analysis, universal-approximation, ntk, neural-operator, sobolev]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+"신경망은 어떤 함수든 근사한다"는 말은 절반만 맞다. 정확히는 **충분한 너비와 비다항식 활성화가 있으면, 컴팩트 도메인 위의 연속함수 공간에서 조밀한 집합을 형성한다**는 존재 명제다. 이 네 챕터는 그 명제를 서로 다른 각도로 파고든다 — 왜 조밀한가, 학습 동역학은 어디서 선형이 되는가, 벡터 대신 함수를 입력으로 받으면 무슨 이론이 필요한가, 도함수까지 근사하려면 활성화함수에 무엇이 요구되는가.
+
+## 조밀성의 출발점 — Stone-Weierstrass
+
+신경망이 함수를 근사할 수 있다는 이유를 한 문장으로 압축하면 Stone-Weierstrass 정리다. 컴팩트 Hausdorff 공간 $K$ 위의 연속함수 공간 $C(K)$에서, 어떤 함수 집합 $A$가 (i) 곱에 닫혀 있고 (ii) $K$의 점들을 분리하며 (iii) 상수함수를 포함하면, $A$는 $C(K)$ 전체에서 조밀하다.
+
+신경망 집합 $H = \{ \sum_j w_j \sigma(v_j \cdot x + b_j) \}$가 이 조건을 채우는지 확인하는 것이 Universal Approximation 정리의 핵심 논증이다.
+
+<Theorem kind="theorem" number="1" title="Universal Approximation — Cybenko 1989, Hornik 1991">
+$\sigma : \mathbb{R} \to \mathbb{R}$가 연속이고 비다항식(non-polynomial)이면, 단일 은닉층 신경망
+
+$$
+N_\sigma(x) = \sum_{j=1}^{m} w_j \sigma(v_j \cdot x + b_j) + w_0
+$$
+
+의 집합은 $C([0,1]^n)$에서 조밀하다. 즉 임의의 $g \in C([0,1]^n)$와 $\varepsilon > 0$에 대해 $\|g - N_\sigma\|_\infty < \varepsilon$을 만족하는 $N_\sigma$가 존재한다.
+</Theorem>
+
+<Proof>
+$\sigma$가 비다항식이고 연속 $\Rightarrow$ $H$는 벡터공간이며 상수를 포함한다. Hornik의 논증에서, $\sigma \in L^1(\mathbb{R}, e^{-x^2}dx)$이면 Fourier 변환이 비영이고 이를 이용해 곱 폐쇄성(multiplicative closure)을 보인다. $H$가 대수(algebra)이고 점 분리(point separation)를 만족하므로, Stone-Weierstrass에 의해 $H$는 $C([0,1]^n)$에서 조밀하다.
+</Proof>
+
+<Callout type="note" title="존재 ≠ 학습 가능성">
+정리는 올바른 가중치가 **존재함**을 보장할 뿐이다. 경사하강법으로 그 가중치를 **찾을 수 있는가**는 별개의 문제다. 초기화, 최적화 알고리즘, 국소 최소점 — 이 모든 것은 이 정리의 사정권 밖에 있다.
+</Proof>
+
+## 무한폭 극한 — NTK와 선형 회귀의 동치
+
+신경망의 학습 동역학을 분석하기 어려운 이유는 파라미터와 출력의 관계가 비선형이기 때문이다. NTK(Neural Tangent Kernel) 이론은 이 비선형성이 사라지는 극한을 특정한다.
+
+초기 파라미터 $\theta_0$에서 정의한 커널
+
+$$
+\Theta(x, x') = \langle \nabla_\theta f(x;\theta_0),\, \nabla_\theta f(x';\theta_0) \rangle
+$$
+
+은 은닉층 너비 $m \to \infty$일 때 결정론적 극한 $\Theta_\infty$에 수렴한다(Jacot et al. 2018). 수렴 속도는 $\|\Theta^{(m)} - \Theta_\infty\|_{op} = O_p(m^{-1/2})$.
+
+무한폭 극한에서 연속 시간 경사 흐름(gradient flow)
+
+$$
+\frac{d\mathbf{f}}{dt} = -\Theta_\infty (\mathbf{f} - \mathbf{y})
+$$
+
+의 해는 $\mathbf{f}(t) = e^{-t\Theta_\infty}(\mathbf{f}_0 - \mathbf{y}) + \mathbf{y}$이고, $t \to \infty$의 극한이 NTK-RKHS 내에서의 Kernel Ridge Regression 해
+
+$$
+\boldsymbol{\alpha} = (\Theta_\infty + \lambda I)^{-1} \mathbf{y}, \quad f^*(x) = \sum_i \alpha_i \Theta_\infty(x, x_i)
+$$
+
+와 일치한다.
+
+<Callout type="warning" title="트레이드오프 — Kernel Regime vs Feature Learning">
+**Kernel regime** ($m$ 크거나 학습 초기): NTK 고정, 선형 학습, 수렴 보장, 분석 가능. 단 특성이 정적이라 표현력 한계가 있다.
+
+**Feature learning regime** ($m$ 작거나 오래 학습): NTK가 훈련 중 변하고 은닉층 활성화가 진화한다. 더 강한 표현력을 얻지만 이론적 분석이 어렵다. NTK 변화량은 $O(m^{-1/2} \cdot T)$로 너비와 학습 스텝 수에 의존한다.
+</Callout>
+
+## 함수를 함수로 — Neural Operator의 무한차원 확장
+
+$\mathbb{R}^n \to \mathbb{R}^m$ 대신 $U \to V$ (함수공간 사이)를 학습하는 문제가 Neural Operator다. PDE의 계수 함수 $u(x)$를 받아 해 $v(x)$를 돌려주는 연산자 $G: C(K) \to C(L)$이 대표 사례다.
+
+Chen & Chen(1995)의 Universal Operator Approximation은 정리 1의 무한차원 버전이다 — 연속이고 비다항식인 $\sigma$로 구성한 신경망 연산자 클래스는 모든 연속 연산자를 연산자 노름 의미에서 근사할 수 있다.
+
+이를 구현하는 두 아키텍처의 핵심 아이디어는 다르다.
+
+**DeepONet** (분해 전략): Mercer 정리에 따라 연산자를 유한 랭크로 분해한다.
+
+$$
+G(u)(y) \approx \sum_{k=1}^p b_k(u) \cdot t_k(y)
+$$
+
+Branch net이 입력 함수를 기저 계수 $b_k(u)$로 인코딩하고, Trunk net이 출력 좌표를 기저값 $t_k(y)$로 매핑한 후 내적으로 합산한다.
+
+**FNO** (Fourier 기저): Parseval 정리를 이용해 연산자를 Fourier 공간에서 대각화한다. 저주파 모드 $M$개만 학습 가능한 가중치로 처리하고 나머지는 0으로 두어 aliasing을 억제한다. 이 설계 덕분에 훈련 해상도와 다른 그리드에서도 추론이 가능하다 — 함수공간 기반 설계의 직접적 귀결이다.
+
+## PINN과 Sobolev 수렴 — 도함수까지 근사하기
+
+PINN(Physics-Informed Neural Network)은 PDE 잔차를 손실 함수에 포함해 신경망이 물리 방정식을 만족하도록 유도한다.
+
+$$
+L = \int_\Omega |N[f_\theta]|^2 dx + \lambda \int_{\partial\Omega} |f_\theta - g|^2 ds
+$$
+
+이 손실을 최소화할 때 $f_\theta$가 실제 해 $u$에 수렴하는 이유는 Lax-Milgram 정리에 있다 — 연산자 $N$이 $H^1(\Omega)$ 위에서 coercive이면 유일한 약 해(weak solution)가 존재하고, 신경망 집합이 $H^k$에서 조밀하므로 최적화 극한에서 $f_\theta \to u$가 성립한다.
+
+여기서 활성화함수의 선택이 결정적이다. SIREN은 $\sigma(x) = \sin(\omega x)$를 사용한다. $\sin \in C^\infty$이므로 모든 도함수가 정의되고 유계이며, 자동미분으로 계산한 $\nabla f_\theta$도 다시 신경망으로 표현된다. 이 성질이 Sobolev 수렴 조건을 채운다 —
+
+$$
+\|u - f_\theta\|_{H^k(\Omega)}^2 = \sum_{|\alpha| \leq k} \|\partial^\alpha u - \partial^\alpha f_\theta\|_{L^2}^2 \to 0
+$$
+
+ReLU는 $x=0$에서 2차 미분이 $\delta$-함수가 되어 고차 Sobolev 노름 계산이 무의미해진다. PINN에서 ReLU가 권장되지 않는 이유가 여기에 있다.
+
+<Aside label="함수공간별 선택">
+**$C(K)$**: 균등 수렴 필요 — 임계값 민감 작업, 영상 처리.
+
+**$L^2$**: 평균 오차 허용 — 통계적 학습, 신호 처리.
+
+**$H^k$**: 도함수까지 제어 — PINN, SIREN, 연속체 역학.
+
+어느 공간을 목표로 하느냐가 활성화함수 선택과 손실 설계를 바꾼다.
+</Aside>
+
+## 정리
+
+네 챕터를 관통하는 하나의 구조가 있다: **함수공간에서의 조밀성이 신경망 이론의 핵심 언어다**.
+
+- Universal Approximation: $\sigma$ 비다항식 $\Rightarrow$ 단일 은닉층 신경망이 $C([0,1]^n)$에서 조밀. 존재 명제이며 학습 가능성은 별개다.
+- NTK: 폭 $m \to \infty$에서 학습 동역학이 RKHS 회귀로 수렴. Kernel regime에서 선형 분석이 가능하지만 feature learning은 포기한다.
+- Neural Operator: 함수 $\to$ 함수 매핑을 학습. DeepONet은 Mercer 분해, FNO는 Fourier 기저를 사용해 해상도 불변성을 얻는다.
+- PINN + SIREN: $C^\infty$ 활성화 $\Rightarrow$ Sobolev 수렴. 함수값뿐 아니라 도함수까지 근사할 수 있다.
+
+조밀성이 보장되는 공간에서, 어떤 노름으로, 어떤 아키텍처로 — 이 세 질문에 대한 답이 신경망 설계의 이론적 출발점이다.
+
+<Reference
+  title="Neural Tangent Kernel: Convergence and Generalization in Neural Networks"
+  authors="Jacot, Gabriel, Hongler"
+  year={2018}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1806.07572"
+/>
+
+<Reference
+  title="Fourier Neural Operator for Parametric Partial Differential Equations"
+  authors="Li et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2

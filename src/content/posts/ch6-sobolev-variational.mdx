@@ -1,0 +1,141 @@
+---
+title: "PINN은 왜 작동하는가 — 함수해석학이 만든 근거"
+description: "약미분부터 Lax-Milgram 정리까지, PINN과 유한요소법의 이론적 뿌리를 추적한다. 비매끄러운 함수도 PDE의 해가 될 수 있다는 주장이 어디서 오는지, 그 수학적 근거를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [functional-analysis, pinn, sobolev-spaces, weak-solution, pde]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ReLU 신경망은 $x=0$에서 미분불가능하다. 그런데 PINN은 이 신경망으로 PDE를 풀고, 그것이 수렴한다고 주장한다. 어떻게 가능한가? 답은 "미분"의 의미를 바꾸는 데 있다. 약미분(weak derivative)에서 Sobolev 공간, Poincaré 부등식, Lax-Milgram 정리까지 — 이 개념들은 하나의 질문에 답하기 위해 연결된다: **비매끄러운 함수도 PDE의 해가 될 수 있는가?**
+
+## 고전 미분의 한계와 약미분
+
+$f(x) = |x|$는 $x=0$에서 미분불가능하다. 좌미분은 $-1$, 우미분은 $+1$. 하지만 부분적분을 뒤집어 생각하면 다른 문로 들어설 수 있다.
+
+고전 부분적분:
+
+$$
+\int_{\Omega} f'(x)\,\phi(x)\,dx = -\int_{\Omega} f(x)\,\phi'(x)\,dx \quad (\phi \in C_c^\infty,\; \text{경계항 0})
+$$
+
+우변은 $f$가 미분불가능해도 계산할 수 있다. 그렇다면 우변을 만족하는 $v$가 존재하면 그것을 $f$의 도함수로 **정의**하면 된다. 이것이 약미분이다.
+
+$$
+\int_{\Omega} v\,\phi\,dx = (-1)^{|\alpha|}\int_{\Omega} u\,D^\alpha\phi\,dx \quad \forall\,\phi \in C_c^\infty(\Omega)
+$$
+
+$|x|$에 대해 이 조건을 만족하는 $v$는 $\operatorname{sgn}(x)$다. 고전적으로는 $x=0$에서 정의되지 않지만, 약미분은 "거의 모든 곳(a.e.)"에서만 유일하면 충분하다. 측도 0인 집합에서의 값은 적분에 영향을 미치지 않는다.
+
+<Theorem kind="proposition" number="1" title="약미분의 유일성">
+$u \in L^1_{\mathrm{loc}}(\Omega)$의 $\alpha$-차 약도함수가 존재하면, a.e.에서 유일하다.
+</Theorem>
+
+<Proof>
+$v_1$, $v_2$가 모두 약도함수라 하면, 모든 $\phi \in C_c^\infty$에 대해
+
+$$
+\int_\Omega (v_1 - v_2)\,\phi\,dx = 0
+$$
+
+임의의 컴팩트 $K \subset \Omega$ 위에서 $(v_1 - v_2)^+$를 근사하는 $C_c^\infty$ 함수열로 극한을 취하면 $(v_1 - v_2)^+ = 0$ a.e. 마찬가지로 $(v_1-v_2)^- = 0$ a.e. □
+</Proof>
+
+## 약미분이 있는 함수들의 집합 — Sobolev 공간
+
+약미분을 $k$차까지 가지면서 도함수까지 $L^p$에 속하는 함수들을 모으면 공간이 된다.
+
+$$
+W^{k,p}(\Omega) = \bigl\{u \in L^p(\Omega) : D^\alpha u \in L^p(\Omega),\; |\alpha| \leq k\bigr\}
+$$
+
+노름은 함수와 도함수의 크기를 함께 측정한다.
+
+$$
+\|u\|_{W^{k,p}} = \left(\sum_{|\alpha|\leq k} \int_\Omega |D^\alpha u|^p\,dx\right)^{1/p}
+$$
+
+$p=2$인 경우 $H^k(\Omega) = W^{k,2}(\Omega)$는 내적을 가진 Hilbert 공간이 된다. 이 완비성이 핵심이다. Cauchy 수열 $\{u_n\} \subset W^{k,p}$가 있으면 각 다중지수 $\alpha$에 대해 $D^\alpha u_n \to v_\alpha$ in $L^p$이고, 극한을 취하면 $v_\alpha = D^\alpha u$임을 확인할 수 있다. 공간이 닫혀 있다.
+
+<Aside label="SIREN과 정규성">
+ReLU 망은 일반적으로 $H^1_{\mathrm{loc}}$에만 속한다. SIREN(정현파 활성화)은 자동으로 더 높은 Sobolev 정규성을 달성하는데, 이것이 고차 PDE에서 SIREN이 유리한 이유다.
+</Aside>
+
+## Poincaré 부등식 — 경계가 도함수를 통제한다
+
+유계 영역 $\Omega$에서 경계에서 0인 함수 $u \in W^{1,p}_0(\Omega)$는 도함수만으로 제어된다.
+
+$$
+\|u\|_{L^p(\Omega)} \leq C_P\,\|\nabla u\|_{L^p(\Omega)}
+$$
+
+1D 증명의 뼈대: $u(0)=0$이면 $u(x) = \int_0^x u'(t)\,dt$이고 Cauchy-Schwarz를 쓰면
+
+$$
+|u(x)|^2 \leq L\int_0^L |u'(t)|^2\,dt
+$$
+
+양변을 적분하면 $\|u\|_{L^2} \leq L\|u'\|_{L^2}$. 따라서 $W^{1,p}_0$에서 $\|\nabla u\|_{L^p}$와 $\|u\|_{W^{1,p}}$는 동치 노름이다. 이 사실이 아래 Lax-Milgram의 강제성 조건으로 직결된다.
+
+<Callout type="note" title="트레이드오프: Poincaré 부등식의 적용 범위">
+경계 조건 $u|_{\partial\Omega}=0$이 없으면 Poincaré 부등식이 성립하지 않는다. 반례는 상수함수 $u=1$ — $L^2$ 노름은 양수지만 도함수는 0이다. PINN에서 경계 조건 손실항 $\lambda_2\|u_\theta|_{\partial\Omega}\|^2$을 제거할 수 없는 이유가 여기 있다.
+</Callout>
+
+그리고 Sobolev 매몰 정리는 미분가능성이 연속성을 함의하는 조건을 준다: $W^{k,p}(\mathbb{R}^n)$이 $C^0$에 매몰되려면 $kp > n$이어야 한다. 1D에서 $W^{1,2}(\mathbb{R})$의 함수는 연속이다. 3D에서는 $W^{1,2}(\mathbb{R}^3)$의 함수가 불연속일 수 있다. 고차원 PINN이 더 어려운 수학적 이유다.
+
+## Lax-Milgram 정리 — 약해의 존재성
+
+PDE $-\Delta u = f$ ($u|_{\partial\Omega}=0$)를 변분 형식으로 쓰면 고전 2계 도함수가 사라진다. 양변에 테스트 함수 $v \in H^1_0$를 곱하고 Green 항등식을 쓰면:
+
+$$
+\int_\Omega \nabla u \cdot \nabla v\,dx = \int_\Omega f\,v\,dx \quad \forall\,v \in H^1_0(\Omega)
+$$
+
+이를 추상화하면 $a(u,v) = F(v)$ 꼴이다. Lax-Milgram 정리는 이 형식의 해가 존재하고 유일함을 보장한다.
+
+<Theorem kind="theorem" number="2" title="Lax-Milgram">
+$V$가 Hilbert 공간, $a: V\times V \to \mathbb{R}$이 연속($|a(u,v)|\leq M\|u\|\|v\|$)이고 강제적($a(u,u)\geq\alpha\|u\|^2$, $\alpha>0$)이면, 임의의 $F\in V^*$에 대해 유일한 $u\in V$가 존재하여 $a(u,v)=F(v)$ ($\forall\,v\in V$). 또한 $\|u\|_V \leq \|F\|_{V^*}/\alpha$.
+</Theorem>
+
+Laplace 방정식에 적용하면: 연속성은 Cauchy-Schwarz, 강제성은 Poincaré 부등식에서 온다. 강제성 조건 $a(u,u) \geq \alpha\|u\|^2$은 시스템이 "비퇴화"임을 보장한다. 강제성이 없으면 행렬로 치면 특이행렬 — 해가 없거나 무한히 많을 수 있다.
+
+유한요소법은 이 이론의 직접 응용이다. $V = H^1_0$를 유한차원 부분공간 $V_h$로 제한하면 같은 Lax-Milgram이 적용되고, Céa 보조정리가 오차를 최적 근사 오차의 상수배로 묶는다.
+
+$$
+\|u - u_h\|_V \leq C\inf_{v_h \in V_h}\|u - v_h\|_V
+$$
+
+선형 FEM에서 $H^1$ 오차는 $O(h)$, $L^2$ 오차는 $O(h^2)$로 수렴한다.
+
+## PINN은 변분 에너지를 최소화한다
+
+PINN 손실함수와 변분 에너지는 같은 문제의 두 표현이다.
+
+$$
+J[u] = \frac{1}{2}\int_\Omega|\nabla u|^2\,dx - \int_\Omega f\,u\,dx
+$$
+
+이 에너지의 Gâteaux 미분을 0으로 놓으면 정확히 약해 조건 $a(u,v) = F(v)$가 나온다. PINN이 PDE 잔차를 최소화하는 것은 이 에너지를 신경망으로 근사하는 것이고, Lax-Milgram의 조건이 충족될 때 수렴이 보장된다.
+
+Tikhonov 정칙화 손실 $\|u_\theta - u_{\mathrm{data}}\|^2 + \lambda\|\nabla u_\theta\|_{L^2}^2$은 $H^1$ 노름을 최소화하는 것과 같다. $\lambda$가 충분히 크면 Poincaré 부등식에 의해 해가 자동으로 더 좋은 함수공간에 놓인다.
+
+## 정리
+
+- 약미분은 부분적분을 뒤집어 미분불가능한 함수를 "미분"한다. ReLU의 역전파가 작동하는 이유도 동일한 원리다.
+- Sobolev 공간 $W^{k,p}$는 약미분을 가진 함수들의 완비 공간이다. 완비성이 수치 해석의 수렴 논증을 가능하게 한다.
+- Poincaré 부등식은 경계 조건이 있을 때 도함수가 함수 전체를 제어한다는 것을 보이고, 이것이 Lax-Milgram의 강제성으로 이어진다.
+- Lax-Milgram 정리는 "연속 + 강제적" 조건 아래 약해가 유일하게 존재함을 보장한다. PINN과 FEM은 이 정리의 서로 다른 수치 구현이다.
+
+PINN이 작동하는 것은 경험적 우연이 아니라, 함수해석학이 미리 닦아놓은 길 위를 걷기 때문이다.

@@ -1,0 +1,123 @@
+---
+title: "Hilbert 공간은 왜 AI 수학의 기반인가"
+description: "내적공간의 공리부터 Fourier 급수의 L² 수렴까지, Hilbert 공간이 Attention·MSE·Kernel Trick을 하나의 구조로 설명하는 과정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [hilbert-space, functional-analysis, fourier, kernel-trick, l2]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer의 Attention은 내적으로 유사도를 측정하고, MSE 손실은 $L^2$ 노름의 제곱이며, SVM의 Kernel Trick은 내적을 커널로 대체한다. 이 세 가지는 서로 다른 기법처럼 보이지만, 모두 같은 수학적 구조 위에 서 있다. 그 구조가 **Hilbert 공간**이다. 왜 하필 Hilbert 공간이어야 하는가?
+
+## 내적이 있어야 기하학이 생긴다
+
+벡터공간에 내적 $\langle \cdot, \cdot \rangle$을 정의하면 세 가지가 따라온다. 노름 $\|x\| = \sqrt{\langle x, x \rangle}$, 거리 $d(x, y) = \|x - y\|$, 그리고 각도. 코사인 유사도 $\frac{\langle x, y \rangle}{\|x\|\|y\|}$가 Attention의 유사도 측정으로 쓰이는 이유는, 내적이 두 벡터 사이의 "기하학적 관계"를 수치 하나로 포착하기 때문이다.
+
+그런데 $L^p$ 공간들 중 내적이 정의되는 것은 **$p = 2$뿐**이다. 이를 판별하는 기준이 평행사변형 법칙이다.
+
+$$
+\|x + y\|^2 + \|x - y\|^2 = 2(\|x\|^2 + \|y\|^2)
+$$
+
+$L^1$에서 $f = \mathbf{1}_{[0,0.5]}$, $g = \mathbf{1}_{[0.5,1]}$로 놓으면 좌변이 2, 우변이 1로 등호가 깨진다. 반대로, 이 등식이 성립하면 편극화 항등식
+
+$$
+\langle x, y \rangle = \frac{1}{4}\left(\|x + y\|^2 - \|x - y\|^2\right)
+$$
+
+으로 내적을 복원할 수 있다(Jordan–von Neumann 정리). 즉, 평행사변형 법칙은 내적 존재의 **필요충분조건**이다.
+
+<Callout type="note" title="왜 MSE인가">
+신경망 회귀에서 $\mathcal{L} = \frac{1}{n}\|y - \hat{y}\|_2^2$가 잘 작동하는 이유는 단순히 "제곱이라 미분하기 쉬워서"가 아니다. $L^2$ 노름이 내적에서 나오므로, 손실 곡면이 볼록하고 기하학적으로 깔끔하다. $L^1$ 손실은 내적이 없어서 이 구조가 깨진다.
+</Callout>
+
+## 완비성 — 극한이 공간 안에 있다는 보장
+
+내적공간만으로는 부족하다. 무한차원에서는 수렴하는 수열의 극한이 공간 밖으로 나갈 수 있다. 이를 막는 조건이 **완비성(completeness)**: 모든 Cauchy 수열이 같은 공간 안에서 수렴한다.
+
+내적공간에 완비성을 더한 것이 **Hilbert 공간**이다. $\mathbb{R}^n$, $L^2([a,b])$, $\ell^2$ 모두 Hilbert 공간이다. $L^1$은 노름 공간(Banach)이지만 내적이 없고, 유리수 위의 다항식 공간은 내적이 있지만 완비가 아니다.
+
+완비성이 없으면 닫힌 부분공간으로의 **수직투영(orthogonal projection)**이 존재한다는 것을 증명할 수 없다. 투영 정리의 핵심 증명 단계는 바로 완비성을 사용해 최근점이 되는 Cauchy 수열의 수렴을 보장하는 것이다.
+
+<Theorem kind="theorem" number="1" title="투영 정리">
+$H$가 Hilbert 공간이고 $M$이 닫힌 부분공간이면, 임의의 $x \in H$에 대해 유일한 $P_M(x) \in M$이 존재하여 $x - P_M(x) \perp M$이다.
+</Theorem>
+
+<Proof>
+$d = \inf_{m \in M} \|x - m\|$로 정의되는 최근점 수열 $(y_n)$이 Cauchy임을 평행사변형 법칙으로 보인다. $M$이 볼록이므로 $\frac{y_n + y_m}{2} \in M$이고,
+
+$$\left\|\frac{y_n - y_m}{2}\right\|^2 = \frac{\|x - y_n\|^2 + \|x - y_m\|^2}{2} - \left\|x - \frac{y_n + y_m}{2}\right\|^2 \leq \frac{\|x-y_n\|^2 + \|x-y_m\|^2}{2} - d^2 \to 0$$
+
+$H$의 완비성으로 $y_n \to y_0 \in M$. 수직 특성 $x - y_0 \perp M$은 $\|x - (y_0 + tm)\|^2 \geq \|x - y_0\|^2$를 모든 $t$에 대해 전개하면 나온다. $\square$
+</Proof>
+
+PCA가 분산을 최대화하는 부분공간을 찾는 것도, Ridge Regression이 가중치를 제약하는 것도, 모두 이 투영 정리의 응용이다.
+
+## Riesz 표현 — 모든 범함수는 내적이다
+
+Hilbert 공간의 또 다른 기적은 쌍대 구조다. 유계 선형범함수 $\phi: H \to \mathbb{F}$ 는 모두 어떤 $y_0 \in H$와의 내적으로 표현된다.
+
+$$
+\phi(x) = \langle x, y_0 \rangle, \quad \|\phi\| = \|y_0\|
+$$
+
+이것이 **Riesz 표현 정리**다. 유한차원에서는 자명하다 — $\phi(x) = a^T x$는 이미 내적 형태다. 하지만 무한차원에서는 이것이 비자명하고, Hilbert 구조가 없으면 성립하지 않는다.
+
+AI에서 이 정리가 결정적으로 나타나는 곳이 **RKHS(Reproducing Kernel Hilbert Space)**다. 점 평가 $\delta_x(f) = f(x)$가 유계 범함수이면, Riesz에 의해 유일한 $k_x \in \mathcal{H}$가 존재하여
+
+$$
+f(x) = \langle f, k_x \rangle_{\mathcal{H}}
+$$
+
+SVM의 Kernel Trick이 작동하는 이유는 고차원 feature map $\phi(x)$의 내적 $\langle \phi(x), \phi(y) \rangle$이 커널 $K(x,y)$로 표현될 수 있기 때문이고, 그 이론적 정당성이 바로 이 재생 성질에 있다.
+
+<Callout type="note" title="트레이드오프">
+Hilbert 공간은 강력하지만 $L^2$ 가정이 필요하다. $L^1$ 공간이 필요한 경우(희소 신호, 로버스트 추정)에는 내적이 없어 투영과 Riesz 표현을 포기해야 한다. 일반 Banach 공간 이론이 필요해지고, 계산과 이론 모두 훨씬 복잡해진다.
+</Callout>
+
+## Parseval 등식 — 기저 분해와 에너지 보존
+
+Hilbert 공간이 완비이고 가분(separable)이면, 정규직교기저 $\{e_n\}$이 존재하여 모든 원소를
+
+$$
+x = \sum_{n=1}^{\infty} \langle x, e_n \rangle e_n
+$$
+
+으로 표현할 수 있다. Parseval 등식은 이 분해가 에너지를 보존함을 말한다.
+
+$$
+\|x\|^2 = \sum_{n=1}^{\infty} |\langle x, e_n \rangle|^2
+$$
+
+Fourier 기저 $e_n(x) = \frac{1}{\sqrt{\pi}} e^{inx}$는 $L^2([-\pi, \pi])$의 정규직교기저다. 이 덕분에 $L^2$ 함수의 Fourier 급수는 **항상** $L^2$ 노름에서 수렴한다.
+
+$$
+\|f - S_N(f)\|_{L^2}^2 = \sum_{|n| > N} |c_n|^2 \to 0
+$$
+
+점별 수렴은 보장되지 않는다. 불연속점에서 약 9%의 오버슈팅(Gibbs 현상)이 생긴다. 그러나 $L^2$ 수렴은 무조건이다. 신호 압축에서 고주파 계수를 제거하면 복원 오차가 생기지만, Parseval에 의해 그 오차의 크기가 제거된 계수의 에너지로 정확히 계산된다. JPEG 압축과 Fourier Neural Operator가 이 보장 위에 서 있다.
+
+<Aside label="통일된 시각">
+Attention의 내적 유사도, MSE의 $L^2$ 노름, Kernel Trick의 재생 성질, Fourier 압축의 에너지 보존 — 이것들은 서로 다른 공학적 선택이 아니다. 모두 "내적이 있고 완비인 공간", 즉 Hilbert 공간의 서로 다른 얼굴이다.
+</Aside>
+
+## 정리
+
+- 평행사변형 법칙이 성립하는 노름 공간에만 내적이 존재한다. $L^p$ 중 $p = 2$만 해당한다.
+- Hilbert 공간 = 내적 + 완비성. 완비성이 없으면 투영 정리가 성립하지 않는다.
+- Riesz 표현 정리는 모든 유계 선형범함수를 내적으로 환원한다. RKHS와 Kernel Trick의 이론적 기반이다.
+- Parseval 등식은 $L^2$ 수렴을 보장한다. 신호 압축의 에너지 오차가 통제되는 이유다.
+
+유한차원 선형대수로 충분해 보이는 AI 수학이 왜 함수해석학까지 올라가야 하는지, 그 이유는 이 구조의 이름이다 — 무한차원에서도 기하학이 작동하게 만드는 유일한 공간.

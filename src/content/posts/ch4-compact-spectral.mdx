@@ -1,0 +1,123 @@
+---
+title: "컴팩트 연산자와 스펙트럼 — 무한차원 대각화의 철학"
+description: "컴팩트 연산자의 정의부터 Fredholm 대안과 Tikhonov 정규화까지, 커널 메서드와 Gaussian Process를 떠받치는 스펙트럼 이론의 핵심을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [functional-analysis, spectral-theory, kernel-methods, compact-operators, regularization]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+SVM, Gaussian Process, Kernel Ridge Regression — 이 셋의 이론적 기반을 파고들면 공통 구조가 나타난다. 무한차원 선형 연산자를 유한차원처럼 다룰 수 있게 해주는 **컴팩트 연산자**와 그 **스펙트럼 분해**다. 왜 Gaussian 커널 행렬은 저랭크로 근사할 수 있고, 왜 정규화 파라미터 $\lambda > 0$이 해의 존재를 보장하는가?
+
+## 무한차원의 핵심 장애물
+
+유한차원에서 모든 닫힌 유계 집합은 컴팩트하다. 따라서 모든 행렬은 고유값을 가진다. 무한차원 Hilbert 공간 $H$에서는 다르다. 표준 기저 $\{e_n\}$은 $\|e_n\| = 1$이지만 쌍마다 $\|e_i - e_j\| = \sqrt{2}$이므로 수렴하는 부분열이 없다. 폐단위구가 컴팩트하지 않기 때문이다.
+
+일반적인 유계 선형 연산자는 고유값을 아예 갖지 않을 수 있다. 이 장애물을 우회하는 조건이 **컴팩트성**이다.
+
+<Theorem kind="definition" number="1" title="컴팩트 연산자">
+$T \in B(X, Y)$가 **컴팩트**라는 것은, $X$의 모든 유계 수열 $\{x_n\}$에 대해 $\{Tx_n\}$이 수렴하는 부분열을 가진다는 것이다. 동등하게, $T$가 폐단위구의 상을 상대적으로 컴팩트하게 만드는 것이다.
+</Theorem>
+
+직관은 "차원 축소"다. 컴팩트 연산자는 무한차원 공간을 받아 그 상이 "얇아서" — 유한랭크이거나, 유한랭크들의 노름 극한이어서 — Bolzano-Weierstrass 논증을 적용할 수 있게 만든다.
+
+두 가지 사실이 이 정의를 실용적으로 만든다. 첫째, 모든 유한 랭크 연산자는 컴팩트다 (치역이 유한차원이므로). 둘째, 컴팩트 연산자의 노름 극한도 컴팩트다 — 대각 논증(diagonal argument)으로 증명한다.
+
+$$\|Tx_{k_j} - Tx_{k_\ell}\| \leq \|T - T_n\|\cdot 2M + \|T_n x_{k_j} - T_n x_{k_\ell}\| < \varepsilon$$
+
+이 두 사실을 조합하면 Hilbert-Schmidt 연산자 ($\sum_n \|Te_n\|^2 < \infty$)가 컴팩트임을 바로 이끌어낼 수 있다 — 유한랭크 절단들의 노름 극한이기 때문이다.
+
+## 수반 연산자 — 역전파의 수학
+
+컴팩트 연산자의 구조를 이해하려면 수반이 필요하다. 행렬 전치의 무한차원 일반화다.
+
+<Theorem kind="definition" number="2" title="수반 연산자">
+$T \in B(H)$의 **수반** $T^*$는 다음을 만족하는 유일한 연산자다.
+
+$$\langle Tx, y \rangle = \langle x, T^* y \rangle \quad \forall x, y \in H$$
+</Theorem>
+
+존재성과 유일성은 Riesz 표현 정리가 보장한다. 고정된 $y$에 대해 $f_y(x) = \langle Tx, y \rangle$는 연속 선형범함수이므로, 유일한 $z_y \in H$가 존재해 $f_y(x) = \langle x, z_y \rangle$. 이 $z_y$를 $T^* y$로 정의한다.
+
+수반의 핵심 성질 중 $\|T^*T\| = \|T\|^2$ (C*-대수 항등식)은 주목할 만하다. 이로부터 역전파의 수학이 나온다 — 순전파 $y = Tx$에서 손실 그래디언트는 $\nabla_x L = T^* \nabla_y L$이다. 자기수반 연산자($T = T^*$)는 고유값이 모두 실수이고, 서로 다른 고유값에 대응하는 고유벡터들이 직교한다.
+
+<Aside label="AI 연결">
+공분산 행렬 $\Sigma = E[XX^T]$는 자기수반 양정치 연산자다. 이 구조가 PCA와 Gaussian Process의 기초다. 신경망의 Hessian $H = \nabla^2 L$도 Schwarz 정리에 의해 항상 자기수반이다.
+</Aside>
+
+양정치 자기수반 연산자($\langle Tx, x\rangle \geq 0$)는 유일한 양의 제곱근 $T^{1/2}$를 가진다. 스펙트럼 분해 $T = \sum_i \lambda_i P_i$에서 $T^{1/2} = \sum_i \sqrt{\lambda_i} P_i$로 구성된다.
+
+## 스펙트럼 정리 — 무한차원 대각화
+
+컴팩트성과 자기수반성이 결합하면, 유한차원의 대각화 정리가 무한차원으로 승격된다.
+
+<Theorem kind="theorem" number="3" title="컴팩트 자기수반 연산자의 스펙트럼 정리">
+$T: H \to H$가 컴팩트이고 $T = T^*$이면, 정규직교 고유벡터들 $\{e_n\}$과 실수 고유값들 $\{\lambda_n\}$이 존재해
+
+$$Tx = \sum_{n=1}^\infty \lambda_n \langle x, e_n \rangle e_n \quad \forall x \in H$$
+
+여기서 $|\lambda_1| \geq |\lambda_2| \geq \cdots$이고, $\lambda_n \to 0$.
+</Theorem>
+
+<Proof>
+핵심 아이디어는 Rayleigh quotient의 최대화다. $M := \sup_{\|x\|=1} |\langle Tx, x\rangle|$을 달성하는 수열 $\{x_n\}$을 잡으면, $T$의 컴팩트성으로 $\{Tx_n\}$에서 수렴하는 부분열을 뽑을 수 있다. 이 극한이 첫 고유벡터 $e_1$이 된다. 이후 $e_1^\perp$에서 같은 과정을 반복하면 $e_2, e_3, \ldots$를 귀납적으로 얻는다. $\lambda_n \to 0$은 $\{Te_n\} = \{\lambda_n e_n\}$이 수렴하는 부분열을 가져야 한다는 컴팩트성 조건에서 자동으로 나온다. $\square$
+</Proof>
+
+$\lambda_n \to 0$이라는 조건이 AI에서 갖는 의미가 바로 **저랭크 근사의 유효성**이다. Gaussian 커널 행렬의 고유값은 지수적으로 감소하므로 (커널의 무한 평활성 때문), 상위 $k$개만으로도 행렬을 잘 근사할 수 있다. $\|T - T_k\|_{\text{op}} = |\lambda_{k+1}|$이 성립하고, Mercer 정리도 이 구조의 직접적 귀결이다.
+
+$$k(x,y) = \sum_{n=1}^\infty \lambda_n \phi_n(x) \phi_n(y)$$
+
+## 스펙트럼 반경과 안정성
+
+컴팩트 연산자를 벗어나면 스펙트럼은 고유값보다 넓다.
+
+$$\sigma(T) := \{\lambda \in \mathbb{C} : (T - \lambda I) \text{가 } B(X) \text{에서 역원을 갖지 않음}\}$$
+
+스펙트럼은 항상 컴팩트 집합이고 ($|\lambda| > \|T\|$이면 Neumann 급수 $\sum_{n=0}^\infty (T/\lambda)^n$으로 역원이 구성되므로), 스펙트럼 반경은
+
+$$r(T) = \lim_{n \to \infty} \|T^n\|^{1/n}$$
+
+으로 주어진다. 자기수반 연산자에서 $r(T) = \|T\|$이고 스펙트럼은 $\mathbb{R}$에 놓인다. 이동 연산자(shift operator)는 $\sigma_p(S) = \emptyset$ — 고유값이 전혀 없지만 — $\sigma(S) = \partial B_1(0)$으로 스펙트럼은 존재한다. 점 스펙트럼과 연속 스펙트럼의 차이가 여기서 드러난다.
+
+<Callout type="warning" title="RNN 학습 안정성의 수학">
+RNN에서 시간 $t$까지의 그래디언트는 $(W^T)^{T-t}$에 비례한다. $r(W) < 1$이면 기하급수적 감소 (vanishing), $r(W) > 1$이면 기하급수적 증가 (exploding). Spectral normalization $W' = W / \sigma(W)$는 $r(W') = 1$을 강제해 안정성을 얻는다.
+</Callout>
+
+## Fredholm 대안 — 정규화의 이유
+
+컴팩트 연산자의 방정식론인 Fredholm 이론은 왜 $\lambda > 0$이 필수인지 정확히 설명한다.
+
+<Theorem kind="theorem" number="4" title="Fredholm 대안">
+$K \in \mathcal{K}(X)$이면, $(I - K)f = g$에 대해 정확히 다음 중 하나가 참이다.
+
+**(1)** 모든 $g$에 대해 유일해가 존재한다.
+
+**(2)** $\ker(I - K) \neq \{0\}$이고, $(I - K)f = g$는 $g \perp \ker(I - K^*)$일 때만 해를 가지며 해는 유일하지 않다.
+</Theorem>
+
+$\lambda = 0$이면 $Kf = g$가 이 대안에 걸려 해가 없거나 무한히 많을 수 있다. $\lambda > 0$은 이를 피한다 — 모든 고유값 $\lambda_n \geq 0$에 대해 $\lambda_n + \lambda \geq \lambda > 0$이므로 $(K + \lambda I)^{-1}$이 항상 존재한다.
+
+스펙트럼 분해로 보면:
+
+$$(K + \lambda I)^{-1} = \sum_{n=1}^\infty \frac{1}{\lambda_n + \lambda} e_n e_n^*$$
+
+작은 고유값 $\lambda_n \ll \lambda$에 대응하는 성분은 $\approx 1/\lambda$로 감쇠된다. 이것이 정규화가 불안정한 방향을 누르는 메커니즘이다.
+
+<Callout type="note" title="트레이드오프">
+$\lambda$를 키우면 $(K + \lambda I)^{-1}$의 노름이 $1/\lambda$로 작아져 안정성이 높아지지만, 작은 고유값 방향의 정보가 과도하게 감쇠되어 편향(bias)이 커진다. Kernel Ridge Regression에서 $\lambda$는 분산-편향 트레이드오프를 직접 조절하는 파라미터다. 최적 $\lambda$는 cross-validation 또는 Generalized Cross-Validation(GCV)으로 선택한다.
+</Callout>
+
+## 정리
+
+- 컴팩트 연산자는 "유한랭크의 극한"이다 — 무한차원 공간

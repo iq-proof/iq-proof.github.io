@@ -1,0 +1,121 @@
+---
+title: "RKHS는 왜 머신러닝의 이론적 토대인가"
+description: "점평가의 연속성이라는 단순한 조건에서 커널 트릭, Representer 정리, Gaussian Process의 동치까지, RKHS가 커널 메서드 전체를 하나로 묶는 방식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [rkhs, kernel-methods, reproducing-kernel, representer-theorem, gaussian-process]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+SVM, Gaussian Process, Kernel Ridge Regression은 표면적으로 다른 알고리즘이다. 그런데 이 셋은 같은 수학적 구조 위에 서 있다 — **재생핵 힐베르트 공간(RKHS)**. 왜 이 공간이 필요한가? 그리고 이 공간의 어떤 성질이 무한차원 문제를 유한차원으로 축소시키는가?
+
+## 점평가(Evaluation)가 연속이 아닐 수 있다
+
+유한차원 $\mathbb{R}^d$에서는 좌표 $x$를 꺼내는 것이 자명하게 연속이다. 무한차원 함수 공간에서는 그렇지 않다. $L^2[0,1]$의 두 함수 $f$와 $g$는 거의 어디서나(almost everywhere) 같아도 특정 점에서 $f(0.5) \neq g(0.5)$일 수 있다. 측도 0인 집합에서 다를 수 있기 때문이다.
+
+RKHS는 이 문제를 정면 돌파한다. **점평가 범함수 $\delta_x: f \mapsto f(x)$가 유계 선형범함수**가 되도록 강제하는 힐베르트 공간이다. 즉,
+
+$$|f(x)| \leq M_x \|f\|_H \quad \forall f \in H$$
+
+가 성립해야 한다. Riesz 표현 정리에 의해 이 조건은 곧 각 $x$마다 유일한 $k_x \in H$가 존재해서
+
+$$f(x) = \langle f, k_x \rangle_H$$
+
+가 성립함을 뜻한다. 이것이 **재생성질(reproducing property)**이다. $k(x, y) := \langle k_x, k_y \rangle_H$로 정의된 함수 $k: X \times X \to \mathbb{R}$가 재생핵이다.
+
+## 재생핵의 대수적 구조 — 양정치성
+
+어떤 함수 $k$가 재생핵이 될 수 있는 조건은 단순하다. 임의의 유한 점집합 $\{x_1, \ldots, x_n\}$과 계수 $\alpha_i$에 대해
+
+$$\sum_{i,j} \alpha_i \alpha_j k(x_i, x_j) \geq 0$$
+
+이 성립하면 된다. 이를 **양정치(positive definite) 커널**이라 한다. 기하학적으로 이 조건은 "어떤 힐베르트 공간 $H$와 특성 맵 $\phi: X \to H$가 존재해서 $k(x,y) = \langle \phi(x), \phi(y) \rangle_H$"와 동치다.
+
+<Callout type="note" title="트레이드오프">
+양정치 커널은 **합, 양의 스칼라 배, 원소별 곱**에 대해 닫혀 있다. 복합 커널 설계가 가능한 이유다. 반면 양정치가 아닌 커널을 SVM에 쓰면 그람 행렬이 PSD가 아니게 되어 쌍대 최적화 문제가 비볼록(non-convex)이 된다. 음의 고유값이 생기는 순간 "최대 마진"이라는 개념 자체가 무너진다.
+</Callout>
+
+Gaussian 커널 $k(x,y) = \exp(-\|x-y\|^2/(2\sigma^2))$이 양정치임은 Bochner 정리로 보인다 — Fourier 변환 $\hat{h}(\omega) = (2\pi\sigma^2)^{d/2} \exp(-\sigma^2\|\omega\|^2/2) > 0$이므로.
+
+## Moore-Aronszajn 정리 — 커널 하나가 RKHS 하나를 결정한다
+
+역방향 질문이 더 중요하다. 양정치 커널이 주어졌을 때 어떤 RKHS가 존재하는가? Moore-Aronszajn 정리의 답은 명쾌하다.
+
+<Theorem kind="theorem" number="1" title="Moore-Aronszajn">
+양정치 커널 $k: X \times X \to \mathbb{R}$에 대해, 유일한 RKHS $H_k$가 존재하여 재생성질 $f(x) = \langle f, k(\cdot, x) \rangle_{H_k}$를 만족한다.
+</Theorem>
+
+<Proof>
+핵 함수들의 유한 선형결합으로 사전 공간 $H_0 = \mathrm{span}\{k(\cdot, x): x \in X\}$를 만들고, 양정치 조건으로부터 내적 $\langle \sum \alpha_i k(\cdot, x_i), \sum \beta_j k(\cdot, y_j) \rangle := \sum_{i,j} \alpha_i \beta_j k(x_i, y_j)$를 정의한다. 이 내적이 양정치임은 $\|\sum \alpha_i k(\cdot, x_i)\|^2 = \sum_{i,j} \alpha_i \alpha_j k(x_i, x_j) \geq 0$에서 나온다. $H_k := \overline{H_0}$ (완비화)로 정의하면, 내적의 연속성으로부터 완비 공간에서도 재생성질이 유지된다. 유일성은 완비화의 유일성에서 따른다. $\square$
+</Proof>
+
+이 정리의 의미: 커널 하나를 정의하는 것은 RKHS 하나를 정의하는 것과 완전히 동치다. 커널 엔지니어링이 곧 함수 공간 설계다.
+
+## Representer 정리 — 무한차원 최적화가 왜 유한차원이 되는가
+
+커널 메서드의 실용성은 여기서 나온다. RKHS $H_k$에서 정규화된 손실 최소화 문제
+
+$$\min_{f \in H_k} \left[\sum_{i=1}^n L(y_i, f(x_i)) + \lambda \|f\|_{H_k}^2\right]$$
+
+의 최적해는 항상 훈련 데이터의 커널 함수로만 표현된다.
+
+<Theorem kind="theorem" number="2" title="Representer 정리">
+위 최적화 문제의 모든 최적해 $f^*$는 $f^*(x) = \sum_{i=1}^n \alpha_i k(x, x_i)$ 형태를 가진다.
+</Theorem>
+
+<Proof>
+직교 분해 $H_k = H_0 \oplus H_0^\perp$에서 임의의 $f = f_\parallel + f_\perp$로 쓴다. 재생성질에 의해 $f_\perp \perp k(\cdot, x_i)$이므로 $f(x_i) = f_\parallel(x_i)$ — 손실 항은 $f_\perp$에 무관하다. 반면 노름은 $\|f\|^2 = \|f_\parallel\|^2 + \|f_\perp\|^2 \geq \|f_\parallel\|^2$. 따라서 $f_\perp \neq 0$이면 $\mathcal{J}(f_\parallel) < \mathcal{J}(f)$로 최적성에 모순. $\square$
+</Proof>
+
+이로부터 무한차원 문제는 $n$개 계수 $\alpha$의 최적화로 축소된다. 제곱 손실에서는 $\alpha = (K + \lambda I)^{-1} y$로 닫힌 형태 해가 존재한다 — 이것이 **Kernel Ridge Regression(KRR)**이다.
+
+## Gaussian Process와 RKHS — 베이지안 관점의 동치
+
+KRR과 Gaussian Process는 놀랍도록 가깝다. 사전분포 $f \sim \mathrm{GP}(0, k)$와 노이즈 모델 $y_i = f(x_i) + \epsilon_i$, $\epsilon_i \sim \mathcal{N}(0, \sigma^2)$ 아래에서 GP의 사후 평균은
+
+$$\mu(x_*) = k(x_*, X)\,[K + \sigma^2 I]^{-1} y$$
+
+이다. $\lambda = \sigma^2$로 놓으면 KRR의 최적해와 **정확히 일치**한다.
+
+<Aside label="Driscoll 정리의 역설">
+GP 사후 평균 $\mu$는 RKHS $H_k$에 속한다 — $\|\mu\|_{H_k} < \infty$. 그러나 GP 샘플 경로 $f \sim \mathrm{GP}(0, k)$는 확률 1로 $H_k$에 속하지 않는다. Mercer 전개에서 $\|f\|_{H_k}^2 = \sum_n c_n^2/\lambda_n$이고 $c_n \sim \mathcal{N}(0, \lambda_n)$이므로 $\mathbb{E}[c_n^2/\lambda_n] = 1$, 합이 발산한다. 정규화는 분포의 "중심"만 제약하고, "꼬리"는 여전히 거칠다.
+</Aside>
+
+두 관점의 차이는 정보다. KRR은 점 예측만 준다. GP는 예측 분산 $\sigma^2(x_*) = k(x_*, x_*) - k(x_*, X)[K + \sigma^2 I]^{-1} k(X, x_*)$까지 준다. 이 불확실성이 Bayesian Optimization의 획득 함수 $\mathrm{UCB}(x) = \mu(x) + \beta\,\sigma(x)$를 가능하게 한다.
+
+## 정리
+
+- RKHS는 점평가 범함수의 연속성을 요구하는 유일한 힐베르트 공간 구조다.
+- 양정치 커널과 RKHS는 일대일 대응한다 (Moore-Aronszajn). 커널 설계 = 함수 공간 설계.
+- Representer 정리는 무한차원 정규화 최적화를 $n$차원 문제로 축소한다. 커널 메서드가 계산 가능한 이유다.
+- GP 사후 평균과 KRR은 $\lambda = \sigma^2$에서 동치다. 베이지안 관점이 불확실성 정량화를 추가한다.
+
+SVM의 쌍대 문제, GP의 사후 추론, KRR의 정규화 — 이 셋은 RKHS라는 공통 언어의 다른 방언이다.
+
+<Reference
+  title="Learning with Kernels: Support Vector Machines, Regularization, Optimization, and Beyond"
+  authors="Bernhard Schölkopf and Alexander J. Smola"
+  year={2002}
+  venue="MIT Press"
+  url="https://mitpress.mit.edu/9780262536578/learning-with-kernels/"
+/>
+
+<Reference
+  title="Gaussian Processes for Machine Learning"
+  authors="Carl Edward Rasmussen and Christopher K. I. Williams"
+  year={2006}
+  venue="MIT Press"
+  url="https://gaussianprocess.org/gpml/"
+/>

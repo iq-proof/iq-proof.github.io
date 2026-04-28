@@ -1,0 +1,109 @@
+---
+title: "함수해석학은 왜 딥러닝의 언어인가"
+description: "유계 선형 연산자의 안정성 조건부터 Hahn-Banach의 분리 정리, 약수렴의 컴팩트성까지 — 신경망 설계에 숨어있는 함수해석학의 통일 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [functional-analysis, operator-norm, hahn-banach, weak-convergence, deep-learning]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+신경망을 행렬의 합성으로만 보면 구현을 이해할 수 있지만, 왜 그 구현이 동작하는지는 설명하기 어렵다. Spectral Norm Regularization이 GAN을 안정화시키는 이유, SVM 초평면이 반드시 존재하는 이유, 유계 최적화 수열이 수렴 부분수열을 갖는 이유 — 이 모든 것은 함수해석학의 같은 언어로 쓰여 있다. 그 언어의 핵심 문법은 무엇인가?
+
+## 유계성 — 안정성의 수학적 이름
+
+신경망 레이어 $T: X \to Y$는 선형 연산자다. 이 연산자가 **유계(bounded)**라는 것은 어떤 $M > 0$이 존재하여
+
+$$\|T(x)\|_Y \leq M \|x\|_X \quad \forall x \in X$$
+
+가 성립한다는 뜻이다. 연산자 노름은 그 최악의 증폭 배수다.
+
+$$\|T\| = \sup_{\|x\|_X = 1} \|T(x)\|_Y$$
+
+유한차원에서는 모든 선형 연산자가 자동으로 유계다. 최대 특이값이 $M$ 역할을 한다. 무한차원에서는 다르다. 미분 연산자 $\frac{d}{dx}$는 $f_n(x) = x^n$처럼 $L^2$ 노름은 작지만 도함수 노름은 $n$에 따라 무한히 커지는 함수열이 존재하기 때문에 비유계다.
+
+선형 연산자에서 유계 $\Leftrightarrow$ 연속 $\Leftrightarrow$ 0에서 연속이라는 동치가 성립한다. 유계 연산자는 입력의 작은 변화가 출력에 큰 변화를 만들지 않음을 보장한다. 깊은 신경망 $f = T_L \circ \cdots \circ T_1$에서 합성의 노름 부등식
+
+$$\|f\| \leq \|T_L\| \cdots \|T_1\|$$
+
+은 각 레이어의 $\|T_i\| > 1$이면 경사가 지수적으로 폭발함을 예측한다. Spectral Norm Regularization이 $\|W_i\|_{\text{op}} \leq 1$을 강제하는 이유가 여기 있다.
+
+## 연산자 공간과 Banach-Steinhaus
+
+유계 선형 연산자들을 모은 $B(X, Y)$는 그 자체로 벡터 공간이다. $Y$가 Banach 공간이면 $B(X, Y)$도 Banach 공간 — Cauchy 수열의 극한이 항상 $B(X, Y)$ 안에 존재한다.
+
+이 완비성은 **Banach-Steinhaus 정리(균일 유계 원리)**와 맞닿아 있다. Baire 범주 정리를 경유하는 이 결과는 강력한 메시지를 전한다.
+
+<Callout type="note" title="Banach-Steinhaus (균일 유계 원리)">
+연산자 족 $(T_\alpha)$가 모든 점 $x$에서 점별로 유계이면 — $\sup_\alpha \|T_\alpha(x)\| < \infty$ — 연산자 노름도 균일하게 유계이다: $\sup_\alpha \|T_\alpha\| < \infty$. 점별 유계 $\Rightarrow$ 균일 유계.
+</Callout>
+
+신경망 훈련에서 각 배치마다 개별 가중치 행렬이 점별로 제어된다는 보장만으로는 부족하다. 전체 학습 과정에서 균일한 제어 — Batch Normalization이나 Spectral Norm이 노리는 것 — 가 있어야 수렴이 수치적으로 안정적이다.
+
+## 쌍대공간 — 경사는 어디에 사는가
+
+손실 함수 $L: \mathbb{R}^n \to \mathbb{R}$의 경사 $\nabla L(w)$는 엄밀히는 **쌍대공간** $(\mathbb{R}^n)^*$의 원소다. $(\mathbb{R}^n)^* \cong \mathbb{R}^n$이기 때문에 실용적으로 구분할 필요는 없지만, 무한차원으로 넘어가면 이 구분이 핵심이 된다. $X$의 쌍대공간 $X^* = B(X, \mathbb{K})$는 $X$의 완비성에 무관하게 항상 Banach 공간이다.
+
+<Theorem kind="theorem" number="1" title="L^p의 쌍대 (Riesz 표현 정리)">
+$1 < p < \infty$이고 $1/p + 1/q = 1$일 때, 임의의 $\varphi \in (L^p)^*$에 대해 유일한 $g \in L^q$가 존재하여
+$$\varphi(f) = \int f(x)\, g(x)\, dx$$
+이며, $\|\varphi\|_{(L^p)^*} = \|g\|_{L^q}$이다.
+</Theorem>
+
+<Proof>
+$g \in L^q$가 주어졌을 때, Hölder 부등식 $\left|\int fg\right| \leq \|f\|_{L^p} \|g\|_{L^q}$에 의해 $\varphi(f) = \int fg$는 $(L^p)^*$의 원소이고 $\|\varphi\| \leq \|g\|_{L^q}$이다. 역방향은 Radon-Nikodym 정리를 경유해 단순함수에서 극한으로 확장하여 증명한다. $\square$
+</Proof>
+
+이 정리는 $L^p$ ($1 < p < \infty$)가 **반사적(reflexive)** 공간임을 함의한다: $X^{**} \cong X$. 켤레 지수 $1/p + 1/q = 1$은 이 쌍대성의 대수적 표현이며, $p$-노름 정규화의 이론적 근거가 모두 Hölder 부등식과 이 관계에서 나온다.
+
+## Hahn-Banach — 분리가 존재하는 이유
+
+SVM 최대 마진 초평면은 왜 반드시 존재하는가? 두 클래스의 볼록 껍질이 서로소이기만 하면 분리 초평면이 반드시 존재한다는 보장은 **Hahn-Banach 분리 정리**에서 온다.
+
+$A$, $B$가 공집합이 아닌 볼록집합이고 $A \cap B = \emptyset$, $A$가 열린집합이면 $\varphi \in X^*$와 $c \in \mathbb{R}$가 존재하여
+
+$$\varphi(x) < c \leq \varphi(y) \quad \forall x \in A,\; y \in B$$
+
+이 정리는 비구성적이다 (Zorn 보조정리 경유). 초평면을 직접 찾아주지 않는다. 하지만 **존재성**을 보장한다는 것 자체가 이론의 역할이다. SVM은 이 존재 보장 위에서 최대 마진이라는 추가 조건으로 초평면을 유일하게 결정한다. 볼록 최적화에서 강쌍대성도 같은 뿌리를 갖는다 — Slater 조건 아래에서 Hahn-Banach가 쌍대 격차(duality gap)를 0으로 만들어 라그랑주 승수 방법이 성립한다.
+
+<Callout type="note" title="트레이드오프">
+Hahn-Banach는 **유계 범함수에만 적용**된다. 증명이 Zorn 보조정리(선택 공리 의존)에 기반한 비구성적 논증이므로, 실제로 확장을 구성하는 것은 매우 어렵다. Slater 조건이 없으면 강쌍대성이 실패하고 쌍대 격차가 발생할 수 있다.
+</Callout>
+
+## 약수렴과 무한차원의 컴팩트성
+
+유한차원에서 Bolzano-Weierstrass 정리는 유계 수열이 항상 수렴 부분수열을 가짐을 보장한다. 무한차원에서 이것은 강수렴 의미에서 일반적으로 거짓이다.
+
+$\ell^2$의 표준 기저 $e_n$을 생각하자. $\|e_n\| = 1$이므로 유계지만 $\|e_m - e_n\| = \sqrt{2}$ ($m \neq n$)이므로 강수렴하지 않는다. 그러나 **약수렴**은 한다: $(y_n) \in \ell^2$이면 $\sum |y_n|^2 < \infty$이므로 $y_n \to 0$이고, 따라서 $\langle e_n, y \rangle = y_n \to 0$이 모든 $y \in \ell^2$에 대해 성립한다. 즉 $e_n \rightharpoonup 0$.
+
+<Theorem kind="theorem" number="2" title="Hilbert 공간에서 약수렴 + 노름 수렴 = 강수렴">
+Hilbert 공간 $H$에서 $x_n \rightharpoonup x$ (약수렴)이고 $\|x_n\| \to \|x\|$이면, $x_n \to x$ (강수렴)이다.
+</Theorem>
+
+<Proof>
+$$\|x_n - x\|^2 = \|x_n\|^2 - 2\langle x_n, x\rangle + \|x\|^2$$
+약수렴에 의해 $\langle x_n, x \rangle \to \|x\|^2$, 노름 가정에 의해 $\|x_n\|^2 \to \|x\|^2$이므로 $\|x_n - x\|^2 \to 0$이다. $\square$
+</Proof>
+
+약수렴의 힘은 **Banach-Alaoglu 정리**에서 정점을 이룬다: 쌍대공간 $X^*$의 단위공은 약*위상에서 컴팩트이다. 반사적 공간($L^p$, $1 < p < \infty$)에서는 유계 수열이 반드시 약수렴 부분수열을 갖는다. 변분법의 직접법이 최솟값 달성을 보장하는 것도, Wasserstein GAN이 분포 수렴을 약*위상으로 정의하는 것도 이 컴팩트성에 기댄다.
+
+## 정리
+
+함수해석학의 다섯 층위 — 유계성, 연산자 공간, 쌍대공간, Hahn-Banach, 약수렴 — 는 각각 독립된 이론이 아니라 하나의 질문의 다른 표현이다: **무한차원에서 선형 구조를 어떻게 안정적으로 다룰 것인가?**
+
+- 유계 연산자는 안정성과 연속성을 동치로 만든다.
+- $B(X, Y)$의 완비성과 Banach-Steinhaus는 점별 제어를 균일 제어로 끌어올린다.
+- Riesz 표현 정리와 쌍대공간은 경사와 범함수를 구체적 대상으로 만든다.
+- Hahn-Banach는 분리와 쌍대성의 존재를 보장한다.
+- 약수렴과 Banach-Alaoglu는 강수렴이 실패하는 곳에서 컴팩트성을 복원한다.
+
+신경망은 유한차원 행렬의 합성이지만, 그 설계 원리는 무한차원 함수 공간의 언어로 쓰여 있다. 그 언어를 읽을 수 있을 때, 왜 어떤 정규화는 작동하고 어떤 최적화는

@@ -1,0 +1,127 @@
+---
+title: "무한차원은 왜 다른가 — 함수해석학이 AI에 던지는 질문"
+description: "거리공간의 완비성부터 Riesz 보조정리까지, 유한차원의 직관이 무한차원에서 무너지는 지점과 그 귀결로서의 정규화를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [functional-analysis, banach-space, completeness, regularization, optimization]
+difficulty: advanced
+series:
+  slug: functional-analysis-deep-dive
+  title: Functional Analysis Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망 훈련은 고차원 공간에서의 반복 알고리즘이다. 유한차원에서는 Cauchy 수열이 수렴하고, 닫힌 유계 집합은 컴팩트하며, 연속함수는 최솟값을 달성한다. 그런데 파라미터 수를 무한으로 보내면 — 또는 함수공간 자체를 탐색 공간으로 설정하면 — 이 "당연한" 사실들이 전부 무너진다. 왜 그런가?
+
+## 완비성 — "극한이 같은 공간 안에 있다"는 보장
+
+거리공간 $(X, d)$에서 Cauchy 수열이란 항들이 서로 임의로 가까워지는 수열이다.
+
+$$\forall \varepsilon > 0,\ \exists N \text{ s.t. } m, n > N \implies d(x_m, x_n) < \varepsilon$$
+
+수렴은 극한점의 **존재**를 전제하지만, Cauchy 수열은 그렇지 않다. 유리수 $\mathbb{Q}$에서 $\sqrt{2}$를 Newton 방법으로 근사하는 수열은 완벽한 Cauchy 수열이지만, 극한 $\sqrt{2} \notin \mathbb{Q}$이다. 이것이 $\mathbb{Q}$가 완비가 아닌 이유다.
+
+**완비 거리공간**은 "모든 Cauchy 수열이 같은 공간 안에서 수렴"한다는 추가 보장을 준다. 경사하강법의 반복
+
+$$\theta_{n+1} = \theta_n - \alpha \nabla L(\theta_n)$$
+
+이 Cauchy 수열을 이룬다면, 완비 공간에서는 극한이 존재함을 보장할 수 있다. 함수공간이 완비가 아니라면, 손실이 단조 감소해도 수렴점이 공간 밖에 있을 수 있다.
+
+<Theorem kind="theorem" number="1" title="Banach 고정점 정리">
+$X$가 완비 거리공간이고 $T: X \to X$가 수축 사상($\exists k \in (0,1)$: $d(Tx, Ty) \leq k \cdot d(x,y)$)이면, $T$는 유일한 고정점 $x^*$를 가지며 임의의 $x_0$에서 시작한 반복 수열 $x_{n+1} = Tx_n$은 $x^*$로 수렴한다.
+</Theorem>
+
+<Proof>
+반복 수열의 항 간 거리를 귀납적으로 추정하면 $d(x_{n+1}, x_n) \leq k^n d(x_1, x_0)$이고, $m > n$에 대해
+
+$$d(x_m, x_n) \leq \frac{k^n}{1-k} d(x_1, x_0) \to 0$$
+
+이므로 수열은 Cauchy다. $X$의 완비성으로 극한 $x^* \in X$가 존재하고, $T$의 연속성(수축 $\Rightarrow$ 연속)에 의해 $Tx^* = x^*$. 유일성은 두 고정점 $x, y$에 대해 $d(x,y) = d(Tx,Ty) \leq k \cdot d(x,y)$이고 $k < 1$이므로 $d(x,y) = 0$. $\square$
+</Proof>
+
+## 노름공간 — 거리보다 강한 구조
+
+거리는 두 점 사이의 간격만 잰다. **노름**은 거기에 벡터공간 구조를 얹는다.
+
+$$\text{(N1) } \|x\| \geq 0,\quad \|x\|=0 \iff x=0 \qquad \text{(N2) } \|\alpha x\| = |\alpha|\|x\| \qquad \text{(N3) } \|x+y\| \leq \|x\|+\|y\|$$
+
+노름이 유도하는 거리 $d(x,y) = \|x-y\|$는 **이동불변**이다. 완비 노름공간을 **Banach 공간**이라 부른다.
+
+$\mathbb{R}^n$에서 $L^1, L^2, L^\infty$ 노름은 모두 동치다 — 어느 노름으로 재든 같은 수열이 수렴한다. 이 동치성은 **유한차원의 특권**이다. 함수공간 $C([0,1])$에서 $L^2$ 노름과 $L^\infty$ 노름은 동치가 아니다. $L^\infty$는 최대 편차를, $L^2$는 평균 제곱을 재기 때문이다.
+
+신경망 정규화의 기하학적 차이는 여기서 나온다. $L^1$ 정규화의 등고선은 마름모 모양으로 꼭짓점에서 희소해(sparse solution)를 촉진하고, $L^2$ 정규화의 등고선은 원형으로 균등 감쇠를 유도한다.
+
+## $L^p$ 공간과 Riesz-Fischer — 함수도 Banach 공간을 이룬다
+
+함수들의 집합을 노름공간으로 만들려면 "거의 모든 곳(a.e.)"에서 같은 함수를 동일시해야 한다. 그 위에서
+
+$$\|f\|_p = \left(\int |f(x)|^p d\mu\right)^{1/p}, \quad 1 \leq p < \infty$$
+
+로 정의된 $L^p$ 공간은 세 가지 핵심 사실로 요약된다.
+
+**Hölder 부등식** ($1/p + 1/q = 1$):
+
+$$\int |fg|\, d\mu \leq \|f\|_p \|g\|_q$$
+
+**Minkowski 부등식**:
+
+$$\|f + g\|_p \leq \|f\|_p + \|g\|_p$$
+
+**Riesz-Fischer 정리**: $L^p$는 완비다 — 모든 Cauchy 수열이 $L^p$ 안에서 수렴한다.
+
+MSE 손실 $\|y - \hat{y}\|_2^2$은 $L^2$ 노름이고, MAE 손실 $\|y - \hat{y}\|_1$은 $L^1$ 노름이다. 이들이 완비 공간의 노름이라는 사실이 최적화 수렴 분석의 토대를 이룬다.
+
+## 무한차원에서 무너지는 것 — Riesz 보조정리
+
+유한차원($\mathbb{R}^n$)에서 Heine-Borel 정리는 "닫혀있고 유계이면 컴팩트"라고 보장한다. 컴팩트성은 연속함수의 최솟값 달성을 보장하는 성질이다.
+
+무한차원 Banach 공간에서는 이것이 **거짓**이다.
+
+<Theorem kind="lemma" number="2" title="Riesz 보조정리">
+$X$가 무한차원 Banach 공간이고 $Y \subsetneq X$가 닫힌 진부분공간이면, 임의의 $\varepsilon \in (0,1)$에 대해 $\|x_\varepsilon\| = 1$이고 $d(x_\varepsilon, Y) > 1 - \varepsilon$인 $x_\varepsilon \in X$가 존재한다.
+</Theorem>
+
+<Proof>
+$z \in X \setminus Y$를 잡고 $d := d(z, Y) > 0$ ($Y$가 닫혀있으므로). $\varepsilon$에 대해 $\|z - y_0\| < d/(1-\varepsilon)$인 $y_0 \in Y$를 고른다. $x_\varepsilon = (z - y_0)/\|z - y_0\|$로 정의하면 $\|x_\varepsilon\| = 1$이고, 임의의 $y \in Y$에 대해
+
+$$\|x_\varepsilon - y\| = \frac{\|z - (y_0 + \|z-y_0\|y)\|}{\|z-y_0\|} \geq \frac{d}{\|z-y_0\|} > 1 - \varepsilon. \quad \square$$
+</Proof>
+
+이 보조정리를 반복 적용하면 단위구 위에 서로 $1/2$ 이상 떨어진 수열 $\{x_n\}$을 무한히 구성할 수 있다. 이 수열은 수렴하는 부분수열을 가질 수 없으므로, **무한차원 Banach 공간의 단위구는 컴팩트하지 않다**.
+
+<Callout type="warning" title="최솟값의 부재">
+무한차원 함수공간에서 손실함수 $\min_f L(f)$는 하한이 존재해도 최솟값을 달성하지 못할 수 있다. 이것이 딥러닝에서 정규화가 단순한 과적합 방지 이상의 역할을 하는 이유다.
+</Callout>
+
+## 정규화 — 유한차원성의 인공적 복구
+
+$L^2$ 정규화를 붙인 문제
+
+$$\min_w \left[L(w) + \lambda \|w\|_2^2\right]$$
+
+는 레벨 집합 $\{w : L(w) + \lambda\|w\|_2^2 \leq c\}$가 유계이므로, 완비 공간에서 최솟값의 존재를 보장하는 방향으로 작용한다. Dropout은 랜덤하게 뉴런을 끔으로써 함수공간을 실질적으로 유한차원화하고, 배치 정규화는 활성값을 제한된 범위로 가둔다.
+
+이 기법들이 공통적으로 하는 일은 하나다 — **무한차원 탐색 공간에 컴팩트성과 유사한 제약을 부과**해 Heine-Borel이 다시 작동하도록 만드는 것이다.
+
+Weierstrass 근사 정리("다항식은 $C([a,b])$에서 조밀하다")가 신경망의 Universal Approximation 정리의 기초가 되듯, 함수해석학의 결과들은 딥러닝의 작동 원리를 설명하는 언어를 제공한다.
+
+<Aside label="직관">
+유한차원의 "좋은 성질"들 — Heine-Borel, 노름 동치성, 최솟값 달성 — 은 전부 차원이 유한하다는 사실에서 나온다. 무한차원으로 가는 순간 이들은 추가 가정 없이는 성립하지 않는다. 딥러닝의 수많은 실용적 기법들은 그 추가 가정을 공학적으로 강제하는 방법들이다.
+</Aside>
+
+## 정리
+
+- Cauchy 수열의 수렴을 보장하는 **완비성**이 없으면 반복 알고리즘의 극한이 공간 밖으로 탈출할 수 있다.
+- $L^p$ 공간은 Riesz-Fischer 정리에 의해 완비 Banach 공간이며, 신경망 손실함수 대부분은 이 구조 위에 정의된다.
+- 유한차원에서 자명한 **컴팩트성(Heine-Borel)**은 무한차원에서 Riesz 보조정리에 의해 깨진다 — 단위구가 컴팩트하지 않다.
+- $L^2$ 정규화·Dropout·배치 정규화는 모두 무한차원 탐색 공간에 유한차원성을 인공적으로 복구하는 기법이다.
+
+다음 글에서는 Banach 공간에 내적 구조를 추가한 Hilbert 공간을 다루고, 정사영(projection)과 Riesz 표현 정리가 어떻게 kernel 방법과 attention 메커니즘의 수학적 토대가 되는지 추적한다.
