@@ -1,0 +1,127 @@
+---
+title: "ML 손실함수의 수학적 토대 — 기댓값에서 부등식까지"
+description: "르베그 적분으로서의 기댓값이 이산·연속·혼합을 단일 정의로 통합하는 원리부터, Jensen·Cauchy-Schwarz가 ELBO와 Cramér-Rao를 만들어내는 과정까지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [probability-theory, expectation, jensen-inequality, characteristic-function, measure-theory]
+difficulty: advanced
+series:
+  slug: probability-theory-deep-dive
+  title: Probability Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+ML의 모든 손실함수는 기댓값이다. $L(\theta) = \mathbb{E}_{(x,y)\sim D}[\ell(f_\theta(x), y)]$. 회귀든 분류든, VAE의 ELBO든 RL의 가치함수든, 형태만 다를 뿐 구조는 같다. 그렇다면 이 "기댓값"이라는 개념은 이산 데이터와 연속 데이터를 어떻게 동시에 품는가? 그리고 KL divergence가 0 이상이고 ELBO가 하한이라는 사실은 어디서 오는가?
+
+## 기댓값의 단일 정의
+
+고등학교에서는 이산과 연속을 따로 배운다.
+
+$$
+\mathbb{E}[X] = \sum_i x_i p_i \quad \text{(이산)}, \qquad \mathbb{E}[X] = \int x f(x)\,dx \quad \text{(연속)}
+$$
+
+그런데 실제 ML 데이터는 이 둘의 혼합이다. 픽셀값은 연속처럼 보이지만 8비트 정수다. 레이블은 이산이다. 측도론은 이 두 식을 하나로 통합한다.
+
+$$
+\mathbb{E}[X] := \int_\Omega X(\omega)\,d\mathbb{P}(\omega)
+$$
+
+이 르베그 적분 정의에서 이산 케이스는 $X = \sum_i x_i \mathbf{1}_{\{X=x_i\}}$로 쓴 단순함수의 적분이고, 연속 케이스는 Radon-Nikodym 도함수 $d\mathbb{P}_X = f_X\,dm$을 적용한 결과다. 형식이 다른 두 식이 사실 같은 정의의 두 얼굴이다.
+
+<Callout type="note" title="Cauchy 분포의 경고">
+PDF가 존재하고 대칭이어도 기댓값이 정의되지 않을 수 있다. Cauchy 분포 $f(x) = 1/[\pi(1+x^2)]$에서 $\int_0^\infty x/(1+x^2)\,dx = \infty$이므로 $\mathbb{E}[|X|] = \infty$. $X \notin L^1$이라 기댓값 자체가 정의되지 않는다. "대칭이니까 0이겠지"라는 추측은 틀렸다.
+</Callout>
+
+이 정의가 실용적으로 중요한 이유는 $L^p$ 공간의 위계를 만들기 때문이다. $L^1$이면 기댓값이 존재하고, $L^2$이면 분산이 유한하다. ML 모델을 분석할 때 "이 분포가 $L^2$에 있는가"라는 질문은 "분산이 유한한가"와 동치다.
+
+## LOTUS — 분포만 알면 충분하다
+
+기댓값이 $\Omega$ 위의 적분으로 정의됐지만, 실제 계산은 $\mathbb{R}$ 위에서 한다. 이를 정당화하는 것이 LOTUS다.
+
+$$
+\mathbb{E}[g(X)] = \int_\Omega g(X(\omega))\,d\mathbb{P}(\omega) = \int_\mathbb{R} g(x)\,d\mathbb{P}_X(x)
+$$
+
+증명 구조는 측도론의 표준 패턴을 따른다. 지시함수 $g = \mathbf{1}_B$에서 시작해 단순함수, 음이 아닌 가측함수, 일반 함수 순으로 단조수렴정리(MCT)를 거쳐 확장한다. 이 4단계 패턴은 측도론적 정리 증명의 공통 구조다.
+
+ML에서 LOTUS의 가치는 "표본평균이 모집단 기댓값을 추정한다"는 Monte Carlo의 이론적 정당성이다. $X_1, \ldots, X_n$ i.i.d. $\sim \mathbb{P}_X$라면 LOTUS + SLLN으로
+
+$$
+\frac{1}{n}\sum_{i=1}^n g(X_i) \xrightarrow{a.s.} \mathbb{E}[g(X)]
+$$
+
+가 성립한다. 학습 루프에서 미니배치 손실의 평균이 진짜 손실로 수렴한다는 보장이 여기서 나온다. Importance sampling의 측도 변환
+
+$$
+\mathbb{E}_p[g] = \mathbb{E}_q\!\left[\frac{p}{q}\,g\right]
+$$
+
+역시 LOTUS의 Radon-Nikodym 응용이다. off-policy RL과 VAE reparameterization trick이 모두 이 측도 변환에 기댄다.
+
+## 공분산과 $L^2$의 기하학
+
+분산과 공분산은 단순한 산포 측도가 아니다. $L^2(\Omega) = \{X : \mathbb{E}[X^2] < \infty\}$ 위에 내적 $\langle X, Y \rangle := \mathbb{E}[XY]$를 정의하면 $L^2$가 Hilbert 공간이 된다. 이 관점에서 상관계수는 두 확률변수 사이 각도의 코사인이다.
+
+$$
+\rho_{X,Y} = \frac{\text{Cov}(X,Y)}{\sigma_X \sigma_Y} = \frac{\langle X - \mu_X,\, Y - \mu_Y\rangle}{\|X - \mu_X\|\,\|Y - \mu_Y\|}
+$$
+
+<Theorem kind="proposition" number="1" title="Cauchy-Schwarz (L² 형태)">
+$X, Y \in L^2$에 대해 $|\mathbb{E}[XY]| \leq \sqrt{\mathbb{E}[X^2]}\cdot\sqrt{\mathbb{E}[Y^2]}$. 등호 $\Leftrightarrow$ $Y = aX$ a.s.
+</Theorem>
+
+<Proof>
+모든 $t \in \mathbb{R}$에 대해 $0 \leq \mathbb{E}[(X + tY)^2] = \mathbb{E}[X^2] + 2t\mathbb{E}[XY] + t^2\mathbb{E}[Y^2]$. 이 $t$의 이차식이 항상 0 이상이므로 판별식 $\leq 0$: $4(\mathbb{E}[XY])^2 - 4\mathbb{E}[X^2]\mathbb{E}[Y^2] \leq 0$. $\square$
+</Proof>
+
+중요한 함정 하나: **무상관 $\neq$ 독립**. $X \sim \mathcal{N}(0,1)$, $Y = X^2$로 놓으면 $\text{Cov}(X, Y) = \mathbb{E}[X^3] = 0$이지만 $Y$는 $X$의 함수다. PCA가 선형 관계만 잡고 ICA나 Mutual Information 기반 방법이 따로 필요한 이유다. SGD 미니배치 분산도 이 틀에서 깔끔하게 나온다. i.i.d. 샘플에서 $\text{Var}(\bar g) = \text{Var}(g)/B$이므로, 배치 크기 4배가 그래디언트 노이즈를 절반으로 줄이는 이유가 된다.
+
+## Jensen 부등식과 ML의 핵심 결과들
+
+볼록함수 $\varphi$에 대해 $\varphi(\mathbb{E}[X]) \leq \mathbb{E}[\varphi(X)]$. 증명은 단 한 줄이다. $\mu = \mathbb{E}[X]$에서 supporting line $\varphi(x) \geq \varphi(\mu) + \lambda(x-\mu)$가 존재하고, 양변에 기댓값을 취하면 우변의 $\lambda(\mathbb{E}[X] - \mu) = 0$이 사라진다.
+
+이 단순한 관찰에서 두 핵심 결과가 나온다.
+
+**KL 비음수성**: $-\log$가 볼록이므로
+
+$$
+\text{KL}(p \| q) = -\mathbb{E}_p[\log(q/p)] \geq -\log\mathbb{E}_p[q/p] = -\log 1 = 0
+$$
+
+**ELBO 하한**: $\log$가 오목이므로
+
+$$
+\log p_\theta(x) = \log \mathbb{E}_{q_\phi}\!\left[\frac{p_\theta(x,z)}{q_\phi(z|x)}\right] \geq \mathbb{E}_{q_\phi}\!\left[\log\frac{p_\theta(x,z)}{q_\phi(z|x)}\right] =: \text{ELBO}
+$$
+
+VAE의 목적함수가 왜 log-likelihood의 하한인지, KL 항이 왜 붙는지가 Jensen 한 번으로 설명된다. Cauchy-Schwarz는 **Cramér-Rao 하한**을 만든다. 불편추정량의 분산은 Fisher 정보의 역수보다 작을 수 없다. MLE가 점근적으로 효율적이라는 사실의 수학적 표현이다.
+
+<Callout type="note" title="트레이드오프: 부등식의 강도와 가정">
+Markov는 $X \geq 0$만 있으면 되지만 매우 느슨하다. Chebyshev는 $L^2$가 필요하고 두 꼬리를 제어한다. Hoeffding은 유계성이 필요하지만 지수적으로 tight하다. Cauchy 분포가 개입하면 분산이 무한대가 되어 Chebyshev 자체가 무력해지고, 집중 부등식 전체가 작동하지 않는다.
+</Callout>
+
+## MGF와 특성함수 — 분포의 지문
+
+Moment Generating Function $M_X(t) = \mathbb{E}[e^{tX}]$은 테일러 전개를 통해 모든 적률을 인코딩한다. $M_X^{(k)}(0) = \mathbb{E}[X^k]$이므로 독립 확률변수의 합에 대해 $M_{X+Y}(t) = M_X(t) \cdot M_Y(t)$가 성립한다. 그런데 Cauchy처럼 heavy tail이 있으면 $t \neq 0$에서 MGF가 발산해 존재하지 않는다.
+
+이를 해결하는 것이 특성함수 $\varphi_X(t) = \mathbb{E}[e^{itX}]$다. $|e^{itX}| = 1$이므로 어떤 분포에서도 $|\varphi_X(t)| \leq 1$이 보장된다. Cauchy의 특성함수는 $\varphi_X(t) = e^{-|t|}$이고, 표본평균 $\bar X_n$의 특성함수는 $(e^{-|t/n|})^n = e^{-|t|}$다. 표본평균이 단일 표본과 **같은 분포**를 가지므로, 데이터를 아무리 모아도 평균이 수렴하지 않는다.
+
+Lévy 연속정리는 분포 수렴을 특성함수의 점별 수렴으로 환원한다. CLT 증명은 표본평균을 정규화한 $Z_n = \sqrt{n}(\bar X - \mu)/\sigma$의 특성함수가
+
+$$
+\varphi_{Z_n}(t) \to e^{-t^2/2}
+$$
+
+로 수렴함을 테일러 전개로 보인 뒤, Lévy 정리로 $Z_n \xrightarrow{d} \mathcal{N}(0,1)$을 결론짓는다. MLE 점근 정규성도 같은 경로를 따른다.
+
+## 정리
+
+- 기댓값 $\mathbb{E}[X] = \int X\,d\mathbb{P}$는 이산·연속·혼합을 단일 정의로 통합한다. Cauchy처럼 $X \notin L^1$이면 기댓값 자체가 정의되지 않는다.
+- LOTUS는 "$X$의 분포만 알면 $g(X)$의 기댓값을 계산할 수 있다"는 원리로, Monte Carlo와 Importance

@@ -1,0 +1,123 @@
+---
+title: "다변수 정규분포는 왜 ML의 기반인가"
+description: "MVN의 PDF 유도부터 Affine 닫힘성, 조건부 분포의 Schur 보수, Gaussian Process, PCA까지 — 하나의 분포가 ML 전체를 어떻게 관통하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [multivariate-normal, gaussian-process, pca, covariance, probability]
+difficulty: advanced
+series:
+  slug: probability-theory-deep-dive
+  title: Probability Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+다변수 정규분포(MVN)는 ML에서 단순히 "자주 쓰이는" 분포가 아니다. VAE의 latent prior, GP 회귀의 posterior, Kalman filter의 state update, PCA의 기하학 — 이 모두가 MVN의 서로 다른 얼굴이다. 왜 이 하나의 분포가 이토록 많은 곳에서 나타나는가?
+
+## MVN의 구조: Mahalanobis 거리와 타원체
+
+1차원 정규분포의 지수부 $(x - \mu)^2 / \sigma^2$를 다차원으로 일반화하면 자연스럽게 **Mahalanobis 거리**가 등장한다.
+
+$$
+f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2} |\boldsymbol\Sigma|^{1/2}} \exp\!\left(-\frac{1}{2}(\mathbf{x}-\boldsymbol\mu)^\top \boldsymbol\Sigma^{-1} (\mathbf{x}-\boldsymbol\mu)\right)
+$$
+
+지수부의 이차형식 $d_M^2 = (\mathbf{x}-\boldsymbol\mu)^\top \boldsymbol\Sigma^{-1} (\mathbf{x}-\boldsymbol\mu)$는 "공분산 구조를 고려한 거리"다. $\boldsymbol\Sigma = I$이면 유클리드 거리로 환원되고, 일반 $\boldsymbol\Sigma$에서는 분산이 큰 방향에서 더 관대하게 거리를 측정한다.
+
+등확률 곡면 $\{f(\mathbf{x}) = c\}$는 $d_M^2 = \text{const}$와 동치이므로 **타원체**다. 타원체의 주축은 $\boldsymbol\Sigma$의 고유벡터이고, 각 주축의 반지름은 $\sqrt{\lambda_i}$다.
+
+<Theorem kind="theorem" number="1" title="Mahalanobis 거리의 분포">
+$\mathbf{X} \sim \mathcal{N}(\boldsymbol\mu, \boldsymbol\Sigma)$이면
+
+$$d_M^2(\mathbf{X}, \boldsymbol\mu) = (\mathbf{X} - \boldsymbol\mu)^\top \boldsymbol\Sigma^{-1} (\mathbf{X} - \boldsymbol\mu) \sim \chi^2_d$$
+</Theorem>
+
+<Proof>
+$\mathbf{Z} = \boldsymbol\Sigma^{-1/2}(\mathbf{X} - \boldsymbol\mu) \sim \mathcal{N}(\mathbf{0}, I)$이면 $d_M^2 = \mathbf{Z}^\top \mathbf{Z} = \sum_{i=1}^d Z_i^2$. 독립 표준정규의 제곱합이므로 $\chi^2_d$를 따른다. $\square$
+</Proof>
+
+이 결과는 이상치 탐지에 직결된다. 95% 신뢰 타원체는 $\{d_M^2 \leq \chi^2_{d, 0.95}\}$로 정의되며, 이 경계 밖의 점은 이상치로 간주할 수 있다.
+
+## Affine 닫힘성: ML tractability의 근거
+
+MVN이 ML 전반에서 쓰이는 핵심 이유는 **Affine 변환에 닫혀 있다**는 성질이다.
+
+$$\mathbf{X} \sim \mathcal{N}(\boldsymbol\mu, \boldsymbol\Sigma) \implies \mathbf{Y} = A\mathbf{X} + \mathbf{b} \sim \mathcal{N}(A\boldsymbol\mu + \mathbf{b},\; A\boldsymbol\Sigma A^\top)$$
+
+증명은 특성함수를 통해 가장 간결하게 나온다. $\varphi_\mathbf{Y}(\mathbf{t}) = e^{i\mathbf{t}^\top\mathbf{b}} \cdot \varphi_\mathbf{X}(A^\top\mathbf{t})$에 MVN의 특성함수를 대입하면 $\mathcal{N}(A\boldsymbol\mu+\mathbf{b},\, A\boldsymbol\Sigma A^\top)$의 특성함수가 나온다.
+
+이 성질의 직접적인 응용이 **VAE의 reparameterization trick**이다.
+
+```python
+# z = μ_φ(x) + L_φ(x) · ε,  ε ~ N(0, I)
+# affine map of standard normal → z ~ N(μ_φ, L_φ L_φᵀ)
+eps = torch.randn_like(std)
+z = mu + L @ eps   # gradient가 μ, L 양쪽으로 흐른다
+```
+
+$\epsilon$이 $\phi$와 무관하므로 $\nabla_\phi z$가 깔끔하게 정의된다. **Cholesky sampling** $\mathbf{X} = \boldsymbol\mu + L\mathbf{Z}$도 같은 원리다 — 표준정규를 한 번 생성하고 Affine으로 밀면 된다.
+
+<Aside label="설계 함의">
+일반 분포에서 Affine 변환 후 같은 family를 유지하는 건 드문 일이다. MVN이 이를 보장하기 때문에, Bayesian Linear Regression의 posterior, Kalman filter의 state update, GP regression의 예측이 모두 closed form으로 나온다.
+</Aside>
+
+## 조건부 분포와 Schur 보수
+
+MVN의 또 다른 핵심 성질은 **조건부 분포도 MVN**이라는 것이다.
+
+$$\mathbf{X} = \begin{pmatrix}\mathbf{X}_1\\\mathbf{X}_2\end{pmatrix} \sim \mathcal{N}\!\left(\begin{pmatrix}\boldsymbol\mu_1\\\boldsymbol\mu_2\end{pmatrix},\begin{pmatrix}\boldsymbol\Sigma_{11} & \boldsymbol\Sigma_{12}\\\boldsymbol\Sigma_{21} & \boldsymbol\Sigma_{22}\end{pmatrix}\right)$$
+
+이면
+
+$$\mathbf{X}_1 \mid \mathbf{X}_2 = \mathbf{x}_2 \;\sim\; \mathcal{N}(\boldsymbol\mu_{1|2},\; \boldsymbol\Sigma_{1|2})$$
+
+여기서
+
+$$\boldsymbol\mu_{1|2} = \boldsymbol\mu_1 + \boldsymbol\Sigma_{12}\boldsymbol\Sigma_{22}^{-1}(\mathbf{x}_2 - \boldsymbol\mu_2)$$
+
+$$\boldsymbol\Sigma_{1|2} = \boldsymbol\Sigma_{11} - \boldsymbol\Sigma_{12}\boldsymbol\Sigma_{22}^{-1}\boldsymbol\Sigma_{21}$$
+
+$\boldsymbol\Sigma_{1|2}$가 바로 **Schur 보수**다. 직관적으로, 조건부 분산은 사전 분산 $\boldsymbol\Sigma_{11}$에서 "$\mathbf{X}_2$가 $\mathbf{X}_1$에 주는 정보"를 뺀 것이다. $\boldsymbol\Sigma_{12}\boldsymbol\Sigma_{22}^{-1}\boldsymbol\Sigma_{21}$은 PSD이므로 관측은 항상 불확실성을 줄인다.
+
+<Callout type="note" title="트레이드오프">
+조건부 평균 $\boldsymbol\mu_{1|2}$는 $\mathbf{x}_2$의 **affine 함수**다. MVN에서는 이것이 동시에 MMSE 추정량이 된다. 비-Gaussian 분포에서 MMSE는 비선형일 수 있고, closed form이 없다. Gaussian 가정을 쓰면 tractability를 얻고, 비선형 dependence 표현력을 잃는다.
+</Callout>
+
+이 공식이 Gaussian Process 회귀 예측식의 정체다. GP는 함수 공간 위의 MVN이고, 새 점 $\mathbf{x}_*$에서의 posterior가 정확히 Schur 보수를 통해 나온다.
+
+$$\bar f_* = \mathbf{k}_*^\top (K + \sigma_n^2 I)^{-1} \mathbf{y}, \qquad V_* = k_{**} - \mathbf{k}_*^\top (K + \sigma_n^2 I)^{-1} \mathbf{k}_*$$
+
+## 공분산의 기하: PCA와 Spectral 분해
+
+공분산 행렬 $\boldsymbol\Sigma$는 대칭 PSD이므로 **Spectral 분해**가 존재한다.
+
+$$\boldsymbol\Sigma = U\Lambda U^\top = \sum_{i=1}^d \lambda_i \mathbf{u}_i \mathbf{u}_i^\top$$
+
+고유벡터 $\mathbf{u}_i$가 데이터의 주축이고, 고유값 $\lambda_i$가 그 방향의 분산이다. 단위 벡터 $\mathbf{w}$ 방향의 분산은
+
+$$\text{Var}(\mathbf{w}^\top \mathbf{X}) = \mathbf{w}^\top \boldsymbol\Sigma \mathbf{w} = \sum_i c_i^2 \lambda_i \leq \lambda_1$$
+
+이 Rayleigh quotient를 최대화하는 방향이 첫 번째 고유벡터 $\mathbf{u}_1$이다. **PCA는 분산 최대화 문제의 해**가 $\boldsymbol\Sigma$의 고유분해임을 보여준다.
+
+Eckart-Young 정리에 따르면 rank-$k$ 근사 중 Frobenius 기준 최적이 PCA reconstruction이다.
+
+$$\min_{\text{rank}\leq k} \|X - \hat X\|_F^2 = \sum_{i=k+1}^d \lambda_i$$
+
+버리는 고유값들의 합이 곧 정보 손실량이다. Whitening $\tilde{\mathbf{x}} = \boldsymbol\Sigma^{-1/2}(\mathbf{x}-\boldsymbol\mu)$은 이 구조를 등방성으로 만들어 $\tilde{\mathbf{x}} \sim \mathcal{N}(0, I)$를 만든다. BatchNorm, LayerNorm은 이 empirical whitening의 근사다.
+
+## 정리
+
+- MVN의 모든 성질은 하나의 구성에서 나온다: $\mathbf{X} = \boldsymbol\mu + \boldsymbol\Sigma^{1/2}\mathbf{Z}$, $\mathbf{Z} \sim \mathcal{N}(0, I)$.
+- Affine 닫힘성이 VAE reparameterization, Kalman filter, Bayesian Linear Regression의 closed form을 가능하게 한다.
+- 조건부 분포의 Schur 보수 공식이 GP 회귀, Kalman update, Bayesian posterior의 공통 언어다.
+- Spectral 분해는 공분산의 기하를 드러내고, PCA와 whitening의 이론적 근거가 된다.
+- Gaussian 가정의 대가는 비선형 dependence 표현력의 상실이다 — GP의 kernel, normalizing flow는 이 한계를 다른 방식으로 우회한다.
+
+MVN은 "단순함을 통한 tractability"의 선택이다. 이 선택이 어디서 깨지는지를 아는 것이, 언제 GP를 쓰고 언제 diffusion model로 가야 하는지를 결정한다.

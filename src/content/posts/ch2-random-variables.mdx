@@ -1,0 +1,119 @@
+---
+title: "확률변수의 분포는 왜 Ω를 필요로 하지 않는가"
+description: "가측함수로서의 확률변수 정의부터 Radon-Nikodym에 의한 PMF/PDF 통일, 혼합 분포와 변수 변환까지 — 측도론이 ML 분포 모델링을 하나의 언어로 묶는 방식을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [probability-theory, measure-theory, random-variable, radon-nikodym, normalizing-flow]
+difficulty: advanced
+series:
+  slug: probability-theory-deep-dive
+  title: Probability Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ML 코드에서 $\Omega$를 쓸 일은 거의 없다. `np.random.normal()`을 호출하고, `torch.distributions.Normal`로 KL을 계산하고, VAE의 ELBO를 최적화한다. 그런데 이 모든 연산의 밑에는 하나의 수학적 구조가 있다. 왜 이산 분포와 연속 분포가 "같은" KL 공식을 쓰는가? 왜 Normalizing Flow의 log-likelihood가 야코비안 행렬식의 합으로 분해되는가?
+
+## 확률변수는 함수다 — 랜덤성은 Ω에 있다
+
+흔한 오해는 확률변수가 "랜덤한 값"이라는 것이다. 정확한 정의는 다르다.
+
+$$X: (\Omega, \mathcal{F}, \mathbb{P}) \to (\mathbb{R}, \mathcal{B}(\mathbb{R}))$$
+
+$X$는 **결정적 함수**다. 랜덤성은 $\Omega$ 위의 확률 $\mathbb{P}$에서 온다. $\omega \in \Omega$가 $\mathbb{P}$에 따라 추출되면, $X(\omega)$가 결정된다.
+
+가측성 조건 $\{X \leq x\} \in \mathcal{F}$은 "수학적 엄밀성을 위한 장식"이 아니다. $\mathbb{P}(X \leq x)$가 의미를 가지려면 $\{X \leq x\} = X^{-1}((-\infty, x])$가 $\mathcal{F}$의 원소여야 한다 — $\mathbb{P}$는 $\mathcal{F}$ 위에서만 정의되기 때문이다. 가측이 아닌 함수는 CDF도, PDF도 정의할 수 없다.
+
+이 가측성의 실용적 함의: 연속함수, 단조함수, 신경망의 모든 활성화함수(ReLU, sigmoid, GELU)는 Borel 가측이다. 합성과 극한도 가측성을 보존한다. 즉 ML에서 만나는 거의 모든 함수는 자동으로 확률변수가 된다.
+
+## Push-forward — Ω가 사라지는 이유
+
+$X$가 $\mathbb{R}$ 위에 새로운 측도를 만들어낸다.
+
+$$\mathbb{P}_X(B) := \mathbb{P}(X^{-1}(B)) = \mathbb{P}(X \in B)$$
+
+이것이 **push-forward 측도** $\mathbb{P}_X = \mathbb{P} \circ X^{-1}$다. $X$의 "분포"는 $\mathbb{R}$ 위의 측도이고, $\Omega$가 무엇이든 우리가 다루는 건 $(\mathbb{R}, \mathcal{B}, \mathbb{P}_X)$다.
+
+<Theorem kind="proposition" number="1" title="Push-forward 측도는 확률측도">
+$X: (\Omega, \mathcal{F}, \mathbb{P}) \to (\mathbb{R}, \mathcal{B})$가 가측함수이면, $\mathbb{P}_X(B) := \mathbb{P}(X \in B)$는 $(\mathbb{R}, \mathcal{B})$ 위의 확률측도다.
+</Theorem>
+
+<Proof>
+비음성·공집합·가산가법성 모두 $\mathbb{P}$의 성질과 역상이 집합 연산을 보존한다는 사실에서 따라온다. $\mathbb{P}_X(\mathbb{R}) = \mathbb{P}(\Omega) = 1$. $\square$
+</Proof>
+
+이 정리가 "$X$의 분포"를 잘 정의된 객체로 만든다. ML에서 $\mathcal{N}(0, I)$나 $\text{Bernoulli}(p)$를 쓸 때 $\Omega$를 신경 쓰지 않는 이유가 여기 있다 — 분포는 이미 $\mathbb{R}$ 위의 측도로 완결되어 있다.
+
+$\sigma(X) := \{X^{-1}(B) : B \in \mathcal{B}(\mathbb{R})\}$는 "$X$의 값으로 답할 수 있는 모든 사건의 모임"이다. VAE의 encoder $q_\phi(z \mid x)$가 $\sigma(X)$-가측이라는 말은 "$z$가 오직 $x$로 결정된다"는 의미다. RL의 가치함수 $V_t = g(S_t)$가 Markov property로 현재 상태만의 함수가 되는 것도 Doob-Dynkin 보조정리 — $\sigma(X)$-가측인 확률변수는 $X$의 함수다 — 의 직접적 귀결이다.
+
+## PMF와 PDF는 같은 것이다 — Radon-Nikodym
+
+이산 분포는 PMF, 연속 분포는 PDF. 왜 같은 KL 공식을 쓰는가? 측도론의 답은 명확하다.
+
+$$\text{KL}(\mathbb{P} \| \mathbb{Q}) = \int \log \frac{d\mathbb{P}}{d\mathbb{Q}}\, d\mathbb{P}$$
+
+여기서 $d\mathbb{P}/d\mathbb{Q}$는 **Radon-Nikodym 도함수**다. $\mathbb{P} \ll \mathbb{Q}$ ($\mathbb{Q}$에 절대연속)이면, 음이 아닌 가측함수 $f$가 존재해 $\mathbb{P}(A) = \int_A f\, d\mathbb{Q}$를 만족한다. 이 $f$를 $d\mathbb{P}/d\mathbb{Q}$라 쓴다.
+
+기준측도를 바꾸면 같은 정의에서 PMF와 PDF가 나온다.
+
+- 기준측도 $\mu$ = 르베그 측도 → $f = d\mathbb{P}_X/dm$ = **PDF**
+- 기준측도 $\mu$ = 카운팅 측도 → $f = d\mathbb{P}_X/d\#$ = **PMF**
+
+PMF와 PDF는 "같은 정의의 두 얼굴"이다. KL, score function $\nabla \log p(x)$, Bayesian 사후분포의 Radon-Nikodym 표현 — 전부 이 통일적 언어로 쓰인다.
+
+<Callout type="note" title="트레이드오프: 절대연속 가정의 한계">
+Radon-Nikodym이 적용되려면 $\mathbb{P} \ll \mathbb{Q}$이어야 한다. 이 조건이 깨지면 도함수가 존재하지 않는다. Spike-and-slab prior($\delta_0$ atom + 연속)와 Gaussian posterior 사이의 KL이 $\infty$가 되는 이유가 여기 있다. 이것이 sparse Bayesian deep learning에서 Gumbel-softmax 같은 연속 완화가 필요한 근본 이유다.
+</Callout>
+
+## 혼합 분포와 Lebesgue-Stieltjes 적분
+
+임의의 분포는 세 가지 순수 형태의 합으로 유일하게 분해된다.
+
+$$\mathbb{P}_X = \underbrace{\mathbb{P}_{ac}}_{\text{PDF 존재}} + \underbrace{\mathbb{P}_{disc}}_{\text{PMF 존재}} + \underbrace{\mathbb{P}_{sc}}_{\text{Cantor 류, ML에서 희귀}}$$
+
+보험금 모델 $\mathbb{P}_X = 0.7\delta_0 + 0.3 \cdot \text{Exp}(1)$처럼, Zero-inflated 모델, censored regression($Y = \min(X, c)$), Tobit 모델 — 모두 이산 + 연속의 혼합이다. Lebesgue-Stieltjes 적분 $\int g\, dF$는 이 구분 없이 단일 표기로 처리한다.
+
+$$\int g\, dF = \sum_i g(x_i) \cdot \mathbb{P}_X(\{x_i\}) + \int g(x) f(x)\, dx$$
+
+이것이 혼합 분포의 기댓값 계산 공식이다. PMF 부분과 PDF 부분이 자동으로 분리된다.
+
+## 변수 변환과 야코비안 — Normalizing Flow의 기반
+
+$\mathbf{Y} = g(\mathbf{X})$, $g$가 $C^1$-가역이면 push-forward 측도의 PDF는 다음과 같다.
+
+$$f_Y(\mathbf{y}) = f_X(g^{-1}(\mathbf{y})) \cdot |\det J_{g^{-1}}(\mathbf{y})|$$
+
+야코비안 행렬식 $|\det J|$는 **부피 변화율**이다. 변환이 부피를 늘리면(밀도가 퍼지면) $|\det J| > 1$이고 PDF는 줄어든다.
+
+가역 변환 $f_\theta = f_K \circ \cdots \circ f_1$을 chain하면 log-det이 합산된다.
+
+$$\log p_x(x) = \log p_{z_K}(z_K) + \sum_{i=1}^K \log |\det J_{f_i}(z_{i-1})|$$
+
+RealNVP의 affine coupling($z_2 = x_2 \cdot \exp(s(x_1)) + t(x_1)$)이 lower triangular Jacobian을 갖는 이유는 이 log-det을 $O(d)$로 만들기 위해서다. 일반 affine $z = Wx + b$는 $O(d^3)$ log-det이 필요하다. VAE의 reparameterization trick $z = \mu + \sigma \cdot \epsilon$도 affine 변수 변환 공식의 직접 응용이다.
+
+<Aside label="결합·주변과 Fubini">
+결합분포 $\mathbb{P}_{X,Y}$에서 $Y$를 적분으로 지우면 주변분포 $\mathbb{P}_X$가 나온다. 독립성 $X \perp Y$는 $\mathbb{P}_{X,Y} = \mathbb{P}_X \otimes \mathbb{P}_Y$ — 결합이 곱측도와 같다는 것이다. Fubini 정리가 이 적분 순서 교환을 보장하며, VAE ELBO의 $\nabla_\phi \mathbb{E}_{q}[\cdot] = \mathbb{E}_q[\nabla_\phi \cdot]$ 교환이 여기에 의존한다. $f \in L^1(\mu \otimes \nu)$ 조건을 확인하지 않고 교환하면 틀린 답이 나올 수 있다.
+</Aside>
+
+## 정리
+
+- 확률변수는 가측함수 $X: \Omega \to \mathbb{R}$이고, 랜덤성은 $\Omega$ 위의 $\mathbb{P}$에서 온다. $\Omega$는 추상적 무대이며 우리가 다루는 것은 push-forward $\mathbb{P}_X$다.
+- PMF와 PDF는 Radon-Nikodym 도함수의 두 특수 케이스다 — 기준측도만 다를 뿐 정의는 동일하다.
+- 임의 분포는 ac + disc + sc로 유일하게 분해되고, Lebesgue-Stieltjes 적분이 이를 단일 표기로 처리한다.
+- 변수 변환 공식 $f_Y = f_X \circ g^{-1} \cdot |\det J_{g^{-1}}|$은 Normalizing Flow, reparameterization trick, inverse transform sampling 모두의 수학적 기반이다.
+
+ML 분포 모델링의 다양한 트릭들은 결국 같은 구조의 다른 표현이다. 측도론은 그것들을 하나의 언어로 묶는다.
+
+<Reference
+  title="Latent Dirichlet Allocation"
+  authors="Blei, D. M., Ng, A. Y., and Jordan, M. I."
+  year={2003}
+  venue="Journal of Machine Learning Research"
+  url="https://www

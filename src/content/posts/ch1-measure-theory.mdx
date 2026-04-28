@@ -1,0 +1,117 @@
+---
+title: "확률은 왜 공리로 정의되는가 — Kolmogorov가 σ-대수를 도입한 이유"
+description: "Laplace의 고전적 확률부터 Banach-Tarski 역설까지, 측도론적 확률 공리화의 필연성과 ML 기반으로서의 통일 프레임을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [probability-theory, measure-theory, sigma-algebra, lebesgue-integral, kolmogorov]
+difficulty: advanced
+series:
+  slug: probability-theory-deep-dive
+  title: Probability Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ML에서 "확률"이라는 단어는 PMF, PDF, 베이즈 사후분포, Diffusion model의 경로공간 측도까지 다섯 가지 이상의 서로 다른 대상을 가리킨다. 이것들이 **모두 동일한 수학적 구조**임을 보이지 못하면, 케이스마다 다른 정리를 외워야 한다. Kolmogorov가 1933년에 도입한 공리 체계는 그 통일을 가능하게 한 유일한 프레임이다. 왜 하필 σ-대수라는 개념이 필요했는가?
+
+## 세 가지 고전적 정의의 실패
+
+확률을 처음 엄밀하게 정의하려 했던 시도는 세 갈래였다.
+
+Laplace(1812)의 고전적 확률은 $\mathbb{P}(A) = |A|/|\Omega|$로, "동등한 결과"라는 개념에 기반한다. 문제는 "동등함"이 이미 확률 개념을 전제한다는 순환성이다. 샘플공간이 무한하면 정의 자체가 무너진다.
+
+von Mises의 빈도주의는 $\mathbb{P}(A) = \lim_{n\to\infty} N_A(n)/n$으로 정의한다. 그러나 이 극한이 **존재한다는 보장**을 어떻게 하는가? 수렴 정리 자체가 확률 개념에 의존하므로, 정당화가 순환에 빠진다. 단일 시행("이 환자의 회복 확률")은 아예 정의할 수 없다.
+
+de Finetti의 주관주의는 객관성이 부족하고, 여러 관찰자의 확률을 결합하는 방법을 제시하지 못한다. 수학적 가법 구조는 여전히 독립적으로 정당화되어야 했다.
+
+Kolmogorov의 통찰은 방향을 바꾸는 것이었다. "확률이 **무엇인지**를 정의하지 않는다. 확률이 **어떤 규칙을 따라야 하는지**를 공리로 정한다." 뉴턴이 "힘이 무엇인가"가 아닌 $F = ma$라는 규칙으로 시작했듯이.
+
+## Banach-Tarski — 모든 부분집합에 측도를 줄 수 없다
+
+왜 "전체 멱집합 $2^\Omega$를 사건의 모임으로 쓰면 안 되는가"라는 질문에 대한 답이 여기 있다.
+
+1924년 Banach-Tarski 역설: $\mathbb{R}^3$의 단위 공을 유한 개 조각으로 분해하여, 회전과 평행이동만으로 **두 개의 단위 공**을 만들 수 있다. $\mathbb{R}$의 1차원 버전이 Vitali 집합이다.
+
+<Theorem kind="theorem" number="1" title="Vitali 집합은 르베그 가측이 아니다">
+평행이동 불변, 가산가법, 단위구간을 1로 정규화하는 측도 $m$은 $\mathbb{R}$의 모든 부분집합에 정의될 수 없다.
+</Theorem>
+
+<Proof>
+$x \sim y \iff x - y \in \mathbb{Q}$로 동치관계를 정의하고, 각 동치류에서 $[0,1]$의 대표원을 하나씩 뽑아 $V \subseteq [0,1]$을 만든다(선택공리). $\mathbb{Q} \cap [-1,1] = \{q_1, q_2, \ldots\}$로 열거하고 $V_n = V + q_n$으로 정의하면, $V_n$들은 서로소이고 $[0,1] \subseteq \bigcup_n V_n \subseteq [-1,2]$가 성립한다.
+
+평행이동 불변과 가산가법성으로부터
+
+$$1 \leq \sum_{n=1}^\infty m(V_n) = \sum_{n=1}^\infty m(V) \leq 3$$
+
+이므로 $1 \leq \sum m(V) \leq 3$. $m(V) = 0$이면 합이 0으로 모순, $m(V) > 0$이면 합이 $\infty$로 모순. 따라서 $m(V)$는 정의될 수 없다. $\square$
+</Proof>
+
+이 결과는 σ-대수가 왜 **반드시** 필요한지를 설명한다. 측도를 부여할 수 있는 "착한" 집합들만 모아야 하고, 그 모임의 조건이 σ-대수의 세 공리다.
+
+## Kolmogorov 공리와 σ-대수
+
+확률공간은 세 쌍 $(\Omega, \mathcal{F}, \mathbb{P})$로 이루어진다. $\Omega$는 샘플공간, $\mathcal{F}$는 σ-대수(사건의 모임), $\mathbb{P}: \mathcal{F} \to [0,1]$은 확률측도다.
+
+σ-대수의 세 조건은 "관찰 가능한 사건들의 자연스러운 닫힘"이다. $A$가 결정 가능하면 $A^c$도 결정 가능(여집합 닫힘), $A_1, A_2, \ldots$가 결정 가능하면 "어떤 $A_n$이 일어남"도 결정 가능(가산 합집합 닫힘). 비가산 합집합까지 요구하면 Vitali 집합도 가측이 되어 모순이 생기므로, 정확히 **가산**에서 멈추는 것이 핵심이다.
+
+확률의 공리는 세 가지다.
+
+$$\mathbb{P}(A) \geq 0, \quad \mathbb{P}(\Omega) = 1, \quad \mathbb{P}\!\left(\bigsqcup_{i=1}^\infty A_i\right) = \sum_{i=1}^\infty \mathbb{P}(A_i)$$
+
+마지막 조건인 **가산가법성**이 유한가법성보다 본질적으로 강하다. 자연밀도 $\mathbb{P}_\text{nat}(A) = \lim_{n\to\infty} |A \cap \{1,\ldots,n\}|/n$은 유한가법적이지만 가산가법적이지 않다. 각 단원소 $\{k\}$의 자연밀도는 0이지만 $\mathbb{P}_\text{nat}(\mathbb{N}) = 1$이므로
+
+$$\sum_{k=1}^\infty \mathbb{P}_\text{nat}(\{k\}) = 0 \neq 1 = \mathbb{P}_\text{nat}(\mathbb{N})$$
+
+가산가법성 없이는 LLN, CLT, Borel-Cantelli 어느 것도 작동하지 않는다.
+
+## 르베그 적분과 기댓값의 통일
+
+측도가 정의되면 적분을 구성할 수 있다. 리만 적분이 $x$-축을 분할하는 데 반해, 르베그 적분은 $y$-축(값 공간)을 분할한다. 단순함수 $\varphi = \sum c_i \mathbf{1}_{A_i}$의 적분을 $\sum c_i \mu(A_i)$로 정의하고, 일반 가측함수는 단순함수의 단조 극한으로 근사한다.
+
+이 구성의 핵심 귀결은 기댓값의 통일이다.
+
+$$\mathbb{E}[X] = \int_\Omega X\, d\mathbb{P}$$
+
+이 단일 정의가 이산 확률변수에서는 $\sum_i x_i p_i$, 연속 확률변수에서는 $\int x f(x)\, dx$, 혼합 분포에서도 동일한 형식으로 계산된다. 수렴 정리(MCT, DCT)는 이 적분 위에서 "기댓값과 미분의 교환"을 정당화한다.
+
+$$\frac{\partial}{\partial \theta}\mathbb{E}_{p_\theta}[f(X)] = \mathbb{E}_{p_\theta}\!\left[\frac{\partial}{\partial \theta} \log p_\theta(X) \cdot f(X)\right]$$
+
+REINFORCE, reparameterization trick, score matching — 이 모두가 지배수렴정리(DCT)의 직접 응용이다.
+
+## 트레이드오프와 한계
+
+<Callout type="note" title="가정과 한계">
+이 공리 체계는 세 가지 중요한 선택에 의존한다.
+
+**선택공리**: Vitali 집합의 존재는 선택공리를 사용한다. Solovay 모델처럼 선택공리를 거부하면 모든 집합이 가측인 수학이 가능하다. 그러나 표준 ZFC에서는 비가측 집합의 존재를 받아들이고 σ-대수를 도입한다.
+
+**가산가법성의 범위**: 비가산족의 합집합은 다루지 못한다. 연속 확률변수에서 $\sum_{x \in \mathbb{R}} \mathbb{P}(X = x) = ?$라는 질문은 가산가법성의 틀 바깥이다.
+
+**$\Omega$의 무관성**: 역설적이지만 중요한 사실 — 실제로 $\Omega$가 무엇인지는 거의 신경 쓰지 않는다. 우리가 다루는 것은 확률변수의 분포 $\mathbb{P}_X$이고, 이것은 $\Omega$의 구체 형태와 거의 무관하다.
+</Callout>
+
+양자역학의 "확률 진폭"은 복소수여서 일반화 측도(부호측도, 복소측도)가 필요하고, 무한차원 다양체 위의 경로공간 측도(Diffusion model의 Wiener 측도)는 σ-대수 위의 측도로만 엄밀하게 정의된다.
+
+## 정리
+
+- Laplace, von Mises, de Finetti의 정의는 각각 순환성·극한 보장 부재·객관성 부족으로 실패했다. Kolmogorov는 "확률이 무엇인가"가 아닌 "확률이 따라야 할 규칙"을 공리로 정했다.
+- Banach-Tarski·Vitali 집합은 모든 부분집합에 측도를 줄 수 없음을 보인다. σ-대수는 그 필연적 귀결이다.
+- 가산가법성은 유한가법성보다 본질적으로 강하며, LLN·CLT·Borel-Cantelli의 수학적 기반이다.
+- 르베그 적분은 이산·연속·혼합 분포의 기댓값을 단일 정의 $\int X\, d\mathbb{P}$로 통합하고, 지배수렴정리는 REINFORCE와 reparameterization trick의 gradient 교환을 정당화한다.
+
+공리 한 줄이 PMF, PDF, 사후분포, 경로공간 측도를 같은 언어로 말하게 만든다.
+
+<Reference
+  title="Grundbegriffe der Wahrscheinlichkeitsrechnung"
+  authors="Kolmogorov, A. N."
+  year={1933}
+  venue="Springer"
+  url="https://link.springer.com/book/9783642498893"
+/>
