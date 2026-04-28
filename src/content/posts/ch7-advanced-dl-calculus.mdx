@@ -79,6 +79,7 @@ $$
 
 <Callout type="note" title="트레이드오프: BN vs LN">
 BatchNorm은 배치 통계를 이용해 **헤시안 조건수를 개선**하고 수렴을 빠르게 한다. 대신 배치 크기에 의존하며 추론 시 running statistics가 필요하다. LayerNorm은 샘플 독립적이라 배치 크기 1에서도 동작하며 Transformer의 표준이 됐다. RMSNorm은 평균 제거를 생략해 계산 효율을 더 높인다 — LLaMA, PaLM 계열이 선택한 이유다.
+</Theorem>
 </Callout>
 
 ## NTK: 그래디언트 내적이 만드는 커널
