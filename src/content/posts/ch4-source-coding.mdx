@@ -1,0 +1,149 @@
+---
+title: "압축은 이해다 — Shannon이 증명한 정보의 한계"
+description: "Kraft 부등식과 엔트로피의 관계부터 AEP의 Typical Set, Arithmetic Coding까지, 소스 코딩 정리가 LLM의 cross-entropy loss를 어떻게 설명하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-theory, source-coding, entropy, arithmetic-coding, llm]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Shannon은 1948년 논문에서 한 가지 사실을 수학적으로 확정했다. 데이터를 압축할 수 있는 만큼만 그 안에 정보가 있다. 그리고 그 한계는 정확히 엔트로피 $H(p)$다. LLM의 cross-entropy loss가 "bits-per-token"으로 환산되고, perplexity가 "다음 토큰을 명시하는 데 필요한 평균 대안 수"로 해석되는 것은 우연이 아니다. 소스 코딩 이론 전체가 그렇게 설계되어 있다. 왜 엔트로피는 압축의 절대 하한인가?
+
+## 코드의 기하학 — Kraft 부등식
+
+기호를 비트열로 부호화할 때 가장 기본적인 요구는 **즉시 디코딩**이다. 어떤 코드도 다른 코드의 접두사가 되지 않는 prefix code는 이 요구를 만족한다. $A = 0$, $B = 10$, $C = 110$, $D = 111$ 처럼 배치하면 비트열이 들어오는 순간 경계를 알 수 있다.
+
+이 prefix code가 존재하기 위한 조건이 **Kraft 부등식**이다.
+
+$$
+\sum_{i=1}^n 2^{-\ell_i} \le 1
+$$
+
+직관은 단순하다. 깊이 $\ell_{\max}$의 완전 이진 트리에 $2^{\ell_{\max}}$개의 leaf가 있다. 길이 $\ell_i$의 코드워드는 그 subtree가 $2^{\ell_{\max} - \ell_i}$개의 leaf를 차지한다. prefix 조건은 이 subtree들이 서로 disjoint하다는 것이므로, leaf 사용량의 합이 전체를 초과할 수 없다.
+
+<Theorem kind="theorem" number="1" title="Kraft Inequality (필요충분)">
+길이 $\ell_1, \ldots, \ell_n$의 binary prefix code가 존재할 **필요충분조건**은 $\sum_i 2^{-\ell_i} \le 1$이다. 또한 uniquely decodable code는 prefix가 아니어도 이 부등식을 만족한다 (McMillan, 1956).
+</Theorem>
+
+McMillan 정리의 함의는 실용적이다. uniquely decodable code라면 길이를 유지하면서 prefix code로 재설계할 수 있다. **실무상 prefix code만 고려해도 손해가 없다**.
+
+## 엔트로피는 왜 하한인가
+
+Kraft 부등식이 코드의 기하학적 조건이라면, 엔트로피는 그 기하학에서 나오는 정보론적 하한이다.
+
+확률분포 $p$에 대한 prefix code의 기대 길이 $L = \sum p_i \ell_i$는 다음을 만족한다.
+
+$$
+L \ge H(p) = -\sum p_i \log_2 p_i
+$$
+
+<Proof>
+$L - H(p) = \sum p_i(\ell_i + \log_2 p_i) = \sum p_i \log_2(2^{\ell_i} p_i)$. Jensen 부등식을 적용하면 $\ge -\log_2 \sum 2^{-\ell_i} \ge 0$. 마지막 부등식은 Kraft에서 $\sum 2^{-\ell_i} \le 1$이기 때문이다. $\blacksquare$
+</Proof>
+
+따라서 **엔트로피는 평균 비트수의 절대 하한**이다. Shannon code $\ell_i = \lceil -\log_2 p_i \rceil$를 선택하면 $L < H(p) + 1$이 보장되고, Huffman 알고리즘은 전체 분포 구조를 활용해 Shannon code보다 일반적으로 짧은 코드를 만든다.
+
+그런데 symbol 단위 코딩에는 정수 길이 제약에서 오는 최대 1 bit의 gap이 남는다. 이 gap을 제거하려면 메시지 전체를 하나의 수로 표현해야 한다. 이것이 arithmetic coding의 출발점이다.
+
+## Typical Set — 정보는 어디에 집중되는가
+
+symbol 단위 코딩의 한계를 넘으려면 먼저 $n$개의 기호로 이루어진 메시지가 어떤 구조를 갖는지 이해해야 한다.
+
+iid source $X_i \sim p$에서 $n$개를 뽑으면, **대수의 법칙**에 의해 다음이 성립한다.
+
+$$
+-\frac{1}{n}\log p(X_1, \ldots, X_n) \xrightarrow{P} H(p)
+$$
+
+이를 **AEP(Asymptotic Equipartition Property)**라 한다. 즉 거의 모든 메시지의 log-probability가 $-nH$ 근방에 집중된다. 이 집중 영역이 **typical set** $A_\epsilon^{(n)}$이다.
+
+<Theorem kind="theorem" number="2" title="Typical Set의 세 가지 성질">
+충분히 큰 $n$에 대해 typical set $A_\epsilon^{(n)}$은 다음을 만족한다.
+
+1. $P(X^n \in A_\epsilon^{(n)}) > 1 - \delta$
+2. 각 원소의 확률: $2^{-n(H+\epsilon)} \le p(x^n) \le 2^{-n(H-\epsilon)}$
+3. 크기: $(1-\delta) 2^{n(H-\epsilon)} \le |A_\epsilon^{(n)}| \le 2^{n(H+\epsilon)}$
+</Theorem>
+
+$|A_\epsilon^{(n)}| \approx 2^{nH}$는 **엔트로피의 물리적 의미**다. $n$개 기호의 시퀀스 공간에서 실제로 "의미있는" 영역의 크기가 $2^{nH}$라는 것이다. 전체 $|\mathcal{X}|^n$개 시퀀스 중 이 집합만 인덱싱하면 $nH$ bits로 충분하다.
+
+<Callout type="warning" title="Mode ≠ Typical">
+직관에 반하지만, 가장 높은 확률의 시퀀스(mode)는 typical set에 속하지 않을 수 있다. $p = (0.9, 0.1)$일 때 mode sequence $(1,1,\ldots,1)$의 rate는 $-\log(0.9) \approx 0.152$지만, typical set은 rate $\approx H \approx 0.469$ 근방에 있다. LLM에서 greedy decoding이 반복적이고 단조로운 출력을 생성하는 이유가 여기 있다. Beam search는 mode를 추구하지, typical region을 샘플링하지 않는다.
+</Callout>
+
+## Shannon의 근본 정리
+
+AEP는 소스 코딩 정리의 증명 도구다.
+
+<Theorem kind="theorem" number="3" title="Source Coding Theorem (Shannon 1948)">
+iid source $X \sim p$에서 achievable rate의 infimum은 $H(p)$다.
+
+- **Achievability**: 임의의 $\epsilon > 0$에 대해 rate $H + \epsilon$으로 $P_e^{(n)} \to 0$ 달성 가능.
+- **Converse**: rate $R < H$이면 $P_e^{(n)} \not\to 0$.
+</Theorem>
+
+Achievability는 AEP에서 직접 나온다. Typical set을 인덱싱하면 $n(H+\epsilon)$ bits로 거의 모든 메시지를 복원할 수 있다. Converse는 Fano 부등식으로 증명한다. rate $R < H$이면 decoder의 출력이 가질 수 있는 값이 $2^{nR}$개뿐이므로, $H(X^n | \hat X^n) \ge nH - nR > 0$이 유지되고 오류 확률이 양수로 하한된다.
+
+**$H$는 정보의 유일한 "값"이다.** 이 이상도 이하도 아닌 숫자.
+
+## Arithmetic Coding과 LLM 압축
+
+Symbol 단위 Huffman의 1 bit/symbol gap을 제거하는 방법이 **arithmetic coding**이다. 전체 메시지를 $[0,1)$ 구간의 실수 하나로 표현한다. 각 기호는 현재 구간을 $p(x_i)$에 비례하는 subinterval로 좁힌다. 최종 구간의 크기가 $p(x^n)$이므로 필요한 bits는 $\lceil -\log_2 p(x^n) \rceil + 1$이다.
+
+$$
+L_{\mathrm{AC}}/n \le H(X) + 2/n \to H(X)
+$$
+
+Huffman의 1 bit/symbol overhead와 달리, arithmetic coding은 메시지 전체에 걸쳐 2 bit만 추가된다. 분포를 모르는 경우 Lempel–Ziv 계열의 universal coder가 asymptotically entropy rate에 수렴한다.
+
+여기서 LLM과의 연결이 완성된다.
+
+<Aside label="Language Modeling is Compression">
+Neural LM $q_\theta$와 arithmetic coding을 결합한 compression rate는 다음과 같다.
+
+$$
+\frac{1}{n}\mathbb{E}[-\log q_\theta(X^n)] = H(p)/n + \frac{1}{n}D(p \| q_\theta)
+$$
+
+이 값은 정확히 **cross-entropy loss**다. $q_\theta \to p$일수록 KL divergence가 0에 수렴하고 압축률이 entropy rate에 도달한다. Deletang et al. (2024)은 GPT-2와 arithmetic coding을 결합하면 gzip을 압도하는 compressor가 된다고 실증했다. 모델이 좋을수록 압축이 강해진다.
+</Aside>
+
+<Callout type="note" title="트레이드오프">
+소스 코딩의 실무 한계는 세 가지다. 첫째, **iid 가정**: 실제 언어는 강한 자기상관을 가지지만, stationary ergodic으로 일반화하면 Shannon–McMillan–Breiman 정리가 성립한다. 둘째, **정수 길이 제약**: arithmetic coding이 이를 제거하지만 무한 정밀도 연산이 필요해 실제로는 integer rescaling을 쓴다. 셋째, **분포 미지**: adaptive coding이나 LZ 계열로 대응하지만 수렴 속도는 $O(\log n / n)$으로 느리다.
+</Callout>
+
+## 정리
+
+- **Kraft 부등식** $\sum 2^{-\ell_i} \le 1$은 prefix code 존재의 필요충분조건이며, uniquely decodable code도 이를 만족한다(McMillan).
+- **엔트로피 $H(p)$는 평균 비트수의 절대 하한**이다. Huffman은 $H + 1$ 이내, arithmetic coding은 $H + 2/n$으로 수렴한다.
+- **AEP와 typical set**: 거의 모든 $n$-기호 시퀀스가 $2^{nH}$ 크기의 집합에 집중하며, 이 집합의 인덱싱이 소스 코딩의 핵심이다.
+- **LLM cross-entropy loss = compression rate**: 모델이 분포를 잘 학습할수록 압축률이 entropy rate에 수렴한다.
+
+소스 코딩 정리는 압축의 한계를 선언하지만, 동시에 "이해가 깊을수록 압축이 강해진다"는 것도 선언한다.
+
+<Reference
+  title="A Mathematical Theory of Communication"
+  authors="C. E. Shannon"
+  year={1948}
+  venue="Bell System Technical Journal"
+  url="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf"
+/>
+
+<Reference
+  title="Language Modeling Is Compression"
+  authors="Deletang et al."
+  year={2024}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2309.10668"

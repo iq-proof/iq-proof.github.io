@@ -1,0 +1,154 @@
+---
+title: "KL에서 Wasserstein까지 — 분산(divergence)은 무엇을 측정하는가"
+description: "KL의 비음수성 증명부터 Forward/Reverse KL의 기하학, JSD와 GAN의 이론적 연결, f-divergence 통일 프레임, Wasserstein의 등장까지 — 분포 간 거리의 설계 철학을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-theory, kl-divergence, wasserstein, gan, variational-inference]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+"두 분포가 얼마나 다른가"를 묻는 방법은 하나가 아니다. KL-divergence, JSD, Wasserstein — 이들은 제각각 다른 질문에 대한 답이다. 그런데 왜 VAE는 reverse KL을 쓰고, WGAN은 Wasserstein을 쓰는가? 단순히 "실험적으로 잘 됐다"는 이유 이전에, 각 선택에는 수학적으로 피할 수 없는 이유가 있다.
+
+## KL의 비음수성 — 출발점
+
+KL-divergence는 다음과 같이 정의된다.
+
+$$
+D(p \| q) = \mathbb{E}_{X \sim p}\!\left[\log \frac{p(X)}{q(X)}\right]
+$$
+
+이 값이 항상 $\geq 0$이라는 사실은 **Gibbs 부등식**이다. 증명의 핵심은 $\log$가 엄격 오목이라는 점에 있다.
+
+<Theorem kind="theorem" number="1" title="Gibbs 부등식">
+임의의 분포 $p, q$에 대해 $D(p \| q) \geq 0$. 등호는 $p = q$ a.s.일 때 정확히 성립한다.
+</Theorem>
+
+<Proof>
+$\log$의 오목성에 Jensen 부등식을 적용하면
+
+$$
+\mathbb{E}_p\!\left[\log \frac{q(X)}{p(X)}\right] \leq \log \mathbb{E}_p\!\left[\frac{q(X)}{p(X)}\right] = \log \sum_x q(x) \leq \log 1 = 0.
+$$
+
+좌변은 $-D(p \| q)$이므로 $D(p \| q) \geq 0$. 등호 조건은 Jensen의 등호($q/p$가 $p$ 아래 상수)와 $\sum_{x: p(x)>0} q(x) = 1$이 동시에 성립해야 하며, 이를 결합하면 $q = p$. $\square$
+</Proof>
+
+이 비음수성이 ML에서 결정적인 이유는 다음 항등식에 있다.
+
+$$
+H(p, q) = H(p) + D(p \| q)
+$$
+
+Cross-entropy 손실을 최소화하는 것은 곧 $D(p \| q)$를 최소화하는 것이고, 이 값이 0일 때 — 그리고 그때만 — 모델이 데이터 분포를 완전히 재현했다는 보장이 생긴다.
+
+<Callout type="warning" title="KL의 절대연속 요건">
+$p(x) > 0$인 어떤 $x$에서 $q(x) = 0$이면 $D(p \| q) = +\infty$. 모델 분포가 데이터 분포의 support를 커버하지 못하면 KL이 폭발한다. GAN의 mode collapse와 직결되는 지점이다.
+</Callout>
+
+## Forward KL vs Reverse KL — 어느 분포의 눈으로 보는가
+
+$D(p \| q)$와 $D(q \| p)$의 차이는 **어느 분포 위에서 기댓값을 취하느냐**다.
+
+- **Forward KL** $D(p \| q)$: $p$의 support에서 적분. $p(x) > 0$인데 $q(x) \to 0$이면 발산 → $q$는 $p$가 있는 모든 곳을 커버해야 한다. 결과: **mean-seeking / zero-avoiding**.
+- **Reverse KL** $D(q \| p)$: $q$의 support에서 적분. $q(x) > 0$인데 $p(x) = 0$이면 발산하지만, $p(x) > 0$이어도 $q(x) = 0$이면 해당 항이 $0$. 결과: **mode-seeking / zero-forcing**.
+
+이중모드 분포 $p$를 단봉 Gaussian $q$로 근사한다고 하자.
+
+```python
+# Forward KL 해: 두 모드의 평균, 넓게 퍼짐
+# Forward KL 해:  mu=0.000  sigma=3.162   (≈ sqrt(1 + a^2) = sqrt(10))
+
+# Reverse KL 해: 두 개의 local minimum, 각각 하나의 모드에 수렴
+# Reverse KL 해(좌):  mu=-3.000  sigma=1.000
+# Reverse KL 해(우):  mu= 3.000  sigma=1.000
+```
+
+Forward KL은 moment-matching이다. 지수족 $q_\theta$에서 forward KL 최소화의 정류점은 충분통계량의 기댓값이 $p$와 일치하는 지점이다. 이것이 MLE와 동치인 이유이기도 하다.
+
+$$
+\arg\min_\theta D(p_{\mathrm{data}} \| q_\theta) = \arg\max_\theta \frac{1}{N}\sum_{i=1}^N \log q_\theta(x_i)
+$$
+
+Reverse KL은 $q$의 support를 $p$의 support 안으로 강제한다. VAE ELBO의 KL 항이 reverse인 이유가 여기 있다 — 근사 사후 $q_\phi(z|x)$를 사전 $p(z)$의 support 밖으로 내보내지 않으려는 설계 철학이다. PPO의 KL penalty가 reverse인 이유도 동일하다: $\pi_\theta$가 $\pi_\text{ref}$의 distribution 밖으로 표류하는 것을 막는다.
+
+## JSD와 GAN — KL의 두 고질병을 고치다
+
+KL에는 두 가지 고질병이 있다. 비대칭성과 support 불일치 시 $\infty$ 발산. Jensen–Shannon Divergence는 이를 가장 단순하게 고친다.
+
+$$
+\mathrm{JSD}(p \| q) = \frac{1}{2}D\!\left(p \,\Big\|\, \frac{p+q}{2}\right) + \frac{1}{2}D\!\left(q \,\Big\|\, \frac{p+q}{2}\right)
+$$
+
+평균 분포 $m = (p+q)/2$는 $p$와 $q$ 양쪽의 support를 포함하므로 발산 문제가 사라지고, 구성상 대칭이다. 또한 $0 \leq \mathrm{JSD} \leq \log 2$로 유계다.
+
+GAN의 이론적 토대가 JSD인 이유는 다음 정리에서 드러난다.
+
+<Theorem kind="theorem" number="2" title="GAN의 최적 판별기와 JSD">
+GAN objective $V(G, D) = \mathbb{E}_{p_{\mathrm{data}}}[\log D(x)] + \mathbb{E}_{p_g}[\log(1-D(x))]$의 판별기 최적해는 $D^*(x) = p_{\mathrm{data}}(x) / (p_{\mathrm{data}}(x) + p_g(x))$이며, 이때 $\max_D V(G, D) = 2\,\mathrm{JSD}(p_{\mathrm{data}} \| p_g) - 2\log 2$.
+</Theorem>
+
+Generator는 JSD를 최소화하고, 최솟값 0은 $p_g = p_{\mathrm{data}}$일 때만 도달한다. 깔끔한 이론이다. 그런데 실제로는 왜 학습이 불안정한가?
+
+<Callout type="warning" title="JSD의 치명적 결함">
+$p$와 $q$의 support가 disjoint이면 $\mathrm{JSD}(p \| q) = \log 2$ — **상수**. Generator의 파라미터에 대한 gradient가 0이 된다. 초기 GAN에서 고차원 이미지 manifold는 거의 항상 이 상황이다.
+</Callout>
+
+## f-divergence — 모든 발산의 통일 프레임
+
+KL, reverse KL, JSD, Hellinger, TV, $\chi^2$는 각각 독립된 공식이 아니다. 볼록함수 $f$에서 $f(1) = 0$인 경우,
+
+$$
+D_f(p \| q) = \mathbb{E}_q\!\left[f\!\left(\frac{p(x)}{q(x)}\right)\right]
+$$
+
+으로 통일된다. $f(t) = t\log t$이면 forward KL, $f(t) = -\log t$이면 reverse KL, $f(t) = (\sqrt{t}-1)^2$이면 Hellinger.
+
+이 틀의 핵심 성질은 세 가지다. 첫째, Jensen 부등식으로 비음수성이 자동으로 성립한다. 둘째, **Data Processing Inequality**: 임의의 채널 $K$에 대해 $D_f(K \circ p \| K \circ q) \leq D_f(p \| q)$ — 데이터 가공은 모든 f-divergence를 감소시킨다. 셋째, Fenchel–Legendre 변분 표현:
+
+$$
+D_f(p\|q) = \sup_{T} \left\{ \mathbb{E}_p[T(X)] - \mathbb{E}_q[f^*(T(X))] \right\}
+$$
+
+이 변분 표현이 f-GAN의 핵심이다 — 신경망 $T_\phi$로 $D_f$를 샘플만으로 추정할 수 있다.
+
+<Aside label="정보기하학과의 연결">
+모든 f-divergence는 지역적으로 동일한 무한소 구조를 갖는다. $D_f(q_{\theta+\delta} \| q_\theta) = \frac{f''(1)}{2} \delta^\top \mathcal{I}(\theta) \delta + O(\|\delta\|^3)$. KL, $\chi^2$, Hellinger 모두 Fisher information matrix의 상수배로 환원된다. 이것이 정보기하학의 출발점이다.
+</Aside>
+
+## Wasserstein — 지리적 거리가 필요할 때
+
+f-divergence는 밀도 비율 $p/q$만 본다. 분포들이 공간 위에 어떻게 놓여 있는지는 무관하다. Wasserstein은 다른 질문을 한다: "한 분포의 질량을 다른 분포로 옮기는 최소 운반 비용은?"
+
+$$
+W_p(p, q) = \left(\inf_{\gamma \in \Pi(p, q)} \int d(x, y)^p\, d\gamma(x, y)\right)^{1/p}
+$$
+
+$\delta_0$과 $\delta_a$ (각각 0과 $a$에 점질량)에 대해: KL은 $\infty$, JSD는 $\log 2$(상수), $W_1 = a$. Wasserstein만이 $a$에 연속이다.
+
+**Kantorovich–Rubinstein 쌍대성**은 WGAN의 이론적 기반이다.
+
+$$
+W_1(p, q) = \sup_{\|f\|_L \le 1} \left\{ \mathbb{E}_p[f(X)] - \mathbb{E}_q[f(X)] \right\}
+$$
+
+WGAN의 critic은 1-Lipschitz 제약 하에서 이 sup를 추정하는 신경망이다. Support가 어긋나도 gradient가 0이 되지 않는다 — JSD의 치명적 결함을 기하학적으로 돌파하는 것이다.
+
+<Callout type="note" title="트레이드오프">
+Wasserstein은 진짜 metric이고 support mismatch에 강하지만, empirical 추정의 수렴율이 $O(n^{-1/d})$로 차원에 취약하다. 반면 MMD는 $O(n^{-1/2})$로 dimension-free다. 고차원 생성모델 평가(FID, KID)가 각각 Gaussian-$W_2^2$와 MMD를 쓰는 이유다. Lipschitz 강제도 실무에서 weight clipping보다 gradient penalty(WGAN-GP)나 spectral norm이 더 안정적이다.
+</Callout>
+
+## 정리
+
+이 장의 발산들은 각각 독립적인 발명이 아니라, 하나의

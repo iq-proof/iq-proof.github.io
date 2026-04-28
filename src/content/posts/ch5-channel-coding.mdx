@@ -1,0 +1,157 @@
+---
+title: "Shannon 채널 코딩 정리 — 존재 증명이 60년을 이끌었다"
+description: "채널 용량 C의 정의부터 Achievability·Converse 증명, Polar·LDPC가 그 한계에 도달하는 방식까지, Shannon 정리가 AI 이론의 기반이 되는 과정을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-theory, channel-capacity, shannon, error-correction, ldpc]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+1948년 Shannon은 놀라운 주장을 했다. 잡음 있는 채널에서도 오류 확률을 임의로 작게 만들 수 있다 — 전송률이 채널 용량 $C$를 넘지 않는 한. 더 놀라운 것은 증명 방식이었다. 구체적인 부호 구성 없이, 순수하게 "랜덤하게 뽑은 부호가 평균적으로 잘 된다"는 확률적 논증이었다. 이 존재 증명이 이후 60년의 공학을 이끌었는데, 왜 그것이 가능했는가?
+
+## 채널 용량 — $\max_{p(x)} I(X;Y)$
+
+이산 메모리리스 채널(DMC)은 전이 확률 $p(y|x)$로 완전히 정의된다. 채널의 "성능"은 공학적 세부사항이 아니라 단 하나의 수 $C$로 결정된다는 것이 Shannon의 핵심 통찰이다.
+
+$$
+C = \max_{p(x)} I(X; Y)
+$$
+
+최대화는 입력 분포 $p(x)$ 위에서 이루어진다. 채널 $p(y|x)$는 자연이 준 것이고, 우리가 선택할 수 있는 것은 어떤 심볼을 어떤 빈도로 보낼 것인가뿐이다. $I(X;Y)$는 $p(x)$에 대해 concave이므로 최대값은 유일하게 존재한다.
+
+세 채널의 용량을 닫힌 형태로 구할 수 있다.
+
+- **BSC$(p)$**: 비트를 확률 $p$로 뒤집는 대칭 채널. $H(Y|X) = H(p)$는 입력 분포와 무관하므로, $H(Y)$를 최대화하는 균등 입력이 최적이다.
+
+$$
+C_\text{BSC} = 1 - H(p)
+$$
+
+- **BEC$(\varepsilon)$**: 확률 $\varepsilon$로 소거(erasure) 발생. 소거된 심볼에서 정보 0, 수신된 심볼에서 완전 복원.
+
+$$
+C_\text{BEC} = 1 - \varepsilon
+$$
+
+- **AWGN (Shannon–Hartley)**: $Y = X + N$, $N \sim \mathcal{N}(0, \sigma^2)$, 입력 파워 제약 $P$. 분산 조건 하에서 미분 엔트로피를 최대화하는 것은 가우시안 분포(MaxEnt 정리)이므로 $X \sim \mathcal{N}(0,P)$가 최적이다.
+
+$$
+C_\text{AWGN} = \frac{1}{2}\log_2\!\left(1 + \frac{P}{\sigma^2}\right)
+$$
+
+SNR = 10 dB일 때 $C \approx 1.73$ bits/use. 5G와 Wi-Fi의 이론 상한이 이 공식으로 결정된다.
+
+## Achievability — 랜덤 부호의 역설
+
+Shannon 정리의 한 방향: $R < C$이면 오류 확률을 0으로 만드는 부호가 존재한다.
+
+<Theorem kind="theorem" number="1" title="Shannon Channel Coding Theorem (Achievability)">
+$C = \max_{p(x)} I(X;Y)$일 때, 모든 $R < C$에 대해 블록 길이 $n \to \infty$에서 $P_e^{(n)} \to 0$인 $(2^{nR}, n)$-부호가 존재한다.
+</Theorem>
+
+<Proof>
+**Random codebook 구성**: capacity-achieving 분포 $p_X$로 각 codeword $X^n(w)$를 iid로 독립 생성한다. Codebook 자체가 확률 변수 $\mathcal{C}$다.
+
+**Jointly typical decoder**: 수신된 $y^n$에 대해 $(X^n(\hat w), y^n) \in A_\varepsilon^{(n)}$인 유일한 $\hat w$를 출력한다.
+
+**오류 분석** (Union bound):
+$$
+\Pr(E) \leq \underbrace{\Pr(E_1)}_{\to 0 \text{ (AEP)}} + \sum_{w=2}^M \underbrace{\Pr(E_w)}_{\leq 2^{-n(I-3\varepsilon)} \text{ (Joint AEP)}}.
+$$
+
+가짜 codeword $X^n(w)$는 $Y^n$과 독립이므로 우연히 jointly typical일 확률은 $2^{-n(I-3\varepsilon)}$로 지수적으로 작다. $M = 2^{nR}$개 합산:
+$$
+\mathbb{E}_\mathcal{C}[P_e^{(n)}] \leq \Pr(E_1) + 2^{-n(I-R-3\varepsilon)} \to 0 \quad (R < I-3\varepsilon).
+$$
+
+기댓값이 0으로 수렴하므로, 이 기댓값을 달성하는 **고정된 codebook $\mathcal{C}^*$가 반드시 존재**한다. $\square$
+</Proof>
+
+이 증명의 핵심은 "특수한 구조의 부호를 구성하지 않았다"는 것이다. 랜덤하게 뽑은 부호가 평균적으로 최적이라는 것 — 이것이 확률적 방법(probabilistic method)의 전형적 논증이며, 이후 ML 이론(PAC learning, Rademacher complexity)의 하한 증명에도 같은 구조가 반복된다.
+
+## Converse — 용량은 진짜 경계다
+
+<Theorem kind="theorem" number="2" title="Weak Converse">
+$(2^{nR}, n)$-부호가 $P_e^{(n)} \to 0$을 달성하면 반드시 $R \leq C$이다.
+</Theorem>
+
+<Proof>
+전송 구조 $W \to X^n \to Y^n \to \hat W$는 Markov chain이다. 핵심 pipeline:
+
+$$
+\log M \underset{\text{entropy}}{=} I(W;\hat W) + H(W|\hat W) \underset{\text{DPI}}{\leq} I(X^n;Y^n) + \underbrace{1 + P_e \log M}_{\text{Fano}} \underset{\text{memoryless}}{\leq} nC + 1 + P_e \log M.
+$$
+
+$\log M = nR$로 나누고 재배치하면:
+$$
+R \leq \frac{C + 1/n}{1 - P_e}.
+$$
+
+$P_e \to 0$, $n \to \infty$에서 $R \leq C$. $\square$
+</Proof>
+
+Wolfowitz(1957)의 **Strong Converse**는 더 강하게: $R > C$이면 $P_e^{(n)} \to 1$이다. 단순히 "오류가 줄지 않는다"가 아니라 "반드시 1로 발산한다"는 것이 실용적으로 중요하다 — $R > C$에서의 시도는 완전히 의미 없다.
+
+<Callout type="note" title="트레이드오프">
+Achievability와 Converse를 합쳐 $C_\text{op} = \sup\{R : R \text{ achievable}\} = C$가 확정된다. 이 경계는 decoder 구현 방식에 무관한 **물리적 한계**다. 또한 Achievability 증명은 존재성만 보장하고 구체적 구성을 주지 않는다 — 실용 부호를 만드는 40년간의 연구가 이 gap을 채웠다.
+</Callout>
+
+## 60년의 공학 — Hamming에서 Polar까지
+
+Shannon의 존재 증명 이후 목표는 단순했다: $R$에 가까우면서 복잡도가 낮은 부호를 실제로 구성하라.
+
+**Hamming(7,4)** (1950): Generator matrix $G$와 parity check matrix $H$를 이용해 단일 비트 오류를 정정한다. $d_\min = 3$, Rate $= 4/7$. Syndrome $s = Hy^\top$으로 오류 위치를 직접 읽어낸다. 간단하지만 Shannon 한계와는 큰 gap이 있다.
+
+**LDPC** (Gallager 1962, MacKay 1996): Parity check matrix $H$가 sparse인 선형 부호. Tanner graph — variable node와 check node의 이분 그래프 — 위에서 Belief Propagation(BP)을 돌린다.
+
+```
+Variable → Check:  m_{v→c} = LLR_v + Σ_{c'≠c} m_{c'→v}
+Check → Variable:  m_{c→v} = 2 arctanh( Π_{v'≠v} tanh(m_{v'→c}/2) )
+```
+
+Density evolution 분석으로 decoder threshold가 $C$에 거의 근접함을 보인다. 5G 데이터 채널의 표준이다.
+
+**Polar Code** (Arıkan 2008): 채널 두 개를 조합하면 하나는 더 좋은 채널 $W^+$, 하나는 더 나쁜 채널 $W^-$로 "극단화"된다. $N = 2^n$회 재귀 적용하면 sub-channel들이 용량 1("완벽") 또는 0("쓸모없음")으로 수렴한다. 완벽한 채널 $N \cdot C$개에는 정보를, 나머지에는 frozen bit을 배정한다.
+
+이것이 Shannon 정리 이후 처음으로 **용량 달성을 수학적으로 증명한** 부호다. 5G 제어 채널의 표준이 되었다.
+
+<Aside label="AI 연결">
+LDPC의 Tanner graph + BP는 GNN의 message passing과 동형이다. Nachmani(2016)은 BP의 weights를 학습 가능하게 바꿔 short-block 영역에서 ~0.5 dB 이득을 얻었다. Diffusion model의 iterative denoising도 구조적으로 BP와 같다 — 각 step이 noisy channel의 반복 디코딩이다. 그리고 Fano + DPI 증명 구조는 PAC learning의 sample complexity 하한 증명에 그대로 재사용된다.
+</Aside>
+
+## 정리
+
+- 채널 용량 $C = \max_{p(x)} I(X;Y)$는 "채널 1회 사용당 신뢰 전송 가능한 최대 비트 수"다.
+- Achievability는 random codebook의 확률 논증으로만 증명된다 — 존재성이지 구성이 아니다.
+- Converse는 Fano 부등식 + DPI 조합으로 $R > C$에서 $P_e \to 1$을 확정한다.
+- Hamming → Turbo → LDPC → Polar의 60년 여정은 이 존재 증명이 실제 구현 가능한 경계임을 공학적으로 확인해 온 과정이다.
+
+존재 증명 하나가 수십 년의 방향을 결정할 수 있다 — Shannon 정리는 그 가장 강력한 사례다.
+
+<Reference
+  title="A Mathematical Theory of Communication"
+  authors="C. E. Shannon"
+  year={1948}
+  venue="Bell System Technical Journal"
+  url="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf"
+/>
+
+<Reference
+  title="Channel Polarization: A Method for Constructing Capacity-Achieving Codes for Symmetric Binary-Input Memoryless Channels"
+  authors="E. Arıkan"
+  year={2009}
+  venue="IEEE Transactions on Information Theory"
+  url="https://arxiv.org/abs/0807.3917"
+/>

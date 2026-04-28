@@ -1,0 +1,177 @@
+---
+title: "상호정보량은 현대 표현학습의 언어다"
+description: "MI의 기본 정의부터 DPI, Fano 부등식, MINE 추정, InfoNCE 기반 대조학습까지 — 표현학습의 설계 결정을 하나의 정보이론적 프레임으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mutual-information, contrastive-learning, information-theory, representation-learning]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+SimCLR, CLIP, MoCo — 이 모델들은 서로 다른 아키텍처처럼 보이지만, 목적함수를 들여다보면 모두 같은 수식의 변형이다. 그 수식의 이름은 **상호정보량(mutual information, MI)** 이다. MI는 "$X$를 알면 $Y$에 대해 얼마나 많은 정보를 얻는가"를 수치로 정의하는데, 이 단순한 질문이 어떻게 현대 딥러닝 표현학습 전체의 언어가 되었는가?
+
+## MI — 독립으로부터의 KL 거리
+
+MI의 가장 핵심적인 정의는 결합분포가 독립분포로부터 얼마나 떨어져 있는지를 KL 발산으로 잰 것이다.
+
+$$
+
+I(X; Y) = D(p_{XY} \| p_X \otimes p_Y) = \sum_{x,y} p(x,y) \log \frac{p(x,y)}{p(x)p(y)}
+
+$$
+
+이 관점에서 세 가지 성질이 즉시 따라온다. 첫째, $I(X;Y) \ge 0$ — KL 발산의 비음성(Gibbs 부등식)으로부터. 둘째, $I(X;Y) = 0 \Leftrightarrow X \perp\!\!\!\perp Y$ — 독립이면 MI가 정확히 0이다. 셋째, 대칭성 $I(X;Y) = I(Y;X)$ — 정의식이 $(x,y)$와 $(y,x)$에 대해 대칭이므로.
+
+엔트로피 언어로 쓰면 세 가지 동치형이 존재한다.
+
+$$
+
+I(X;Y) = H(X) - H(X|Y) = H(Y) - H(Y|X) = H(X) + H(Y) - H(X,Y)
+
+$$
+
+이를 Venn 다이어그램으로 보면 MI는 $H(X)$와 $H(Y)$ 두 원의 **교집합**이다. "$X$의 불확실성 중 $Y$를 알면 사라지는 부분" — 이것이 두 변수가 공유하는 정보다.
+
+Gaussian의 경우 상관계수 $\rho$가 있으면 닫힌 형태로 계산된다.
+
+$$
+
+I(X;Y) = -\tfrac{1}{2}\log(1 - \rho^2)
+
+$$
+
+주목할 점은 $\rho = 0$이어도 MI가 0이 아닐 수 있다는 것이다 — Gaussian에서만 correlation=0이 독립과 동치다. $Y = X^2$처럼 비선형 의존이 있으면 $\mathrm{Corr}(X,Y)=0$이지만 $I(X;Y) > 0$이다. **MI는 모든 통계적 의존을 잡고, 상관계수는 선형 의존만 잡는다.**
+
+한 가지 더 주의할 함정이 있다. Conditioning은 MI를 단조적으로 줄이지 않는다. $X, Y$가 독립이어도 $Z = X \oplus Y$로 conditioning하면 $I(X;Y|Z) = \log 2 > 0 = I(X;Y)$가 된다. 이 "explain-away" 현상은 Simpson's paradox의 정보이론적 뿌리다.
+
+## DPI — 정보는 처리로 늘지 않는다
+
+표현학습의 근본 제약은 **Data Processing Inequality(DPI)** 에서 온다.
+
+<Theorem kind="theorem" number="1" title="Data Processing Inequality">
+$X \to Y \to Z$가 Markov chain이면
+
+$$
+
+I(X; Z) \le I(X; Y)
+
+$$
+
+등호는 $X \to Z \to Y$도 Markov일 때, 즉 $Z$가 $Y$에 대해 충분통계량일 때.
+</Theorem>
+
+<Proof>
+Chain rule로 전개하면
+
+$$
+
+I(X; Y, Z) = I(X; Y) + I(X; Z | Y) = I(X; Z) + I(X; Y | Z)
+
+$$
+
+Markov 가정 $X \perp Z \mid Y$이므로 $I(X; Z|Y) = 0$. 따라서
+
+$$
+
+I(X; Y) = I(X; Z) + \underbrace{I(X; Y|Z)}_{\ge 0} \ge I(X; Z). \blacksquare
+
+$$
+</Proof>
+
+신경망 $X \to h_1 \to h_2 \to \cdots \to h_L \to \hat Y$는 Markov chain이다. DPI를 반복 적용하면
+
+$$
+
+I(X; \hat Y) \le I(X; h_L) \le \cdots \le I(X; h_1) \le H(X)
+
+$$
+
+**각 레이어는 정보 손실의 Markov step이다.** 인코더를 통과하는 순간 정보는 절대 추가되지 않는다. 중요한 것은 "무엇을 보존하느냐"다. Tishby–Shwartz-Ziv(2017)의 Information Bottleneck 관점에서 학습은 두 단계로 해석된다: 초기 fitting phase에서 $I(X; h_l)$과 $I(h_l; Y)$가 함께 증가하다가, 후기 compression phase에서 $I(X; h_l)$이 감소하면서 $I(h_l; Y)$는 유지된다.
+
+DPI는 동시에 Privacy와 Knowledge Distillation에도 직결된다. Post-processing은 민감속성으로부터의 정보를 절대 늘릴 수 없고, teacher의 정보량 이상을 student가 가질 수 없다는 것도 같은 논리다.
+
+## Fano 부등식 — 분류 오차의 정보이론적 하한
+
+MI가 작으면 아무리 좋은 모델을 써도 분류 오차가 일정 수준 이하로 내려갈 수 없다.
+
+<Theorem kind="theorem" number="2" title="Fano 부등식">
+$X \in \mathcal{X}$, $|\mathcal{X}| = K$, 추정량 $\hat X = g(Y)$, $P_e = P(\hat X \ne X)$라 하면
+
+$$
+
+H(P_e) + P_e \log(K-1) \ge H(X|Y) = H(X) - I(X;Y)
+
+$$
+</Theorem>
+
+<Proof>
+에러 지시 확률변수 $E = \mathbb{1}[X \ne \hat X]$를 도입한다. $E=0$이면 $X = \hat X$로 결정되어 $H(X|E=0,\hat X)=0$. $E=1$이면 $X$는 나머지 $K-1$개 중 하나이므로 $H(X|E=1,\hat X) \le \log(K-1)$. Chain rule을 전개하면
+
+$$
+
+H(X|\hat X) \le H(E|\hat X) + H(X|E,\hat X) \le H(P_e) + P_e \log(K-1)
+
+$$
+
+DPI에서 $X \to Y \to \hat X$ Markov이므로 $H(X|\hat X) \ge H(X|Y)$. 두 부등식을 결합하면 성립한다. $\blacksquare$
+</Proof>
+
+$X$가 $K=10$개 클래스에 uniform하고 $I(X;Y) = 0.023$ nats라면 — 노이즈가 99%인 채널 — $P_e \ge 0.948$이다. **정보가 거의 없는 데이터로는 어떤 모델도 5% 이상의 정확도를 낼 수 없다.** Binary case에서 이 bound는 정확히 Bayes error와 일치한다.
+
+<Callout type="note" title="트레이드오프">
+Fano bound는 binary symmetric channel에서 tight하다. 반면 $K$가 커질수록 느슨해지고, non-uniform prior에서는 trivial estimator가 이미 bound를 이길 수 있다. 연속 타겟에는 packing argument를 이용한 minimax 확장(Yu 1997)이 필요하다. Representation 품질 지표로 읽으면 "$I(Z;Y)$가 클수록 linear probe accuracy의 하한이 높아진다"는 뜻이기도 하다.
+</Callout>
+
+## MINE과 InfoNCE — MI를 어떻게 최적화하는가
+
+연속 변수의 MI를 샘플만으로 추정하는 것은 근본적으로 어렵다. MINE(Belghazi 2018)은 Donsker–Varadhan 변분 표현을 이용한다.
+
+$$
+
+I(X;Y) = \sup_T\ \mathbb{E}_{p_{XY}}[T(X,Y)] - \log \mathbb{E}_{p_X p_Y}[e^{T(X,Y)}]
+
+$$
+
+$T$를 신경망 $T_\theta$로 파라미터화하고, joint 샘플과 marginal 샘플(배치 내 $y$ permutation)을 이용해 이 bound를 최대화하면 MI의 하한 추정기가 된다. 하지만 실용적 한계가 있다. McAllester–Stratos(2020)에 따르면 $I(X;Y) \ge B$일 때 $2^B$ 이하의 샘플로는 어떤 추정기도 안정적으로 추정할 수 없다 — 큰 MI 값은 구조적으로 추정 불가능하다.
+
+InfoNCE는 더 실용적인 경로다. $K$-way 분류 문제로 MI를 연결한다.
+
+$$
+
+I(X; Y) \ge \log K - \mathcal{L}_\text{NCE}
+
+$$
+
+$\mathcal{L}_\text{NCE} \ge 0$이므로 이 bound의 최댓값은 $\log K$다. 배치 크기가 MI 추정의 상한을 결정한다. CLUB(Cheng 2020)은 반대 방향 — $I(X;Z)$를 minimize할 때 필요한 **상한** 추정기로, Information Bottleneck의 압축 항을 다룰 때 쓰인다.
+
+대조학습의 기하학적 분해는 Wang & Isola(2020)에서 나온다. $K \to \infty$ 극한에서 InfoNCE는 두 항의 합으로 쓰인다.
+
+$$
+
+\mathcal{L}_\text{NCE} \to \underbrace{\mathbb{E}_\text{pos}[-\text{sim}(X,Y)/\tau]}_{\text{alignment}} + \underbrace{\log \mathbb{E}_{p_X p_Y}[e^{\text{sim}(X,Y^-)/\tau}]}_{\text{uniformity}}
+
+$$
+
+Alignment는 positive pair를 가깝게, Uniformity는 embedding을 구면 위에 균등하게 분산시킨다. SimCLR, MoCo, CLIP, DINO는 모두 이 두 목표를 다른 방식으로 달성하는 변형이다.
+
+<Aside label="설계 철학">
+BYOL과 SimSiam은 negative 없이 stop-gradient와 momentum teacher로 collapse를 막는다. 이론적으로 완전히 해명되지 않았지만, 암묵적으로 같은 alignment-uniformity 균형을 추구한다. "MI 최대화"라는 목표는 하나지만 그것을 구현하는 방법은 여럿이다.
+</Aside>
+
+## 정리
+
+- $I(X;Y) = D(p_{XY} \| p_X p_Y)$ — 독립으로부터의 KL 거리이며, 비선형 의존까지 모두 잡는다.
+- DPI: 레이어를 통과할수록 정보는 단조 감소한다. 표현학습의 목표는 손실을 최소화하는 충분통계량을 찾는 것이다.
+- Fano 부등식: $I(X;Y)$가 작으면 $P_e$는 반드시 크다. 정보이론적으로 풀 수 없는 문제의 한계가 명시적으로 존재한다.
+- MINE은 MI의 하한, CLUB은 상한 추정기다. InfoNCE의 $\log K$ 상한이 대조학습에서 거대 배치가 필요한 이유다.
+- SimCLR, MoCo, CLIP은 모두 $I(X;Y) \ge \log K - \mathcal{L}_\text{NCE}$의 변형이다.

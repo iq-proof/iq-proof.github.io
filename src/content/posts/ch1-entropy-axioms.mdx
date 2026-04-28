@@ -1,0 +1,141 @@
+---
+title: "왜 ML의 모든 손실 함수에는 로그가 있는가"
+description: "Shannon의 세 공리에서 $-\\log p$가 유일하게 강제되는 이유부터, 엔트로피·상호정보량·최대 엔트로피 분포까지 — ML 수식 속 로그의 기원을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-theory, entropy, mutual-information, maxent, cross-entropy]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Cross-Entropy 손실, KL-divergence, Mutual Information, VAE의 ELBO — 현대 ML의 거의 모든 핵심 수식에 $\log$가 등장한다. 이 $\log$는 관습이 아니다. 정보를 수치화하려는 소박한 요구 세 가지로부터 수학적으로 유일하게 강제되는 형태다. 그렇다면 그 세 가지 요구란 무엇이고, 어떻게 $-\log p$가 튀어나오는가?
+
+## 정보량의 공리: 세 가지 요구
+
+사건의 "정보량" $I(p)$에 우리가 바라는 것은 세 가지다.
+
+첫째, **연속성**: 확률이 조금 바뀌면 정보량도 조금만 바뀌어야 한다. 측정 오차가 유한한 영향만 주어야 한다는 공학적 요구다.
+
+둘째, **가법성**: 두 독립 사건이 동시에 일어났다는 소식의 정보량은, 각각을 따로 들었을 때의 합이어야 한다.
+
+$$I(p \cdot q) = I(p) + I(q) \quad \text{(독립 사건)}$$
+
+독립 사건의 확률은 곱이고, 정보는 합이다. 즉 $I$는 곱을 합으로 바꾸는 함수여야 한다.
+
+셋째, **단조성**: 확률이 낮은 사건일수록 정보량이 크다. 로또 당첨은 내일 해가 뜬다는 소식보다 훨씬 놀랍다.
+
+<Theorem kind="theorem" number="1" title="Shannon 정보 측도의 유일성">
+위 세 공리를 만족하는 함수 $I: (0, 1] \to \mathbb{R}_{\geq 0}$는 반드시
+
+$$I(p) = -\log_b p$$
+
+형태이며, 밑 $b > 1$이 유일하게 자유로운 선택이다.
+</Theorem>
+
+<Proof>
+가법성 조건 $I(pq) = I(p) + I(q)$에서 $f(x) := I(x)$는 $(0,1]$ 위의 함수방정식 $f(xy) = f(x) + f(y)$를 만족한다. $g(t) := f(e^t)$로 치환하면 $g(t+s) = g(t) + g(s)$ — Cauchy 가법 방정식이다. 연속성을 가정하면 이 방정식의 해는 $g(t) = ct$로 유일하다 (연속성 없이는 Hamel 기저를 이용한 병적 해가 존재한다). 원래 변수로 돌아오면 $f(x) = c \log x$. 단조성 조건에서 $c < 0$이고, 밑 재정의로 상수를 흡수하면 $I(p) = -\log_b p$.
+</Proof>
+
+<Callout type="note" title="연속성이 핵심">
+세 공리 중 연속성이 없으면 증명이 무너진다. 가법적이지만 모든 점에서 불연속인 해가 존재하기 때문이다. 연속성은 "확률 측정에 작은 오차가 있어도 정보량이 안정적으로 변한다"는 물리적 요구를 수식화한 것이다.
+</Callout>
+
+밑 $b$는 단위를 결정할 뿐이다. $b = 2$이면 **bits**, $b = e$이면 **nats**. 1 nat $= \log_2 e \approx 1.443$ bits — 단위만 다른 같은 양이다.
+
+## 엔트로피: 평균 놀라움
+
+단일 사건의 정보량에서 자연스럽게 확률변수 전체의 "평균 놀라움"으로 이동한다.
+
+$$H(X) := \mathbb{E}[-\log p(X)] = -\sum_{x} p(x) \log p(x)$$
+
+$H$의 범위는 공리에서 바로 결정된다.
+
+$$0 \leq H(p) \leq \log |\mathcal{X}|}$$
+
+하한 $H = 0$은 한 점에 확률이 집중된 결정적 분포에서만 달성된다 — 정보가 없다. 상한 $H = \log n$은 균등분포에서 달성된다 — 가장 예측 불가능하다.
+
+상한의 증명은 우아한 항등식으로 표현된다.
+
+$$\log n - H(p) = \sum_x p(x) \log \frac{p(x)}{1/n} = D(p \| u) \geq 0$$
+
+"균등분포에서 얼마나 벗어났는가"가 "엔트로피가 최대에서 얼마나 떨어졌는가"와 정확히 같다.
+
+$H$는 $p$에 대해 **오목 함수**다. 두 분포를 섞으면 엔트로피가 줄지 않는다 — "섞음은 불확실성을 증가시킨다." ML에서 Label Smoothing이 모델의 과신을 억제하고, Entropy Regularization이 다양성을 유지하는 원리가 여기에 있다.
+
+## 상호정보량과 Chain Rule
+
+두 변수를 함께 볼 때 정보 구조는 벤다이어그램으로 직관화된다.
+
+```
+  ┌─── H(X,Y) ───┐
+  │  H(X|Y) I(X;Y) H(Y|X)  │
+  └───────────────┘
+      H(X)    H(Y)
+```
+
+**Chain Rule**: 결합 분포의 엔트로피는 순차 조건부 엔트로피의 합이다.
+
+$$H(X_1, \ldots, X_n) = \sum_{i=1}^{n} H(X_i \mid X_1, \ldots, X_{i-1})$$
+
+이것이 GPT 같은 autoregressive 모델의 수학적 근간이다. $p(w_{1:T}) = \prod_t p(w_t \mid w_{<t})$에 로그를 취하면 정확히 chain rule의 항들이다. 학습 손실로 쓰는 token-level NLL의 평균은 데이터의 **평균 조건부 엔트로피** 추정이고, 그 지수가 Perplexity다.
+
+**상호정보량** $I(X; Y)$는 결합 분포가 독립에서 벗어난 정도를 KL로 측정한다.
+
+$$I(X; Y) = D(p_{XY} \| p_X p_Y) = H(X) - H(X \mid Y) \geq 0$$
+
+등호는 독립일 때만이다. "조건은 엔트로피를 감소시킨다" — $H(X \mid Y) \leq H(X)$ — 는 $I \geq 0$의 직접적 귀결이다. 더 많이 알수록 덜 혼란스럽다는 당연한 사실이, 평균에서는 항상 성립한다는 것이 정리다.
+
+<Callout type="note" title="트레이드오프: 미분 엔트로피의 한계">
+연속 변수로 넘어가면 엔트로피는 **좌표에 의존**하게 된다. $h(aX) = h(X) + \log |a|$ — 단위만 바꿔도 값이 달라진다. 균등분포 $U(0, 0.1)$의 엔트로피는 $\log 0.1 < 0$, 음수다. 반면 KL과 MI는 좌표 변환에 불변이다 — Jacobian이 상쇄되기 때문이다. 이것이 ML의 실제 손실 함수가 항상 KL이나 MI의 형태로 쓰이는 이유다. 미분 엔트로피는 "절대 정보량"이 아니라 상대량의 재료다.
+</Callout>
+
+## 최대 엔트로피 분포: 지수족의 기원
+
+"아는 것만 제약하고 나머지는 최대한 모른다고 가정하라" — Jaynes의 MaxEnt 원리다. 라그랑주 승수법으로 풀면 해는 항상 **지수족** 형태가 된다.
+
+$$f^*(x) \propto \exp\!\left(-\sum_k \lambda_k g_k(x)\right)$$
+
+세 가지 대표 결과가 ML에서 반복적으로 등장한다.
+
+| 제약 | MaxEnt 분포 |
+|------|------------|
+| Support $[a, b]$만 | 균등 $U(a, b)$ |
+| 양수, 평균 $\mu$ | 지수 $\text{Exp}(1/\mu)$ |
+| 실수, 평균·분산 | 정규 $\mathcal{N}(\mu, \sigma^2)$ |
+
+Softmax classifier는 이 틀에서 자동으로 나온다. 유한 알파벳에서 feature 기대값 $\mathbb{E}[g_k(X)]$를 맞추는 MaxEnt 분포가 정확히 softmax다. "왜 분류기는 softmax인가"에 대한 정보이론적 답이 여기에 있다.
+
+VAE의 KL 항 $\frac{1}{2}[\mu^2 + \sigma^2 - 1 - \log \sigma^2]$에서 $\log \sigma^2$의 출처, Normalizing Flow의 Jacobian 보정, SAC 정책의 $\text{softmax}(Q/\alpha)$ 형태 — 전부 이 원리의 다른 표현이다.
+
+<Aside label="공통 실">
+Cross-Entropy 손실의 $\log$, 정규분포 NLL의 $\log \sigma^2$, KL 항의 $\log$, MaxEnt의 지수족 — 이것들은 별개의 발명이 아니다. "정보를 수치화하려면 로그를 써야 한다"는 공리적 필연이 ML 전체에 걸쳐 반복되는 것이다.
+</Aside>
+
+## 정리
+
+- $I(p) = -\log_b p$는 연속성·가법성·단조성 세 공리의 유일한 해다.
+- $H(p) = \mathbb{E}[-\log p]$는 $[0, \log n]$ 사이이며, 균등분포에서 최대 엔트로피를 달성한다.
+- Chain Rule $H(X_{1:n}) = \sum_i H(X_i \mid X_{<i})$는 autoregressive 모델링의 수학적 기반이다.
+- 제약 조건 하 MaxEnt의 해는 항상 지수족이며, softmax와 정규분포는 그 특수 사례다.
+- 미분 엔트로피는 좌표에 의존하지만, KL과 MI는 불변이다 — ML 손실은 항상 후자 형태를 쓴다.
+
+정보이론의 출발점은 "놀라움을 어떻게 잴 것인가"라는 단순한 질문이다. 그 답이 $-\log p$이고, 그 위에 현대 ML의 손실 함수 대부분이 세워져 있다.
+
+<Reference
+  title="A Mathematical Theory of Communication"
+  authors="Shannon, C. E."
+  year={1948}
+  venue="Bell System Technical Journal"
+  url="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf"
+/>

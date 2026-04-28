@@ -1,0 +1,145 @@
+---
+title: "정보이론은 어떻게 AI의 모든 손실함수를 하나로 설명하는가"
+description: "Cross-Entropy와 MLE의 동등성부터 ELBO 분해, MDL, Information Bottleneck, Diffusion ELBO, Fisher 기하까지 — AI 학습 목적함수의 공통 뿌리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-theory, cross-entropy, elbo, vae, diffusion]
+difficulty: advanced
+series:
+  slug: information-theory-deep-dive
+  title: Information Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+분류 모델의 `CrossEntropyLoss`, VAE의 재구성 오차, Diffusion의 MSE, RLHF의 Bradley-Terry 손실 — 이것들은 얼핏 제각각처럼 보인다. 그런데 단 하나의 질문으로 모두 관통된다: **데이터를 가장 짧게 설명하려면 파라미터를 어떻게 조정해야 하는가?**
+
+## 모든 손실함수의 공통 분모: Cross-Entropy
+
+Cross-entropy $H(p, q) = -\sum_x p(x) \log q(x)$ 는 "실제 분포 $p$ 에서 온 데이터를 모델 $q$ 의 코드로 기술할 때 평균 비트 수"다. 핵심 항등식은 다음이다.
+
+$$
+H(p, q) = H(p) + D(p \| q)
+$$
+
+$H(p)$ 는 $\theta$ 에 무관한 상수이므로, Cross-Entropy 최소화는 곧 $D(p \| q_\theta)$ 최소화다. 그리고 MLE는 $\max \sum \log q_\theta(x_i)$, 즉 $\min H(\hat{p}, q_\theta)$와 동치다. 결국 분류기를 학습하든 언어모델을 학습하든, 우리는 항상 같은 일을 하고 있다 — **경험분포와 모델분포 사이의 KL을 줄인다.**
+
+<Callout type="note" title="Perplexity의 정보이론적 의미">
+언어모델의 PPL은 $\exp(H(\hat{p}, q_\theta))$다. PPL = 20이면 "매 토큰마다 20개 후보 중 하나 수준의 불확실성", 즉 $\log_2 20 \approx 4.3$ bits/token. Uniform 분포(vocab=50000)의 15.6 bits와 비교하면 11 bits를 압축한 셈이다.
+</Callout>
+
+## ELBO: 잠재변수 모델에서의 정확한 분해
+
+$p(z|x)$ 를 직접 계산할 수 없을 때 — VAE, Diffusion, 모든 잠재변수 모델에서 — 다음 항등식이 출발점이 된다.
+
+$$
+\log p(x) = \underbrace{\mathbb{E}_{q(z|x)}[\log p(x|z)] - D(q(z|x) \| p(z))}_{\text{ELBO}} + D(q(z|x) \| p(z|x))
+$$
+
+ELBO는 $\log p(x)$ 의 하한이 아니라 **정확한 분해**다. Gap은 항상 근사 posterior와 진짜 posterior 사이의 KL이다. Encoder가 완벽하다면 gap은 0이 된다.
+
+두 항의 역할은 명확하다. Reconstruction term $\mathbb{E}_q[\log p(x|z)]$는 "$z$로부터 $x$를 얼마나 잘 복원하는가"를, KL term $D(q(z|x) \| p(z))$는 "posterior가 prior에서 얼마나 벗어났는가"를 잰다. $\beta$-VAE는 KL 계수를 $\beta > 1$로 키워 $I(X;Z)$를 압축함으로써 latent 축의 disentanglement를 유도한다.
+
+## MDL: 모델 복잡도도 비트로 센다
+
+Rissanen(1978)의 MDL 원리는 같은 프레임을 모델 선택으로 확장한다.
+
+$$
+\hat{M} = \arg\min_M \{ L(M) + L(D|M) \}
+$$
+
+$L(M) = -\log p(M)$, $L(D|M) = -\log p(D|M)$ 으로 놓으면 이것은 MAP 추정과 동치다. L2 정규화는 $\theta \sim \mathcal{N}(0, 1/\lambda)$ prior 하의 MDL이고, L1은 Laplace prior다. BIC의 $\frac{k}{2}\log n$ 페널티는 Rissanen stochastic complexity의 선행항이다.
+
+<Aside label="Deep learning의 역설">
+파라미터 수억 개인 모델에 $\frac{k}{2}\log n$ 을 적용하면 페널티가 천문학적이어야 한다. 그런데 왜 overfit하지 않는가? MDL 관점의 답: 실제 description length는 parameter count가 아니라 flat minima의 precision으로 결정된다. Hochreiter(1997)의 flat minima 가설이 바로 이 아이디어다 — flat minima는 낮은 정밀도로도 손실이 변하지 않으므로 더 짧은 코드로 기술된다.
+</Aside>
+
+## Information Bottleneck: 좋은 표현의 정의
+
+Tishby(1999)는 표현 $Z$의 최적성을 다음 목적으로 정의했다.
+
+$$
+\min_{p(z|x)} \big[ I(X;Z) - \beta\, I(Z;Y) \big]
+$$
+
+$I(X;Z)$는 작을수록 좋다 — $Z$가 $X$를 압축했다는 뜻. $I(Z;Y)$는 클수록 좋다 — $Z$가 레이블 $Y$를 예측한다는 뜻. $\beta$는 두 힘의 균형이다.
+
+Alemi(2016)의 VIB는 이를 tractable하게 만든다. $I(X;Z)$를 KL로 상한하고, $I(Z;Y)$를 분류기 log-likelihood로 하한하면:
+
+$$
+\mathcal{L}_\text{VIB} = -\mathbb{E}_{q(z|x)}[\log q(y|z)] + \beta \cdot D(q(z|x) \| r(z))
+$$
+
+구조가 VAE와 완전히 같다. Target만 "$x$ 재구성"에서 "$y$ 예측"으로 바뀌었을 뿐이다. VAE는 unsupervised IB, VIB는 supervised VAE다.
+
+## Diffusion ELBO: KL의 시간 합산
+
+DDPM의 학습 목적도 같은 분해에서 출발한다. Latent가 하나인 VAE와 달리, Diffusion은 $x_{1:T}$ 전체를 잠재변수로 가진다.
+
+$$
+-\log p_\theta(x_0) \leq \underbrace{D(q(x_T|x_0) \| p(x_T))}_{L_T \approx 0} + \sum_{t=2}^T \underbrace{D(q(x_{t-1}|x_t,x_0) \| p_\theta(x_{t-1}|x_t))}_{L_{t-1}} - \underbrace{\log p_\theta(x_0|x_1)}_{L_0}
+$$
+
+각 $L_{t-1}$은 두 Gaussian 사이의 KL이다. $q(x_{t-1}|x_t, x_0)$는 closed form Gaussian이고, $p_\theta$도 Gaussian으로 파라미터화한다. 두 Gaussian KL을 전개하면 Ho(2020)의 단순 MSE loss가 나온다.
+
+$$
+\mathcal{L}_\text{simple}(\theta) = \mathbb{E}_{t,x_0,\epsilon}\bigl[\|\epsilon - \epsilon_\theta(\sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon,\, t)\|^2\bigr]
+$$
+
+이 loss는 full ELBO의 각 $t$별 KL 계수를 1로 reweight한 버전이다. 그리고 Song(2021)이 보였듯 Denoising Score Matching과 상수 factor를 제외하면 정확히 동치다.
+
+## Fisher 정보: KL의 무한소 기하
+
+파라미터를 조금 바꿨을 때 분포가 얼마나 변하는가를 측정하면 Fisher Information Matrix가 나온다.
+
+<Theorem kind="theorem" number="1" title="KL의 2차 근사">
+$$
+D(p_\theta \| p_{\theta + d\theta}) = \frac{1}{2} d\theta^\top I(\theta)\, d\theta + O(\|d\theta\|^3)
+$$
+</Theorem>
+
+<Proof>
+$D(p_\theta \| p_{\theta+d\theta}) = -\mathbb{E}_{p_\theta}[\ell(\theta+d\theta) - \ell(\theta)]$를 Taylor 전개한다. $\mathbb{E}[\nabla\ell] = 0$ (score의 기대값이 0)이므로 1차 항은 사라지고, $\mathbb{E}[\nabla^2\ell] = -I(\theta)$를 이용하면 2차 항만 남는다. $\blacksquare$
+</Proof>
+
+즉 Fisher는 파라미터 공간 위의 **Riemannian metric**이다. 이 metric으로 steepest descent를 정의하면 Natural Gradient $I(\theta)^{-1}\nabla L$가 된다. Adam의 $v_t$는 대각 empirical Fisher의 running estimate로 볼 수 있다 — Adam이 diagonal natural gradient descent에 가까운 이유다.
+
+<Callout type="note" title="트레이드오프">
+Natural Gradient는 파라미터 재구성에 invariant하고 이론적으로 optimal하지만, $I(\theta)^{-1}$의 계산 비용이 파라미터 수의 제곱에 비례한다. K-FAC(Martens 2015)는 층별 Kronecker factorization으로, Adam은 대각 근사로 이 비용을 줄인다. 정확도와 비용 사이의 균형이 여전히 활발한 연구 주제다.
+</Callout>
+
+## 정리
+
+여섯 챕터가 말하는 것은 결국 하나다.
+
+- Cross-Entropy 최소화 = MLE = KL 최소화 = 데이터의 최단 코드 학습.
+- ELBO는 잠재변수 모델에서 이 원리를 정확하게 분해한다 — gap은 posterior 근사 오차.
+- MDL은 모델 자체의 complexity도 코드 길이로 환산해 Occam의 면도날을 수치화한다.
+- Information Bottleneck은 "좋은 표현"을 $I(X;Z)$와 $I(Z;Y)$의 트레이드오프로 정의한다.
+- Diffusion ELBO는 VAE의 단일 잠재변수를 $T$-step 시퀀스로 확장한 것이며 MSE loss가 그 귀결이다.
+- Fisher Information은 KL의 2차 근사로서, 파라미터 공간에 정보이론적 기하를 부여한다.
+
+이 모든 아이디어의 공통 언어는 **비트**다 — 데이터를 설명하는 데 드는 최소 코드 길이.
+
+<Reference
+  title="Auto-Encoding Variational Bayes"
+  authors="Kingma, D.P. and Welling, M."
+  year={2013}
+  venue="ICLR 2014"
+  url="https://arxiv.org/abs/1312.6114"
+/>
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho, J., Jain, A., and Abbeel, P."
+  year={2020}
+  venue="NeurIPS 2020"
+  url="https://arxiv.org/abs/2006.11239"
+/>
