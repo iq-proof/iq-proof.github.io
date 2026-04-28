@@ -1,0 +1,129 @@
+---
+title: "역전파는 어떻게 수십억 파라미터의 기울기를 한 번에 계산하는가"
+description: "계산 그래프와 자동미분의 수학적 구조부터 기울기 소실·폭발의 원인과 해결책, Autograd 엔진의 내부 동작까지 딥러닝 최적화의 핵심을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [backpropagation, autograd, computational-graph, gradient-vanishing, deep-learning]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-3는 1750억 개의 파라미터를 가진다. 수치 미분으로 기울기를 계산하려면 1750억 번의 forward pass가 필요하다. 그런데 실제로는 단 한 번의 forward pass와 한 번의 backward pass로 모든 기울기를 기계 정밀도로 계산한다. 어떻게 가능한가?
+
+## 세 가지 미분 방법의 비용
+
+미분을 계산하는 방법은 세 가지다. **수치 미분**은 중심 차분 공식
+
+$$\frac{\partial f}{\partial x_i} \approx \frac{f(x + h e_i) - f(x - h e_i)}{2h}$$
+
+으로 각 파라미터마다 forward pass 두 번을 요구한다. $n$개 파라미터면 $2n$회. ResNet-50의 2500만 파라미터라면 5천만 번의 forward pass가 필요하다. **기호 미분**은 수식을 해석적으로 유도하므로 정확하지만, 복합함수가 깊어질수록 유도된 수식이 지수적으로 팽창한다. 중간 결과를 재활용하지 못한다는 근본적 한계가 있다.
+
+**자동미분(AD)**은 계산 그래프를 따라 중간 값을 재활용하며 기울기를 축적한다. 비용은 forward pass의 상수배(보통 1.5-3배)이고, 정확도는 기계 정밀도다. 이것이 딥러닝이 존재할 수 있는 이유다.
+
+## Forward Mode vs Reverse Mode
+
+자동미분에는 두 가지 방향이 있다.
+
+<Theorem kind="theorem" number="1" title="Reverse Mode AD의 최적성">
+$f: \mathbb{R}^n \to \mathbb{R}^m$이 계산 그래프로 표현될 때, $n \gg m$이면 Reverse Mode로 1회 backward pass만으로 전체 기울기 $\nabla_x L$을 계산할 수 있다.
+</Theorem>
+
+<Proof>
+스칼라 손실 $L = u^\top f(x)$에 대해 **adjoint 변수** $\bar{v}_i = \frac{\partial L}{\partial v_i}$를 정의한다. 연쇄 법칙에 의해
+
+$$\bar{v}_j = \sum_{i: j \to i} \bar{v}_i \frac{\partial v_i}{\partial v_j}$$
+
+역위상(reverse topological) 순서로 $\bar{v}_N = u$부터 계산하면, 각 노드를 정확히 한 번씩 방문하므로 backward pass 1회로 $\bar{v}_0 = \nabla_x L$을 얻는다. ∎
+</Proof>
+
+반면 **Forward Mode**는 벡터 $v \in \mathbb{R}^n$에 대해 Jacobian-vector product $J_f v$만을 한 번에 계산한다. 전체 Jacobian을 얻으려면 $n$번 반복해야 한다. 딥러닝은 $n$ (파라미터 수) $\gg$ $m$ (출력 수 = 1)이므로 Reverse Mode가 $O(n)$배 유리하다.
+
+<Aside label="Dual Numbers">
+Forward Mode는 이중수(dual number) $a + b\epsilon$ ($\epsilon^2 = 0$)으로 구현할 수 있다. 임의의 함수에 dual number를 입력하면 $f(a + b\epsilon) = f(a) + f'(a)b\epsilon$가 되어, 실수부는 함숫값, 이중수부는 방향 미분을 자동으로 돌려준다.
+</Aside>
+
+## 역전파의 완전 유도
+
+$L$층 신경망에서 역전파의 핵심은 **에러 신호** $\delta^{(l)} = \frac{\partial L}{\partial z^{(l)}}$의 재귀 계산이다.
+
+$$\delta^{(l)} = (W_{l+1}^\top \delta^{(l+1)}) \odot \sigma'(z^{(l)})$$
+
+이 식의 구조를 읽으면: 윗 층의 에러 신호를 가중치 전치로 투영하고($W_{l+1}^\top \delta^{(l+1)}$), 현재 층 활성화 함수의 국소 기울기로 마스킹($\odot \sigma'$)한다. 파라미터 기울기는
+
+$$\frac{\partial L}{\partial W_l} = \delta^{(l)} (a^{(l-1)})^\top$$
+
+로 에러 신호와 이전 층 활성화의 외적이다. Cross-entropy와 Softmax를 조합하면 특히 우아한 소거가 일어난다.
+
+<Theorem kind="proposition" number="2" title="Cross-Entropy + Softmax 기울기 소거">
+Cross-entropy 손실 $L = -\sum_j y_j \log \hat{y}_j$와 Softmax 출력 $\hat{y}$의 조합에서
+
+$$\frac{\partial L}{\partial z} = \hat{y} - y$$
+</Theorem>
+
+<Proof>
+$\frac{\partial \hat{y}_k}{\partial z_j}$를 $k=j$와 $k \neq j$ 경우로 나누어 전개하면
+
+$$\frac{\partial L}{\partial z_j} = -y_j(1 - \hat{y}_j) + \sum_{k \neq j} y_k \hat{y}_j = -y_j + \hat{y}_j \sum_k y_k = \hat{y}_j - y_j$$
+
+$\sum_k y_k = 1$ (one-hot)이므로 성립. ∎
+</Proof>
+
+복잡한 Softmax-Jacobian 계산이 예측값과 레이블의 차이로 소거된다. 이는 수치적으로도 안정하고 구현도 단순하다.
+
+## 기울기 소실과 폭발: 언제 무너지는가
+
+에러 신호가 역방향으로 흐를 때 각 층에서 $\sigma'(z^{(l)})$만큼 스케일된다. Sigmoid의 경우
+
+$$\sigma'(z) = \sigma(z)(1 - \sigma(z)) \leq \frac{1}{4}$$
+
+이므로 100층 네트워크에서 첫 번째 층의 기울기는 최악 $(1/4)^{100} \approx 10^{-60}$으로 수렴한다. 실험으로 확인하면 Sigmoid는 30층 이상에서 사실상 기울기가 0이 되지만, ReLU는 100층에서도 기울기 크기가 유지된다.
+
+<Callout type="warning" title="기울기 소실의 수학적 조건">
+역전파에서 기울기 크기는 $\prod_{k=l}^{L-1} \|W_{k+1}\| \cdot |\sigma'(z^{(k)})|$에 비례한다. 이 곱이 1보다 작으면 기울기 소실, 1보다 크면 기울기 폭발이다. Sigmoid의 $\sigma' \leq 1/4$는 소실을 구조적으로 유발한다.
+</Callout>
+
+현대 딥러닝의 해결책은 세 가지다. **ReLU**는 $\sigma'(z) \in \{0, 1\}$이므로 활성 뉴런을 통한 기울기가 1:1로 흐른다. **He 초기화**는 ReLU가 절반의 뉴런을 죽인다는 사실을 반영해 $\text{Var}(W) = 2/n_{\text{in}}$으로 설정, 층을 거쳐도 분산을 유지한다. **Batch Normalization**은 중간 활성화를 배치마다 표준화해 내부 공변량 변화를 제거한다. 실험에서 BN이 없으면 20층 네트워크의 분산이 층마다 절반씩 붕괴되지만, BN이 있으면 모든 층에서 분산이 1에 가깝게 유지된다.
+
+## 트레이드오프
+
+<Callout type="note" title="메모리 vs 연산 속도">
+Reverse Mode AD는 backward pass에서 forward의 중간 활성화를 역순으로 참조해야 하므로 **모든 중간 값을 저장**해야 한다. 메모리 비용은 $O(\text{depth} \times \text{width})$다. **Gradient Checkpointing**은 일부 체크포인트만 저장하고 필요시 재계산하여 메모리를 $O(\sqrt{\text{depth}} \times \text{width})$로 줄이지만, 연산 비용이 약 33% 증가한다.
+</Callout>
+
+Baur-Strassen 정리에 의하면 산술 회로로 표현된 $f$의 전체 Jacobian 계산 비용은 forward pass 비용의 5배를 넘지 않는다. 딥러닝의 $m=1$ (스칼라 손실) 구조에서는 실제로 1.5-2배 수준이다. Forward Mode는 입력 차원이 작을 때($n \ll m$) 유리하므로, 3D 렌더러 파라미터 미분이나 물리 시뮬레이션에 쓰인다.
+
+## 정리
+
+- 역전파 = Reverse Mode AD. $n \gg m$인 딥러닝 구조에서 1 forward + 1 backward로 수십억 파라미터의 기울기를 모두 계산한다.
+- 에러 신호 $\delta^{(l)} = (W_{l+1}^\top \delta^{(l+1)}) \odot \sigma'(z^{(l)})$는 연쇄 법칙을 층별로 분해한 것이다.
+- Sigmoid의 기울기 소실은 설계상 필연이다. ReLU + He 초기화 + BatchNorm 조합이 100층 이상 네트워크를 가능하게 만들었다.
+- Autograd 엔진의 핵심은 연산 오버로딩으로 DAG를 구성하고, 위상 역순 순회로 기울기를 축적하는 것이다. PyTorch, TensorFlow, JAX 모두 이 원리를 공유한다.
+
+수식 한 줄 뒤에는 "모든 기울기를 한 번에 얻어야 학습이 가능하다"는 구체적인 엔지니어링 요구가 숨어 있다.
+
+<Reference
+  title="Learning Representations by Back-propagating Errors"
+  authors="Rumelhart, Hinton, Williams"
+  year={1986}
+  venue="Nature"
+  url="https://www.nature.com/articles/323533a0"
+/>
+
+<Reference
+  title="Automatic Differentiation in Machine Learning: a Survey"
+  authors="Baydin et al."
+  year={2018}
+  venue="JMLR"
+  url="https://arxiv.org/abs/1502.05767"
+/>

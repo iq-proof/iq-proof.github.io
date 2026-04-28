@@ -1,0 +1,122 @@
+---
+title: "제약 최적화는 왜 AI의 핵심 언어인가"
+description: "라그랑주 승수법부터 KKT 조건, 라그랑지안 쌍대성, 엔벨로프 정리, RLHF까지 — 제약 최적화의 수학적 구조가 AI 알고리즘 설계를 어떻게 결정하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [constrained-optimization, lagrange-multipliers, kkt, duality, rlhf]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+AI 알고리즘을 충분히 깊이 들여다보면, 그 중심에는 항상 하나의 질문이 있다. "어떤 제약 아래서 무언가를 최대화하거나 최소화하는가?" SVM의 마진, RLHF의 KL 제약, PCA의 단위 노름 — 이것들은 독립된 기법이 아니라 하나의 수학적 언어, 즉 **제약 최적화**의 다른 방언이다. 그 언어의 문법을 모르면 알고리즘을 "쓸" 수는 있어도 "읽을" 수는 없다.
+
+## 라그랑주 승수법 — 기하가 먼저다
+
+등식 제약 최적화의 출발점은 기하적 직관이다.
+
+$$
+\min_{x \in \mathbb{R}^n} f(x) \quad \text{s.t.} \quad g(x) = 0
+$$
+
+최적점 $x^*$에서 목적함수의 그래디언트 $\nabla f(x^*)$는 제약 다양체의 접공간에 수직이어야 한다. 만약 수직이 아니라면, 접공간 방향으로 조금 움직여 $f$를 더 줄일 수 있고, 그러면 $x^*$는 최적점이 아니다. 이 관찰이 곧 라그랑주 필요조건이다.
+
+<Theorem kind="theorem" number="1" title="라그랑주 필요조건 (LICQ 하)">
+$x^*$가 국소 최솟값이고 $\nabla g_1(x^*), \ldots, \nabla g_m(x^*)$가 선형독립(LICQ)이면, $\lambda^* \in \mathbb{R}^m$이 존재하여
+
+$$
+\nabla f(x^*) + \sum_{i=1}^{m} \lambda_i^* \nabla g_i(x^*) = 0
+$$
+</Theorem>
+
+<Proof>
+$x^*$가 최적이므로 접선 방향 $d$ (즉, $\nabla g(x^*)^\top d = 0$인 모든 $d$)에 대해 $\nabla f(x^*)^\top d = 0$이다. 이는 $\nabla f(x^*)$가 $\{\nabla g_i(x^*)\}$의 열 공간에 속함을 의미한다. LICQ 하에서 그 열 공간의 차원은 정확히 $m$이므로 계수 $\lambda_i^*$가 유일하게 결정된다.
+</Proof>
+
+PCA는 이 정리의 가장 우아한 응용이다. $\max_x x^\top \Sigma x$ s.t. $x^\top x = 1$의 라그랑지안 1차 조건을 쓰면 $\Sigma x = \lambda x$, 즉 고유벡터 방정식이 된다. 라그랑주 승수가 바로 분산값(고유값)이다.
+
+## KKT 조건 — 활성 제약만 중요하다
+
+부등식 제약 $g_i(x) \leq 0$이 추가되면 상보적 여유(complementary slackness) 조건이 등장한다.
+
+$$
+\mu_i \geq 0, \quad \mu_i g_i(x^*) = 0
+$$
+
+이 조건이 담은 핵심은 단순하다. **비활성 제약($g_i(x^*) < 0$)은 최적성에 기여하지 않는다.** 오직 활성 집합 $\mathcal{A}(x^*) = \{i : g_i(x^*) = 0\}$만이 최적점의 형태를 결정한다.
+
+SVM에서 지지벡터(support vector)가 바로 활성 제약에 대응하는 점들이다. $\mu_i > 0$인 점만 결정 경계를 정의하고, 나머지 모든 학습 데이터는 최적화 결과에 영향을 미치지 않는다.
+
+<Callout type="note" title="볼록 문제에서 KKT는 필요충분조건">
+$f$와 $g_i$가 볼록함수이고 Slater 조건(내점 존재)이 성립하면, KKT 조건을 만족하는 점은 **전역 최솟값**이다. 이때 KKT 조건 확인만으로 전역 최적성이 보장되므로, 볼록 제약 최적화는 사실상 KKT 시스템을 푸는 문제가 된다.
+</Callout>
+
+## 라그랑지안 쌍대성 — 어려운 문제를 뒤집어라
+
+쌍대 함수 $q(\mu, \lambda) = \inf_x \mathcal{L}(x, \mu, \lambda)$는 항상 **오목함수**다. $\inf$가 아핀 함수들의 하한이기 때문이다. 이 사실의 함의는 강력하다. 원문제(primal)가 비볼록이더라도, 쌍대 문제(dual)는 **항상 볼록 최적화**다.
+
+약한 쌍대성은 $d^* \leq p^*$를 보장한다. 쌍대 함수가 실현가능 점에서의 목적함수값의 하한이기 때문이다. 볼록 문제에서 Slater 조건이 성립하면 $d^* = p^*$ (강한 쌍대성)가 되어 쌍대 갭이 0이 된다.
+
+SVM의 쌍대 문제가 이를 잘 보여준다. 원문제는 고차원 가중치 벡터 $w$에 대한 이차계획법이지만, 쌍대 문제는 샘플 수 $n$에 대한 이차계획법으로 바뀐다. 고차원 특징 공간에서도 내적 $x_i^\top x_j$만 계산하면 되므로 커널 트릭이 자연스럽게 등장한다.
+
+$$
+d^* = \max_\alpha \sum_i \alpha_i - \frac{1}{2}\sum_{i,j} \alpha_i \alpha_j y_i y_j K(x_i, x_j)
+$$
+
+## 엔벨로프 정리 — 간접 효과는 소거된다
+
+파라미터 $p$가 변할 때 최적값 $f^*(p)$는 어떻게 변하는가? 직관적으로는 최적해 $x^*(p)$의 변화까지 추적해야 할 것 같다. 엔벨로프 정리는 그럴 필요가 없다고 말한다.
+
+$$
+\frac{df^*(p)}{dp} = \frac{\partial \mathcal{L}(x^*(p), \lambda^*(p), p)}{\partial p}
+$$
+
+KKT 조건이 최적해를 통한 간접 효과를 정확히 소거하기 때문이다. 라그랑지안의 직접 편미분만 계산하면 충분하다.
+
+이 원리는 Bilevel Optimization에서 결정적이다. DARTS 같은 신경구조 탐색에서 아키텍처 파라미터 $\phi$에 대한 검증 손실의 그래디언트는 다음과 같이 계산된다.
+
+$$
+\frac{dL_{\text{val}}}{d\phi} = \frac{\partial L_{\text{val}}}{\partial \phi} - \frac{\partial L_{\text{val}}}{\partial x}\bigg|_{x^*} \left(\nabla_{xx}^2 L_{\text{train}}\right)^{-1} \nabla_{x\phi}^2 L_{\text{train}}\bigg|_{x^*}
+$$
+
+헤시안 역행렬 계산이 병목이 되지만, Neumann 급수 근사나 유한 차분으로 우회할 수 있다.
+
+## RLHF — KKT 조건이 정책의 형태를 결정한다
+
+RLHF는 KL 제약 하의 보상 최대화다.
+
+$$
+\max_\pi \mathbb{E}[r(s,a)] \quad \text{s.t.} \quad D_{\text{KL}}(\pi \| \pi_{\text{ref}}) \leq \delta
+$$
+
+라그랑지안 1차 조건을 풀면 최적 정책의 닫힌 형식이 나온다.
+
+$$
+\pi^*(a|s) \propto \pi_{\text{ref}}(a|s) \exp\left(\frac{r(s,a)}{\beta}\right)
+$$
+
+$\beta$는 KL 제약의 라그랑주 승수다. 보상이 높을수록, 그리고 참조 정책의 확률이 높을수록 최적 정책의 확률이 높아진다. 이 수식은 "경험적으로 잘 동작한다"는 관찰이 아니라 **KKT 조건의 직접적인 귀결**이다.
+
+<Aside label="통일된 시각">
+Proximal Gradient의 Soft-thresholding, Frank-Wolfe의 선형 최소화 오라클, RLHF의 최적 정책 — 이 세 가지는 각각 L1 정규화 제약, 컨벡스 집합 제약, KL 발산 제약에 대한 KKT 조건을 풀어낸 결과다. 알고리즘의 외형은 달라도 수학적 구조는 같다.
+</Aside>
+
+## 정리
+
+- 라그랑주 승수법의 기하적 의미: 최적점에서 $\nabla f \parallel \nabla g$. PCA의 고유벡터가 여기서 나온다.
+- KKT 조건은 활성 제약만 최적성에 기여한다는 사실을 정형화한다. SVM의 지지벡터는 활성 제약의 다른 이름이다.
+- 쌍대 함수는 항상 오목하다 — 원문제가 비볼록이어도 쌍대 문제는 볼록이다.
+- 엔벨로프 정리는 Bilevel Optimization의 이론적 기반이다. KKT 조건이 간접 효과를 소거하기 때문에 라그랑지안의 직접 편미분만 필요하다.
+- RLHF의 최적 정책 $\pi^* \propto \pi_{\text{ref}} \exp(r/\beta)$는 KKT 조건의 닫힌 해다.
+
+제약 최적화는 AI 알고리즘의 "왜"를 설명하는 언어다. 수식의 형태 뒤에 어떤 제약이 숨어 있는지 보이기 시작하면, 알고리즘은 더 이상 마법처럼 보이지 않는다.

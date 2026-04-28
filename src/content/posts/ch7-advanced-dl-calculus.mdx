@@ -1,0 +1,179 @@
+---
+title: "딥러닝 미분의 통일된 언어 — 야코비안에서 암묵적 미분까지"
+description: "Softmax 야코비안의 행렬 구조부터 DEQ의 고정점 역전파, MAML의 2차 미분까지 — 딥러닝 최적화를 관통하는 하나의 언어를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [calculus, backpropagation, jacobian, normalization, meta-learning]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Softmax 야코비안을 유도하고, BatchNorm 역전파를 계산하고, MAML 메타 그래디언트를 추적하다 보면 같은 패턴이 반복된다. **"어디서 어디로 미분이 흐르는가"** — 이 시리즈의 챕터들은 각자 다른 주제처럼 보이지만, 하나의 공통 언어로 수렴한다. 그 언어란 무엇인가?
+
+## 야코비안: 미분이 흐르는 방향
+
+Softmax는 벡터를 벡터로 보내는 함수다. 역전파를 계산하려면 스칼라 미분이 아니라 **야코비안 행렬**이 필요하다.
+
+$$
+\mathbf{J}_\sigma = \text{diag}(\boldsymbol{\sigma}) - \boldsymbol{\sigma}\boldsymbol{\sigma}^\top
+$$
+
+<Theorem kind="theorem" number="1" title="Softmax 야코비안">
+$\sigma_i = e^{z_i}/\sum_j e^{z_j}$ 에 대해:
+
+$$
+\frac{\partial \sigma_i}{\partial z_j} = \begin{cases} \sigma_i(1 - \sigma_i) & i = j \\ -\sigma_i \sigma_j & i \neq j \end{cases}
+$$
+</Theorem>
+
+<Proof>
+$i = j$인 경우, 몫의 미분법으로:
+
+$$
+\frac{\partial \sigma_i}{\partial z_i} = \frac{e^{z_i} \cdot \sum_k e^{z_k} - e^{z_i} \cdot e^{z_i}}{(\sum_k e^{z_k})^2} = \sigma_i(1 - \sigma_i)
+$$
+
+$i \neq j$인 경우, 분자는 $z_j$에 독립이므로:
+
+$$
+\frac{\partial \sigma_i}{\partial z_j} = -\frac{e^{z_i} \cdot e^{z_j}}{(\sum_k e^{z_k})^2} = -\sigma_i \sigma_j \quad \checkmark
+$$
+</Proof>
+
+이 야코비안이 중요한 이유는 Cross-Entropy와 결합했을 때 극적으로 단순해지기 때문이다. $\mathcal{L} = -\sum_i y_i \log \sigma_i$ 에서 연쇄법칙을 전개하면:
+
+$$
+\frac{\partial \mathcal{L}}{\partial z_j} = \sigma_j - y_j
+$$
+
+복잡한 야코비안이 $\boldsymbol{\sigma} - \mathbf{y}$ 한 줄로 압축된다. 이것이 신경망 분류기의 역전파가 실용적인 이유다.
+
+## 정규화의 야코비안: 배치가 만드는 복잡성
+
+BatchNorm과 LayerNorm은 같은 정규화처럼 보이지만, **미분이 흐르는 범위**가 다르다.
+
+LayerNorm은 샘플 $i$의 출력이 같은 샘플 $i$의 입력에만 의존한다:
+
+$$
+\frac{\partial y_{id}}{\partial x_{i'j}} = 0 \quad (i \neq i')
+$$
+
+BatchNorm은 그렇지 않다. 배치 평균 $\mu_B = \frac{1}{B}\sum_i x_i$ 와 분산 $\sigma_B^2$ 이 모든 샘플을 통해 계산되므로, 샘플 $i$의 출력이 샘플 $j$의 입력에도 의존한다. 이 배치 간 의존성이 역전파 수식을 복잡하게 만든다:
+
+$$
+\frac{\partial L}{\partial x_i} = \frac{1}{\sqrt{\sigma_B^2+\epsilon}}\left(\frac{\partial L}{\partial \hat{x}_i} - \frac{1}{B}\sum_{j}\frac{\partial L}{\partial \hat{x}_j} - \hat{x}_i\frac{1}{B}\sum_{j}\frac{\partial L}{\partial \hat{x}_j}\odot\hat{x}_j\right)
+$$
+
+세 항이 나타나는 이유는 기울기가 세 경로 — 직접 경로, 평균을 통한 경로, 분산을 통한 경로 — 를 따라 흐르기 때문이다.
+
+<Callout type="note" title="트레이드오프: BN vs LN">
+BatchNorm은 배치 통계를 이용해 **헤시안 조건수를 개선**하고 수렴을 빠르게 한다. 대신 배치 크기에 의존하며 추론 시 running statistics가 필요하다. LayerNorm은 샘플 독립적이라 배치 크기 1에서도 동작하며 Transformer의 표준이 됐다. RMSNorm은 평균 제거를 생략해 계산 효율을 더 높인다 — LLaMA, PaLM 계열이 선택한 이유다.
+</Theorem>
+</Callout>
+
+## NTK: 그래디언트 내적이 만드는 커널
+
+Neural Tangent Kernel은 파라미터 공간의 그래디언트 내적을 함수 공간의 커널로 해석한다:
+
+$$
+\Theta(x, x') = \nabla_\theta f(x, \theta)^\top \nabla_\theta f(x', \theta)
+$$
+
+NTK가 훈련 중 거의 상수라면(무한 폭 극한), 예측의 동역학은 선형 ODE로 단순화된다:
+
+$$
+\frac{d(f_t - y)}{dt} = -\Theta(f_t - y)
+$$
+
+$\Theta$가 양정부호이면 해는 $\|f_t - y\| \le \|f_0 - y\| e^{-\lambda_{\min} t}$ 로 지수 수렴한다. 신경망이 왜 수렴하는지에 대한 수학적 설명이다.
+
+<Aside label="이론과 실제의 간극">
+NTK 이론은 무한 폭에서 성립한다. 실제 유한 폭 네트워크는 파라미터가 초기값에서 크게 이동하며 feature learning이 발생한다 — NTK가 예측하지 못하는 영역이다. ResNet, Transformer 같은 현대 아키텍처는 이 "rich regime"에서 동작한다.
+</Aside>
+
+## MAML: 헤시안이 등장하는 이유
+
+Meta-learning의 수학적 구조는 "업데이트된 파라미터를 다시 미분"하는 데 있다. MAML의 inner update:
+
+$$
+\phi_i = \theta - \alpha \nabla_\theta \mathcal{L}_i^{\text{sup}}(\theta)
+$$
+
+를 $\theta$에 대해 미분하면:
+
+$$
+\frac{\partial \phi_i}{\partial \theta} = I - \alpha \nabla_\theta^2 \mathcal{L}_i^{\text{sup}} = I - \alpha H_i
+$$
+
+이것이 meta-gradient에 헤시안이 나타나는 이유다:
+
+$$
+\nabla_\theta \mathcal{L}_{\text{meta}} = \sum_i (I - \alpha H_i)^\top \nabla_{\phi_i} \mathcal{L}_i^{\text{query}}
+$$
+
+$n \times n$ 헤시안을 명시적으로 저장하면 $O(n^2)$ 메모리가 필요하다. Pearlmutter의 HVP 트릭은 이를 $O(n)$으로 줄인다:
+
+$$
+Hv = \nabla_\theta(\nabla_\theta \mathcal{L} \cdot v)
+$$
+
+역전파를 두 번 수행하면 헤시안 전체 없이 헤시안-벡터 곱을 계산할 수 있다. FOMAML은 이 헤시안 항을 아예 무시하는 근사로, 계산 효율은 높지만 2차 정보를 잃는다.
+
+## 암묵적 미분: 고정점에서의 기울기
+
+가장 우아한 아이디어는 마지막에 등장한다. 최적화 문제의 해 $x^*(\theta)$가 $F(x^*, \theta) = 0$을 만족한다면, 전개하지 않고도 기울기를 얻을 수 있다:
+
+$$
+\frac{\partial x^*}{\partial \theta} = -\left[\frac{\partial F}{\partial x^*}\right]^{-1} \frac{\partial F}{\partial \theta}
+$$
+
+Deep Equilibrium Model은 이 아이디어를 신경망에 적용한다. 고정점 $z^* = f_\theta(z^*, x)$에서 역전파는 선형계를 푸는 것과 같다:
+
+$$
+(I - J_f)^\top u = v
+$$
+
+이 선형계를 Conjugate Gradient로 풀면 중간 활성화를 하나도 저장하지 않아도 된다. 깊이 L의 표준 네트워크가 $O(L \cdot d)$ 메모리를 쓸 때, DEQ는 $O(d)$만 쓴다. Neural ODE의 adjoint method도 같은 원리다 — ODE를 역방향으로 다시 풀면서 기울기를 얻고, 순전파의 활성화를 저장하지 않는다.
+
+<Callout type="note" title="트레이드오프: 메모리 절약의 비용">
+암묵적 미분 기반 모델들은 메모리를 절약하는 대신 **재계산** 비용을 치른다. DEQ는 CG 반복이 필요하고, Neural ODE는 역방향 ODE를 다시 적분한다. 계산량이 늘어나는 것을 감수하고 메모리 병목을 제거하는 트레이드오프다.
+</Callout>
+
+## 정리
+
+이 시리즈의 다섯 챕터는 표면적으로는 다른 주제다 — Softmax, 정규화, NTK, 메타 학습, 암묵적 미분. 하지만 모두 같은 질문을 다른 방식으로 묻고 있다: **"이 변환의 기울기는 어디서 어디로 흐르는가?"**
+
+- Softmax 야코비안 $\text{diag}(\sigma) - \sigma\sigma^\top$: 벡터 함수의 기울기 구조
+- BatchNorm 역전파의 세 항: 배치 의존성이 만드는 기울기 경로
+- NTK $\Theta = \nabla f^\top \nabla f$: 파라미터 공간 기울기를 커널로 재해석
+- MAML HVP $Hv = \nabla(\nabla L \cdot v)$: 2차 미분을 $O(n)$으로 계산
+- DEQ 선형계 $(I - J_f)^\top u = v$: 고정점에서 메모리 없이 역전파
+
+미분 계산을 이해한다는 것은 수식 암기가 아니라, **기울기가 흐르는 경로의 구조**를 보는 것이다.
+
+<Reference
+  title="Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks"
+  authors="Finn et al."
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1703.03400"
+/>
+
+<Reference
+  title="Deep Equilibrium Models"
+  authors="Bai et al."
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1909.01377"
+/>

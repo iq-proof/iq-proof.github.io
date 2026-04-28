@@ -1,0 +1,126 @@
+---
+title: "미분가능성의 계층 — 편미분에서 역전파까지"
+description: "편미분이 존재해도 전미분이 없을 수 있다는 사실부터, 야코비안-헤시안-연쇄법칙이 하나의 선형근사 철학으로 통일되는 구조까지, 딥러닝 최적화의 수학적 뼈대를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [calculus, gradient, jacobian, backpropagation, optimization]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+PyTorch의 `loss.backward()`는 단 한 줄이다. 그 한 줄이 수십 개의 레이어를 타고 올라가며 수백만 개의 편미분을 계산한다. 그런데 "편미분의 모음"인 gradient만으로는 충분하지 않다. 편미분이 모두 존재해도 전미분이 존재하지 않는 함수가 있다. 역전파가 올바르게 작동하려면 왜 **전미분**이 필요한가?
+
+## 편미분과 전미분의 간극
+
+편미분 $\partial f / \partial x_i$는 하나의 축 방향으로만 본 단면 경사다. gradient $\nabla f = (\partial f/\partial x_1, \ldots, \partial f/\partial x_n)$는 그 편미분들의 나열이다. 문제는 여기서 시작된다.
+
+$$f(x, y) = \begin{cases} \dfrac{x^2 y}{x^2 + y^2} & (x,y) \neq (0,0) \\ 0 & (x,y) = (0,0) \end{cases}$$
+
+이 함수는 $(0,0)$에서 두 편미분이 모두 0으로 존재한다. $\nabla f(0,0) = (0,0)$이다. 그러나 방향 $v = (\cos\theta, \sin\theta)$로 방향도함수를 계산하면:
+
+$$D_v f(0,0) = \cos^2\theta \sin\theta$$
+
+이것은 $\nabla f \cdot v = 0$과 다르다. **편미분이 모두 존재해도 $D_v f = \nabla f \cdot v$는 성립하지 않는다.** 전미분이 존재할 때만 이 등식이 보장된다.
+
+<Theorem kind="theorem" number="1" title="전미분과 방향도함수의 관계">
+$f: \mathbb{R}^n \to \mathbb{R}$이 점 $a$에서 전미분가능이면, 모든 단위벡터 $v$에 대해:
+
+$$D_v f(a) = \nabla f(a) \cdot v$$
+</Theorem>
+
+<Proof>
+전미분가능이란 선형사상 $L$이 존재하여 $f(a+h) = f(a) + L(h) + o(\|h\|)$가 성립함을 의미한다. $h = tv$로 놓으면 $D_v f(a) = \lim_{t \to 0}(f(a+tv)-f(a))/t = L(v)$. $v = e_i$로 놓으면 $L(e_i) = \partial f/\partial x_i(a)$이고 선형사상의 표현에 의해 $L(v) = \nabla f(a) \cdot v$. $\square$
+</Proof>
+
+역으로, $C^1$ 조건(편미분이 연속)이면 전미분이 보장된다. 대부분의 딥러닝 연산이 $C^1$인 이유가 바로 여기에 있다.
+
+## 야코비안 — 선형근사의 행렬 표현
+
+단변수에서 $f(a+h) \approx f(a) + f'(a) h$라면, 다변수 $f: \mathbb{R}^n \to \mathbb{R}^m$에서는:
+
+$$f(a+h) = f(a) + J_f(a)\, h + o(\|h\|), \quad J_f(a) \in \mathbb{R}^{m \times n}$$
+
+야코비안 $J_f$는 전미분의 행렬 표현이다. 원소는 $[J_f]_{ij} = \partial f_i / \partial x_j$. 특수 경우로 $m=1$이면 $J_f = (\nabla f)^\top$, $n = m$이면 정방 행렬이 되어 $\det J_f$가 국소 부피 변환율을 의미한다.
+
+역전파에서 핵심 연산은 야코비안 전체가 아니라 **VJP(Vector-Jacobian Product)**다. 상위 gradient $\delta = \partial L / \partial f(x)$가 주어질 때:
+
+$$\frac{\partial L}{\partial x} = J_f(x)^\top \delta$$
+
+$m \times n$ 행렬을 명시적으로 만들지 않고 $n$-차원 벡터 하나만 계산한다. 스칼라 손실의 역전파 비용이 $O(n)$에 머무는 이유다.
+
+## gradient는 왜 최대 증가 방향인가
+
+$D_v f = \nabla f \cdot v$ 위에서, 코시-슈바르츠를 적용하면:
+
+$$D_v f(a) = \nabla f(a) \cdot v \leq \|\nabla f(a)\| \cdot \|v\| = \|\nabla f(a)\|$$
+
+등호는 $v = \nabla f(a) / \|\nabla f(a)\|$일 때 성립한다. 반대 방향 $v = -\nabla f / \|\nabla f\|$에서는 방향도함수가 $-\|\nabla f\|$로 최솟값이다. 이것이 경사하강법의 수학적 정당성이다.
+
+$$x_{k+1} = x_k - \eta \nabla f(x_k)$$
+
+이 업데이트는 **무한소 스텝에서 가장 빠르게 감소하는 방향**을 따른다. 유한한 $\eta$에서는 L-smooth 조건이 추가로 필요하다.
+
+<Aside label="기하학적 직관">
+gradient는 등위면에 수직이다. 등위면 $\{f = c\}$ 위의 곡선 $\gamma(t)$에 대해 $f(\gamma(t)) = c$를 미분하면 $\nabla f \cdot \gamma'(0) = 0$. 경사하강법은 등위면을 가장 빨리 가로지르는 방향으로 이동한다.
+</Aside>
+
+## 헤시안과 2차 곡률
+
+테일러 전개를 2차항까지 쓰면:
+
+$$f(a+h) = f(a) + \nabla f(a)^\top h + \frac{1}{2} h^\top H_f(a) h + o(\|h\|^2)$$
+
+헤시안 $H_f \in \mathbb{R}^{n \times n}$은 $[H_f]_{ij} = \partial^2 f / \partial x_i \partial x_j$. $f \in C^2$이면 슈바르츠 정리에 의해 대칭행렬이므로 스펙트럼 분해가 가능하다. 고유벡터 방향 $q_i$의 곡률은 대응 고유값 $\lambda_i$다.
+
+| 헤시안 부호 | 의미 | 최적화 |
+|---|---|---|
+| 모든 $\lambda_i > 0$ (PD) | 국소 최솟값 | 볼록, 안정 수렴 |
+| 혼합 부호 (Indefinite) | 안장점 | GD 탈출 필요 |
+| 모든 $\lambda_i < 0$ (ND) | 국소 최댓값 | GD 접근 불가 |
+
+딥러닝에서 헤시안의 최대 고유값 $\lambda_{\max}$가 작은 "flat minimum"이 일반화 성능이 좋다는 주장(Hochreiter & Schmidhuber 1997)은 이 곡률 해석에서 나온다. 뉴턴 방법 $x \leftarrow x - H^{-1}\nabla f$는 헤시안으로 곡률을 보정하여 2차 수렴을 달성하지만, $O(n^3)$ 역행렬 비용 때문에 대규모 모델에는 L-BFGS 같은 근사가 필요하다.
+
+## 연쇄법칙 — 역전파의 수학적 실체
+
+$g: \mathbb{R}^n \to \mathbb{R}^k$와 $f: \mathbb{R}^k \to \mathbb{R}^m$이 전미분가능이면:
+
+$$J_{f \circ g}(a) = J_f(g(a)) \cdot J_g(a) \in \mathbb{R}^{m \times n}$$
+
+왜 행렬 곱인가? 선형근사의 합성이기 때문이다. $g(a+h) \approx g(a) + J_g h$이고 $f(g(a+h)) \approx f(g(a)) + J_f \cdot (J_g h) = f(g(a)) + (J_f \cdot J_g) h$. **합성의 선형근사 = 선형근사의 합성 = 행렬 곱**.
+
+$N$층 네트워크 $L = f_N \circ \cdots \circ f_1(x)$에서 역전파는 이 곱을 오른쪽부터 누적한다:
+
+$$\delta^{(n)} = J_{f_n}(x^{(n-1)})^\top \cdot \delta^{(n+1)}$$
+
+각 단계에서 야코비안 전체를 만들지 않고 VJP만 계산한다. 전체 역전파 비용이 $O(N \cdot mn)$에 머무는 이유다.
+
+<Callout type="note" title="트레이드오프: 순전파 저장 vs 재계산">
+역전파는 순전파 시 모든 중간 활성화값을 저장해야 VJP를 계산할 수 있다. 레이어가 깊을수록 메모리 비용이 선형으로 증가한다. Gradient Checkpointing은 일부 중간값만 저장하고 필요 시 재계산하여 메모리를 줄이는 대신 연산을 추가한다. 전형적인 메모리-연산 트레이드오프다.
+</Callout>
+
+음함수 정리는 이 연쇄법칙의 자연스러운 확장이다. Deep Equilibrium Model에서 고정점 방정식 $z^* = f_\theta(z^*)$을 $F(z, \theta) = z - f_\theta(z) = 0$으로 쓰면, 음함수 정리에 의해:
+
+$$\frac{\partial z^*}{\partial \theta} = -\left[\frac{\partial F}{\partial z}\right]^{-1} \frac{\partial F}{\partial \theta} = \left(I - J_f\right)^{-1} \frac{\partial f}{\partial \theta}$$
+
+무한 깊이 네트워크를 실제로 펼치지 않고도 gradient를 얻는다.
+
+## 정리
+
+- **편미분 존재 $\not\Rightarrow$ 전미분 존재 $\not\Rightarrow$ 연속**. 역전파가 올바르게 동작하려면 각 층의 연산이 전미분가능해야 한다.
+- **야코비안은 전미분의 행렬 표현**이다. 역전파의 핵심 연산은 야코비안 전체가 아니라 VJP다.
+- **gradient가 최대 감소 방향인 이유는 코시-슈바르츠**에서 나온다. 이것은 무한소 스텝에 대한 주장이며, 유한 학습률에서는 L-smooth 조건이 필요하다.
+- **헤시안의 고유값은 방향별 곡률**이다. Flat minima, 뉴턴 방법, Adam의 적응적 스케일링 — 모두 헤시안 정보를 다른 방식으로 활용한다.
+- **역전파는 다변수 연쇄법칙의 VJP 누적**이다. 음함수 정리로 미분가능성을 끝까지 확장하면 DEQ처럼 암묵적으로 정의된 함수도 gradient를 가진다.
+
+다음 글에서는 이 미분가능성 위에 볼록성과 L-smooth 조건을 얹어, 경사하강법의 수렴 속도 $O(1/k)$가 어디서 나오는지 추적한다.

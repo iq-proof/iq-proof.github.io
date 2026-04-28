@@ -1,0 +1,111 @@
+---
+title: "손실 함수의 기하학 — 헤시안이 최적화를 지배하는 방식"
+description: "다변수 테일러 전개의 2차 항부터 조건수와 수렴 속도의 관계까지, 경사하강법과 뉴턴 방법의 이론적 기반을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [optimization, hessian, convexity, condition-number, saddle-point]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+경사하강법은 왜 어떤 문제에서는 수십 번 만에 수렴하고 어떤 문제에서는 수천 번이 지나도 제자리인가? 딥러닝 학습에서 안장점은 정말 문제인가, 아니면 국소 최솟값이 문제인가? 이 질문들의 답은 모두 같은 곳에서 나온다 — **손실 함수의 2차 테일러 전개와 헤시안의 스펙트럼**.
+
+## 2차 테일러 전개 — 모든 최적화 이론의 출발점
+
+$C^2$ 함수 $f: \mathbb{R}^n \to \mathbb{R}$에 대해 점 $x$에서 방향 $h$로의 전개는 다음과 같다.
+
+$$
+f(x+h) = f(x) + \nabla f(x)^\top h + \frac{1}{2} h^\top H_f(x) h + o(\|h\|^2)
+$$
+
+이 수식은 단순한 근사가 아니다. 경사하강법의 학습률 상한, 뉴턴 방법의 업데이트 규칙, L-smooth 조건의 수렴 보장이 전부 이 한 줄에서 유도된다.
+
+<Theorem kind="theorem" number="1" title="2차 다변수 테일러 정리">
+$f \in C^2$이면, $g(t) = f(x + th)$로 놓으면 $g'(t) = \nabla f(x+th)^\top h$, $g''(t) = h^\top H_f(x+th) h$이다. 단변수 테일러를 $t=0$에서 $t=1$까지 적용하면 위 전개식이 엄밀히 유도된다. 나머지 항은 $H_f$의 연속성에서 $|R_2| \leq \frac{\|h\|^2}{2}\sup_{t}\|H_f(x+th)-H_f(x)\| = o(\|h\|^2)$로 추정된다.
+</Theorem>
+
+1차 항 $\nabla f^\top h$는 경사하강법의 기반이다. 학습률 $\eta$로 $h = -\eta\nabla f$를 대입하면:
+
+$$
+f(x - \eta\nabla f) \leq f(x) - \eta\left(1 - \frac{\eta L}{2}\right)\|\nabla f\|^2
+$$
+
+$H_f$의 최대 고유값이 $L$ 이하일 때 성립한다. $\eta < 2/L$이면 손실이 단조 감소한다. 이것이 학습률 상한의 수학적 근거다.
+
+## 헤시안의 스펙트럼이 결정하는 것들
+
+헤시안의 고유값 부호는 정류점의 유형을 완전히 결정한다.
+
+<Theorem kind="theorem" number="2" title="2차 충분조건">
+$\nabla f(a) = 0$인 정류점에서, Spectral Theorem에 의해 $H = Q\Lambda Q^\top$. 최솟값 고유값 $\mu = \min_i \lambda_i$에 대해:
+
+$$h^\top H h = \|h\|^2 \sum_i \lambda_i v_i^2 \geq \mu\|h\|^2$$
+
+모든 $\lambda_i > 0$이면 (PD) $f(a+h) \geq f(a) + \frac{\mu}{2}\|h\|^2 + o(\|h\|^2) > f(a)$이므로 $a$는 엄격한 국소 최솟값이다. 고유값이 양/음 혼재이면 (부정부호) $a$는 안장점이다.
+</Theorem>
+
+딥러닝에서 이 결과가 갖는 함의는 결정적이다. $n$차원 대칭 랜덤 행렬(GOE)에서 모든 고유값이 양수일 확률은 $e^{-\Theta(n^2)}$으로 감소한다(Wigner 반원 법칙). 즉 고차원 손실 함수에서 **진정한 국소 최솟값은 지수적으로 드물고, 안장점이 지배적**이다.
+
+Dauphin et al. (2014)의 핵심 주장이 여기서 나온다: 딥러닝의 실제 문제는 국소 최솟값에 갇히는 것이 아니라 **안장점 근방에서의 느린 수렴**이다.
+
+## 볼록성 — "정류점 = 전역 최솟값"이 보장되는 조건
+
+$$
+f \text{ 볼록} \iff H_f(x) \text{ PSD for all } x \iff f(y) \geq f(x) + \nabla f(x)^\top(y-x)
+$$
+
+이 동치 관계는 중요하다. Logistic Regression의 Cross-Entropy Loss는 헤시안이 $X^\top \text{diag}(\sigma_i(1-\sigma_i)) X$로 PSD이므로 볼록이다. 정류점을 찾으면 그것이 전역 최솟값이다. 반면 ReLU 네트워크는 비볼록이다. GD는 안장점이나 국소 최솟값에 멈출 수 있다.
+
+<Callout type="note" title="SGD의 비볼록 이점">
+SGD의 gradient 잡음은 볼록 문제에서는 불필요한 노이즈지만, 비볼록 문제에서는 안장점 탈출의 동력이 된다. 안장점에서 헤시안의 음의 고유값 방향으로 잡음이 축적되면 탈출이 가능하다(Jin et al. 2017). 작은 배치가 flat minima로 수렴하는 경향도 이 메커니즘과 연결된다.
+</Callout>
+
+## 조건수 — 수렴 속도의 지배자
+
+헤시안 조건수 $\kappa = \lambda_{\max}/\lambda_{\min}$이 등위면의 형태를 결정한다.
+
+$$
+f(x) = \tfrac{1}{2}x^\top H x \text{의 등위면 반축 비} = \sqrt{\kappa(H)}
+$$
+
+$\kappa$가 크면 등위면은 극단적으로 납작한 타원이 되고, GD는 좁은 골짜기를 지그재그로 오간다. 강볼록($\mu$-SC)이고 $L$-smooth인 함수에서 GD의 수렴 계수는 $\rho = \left(\frac{\kappa-1}{\kappa+1}\right)^2$이다.
+
+| 조건수 $\kappa$ | 수렴 계수 $\rho$ | 의미 |
+|:-:|:-:|:--|
+| 1 | 0 | 1스텝 수렴 |
+| 10 | ~0.67 | 느림 |
+| 100 | ~0.96 | 매우 느림 |
+
+뉴턴 방법은 이 문제를 근본적으로 해결한다. $x \leftarrow x - H^{-1}\nabla f$는 입력 공간을 $H$로 재스케일하여 조건수를 1로 만드는 Preconditioning과 동치다. 2차 함수에서는 단 1번 스텝에 수렴한다.
+
+<Aside label="Adam = 대각 Preconditioning">
+Adam의 분모 $\sqrt{\hat{v}_t}$는 gradient의 RMS로, 헤시안 대각 성분의 제곱근 근사다. 따라서 Adam은 $P^{-1} \approx \text{diag}(H)^{-1/2}$인 대각 Preconditioning으로 볼 수 있다. 조건수가 큰 문제에서 Adam이 SGD보다 빠른 이유가 여기 있다. Batch Normalization도 층별 활성화를 정규화하여 헤시안의 고유값 분포를 균일하게 만들고, 암묵적으로 $\kappa$를 감소시킨다.
+</Aside>
+
+## 정리
+
+- 다변수 테일러 전개의 2차 항이 경사하강법의 학습률 상한 $\eta < 2/L$을 결정한다.
+- 헤시안 고유값의 부호가 정류점의 유형(최솟값/최댓값/안장점)을 완전히 결정한다.
+- 고차원에서 안장점이 지배적이다. 딥러닝의 실제 문제는 국소 최솟값이 아니라 안장점 근방의 느린 수렴이다.
+- 조건수 $\kappa = \lambda_{\max}/\lambda_{\min}$이 GD 수렴 속도를 결정한다. 뉴턴 방법과 Preconditioning(Adam, BN)은 모두 $\kappa$를 줄이는 전략이다.
+
+손실 함수의 기하학을 읽는 것은 결국 헤시안을 읽는 것이다.
+
+<Reference
+  title="Identifying and attacking the saddle point problem in high-dimensional non-convex optimization"
+  authors="Dauphin et al."
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1406.2572"
+/>

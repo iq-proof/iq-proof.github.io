@@ -1,0 +1,151 @@
+---
+title: "딥러닝의 수학은 왜 극한에서 시작하는가"
+description: "ε-δ 언어부터 Subgradient까지, 경사하강법·역전파·ReLU가 작동하는 이유를 하나의 수렴 철학으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [calculus, optimization, gradient-descent, backpropagation, subgradient]
+difficulty: advanced
+series:
+  slug: calculus-optimization-deep-dive
+  title: Calculus Optimization Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+딥러닝 논문을 읽다 보면 "충분히 작은 학습률", "수렴이 보장되는 조건", "$h \to 0$ 극한에서 gradient와 일치"라는 문구를 반복해서 마주친다. 이 표현들은 모두 하나의 언어 체계, **ε-δ 언어**로 번역된다. 그렇다면 이 챕터들이 공유하는 철학은 무엇인가? 단변수 해석학의 다섯 개 주제 — 극한, 연속, 미분, 테일러 정리, 미분가능성 반례 — 는 결국 하나의 질문으로 수렴한다: **"얼마나 가까우면 충분히 가까운가?"**
+
+## 극한: 수렴을 정량화하는 언어
+
+"가까워진다"는 직관은 수학적으로 부족하다. $f(x) = \sin(1/x)$는 $x$가 0에 가까워질수록 $[-1, 1]$ 전체를 진동하며, "가까워진다"는 표현만으로는 이 함수가 극한이 없다는 사실을 표현할 수 없다.
+
+ε-δ 정의는 이 문제를 정량적으로 해결한다.
+
+$$\lim_{x \to a} f(x) = L \iff \forall \varepsilon > 0,\; \exists \delta > 0 \text{ s.t. } 0 < |x-a| < \delta \Rightarrow |f(x)-L| < \varepsilon$$
+
+ε은 "출력의 허용 오차", δ는 "그것을 달성하기 위한 입력 제어량"이다. 이 정의가 **모든** ε > 0에 대해 성립할 때 수렴이라 한다.
+
+딥러닝에서 SGD 수렴 주장 "$k \to \infty$일 때 $\mathbb{E}[f(x_k)] \to f^*$"는 수열 극한의 ε-N 표현이다. Robbins-Monro 조건
+
+$$\sum_{k=1}^\infty \eta_k = \infty, \quad \sum_{k=1}^\infty \eta_k^2 < \infty$$
+
+의 두 줄 역시 수렴과 발산의 정의 위에 서 있다.
+
+<Theorem kind="proposition" number="1" title="극한의 유일성">
+$\lim_{x \to a} f(x) = L$이고 $\lim_{x \to a} f(x) = M$이면 $L = M$이다.
+</Theorem>
+
+<Proof>
+$L \neq M$이라 가정하고 $\varepsilon = |L - M|/2 > 0$으로 놓자. 각 극한 정의에서 $\delta_1, \delta_2 > 0$이 존재하며, $\delta = \min(\delta_1, \delta_2)$로 잡으면 $0 < |x - a| < \delta$인 $x$에 대해
+
+$$|L - M| \leq |L - f(x)| + |f(x) - M| < \varepsilon + \varepsilon = |L - M|$$
+
+이는 모순이다. 따라서 $L = M$. $\square$
+</Proof>
+
+## 연속과 균등연속: δ가 점에 의존하는가
+
+점별 연속과 균등연속의 차이는 δ가 점 $a$에 의존하는지 여부다.
+
+| 개념 | δ의 의존성 |
+|------|------------|
+| 점별 연속 | $\delta = \delta(\varepsilon, a)$ |
+| 균등연속 | $\delta = \delta(\varepsilon)$ |
+| Lipschitz 연속 | $L$ 상수 하나로 충분 |
+
+$f(x) = 1/x$는 $(0, 1]$에서 점별 연속이지만 균등연속이 아니다. $x$가 0에 가까울수록 같은 ε을 달성하기 위해 δ가 0으로 수렴해야 하기 때문이다.
+
+균등연속의 강화인 **Lipschitz 조건** $|f(x) - f(y)| \leq L|x - y|$는 AI에서 직접적으로 등장한다. gradient가 폭발할 때 쓰는 Gradient Clipping
+
+$$g \leftarrow g \cdot \min\left(1, \frac{c}{\|g\|}\right)$$
+
+은 손실 함수를 사실상 $c$-Lipschitz로 제한하는 연산이다. 콤팩트 집합 위의 연속 함수는 균등연속(Heine-Cantor 정리)이므로, 정규화로 유효 탐색 공간을 제한하면 최솟값 존재도 보장된다.
+
+## 미분: 최선의 선형근사
+
+도함수를 "기울기"로만 이해하면 역전파의 원리가 보이지 않는다. 더 정확한 정의는 이것이다.
+
+$$f(a + h) = f(a) + f'(a) \cdot h + \underbrace{r(h)}_{o(h)}$$
+
+$r(h) = o(h)$, 즉 $\lim_{h \to 0} r(h)/h = 0$이라는 조건이 $f'(a)$를 "점 $a$ 근방에서 $f$를 가장 잘 흉내 내는 선형 함수의 계수"로 만든다. 이 계수는 유일하다.
+
+역전파는 이 선형근사를 역방향으로 전파한다. 각 층 연산 $z = f(x)$에서
+
+$$\delta x = f'(x) \cdot \delta z$$
+
+가 성립하는 이유는 선형근사의 오차가 $o(\delta z)$이고, $\delta z \to 0$ 극한에서 정확하기 때문이다.
+
+수치 미분 방법의 정확도 차이도 같은 틀로 이해된다.
+
+| 방법 | 수식 | 오차 | float64 최적 h |
+|------|------|------|---------------|
+| 전방 차분 | $(f(x+h)-f(x))/h$ | $O(h)$ | $\approx 10^{-8}$ |
+| 중심 차분 | $(f(x+h)-f(x-h))/2h$ | $O(h^2)$ | $\approx 10^{-5}$ |
+
+PyTorch `gradcheck`이 중심 차분을 쓰고 `float64`를 요구하는 이유가 여기 있다.
+
+## 테일러 정리: 학습률 상한의 근거
+
+Rolle → MVT → 테일러 정리는 논리적으로 연결된 사슬이다. MVT가 "전체 변화량을 한 순간의 변화율로 설명"한다면, 테일러 정리는 이를 반복 적용해 함수를 임의의 차수로 근사한다.
+
+$$f(x) = \sum_{k=0}^{n} \frac{f^{(k)}(a)}{k!}(x-a)^k + \frac{f^{(n+1)}(c)}{(n+1)!}(x-a)^{n+1}$$
+
+AI에서 결정적으로 중요한 응용은 **$L$-smooth 조건**이다. 기울기 $\nabla f$가 Lipschitz 연속일 때, 2차 테일러 여분항의 상한으로부터
+
+$$f(y) \leq f(x) + \nabla f(x)^\top (y-x) + \frac{L}{2}\|y-x\|^2$$
+
+가 성립한다. 여기에 $y = x - \eta \nabla f(x)$를 대입하면
+
+$$f(x - \eta \nabla f) \leq f(x) - \eta\left(1 - \frac{L\eta}{2}\right)\|\nabla f\|^2$$
+
+$\eta < 2/L$이면 괄호 안이 양수이므로 **매 스텝 손실이 반드시 감소**한다. "학습률이 충분히 작아야 한다"는 말의 수학적 의미가 바로 $\eta < 2/L$이다.
+
+뉴턴 방법은 2차 테일러 근사를 직접 최소화해 도출된다.
+
+$$x_{k+1} = x_k - H_k^{-1} \nabla f(x_k)$$
+
+2차 수렴의 근거는 3차 여분항 $O(\|x - x_k\|^3)$이 수렴 속도를 결정한다는 점이다.
+
+## Subgradient: 미분불가능해도 최적화가 되는 이유
+
+딥러닝의 활성화 함수들은 어딘가에서 미분불가능하다. ReLU는 $x = 0$에서 왼쪽 기울기 0, 오른쪽 기울기 1로 갈라진다. 그런데도 역전파가 작동한다.
+
+세 가지 이유가 결합된다.
+
+**측도론적 근거**: Rademacher 정리에 의해 Lipschitz 연속 함수는 거의 어디서나(a.e.) 미분가능하다. 연속 분포에서 preactivation이 정확히 0일 확률은 0이므로, 학습 중 실제로 미분불가능점을 만날 일이 없다.
+
+**Subgradient**: 볼록 함수 $f$에서 벡터 $g$가 점 $x$의 subgradient라는 것은
+
+$$\forall y,\quad f(y) \geq f(x) + g^\top(y - x)$$
+
+를 의미한다. $f(x) = |x|$에서 $x = 0$의 subdifferential은 $[-1, 1]$ 전체다. 이 집합 안의 원소를 하나 선택해 하강 방향으로 쓰면, 볼록 함수 최적화의 수렴이 보장된다.
+
+<Theorem kind="proposition" number="2" title="Subgradient 최적성">
+볼록 함수 $f$에서 $x^*$가 전역 최솟값인 것은 $0 \in \partial f(x^*)$인 것과 동치이다.
+</Theorem>
+
+<Proof>
+$(\Rightarrow)$ $x^*$가 최솟값이면 $\forall y$, $f(y) \geq f(x^*)$이므로 $g = 0$이 subgradient 정의를 만족한다.
+
+$(\Leftarrow)$ $0 \in \partial f(x^*)$이면 $\forall y$, $f(y) \geq f(x^*) + 0 = f(x^*)$이므로 $x^*$는 전역 최솟값이다. $\square$
+</Proof>
+
+L1 정규화 $\mathcal{L}(W) + \lambda \|W\|_1$에서 $W_i = 0$일 때 subdifferential이 $[-1, 1]$인 덕분에 최솟값 조건 $\nabla_i \mathcal{L} + \lambda g_i = 0$이 $g_i \in [-1, 1]$ 범위 안에서 충족될 수 있다. 이것이 L1이 희소해를, L2가 작은 값을 만드는 수학적 이유다.
+
+<Callout type="note" title="트레이드오프">
+Subgradient 방법은 볼록 함수에서 수렴이 보장되지만, ReLU 네트워크 같은 비볼록 경우에는 이론 보장이 약해진다. PyTorch는 $x = 0$에서 ReLU gradient를 0으로 정의하는데, 이는 subdifferential의 원소 중 하나를 관례적으로 선택한 것이다. 구현마다 다를 수 있으며, 유일한 "올바른" 값은 존재하지 않는다.
+</Callout>
+
+## 정리
+
+다섯 챕터가 공유하는 철학은 하나다 — **"얼마나 가까우면 충분히 가까운가"를 정량화하라**.
+
+- ε-δ 극한은 수렴을 입력·출력 오차의 관계로 정량화한다.
+- 균등연속과 Lipschitz 조건은 그 정량화를 전역으로 확장한다.
+- 도함수는 "최선의 선형근사"이며, 역전파는 이 근사의 역방향 전파다.
