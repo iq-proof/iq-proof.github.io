@@ -1,0 +1,132 @@
+---
+title: "BNN은 왜 그토록 어려운가 — 근사 추론의 스펙트럼"
+description: "가중치를 확률변수로 취급하는 BNN의 수학적 출발점부터 Laplace, Bayes by Backprop, MC Dropout, SWAG까지, posterior 근사 전략의 트레이드오프를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [bayesian-neural-network, variational-inference, mc-dropout, laplace, swag]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+일반적인 신경망은 가중치 $W$를 하나의 점으로 최적화한다. Bayesian Neural Network(BNN)는 그 점을 **분포** $p(W|D)$로 바꾼다. 이 차이는 작아 보이지만, 계산 복잡도의 지형을 완전히 바꾼다. 수백만 파라미터에 대한 posterior를 정확히 구하는 것은 원리적으로 불가능하다. 그렇다면 실전에서 BNN을 쓴다는 것은 무엇을 근사하는가?
+
+## 문제: posterior가 왜 intractable인가
+
+BNN의 수학적 구조는 간결하다.
+
+$$
+p(W|D) = \frac{p(D|W)\,p(W)}{p(D)}, \qquad p(y^*|x^*, D) = \int p(y^*|x^*, W)\,p(W|D)\,dW
+$$
+
+Prior $p(W) = \mathcal{N}(0, \sigma^2 I)$, likelihood $p(y|x, W) = \mathcal{N}(f_W(x), \sigma_n^2)$. 형식은 교과서 Bayes다. 문제는 분모 $p(D) = \int p(D|W)p(W)\,dW$다. 이 적분은 $d$차원 — $d \sim 10^6 \sim 10^9$ — 에서 닫힌 형태가 존재하지 않는다. loss landscape는 다봉(multimodal)이고 비볼록이어서 일반 MCMC도 이 차원에서 수렴하지 않는다.
+
+<Callout type="note" title="MAP = L2 정규화 NN">
+Prior $\mathcal{N}(0, \tau^2 I)$ 하에서 MAP 추정은 $\arg\min_W [-\log p(D|W) + \frac{1}{2\tau^2}\|W\|^2]$다. 이것이 L2 정규화 학습과 동일하다. 즉 **일반적인 SGD-trained NN은 BNN의 한 극단 — delta posterior에서의 MAP**이다.
+</Callout>
+
+## 불확실성의 두 층위
+
+BNN이 MAP과 근본적으로 다른 지점은 예측 분산의 분해다.
+
+$$
+\text{Var}[y^*|x^*, D] = \underbrace{\mathbb{E}_{W|D}[\text{Var}(y^*|x^*, W)]}_{\text{aleatoric}} + \underbrace{\text{Var}_{W|D}[\mathbb{E}(y^*|x^*, W)]}_{\text{epistemic}}
+$$
+
+**Aleatoric uncertainty**는 데이터 노이즈에서 비롯된다. 데이터를 아무리 늘려도 줄지 않는다. **Epistemic uncertainty**는 모델이 아직 보지 못한 영역에서의 가중치 불확실성이다. 데이터가 많아질수록 사라져야 한다. 자율주행이나 의료 진단처럼 OOD 탐지가 중요한 응용에서, point-estimate NN은 두 번째 항이 0이다 — 본질적으로 epistemic 불확실성을 인식하지 못한다.
+
+## 근사 추론의 네 가지 전략
+
+정확한 posterior를 구할 수 없다면 근사해야 한다. 근사 전략마다 서로 다른 가정과 비용을 지불한다.
+
+**Laplace Approximation**은 MAP 해 $W^*$ 주변에서 $\log p(W|D)$를 2차 Taylor 전개한다.
+
+$$
+p(W|D) \approx \mathcal{N}(W^*,\, H^{-1}), \qquad H = -\nabla^2 \log p(W|D)\big|_{W^*}
+$$
+
+Hessian $H$는 Fisher 정보 + prior precision으로 분해된다. 이 방법의 장점은 **post-hoc** 적용이 가능하다는 것이다 — 이미 학습된 NN에 재학습 없이 uncertainty를 붙인다. `laplace-torch` 라이브러리는 이 절차를 ResNet, BERT 규모까지 확장한다. 단 $d \times d$ Hessian은 저장조차 불가능하므로, 실전에서는 마지막 레이어만 적용하거나 Kronecker-factored 근사(KFAC)를 사용한다.
+
+**Bayes by Backprop**(Blundell et al. 2015)은 factorized Gaussian $q_\phi(W) = \prod_{ij} \mathcal{N}(\mu_{ij}, \sigma_{ij}^2)$로 posterior를 근사하고 ELBO를 최대화한다.
+
+$$
+\mathcal{L}(\phi) = \mathbb{E}_{q_\phi(W)}[\log p(D|W)] - \mathrm{KL}(q_\phi(W)\|p(W))
+$$
+
+Reparameterization trick $w_{ij} = \mu_{ij} + \sigma_{ij}\epsilon_{ij}$으로 gradient를 역전파한다. 파라미터 수가 2배(mean + log-σ)가 되지만, 각 $\sigma_{ij}$가 weight별 uncertainty를 직접 encode한다. $\sigma_{ij}$가 큰 가중치는 posterior가 prior와 다르지 않다 — pruning 후보다.
+
+**MC Dropout**(Gal & Ghahramani 2016)은 dropout이 있는 NN이 이미 variational BNN이라는 통찰에서 출발한다. Dropout rate $p$인 NN의 학습 objective는 Bernoulli posterior $q(W) = \prod_{ij}[p\cdot\delta_0 + (1-p)\cdot\delta_{M_{ij}}]$의 ELBO 최대화와 동치다. 따라서 test 시 dropout을 끄지 않고 $T$회 forward pass를 실행하면 posterior sample을 얻는다.
+
+```python
+model.train()  # dropout을 유지한다
+preds = [model(x_test) for _ in range(T)]
+mean = torch.stack(preds).mean(0)
+variance = torch.stack(preds).var(0)
+```
+
+추가 학습이 필요 없다는 점에서 "공짜 BNN"이다. 구현이 극도로 단순하고 이것이 가장 널리 쓰이는 이유다. 한계는 Bernoulli mask family의 표현력이 제한적이라는 것과, epistemic uncertainty가 데이터가 늘어도 감소하지 않는다는 비판(Osband 2016)이 있다.
+
+**SWAG**(Maddox et al. 2019)는 SGD 학습 궤적을 재사용한다. 학습 후반부의 weight snapshot $W_1, \ldots, W_K$에서 mean $\bar{W}$와 low-rank covariance를 추출해 Gaussian posterior를 구성한다.
+
+$$
+p(W|D) \approx \mathcal{N}\!\left(\bar{W},\, \tfrac{1}{2}(\hat\Sigma_{\text{diag}} + \hat D\hat D^T/(K-1))\right)
+$$
+
+이 배경에는 Mandt et al. (2017)의 주장이 있다 — constant learning rate SGD의 정상분포가 local posterior의 근사다. 연관된 SGLD(Welling & Teh 2011)는 SGD gradient에 Langevin noise를 더해 posterior 샘플링을 명시적으로 수행한다.
+
+$$
+W_{k+1} = W_k + \frac{\eta}{2}\nabla\log p(W_k|D) + \sqrt{\eta}\,\xi_k, \quad \xi_k \sim \mathcal{N}(0, I)
+$$
+
+이 업데이트는 Langevin SDE $dW = \frac{1}{2}\nabla\log p(W|D)\,dt + dB_t$의 Euler-Maruyama 이산화이고, 정상분포가 $p(W|D)$임이 Fokker-Planck 방정식으로 보장된다.
+
+## 트레이드오프
+
+<Callout type="note" title="근사 추론의 계층">
+원리적 정확도와 계산 확장성은 반비례한다.
+
+| 방법 | 정확도 | 확장성 | 추가 비용 |
+|------|--------|--------|-----------|
+| Exact posterior | ∞ | 불가 | — |
+| HMC | 높음 | 소형 BNN | 수천 step |
+| Laplace (KFAC) | 중간 | ResNet 규모 | Hessian 1회 |
+| Bayes by Backprop | 중간 | 중형 | 2× 파라미터 |
+| SWAG | 중간 | 대형 | 수 epoch 추가 |
+| MC Dropout | 낮음~중간 | 무제한 | $T$× 추론 |
+| MAP (point) | 최저 | 무제한 | 0 |
+</Callout>
+
+모든 방법이 단일 mode를 가정한다는 공통 한계가 있다. NN의 loss landscape는 다봉이고, 서로 다른 초기화에서 수렴하는 해들이 같은 함수를 구현할 수 있다(weight symmetry). 이 degeneracy는 weight-space MCMC를 느리게 만들고 Laplace의 Hessian을 singular하게 만든다. Deep Ensembles(Lakshminarayanan et al. 2017)가 heuristic임에도 강한 baseline인 이유가 여기에 있다 — 여러 MAP의 이산 혼합이 multimodal posterior를 암묵적으로 포착한다.
+
+## 정리
+
+- BNN의 핵심 공식은 단순하지만, evidence $p(D)$가 수백만 차원에서 intractable하다.
+- MAP-trained NN은 BNN의 delta posterior 극단이다 — 이미 Bayesian의 일부다.
+- 근사 방법은 정확도-확장성 스펙트럼 위에 있다: Laplace는 post-hoc으로 가장 저렴하고, BBB는 명시적이며, MC Dropout은 가장 단순하고, SWAG은 SGD 궤적을 재활용한다.
+- Epistemic과 aleatoric uncertainty의 분리가 BNN의 실전 가치다 — OOD 탐지, 능동 학습, 신뢰도 보정 모두 이 분해에 의존한다.
+
+<Reference
+  title="Weight Uncertainty in Neural Networks"
+  authors="Blundell et al."
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1505.05424"
+/>
+
+<Reference
+  title="Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning"
+  authors="Gal & Ghahramani"
+  year={2016}
+  venue="ICML"
+  url="https://arxiv.org/abs/1506.02142"
+/>

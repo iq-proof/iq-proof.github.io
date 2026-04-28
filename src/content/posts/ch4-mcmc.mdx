@@ -1,0 +1,159 @@
+---
+title: "MCMC는 왜 evidence 없이도 posterior를 얻는가"
+description: "Metropolis-Hastings의 detailed balance부터 NUTS의 자동 튜닝, VI와의 정확도-속도 트레이드오프까지 — MCMC 추론 체계의 핵심 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [mcmc, bayesian, metropolis-hastings, nuts, variational-inference]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Bayesian 추론의 근본 장벽은 evidence $p(D)$다. 이 적분이 대부분의 실용적 모델에서 계산 불가능하다. 그런데 PyMC와 Stan은 evidence를 단 한 번도 계산하지 않고 posterior 샘플을 뽑아낸다. 어떻게 가능한가?
+
+## 비율만으로 충분하다 — MH의 핵심 트릭
+
+Metropolis-Hastings(MH)의 acceptance ratio를 보면 즉시 드러난다.
+
+$$
+\alpha = \min\left(1, \frac{\pi(\theta')q(\theta|\theta')}{\pi(\theta)q(\theta'|\theta)}\right)
+$$
+
+여기서 $\pi(\theta) = p(D|\theta)p(\theta)/p(D)$. 비율을 취하는 순간:
+
+$$
+\frac{\pi(\theta')}{\pi(\theta)} = \frac{p(D|\theta')p(\theta')}{p(D|\theta)p(\theta)}
+$$
+
+$p(D)$가 분자·분모에서 동시에 상쇄된다. MCMC가 intractable evidence를 우회하는 방식은 이처럼 단순하다 — **비율만 계산하면 되므로 상수는 필요 없다**.
+
+이 트릭이 작동하려면 Markov chain이 정확히 $\pi$를 정상분포(stationary distribution)로 가져야 한다. 그 보장이 **detailed balance**다.
+
+$$
+\pi(\theta)\,T(\theta \to \theta') = \pi(\theta')\,T(\theta' \to \theta)
+$$
+
+MH acceptance $\alpha = \min(1, R)$으로 정의하면 이 등식이 성립함을 case analysis로 증명할 수 있다. $R \leq 1$일 때 좌변을 전개하면 $\pi(\theta')q(\theta|\theta')$, 우변도 동일한 값이 나온다. Detailed balance는 국소 균형이고, 이 국소 균형을 $\theta$에 대해 적분하면 $\pi T = \pi$, 즉 $\pi$가 정상분포임이 따라온다.
+
+<Theorem kind="proposition" number="1" title="Evidence 상쇄">
+$\pi(\theta) = p(D|\theta)p(\theta)/p(D)$에 대해 MH acceptance ratio는 $p(D)$ 없이 계산 가능하다.
+</Theorem>
+
+<Proof>
+$\pi(\theta')/\pi(\theta) = [p(D|\theta')p(\theta')/p(D)] / [p(D|\theta)p(\theta)/p(D)] = p(D|\theta')p(\theta') / [p(D|\theta)p(\theta)]$. $p(D)$는 분자·분모에서 정확히 상쇄된다.
+</Proof>
+
+## Gibbs에서 HMC까지 — 같은 원리의 다른 표현
+
+MH는 MCMC 알고리즘 군의 공통 언어다. Gibbs sampler는 각 차원 $\theta_i$를 완전조건부 $p(\theta_i|\theta_{-i}, D)$로 교체하는 MH의 특수경우다. Gibbs proposal에서 acceptance를 계산하면 정확히 1이 나온다 — **Gibbs는 항상 accept하는 MH**다.
+
+```
+# Gibbs: 조건부가 닫힌형일 때
+for i in range(d):
+    θ[i] ~ p(θ_i | θ_{-i}, D)   # 항상 수락
+
+# MH: 조건부가 복잡할 때
+θ_prop = θ + ε * randn()
+α = min(1, π(θ_prop) / π(θ))
+θ = θ_prop if rand() < α else θ
+```
+
+Gibbs의 장점은 rejection 없이 매 step이 유의미한 이동이라는 것이다. 단점은 차원 간 상관이 강할수록 mixing이 느려진다는 것이다. 2D Gaussian에서 correlation $\rho = 0.99$이면 Gibbs의 relaxation rate는 $1 - \rho^2 \approx 0.02$, 즉 수렴에 약 50배 더 많은 step이 필요하다.
+
+**Hamiltonian Monte Carlo(HMC)**는 고차원에서 이 문제를 근본적으로 해결한다. 보조 momentum $p$를 도입해 Hamiltonian을 정의한다.
+
+$$
+H(\theta, p) = U(\theta) + \frac{1}{2}p^T M^{-1} p, \quad U(\theta) = -\log\pi(\theta)
+$$
+
+Leapfrog integrator로 Hamiltonian dynamics를 시뮬레이션하면 gradient 방향으로 길게 이동한 $\theta^*$를 얻는다. Leapfrog는 symplectic이므로 volume-preserving(Jacobian det = 1)이고 reversible하다. 이 두 성질 덕분에 acceptance가 $\min(1, \exp(H_0 - H_L))$로 단순화된다 — discretization 오차만 수정하면 되므로 이상적 dynamics에서 acceptance는 1에 가깝다.
+
+Random-walk MH의 optimal acceptance rate가 고차원에서 $\approx 0.234$로 떨어지는 반면, HMC는 $\approx 0.65$를 유지하며 dimension-independent mixing을 달성한다(이상화된 조건에서).
+
+## NUTS — 튜닝 없는 HMC
+
+HMC의 실용적 장벽은 두 hyperparameter다: step size $\epsilon$과 trajectory length $L$. No-U-Turn Sampler(NUTS, Hoffman & Gelman 2014)는 이를 완전 자동화한다.
+
+핵심 아이디어는 **U-turn 감지**다. Trajectory의 시작점 $\theta_-$과 끝점 $\theta_+$에 대해
+
+$$
+(\theta_+ - \theta_-)^T p_- < 0 \quad \text{또는} \quad (\theta_+ - \theta_-)^T p_+ < 0
+$$
+
+이면 trajectory가 되돌아오기 시작한 것이다. NUTS는 binary tree doubling으로 trajectory를 양방향으로 확장하면서 U-turn이 감지되는 순간 멈춘다. 이렇게 얻은 tree의 valid states 중 하나를 multinomial sampling으로 선택한다.
+
+$\epsilon$은 dual averaging(Nesterov 2009)으로 자동 조정된다. Warmup 동안 target acceptance rate(기본 0.8)에 맞춰 수렴하는 Robbins-Monro 형태의 scheme이다.
+
+<Callout type="note" title="Divergent transition의 의미">
+Stan/PyMC에서 "divergent transition" 경고는 특정 region에서 $|\Delta H|$가 threshold를 넘었다는 신호다. Step size가 너무 크거나 posterior geometry가 pathological한 경우 — 주로 hierarchical model의 funnel shape — 에 발생한다. 이 경고는 무시하지 말고 non-centered parameterization이나 prior 조정으로 대응해야 한다.
+</Callout>
+
+## 수렴은 어떻게 아는가 — $\hat{R}$과 ESS
+
+MCMC가 수렴했는지 판단하는 표준 도구는 두 가지다.
+
+**Gelman-Rubin $\hat{R}$**: $M$개 chain의 within-variance $W$와 between-variance $B$를 비교한다.
+
+$$
+\hat{R} = \sqrt{\frac{\hat{V}}{W}}, \quad \hat{V} = \frac{N-1}{N}W + \frac{B}{N}
+$$
+
+수렴한 chain들은 $B/N \to 0$이므로 $\hat{R} \to 1$. 실전 기준은 $\hat{R} < 1.01$. 주의할 점은 multimodal posterior에서 모든 chain이 같은 mode에 갇히면 $\hat{R} \approx 1$이어도 실제로 수렴하지 않은 경우가 있다는 것이다.
+
+**Effective Sample Size(ESS)**: MCMC 샘플은 autocorrelated이므로 $N$개 샘플이 IID $N$개만큼의 정보를 갖지 않는다.
+
+$$
+\text{ESS} = \frac{N}{1 + 2\sum_{k=1}^{K^*}\rho_k}
+$$
+
+$\rho_k$는 lag-$k$ autocorrelation. Autocorrelation time이 50이면 10,000 샘플의 ESS는 200에 불과하다. Vehtari et al.(2021)의 현대 기준은 bulk ESS와 tail ESS 모두 400 이상이다.
+
+## MCMC vs VI — 정확도와 속도의 근본 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+VI는 **빠르고 biased**다. Approximation gap이 영구적으로 남는다 — variational family의 제약으로 인한 구조적 한계다. MCMC는 **느리고 asymptotically unbiased**다. $T \to \infty$에서 exact posterior로 수렴하지만 finite $T$에서 mixing time이 실용적 장벽이 된다.
+</Callout>
+
+Multimodal posterior는 두 방법 모두에게 어렵다. VI(reverse KL)는 mode-seeking 특성으로 인해 한 mode에 집중하고 나머지를 무시한다. MCMC 단일 chain은 mode 간 에너지 장벽을 넘는 데 지수적 시간이 필요하다.
+
+실용적 선택 기준은 문제 규모와 요구 정확도로 나뉜다. $N > 10^5$이거나 NN latent variable model이면 VI가 사실상 유일한 선택이다. 중소 규모의 hierarchical model이나 과학적 분석처럼 정확한 uncertainty quantification이 중요한 경우엔 NUTS가 표준이다.
+
+<Aside label="설계 철학">
+MCMC 체계가 주는 핵심 통찰은 "exact posterior sampling은 정상분포 조건만 만족하면 된다"는 것이다. Evidence를 모르고, posterior의 함수형을 모르고, 고차원이어도 — 비율만 계산할 수 있으면 충분하다. MH, Gibbs, HMC, NUTS는 모두 이 단순한 원리 위에 쌓인 엔지니어링이다.
+</Aside>
+
+## 정리
+
+- MH의 acceptance ratio에서 $p(D)$는 자동 상쇄된다. Evidence intractability가 MCMC의 장벽이 아닌 이유다.
+- Gibbs는 항상 accept하는 MH, HMC는 gradient-aware proposal을 쓰는 MH다. 셋 모두 detailed balance를 만족하고 같은 이론적 보장을 공유한다.
+- NUTS는 U-turn 감지와 dual averaging으로 HMC의 두 hyperparameter를 완전 자동화한다. Stan과 PyMC의 기본 sampler가 된 이유다.
+- $\hat{R} < 1.01$, bulk/tail ESS $> 400$이 수렴의 실전 기준이다.
+- VI는 빠르고 biased, MCMC는 느리고 unbiased다. 이 트레이드오프가 모든 방법 선택 결정의 출발점이다.
+
+다음 챕터에서는 이 MCMC 체계를 신경망에 적용하려 할 때 어디서 무너지는지, 그리고 Laplace approximation과 SGLD가 어떻게 그 간극을 메우는지 추적한다.
+
+<Reference
+  title="The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian Monte Carlo"
+  authors="Hoffman, M. D. and Gelman, A."
+  year={2014}
+  venue="JMLR"
+  url="https://arxiv.org/abs/1111.4246"
+/>
+
+<Reference
+  title="Rank-normalization, folding, and localization: An improved R-hat for assessing convergence of MCMC"
+  authors="Vehtari, A. et al."
+  year={2021}
+  venue="Bayesian Analysis"
+  url="https://arxiv.org/abs/1903.08008"
+/>

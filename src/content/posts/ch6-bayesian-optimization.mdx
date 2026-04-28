@@ -1,0 +1,155 @@
+---
+title: "Bayesian Optimization은 어떻게 적은 실험으로 최적을 찾는가"
+description: "GP posterior로 불확실성을 정량화하고, acquisition function으로 탐색-활용 균형을 수학적으로 구현하는 BO 프레임워크의 설계 원리부터 고차원 확장과 수렴 보장까지."
+pubDate: 2026-04-28
+category: ai
+tags: [bayesian-optimization, gaussian-process, acquisition-function, regret-bound]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+딥러닝 하이퍼파라미터 탐색, 분자 설계, 로봇 제어 — 이 문제들의 공통점은 **평가 한 번이 비싸다**는 것이다. 그리드 탐색은 차원이 늘수록 지수적으로 터지고, 랜덤 탐색은 이전 실험 결과를 전혀 활용하지 않는다. Bayesian Optimization(BO)은 GP의 posterior uncertainty를 이용해 "아직 탐색하지 않은 + 유망한" 지점을 골라 $O(\log T)$ 수준의 평가만으로 near-optimal에 도달한다. 어떻게 이게 가능한가?
+
+## GP Prior — 함수에 대한 분포
+
+BO의 출발점은 목적 함수 $f$를 **Gaussian Process**로 모델링하는 것이다.
+
+$$f \sim \mathcal{GP}(m, k) \iff (f(x_i))_i \sim \mathcal{N}(m, K),\quad K_{ij} = k(x_i, x_j)$$
+
+각 점 $x$에서 $f(x)$는 Gaussian이고, 여러 점을 함께 보면 multivariate Gaussian이다. Kernel $k(x, x')$는 두 점 사이의 공분산을 결정한다. 가장 널리 쓰이는 RBF kernel은 다음과 같다.
+
+$$k(x, x') = \sigma_f^2 \exp\left(-\frac{\|x - x'\|^2}{2\ell^2}\right)$$
+
+length-scale $\ell$은 "correlation 거리"를 결정한다. $\ell$이 작으면 근거리에서도 빠르게 uncorrelated — wiggly한 posterior. $\ell$이 크면 long-range correlation — smooth한 posterior.
+
+관측 $y_i = f(x_i) + \epsilon_i$, $\epsilon_i \sim \mathcal{N}(0, \sigma_n^2)$가 쌓이면, Gaussian conditioning으로 posterior를 닫힌 형태로 계산할 수 있다.
+
+<Theorem kind="theorem" number="1" title="GP Posterior (Conditional Gaussian)">
+$f \sim \mathcal{GP}(0, k)$, 관측 $y = f(X) + \epsilon$, $\epsilon \sim \mathcal{N}(0, \sigma_n^2 I)$이면:
+
+$$f(x_*) \mid y \sim \mathcal{N}(\mu_n(x_*),\; \sigma_n^2(x_*))$$
+
+$$\mu_n(x) = k(x, X)[K + \sigma_n^2 I]^{-1} y$$
+
+$$\sigma_n^2(x) = k(x, x) - k(x, X)[K + \sigma_n^2 I]^{-1} k(X, x)$$
+</Theorem>
+
+<Proof>
+Joint $(f_*, y)^\top \sim \mathcal{N}(0, \Sigma)$, $\Sigma = \begin{pmatrix} k(x_*, x_*) & k(x_*, X) \\ k(X, x_*) & K + \sigma_n^2 I \end{pmatrix}$. Conditional Gaussian formula를 적용하면 위 $\mu_n$, $\sigma_n^2$가 나온다. $\square$
+</Proof>
+
+Posterior mean $\mu_n(x) = \sum_i \alpha_i k(x, x_i)$는 training point의 kernel-weighted sum이다 — GP regression은 kernel ridge regression과 동일한 해를 갖는다. 그리고 새 관측을 추가할수록 $\sigma_n^2(x)$는 단조 감소한다. 관측이 쌓일수록 posterior가 좁아지는 것이 BO의 수렴 직관이다.
+
+## Acquisition Function — 탐색-활용의 수학적 구현
+
+GP posterior $(\mu_n, \sigma_n^2)$를 얻었으면, 다음 평가점은 **acquisition function**으로 결정한다.
+
+$$x_{n+1} = \arg\max_{x \in \mathcal{X}}\; a(x;\, \mathcal{D}_n)$$
+
+네 가지 주요 acquisition을 비교하면 다음과 같다.
+
+| | 수식 | 탐색 강도 | 특징 |
+|---|---|---|---|
+| **EI** | $\mathbb{E}[\max(0, f_{\text{best}} - f(x))]$ | 균형 | 안정적 default |
+| **UCB** | $\mu(x) - \kappa\sigma(x)$ | $\kappa$로 조절 | regret bound 증명 |
+| **TS** | $\arg\min \tilde{f}$, $\tilde{f} \sim \mathcal{GP}$ | 확률적 | batch 병렬화 자연 |
+| **PI** | $P(f(x) < f_{\text{best}})$ | 약 | over-greedy, 비권장 |
+
+EI의 closed form은 다음과 같이 유도된다.
+
+<Theorem kind="proposition" number="2" title="EI Closed Form">
+Posterior $f(x) \sim \mathcal{N}(\mu(x), \sigma^2(x))$이면:
+
+$$\text{EI}(x) = \sigma(x)\bigl[z\,\Phi(z) + \phi(z)\bigr], \quad z = \frac{f_{\text{best}} - \mu(x)}{\sigma(x)}$$
+
+$\Phi$: standard normal CDF, $\phi$: PDF.
+</Theorem>
+
+<Proof>
+$Y := f_{\text{best}} - f(x) \sim \mathcal{N}(f_{\text{best}} - \mu, \sigma^2)$. $\mathbb{E}[\max(0, Y)]$를 truncated Gaussian expectation 공식으로 전개하면 $\sigma[z\Phi(z) + \phi(z)]$가 나온다. $\square$
+</Proof>
+
+EI의 해석은 명확하다. $\sigma(x)$가 크면(미탐색) EI 증가 → exploration. $\mu(x)$가 낮으면(유망) $z$가 커져 $\Phi(z) \to 1$ → exploitation. 두 축이 자연스럽게 균형을 이룬다.
+
+<Callout type="note" title="실무 선택 가이드">
+- **EI**: 안전한 default
+- **UCB**: regret bound가 필요한 경우
+- **TS**: 여러 GPU에서 batch 병렬 평가할 때 — 각 샘플이 서로 다른 posterior realization에서 나오므로 자연스러운 diversity
+- **PI**: exploration이 지나치게 억제되므로 회피
+</Callout>
+
+## 수렴 보장 — Regret Bound와 Kernel의 역할
+
+BO의 이론적 근거는 Srinivas et al. (2010)의 GP-UCB regret bound다.
+
+<Theorem kind="theorem" number="3" title="GP-UCB Regret Bound (Srinivas et al. 2010)">
+적절한 $\kappa_t$ schedule 하에서, 확률 $1 - \delta$로:
+
+$$R_T = \sum_{t=1}^T (f(x_t) - f(x^*)) \leq \tilde{O}(\sqrt{T \gamma_T})$$
+
+$\gamma_T$: maximum information gain, $\gamma_T = \max_{|A|=T} \frac{1}{2}\log|I + \sigma_n^{-2} K(A, A)|$.
+</Theorem>
+
+$R_T = \tilde{O}(\sqrt{T\gamma_T})$이면 평균 regret $R_T/T \to 0$ — 이것이 **no-regret** property다. $\gamma_T$는 kernel의 information capacity이며, kernel에 따라 수렴 속도가 달라진다.
+
+| Kernel | $\gamma_T$ | Regret |
+|---|---|---|
+| Linear | $O(d \log T)$ | $\tilde{O}(\sqrt{dT\log T})$ |
+| SE (RBF) | $O((\log T)^{d+1})$ | $\tilde{O}(\sqrt{T}(\log T)^{(d+1)/2})$ |
+| Matérn-$\nu$ | $O(T^{d(d+1)/(2\nu + d(d+1))})$ | $\nu$ 작을수록 느려짐 |
+
+SE kernel은 $(\log T)^{d+1}$ 수준으로 $\gamma_T$가 자라므로 sublinear regret을 보장한다. 그러나 $d = 30$이면 $(\log T)^{31}$이 $T = 1000$에서 이론적으로는 폭발한다. 고차원 BO가 어려운 근본 이유다.
+
+<Aside label="하한과 최적성">
+Scarlett (2018)은 어떤 알고리즘도 $\Omega(\sqrt{T\gamma_T})$ 이하로 regret을 줄일 수 없음을 보였다. UCB는 log factor 내에서 minimax optimal이다.
+</Aside>
+
+## 트레이드오프 — 계산 비용과 고차원 한계
+
+<Callout type="note" title="트레이드오프">
+표준 GP-BO의 비용 구조: posterior fit $O(n^3)$, 새 점 예측 $O(n^2)$, acquisition 최적화 $O(n^2 \cdot |\mathcal{X}_{\text{cand}}|)$. $n > 1000$에서 폭발하므로 sparse GP나 inducing point (Titsias 2009)가 필요하다.
+
+고차원($d > 20$)에서는 $\gamma_T$가 지수적으로 증가해 수렴이 보장되지 않는다. 이를 완화하는 전략들:
+
+- **REMBO**: $x = Az$, $z \in \mathbb{R}^{d_e}$로 저차원 임베딩 후 BO. $f$가 effective dimension $d_e$를 갖는다고 가정.
+- **TuRBO**: 현재 best 주변 trust region 내에서 local GP + Thompson Sampling. 100D 이상에서도 작동함이 경험적으로 확인됐다 (Eriksson et al. 2019).
+- **Multi-fidelity BO (FABOLAS)**: dataset 크기나 epoch 수를 fidelity $s \in [0, 1]$로 취급해 cheap proxy 평가를 먼저 수집. Cost-normalized acquisition $\alpha(x, s) = \text{EI}(x, s) / c(s)$로 비용 대비 정보량 최대화.
+</Callout>
+
+실무 기준으로 정리하면: $d \leq 20$은 vanilla BO (BoTorch/Ax), $d = 20 \sim 100$은 TuRBO나 sparse kernel, $d > 100$은 도메인 특화 kernel(그래프, 분자 fingerprint 등)이 필요하다.
+
+## 정리
+
+- GP posterior $(\mu_n, \sigma_n^2)$는 Gaussian conditioning으로 닫힌 형태가 존재하며, 관측이 쌓일수록 $\sigma_n^2$는 단조 감소한다.
+- EI는 exploration($\sigma$)과 exploitation($\mu$)을 하나의 수식으로 균형 잡는 closed-form acquisition이다. TS는 batch 병렬 평가에 자연스럽다.
+- GP-UCB의 cumulative regret은 $\tilde{O}(\sqrt{T\gamma_T})$이며, UCB는 minimax optimal이다. $\gamma_T$는 kernel의 정보 용량으로 수렴 속도를 결정한다.
+- $d > 20$에서는 TuRBO, REMBO, multi-fidelity 등의 확장이 필요하다. 고차원 curse는 $\gamma_T$의 폭발로 수식화된다.
+
+평가 한 번이 수 시간짜리 GPU 실험이라면, 불확실성을 정량화해 "다음 실험"을 고르는 것과 무작정 고르는 것의 차이는 10배 이상의 wall-clock으로 돌아온다.
+
+<Reference
+  title="Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design"
+  authors="Srinivas, Krause, Kakade, Seeger"
+  year={2010}
+  venue="ICML"
+  url="https://arxiv.org/abs/0912.3995"
+/>
+
+<Reference
+  title="Scalable Global Optimization via Local Bayesian Optimization"
+  authors="Eriksson, Pearce, Gardner, Turner, Poloczek"
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1910.01739"
+/>

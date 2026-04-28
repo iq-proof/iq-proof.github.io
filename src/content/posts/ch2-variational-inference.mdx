@@ -1,0 +1,133 @@
+---
+title: "Variational Inference는 왜 ELBO를 최대화하는가"
+description: "Intractable posterior를 tractable 분포로 근사하는 VI의 아이디어부터 ELBO의 세 분해, CAVI의 단조 수렴, reparameterization trick의 저분산 원리까지 하나의 최적화 철학으로 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [variational-inference, elbo, bayesian, reparameterization, mean-field]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+현대 딥러닝에서 VAE, BNN, Diffusion Model은 표면적으로 전혀 다른 모델처럼 보인다. 그러나 이 모델들은 공통된 수학적 뼈대를 공유한다 — **ELBO(Evidence Lower Bound)**. ELBO가 없으면 VAE 학습은 불가능하고, BNN의 variational posterior도 정의되지 않는다. 왜 현대 Bayesian 딥러닝의 거의 모든 scalable 방법이 하나의 부등식으로 수렴하는가?
+
+## 출발점: Inference를 Optimization으로
+
+Bayesian inference의 핵심 목표는 posterior $p(\theta|x)$를 구하는 것이다. 문제는 이 posterior가 대부분의 실전 모델에서 **intractable**하다는 점이다 — 분모인 evidence $p(x) = \int p(x|\theta)p(\theta)d\theta$를 닫힌형으로 계산할 수 없다.
+
+Variational Inference(VI)는 이 문제를 다르게 접근한다. 정확한 posterior를 구하는 대신, tractable한 분포 족 $\mathcal{Q} = \{q_\phi : \phi \in \Phi\}$ 안에서 posterior에 가장 가까운 $q_\phi^*$를 찾는다.
+
+$$\underbrace{p(\theta|x)}_{\text{intractable}} \approx \underbrace{q_\phi^*(\theta)}_{\text{tractable}}$$
+
+"가까움"의 척도는 **KL divergence**다. 그런데 $\text{KL}(q \| p(\cdot|x))$를 직접 최소화하려면 $p(\theta|x)$를 알아야 한다 — 애초에 모르기 때문에 근사를 하는 것인데. 이 순환을 끊는 것이 ELBO다.
+
+## ELBO: 단 하나의 항등식
+
+$\log p(x)$를 $q$를 이용해 분해하면 다음 항등식이 성립한다.
+
+$$\log p(x) = \mathcal{L}(q) + \text{KL}(q(\theta)\|p(\theta|x))$$
+
+<Theorem kind="proposition" number="1" title="ELBO–KL 분해">
+임의의 분포 $q(\theta)$에 대해 위 항등식이 성립한다. 여기서
+
+$$\mathcal{L}(q) = \mathbb{E}_{q(\theta)}[\log p(x, \theta) - \log q(\theta)]$$
+
+를 **ELBO(Evidence Lower Bound)**라 한다.
+</Theorem>
+
+<Proof>
+$\mathcal{L}(q) = \mathbb{E}_q[\log p(x,\theta)] - \mathbb{E}_q[\log q(\theta)]$. $p(x,\theta) = p(\theta|x)p(x)$로 분해하면
+
+$$\mathcal{L}(q) = \log p(x) + \mathbb{E}_q[\log p(\theta|x) - \log q(\theta)] = \log p(x) - \text{KL}(q\|p(\cdot|x))$$
+
+이항하면 항등식이 된다. $\square$
+</Proof>
+
+이 항등식의 함의는 명확하다. $\log p(x)$는 $q$에 무관한 상수이므로, **KL을 최소화하는 것과 ELBO를 최대화하는 것은 완전히 동치**다. 계산 불가능한 KL 최소화가 계산 가능한 ELBO 최대화로 바뀐다.
+
+Jensen 부등식으로도 같은 결론에 도달한다.
+
+$$\log p(x) = \log \mathbb{E}_q\!\left[\frac{p(x,\theta)}{q(\theta)}\right] \geq \mathbb{E}_q\!\left[\log \frac{p(x,\theta)}{q(\theta)}\right] = \mathcal{L}(q)$$
+
+등호는 $q = p(\cdot|x)$일 때만 성립한다. ELBO는 log evidence의 **하한**이며, $q$가 true posterior에 가까울수록 이 하한이 타이트해진다.
+
+## ELBO의 세 얼굴
+
+ELBO는 수학적으로 동치인 세 가지 분해를 갖는다. 각 분해는 같은 양을 다른 관점에서 조명한다.
+
+$$\mathcal{L}(q) = \underbrace{\log p(x) - \text{KL}(q\|p(\cdot|x))}_{\text{(1) Evidence} - \text{gap}} = \underbrace{\mathbb{E}_q[\log p(x|\theta)] - \text{KL}(q\|p(\theta))}_{\text{(2) Reconstruction} + \text{prior reg}} = \underbrace{\mathbb{E}_q[\log p(x,\theta)] + H(q)}_{\text{(3) Energy} + \text{entropy}}$$
+
+분해 **(2)**는 딥러닝과 가장 자연스럽게 연결된다. VAE에서 latent $z$에 대입하면
+
+$$\mathcal{L}(x) = \mathbb{E}_{q(z|x)}[\log p(x|z)] - \text{KL}(q(z|x)\|p(z))$$
+
+왼쪽 항이 reconstruction loss, 오른쪽이 KL regularization이다. VAE의 학습 목적함수는 ELBO 분해 (2)의 직접적 특수화다.
+
+분해 **(3)**은 통계역학과 연결된다. $U := -\log p(x,\theta)$를 에너지로 놓으면 $-\mathcal{L}(q) = \mathbb{E}_q[U] - H(q)$는 Helmholtz free energy $F = U - TS$($T=1$)와 동일한 구조다. **ELBO 최대화 = free energy 최소화**.
+
+<Callout type="note" title="트레이드오프">
+분해 선택은 implementation에 영향을 준다. VAE 학습 시에는 분해 (2)의 두 항을 **따로 모니터링**하는 것이 표준 — KL 항이 0으로 수렴하면 posterior collapse(decoder가 latent를 무시하는 현상)를 조기에 감지할 수 있다. 분해 (1)은 이론 분석에, 분해 (3)은 physics-inspired 모델에 적합하다.
+</Callout>
+
+## Mean-Field와 CAVI: 좌표로 올라가기
+
+Variational family $\mathcal{Q}$를 어떻게 선택하느냐가 근사 품질을 결정한다. 가장 널리 쓰이는 선택은 **Mean-Field 가정**이다.
+
+$$q(\theta_1, \ldots, \theta_d) = \prod_{i=1}^d q_i(\theta_i)$$
+
+모든 파라미터가 독립이라 가정한다. 이 가정 아래서 ELBO를 $q_i$에 대해 최대화하면 닫힌형 해가 나온다.
+
+$$q_i^*(\theta_i) \propto \exp\!\left(\mathbb{E}_{q_{-i}}[\log p(x, \theta)]\right)$$
+
+이를 순환적으로 적용하는 알고리즘이 **CAVI(Coordinate Ascent VI)**다. 각 업데이트가 $\mathbb{E}[\mathcal{L}]$를 감소시키지 않으므로 ELBO는 **단조 증가**하고, ELBO가 위로 유계이므로 수렴이 보장된다.
+
+Conjugate-exponential 구조를 갖는 모델(LDA, Bayesian Mixture 등)에서는 $\mathbb{E}_{q_{-i}}[\log p]$가 자연매개변수 공간에서의 덧셈으로 표현된다 — 닫힌형 업데이트가 가능해 코드 한 줄로 구현된다.
+
+단, Mean-Field는 posterior의 **correlation 구조를 완전히 무시**한다. 2D Gaussian posterior $\mathcal{N}(0, \Sigma)$에 Mean-Field를 적용하면 최적 분산이 $\sigma_i^2 = 1/[\Sigma^{-1}]_{ii}$가 되어 참 marginal variance $\Sigma_{ii}$보다 항상 작다. **Mean-Field는 posterior mean은 잘 추정하지만 uncertainty는 체계적으로 과소추정한다.**
+
+## Reparameterization Trick: 미분 가능한 샘플링
+
+CAVI는 conjugate 구조 없이는 gradient 기반 최적화로 ELBO를 최대화해야 한다. 문제는 ELBO gradient
+
+$$\nabla_\phi \mathcal{L}(\phi) = \nabla_\phi \mathbb{E}_{q_\phi(z)}[f(z)]$$
+
+에서 $q_\phi$가 $\phi$에 의존하는 분포이므로 gradient를 기댓값 안으로 단순히 넣을 수 없다는 것이다.
+
+두 가지 해법이 있다. **REINFORCE**는 log-derivative trick으로 unbiased gradient를 구성한다.
+
+$$\nabla_\phi \mathbb{E}_{q_\phi}[f] = \mathbb{E}_{q_\phi}[f \cdot \nabla_\phi \log q_\phi]$$
+
+Unbiased이지만 $\nabla_\phi \log q_\phi$가 tail에서 폭발해 **분산이 매우 크다**.
+
+**Reparameterization**은 분포의 randomness를 $\phi$와 분리한다.
+
+$$z = g_\phi(\epsilon), \quad \epsilon \sim p(\epsilon) \text{ (φ와 무관)}$$
+
+예: $z \sim \mathcal{N}(\mu_\phi, \sigma_\phi^2)$를 $z = \mu_\phi + \sigma_\phi \epsilon$, $\epsilon \sim \mathcal{N}(0,1)$로 재표현한다. 기댓값이 $\phi$와 무관한 측도 $p(\epsilon)$에 대한 것이 되므로 Leibniz rule로 미분과 기댓값 교환이 정당화된다.
+
+$$\nabla_\phi \mathbb{E}_{q_\phi}[f(z)] = \mathbb{E}_{p(\epsilon)}[\nabla_\phi f(g_\phi(\epsilon))]$$
+
+"shared randomness" $\epsilon$이 $\phi$ 변화에 따른 noise를 상쇄시켜 **분산이 REINFORCE 대비 수 배에서 수십 배 낮다**. VAE 인코더의 end-to-end gradient가 가능한 이유가 바로 이 트릭이다.
+
+Discrete 분포는 표준 reparameterization이 불가능하다. 이때는 **Gumbel-Softmax**가 우회로를 제공한다 — Categorical 분포의 연속 완화(continuous relaxation)로, temperature $\tau \to 0$ 극한에서 one-hot categorical로 수렴하면서 $\tau > 0$에서 reparameterizable하다.
+
+<Aside label="통합 관점">
+VI의 모든 알고리즘 변형은 같은 문제의 서로 다른 해법이다. CAVI는 conjugate 구조를 이용한 closed-form 좌표 상승, SVI(Stochastic VI)는 mini-batch + natural gradient로 대규모 확장, reparameterization gradient는 연속 분포에서 저분산 gradient, REINFORCE + control variate는 discrete 분포의 차선. 모두 $\max_q \mathcal{L}(q)$라는 단일 목표의 변주다.
+</Aside>
+
+## 정리
+
+- **ELBO = log evidence − KL gap**: KL 최소화와 ELBO 최대화는 동치다. intractable inference가 tractable optimization으로 바뀐다.
+- **세 분해는 같은 수량의 세 관점**: 분해 (2)는 VAE/BNN의 loss 구조, 분해 (3)은 free energy와의 연결, 분해 (1)은 이론 분석에 각각 핵심적이다.
+- **CAVI는 단조 수렴하지만 correlation을 버린다**: Mean-Field는 빠르고 구현이 간단하지만 uncertainty를 과소추정한다. 정확도가 중요하면 MCMC로 검증하라.
+- **Reparameterization은 VAE 학습의 기술적 핵심**: $\epsilon$과 $\phi$의 분리가 미분 가능한 샘플링을 가능케 하고, REINFORCE

@@ -1,0 +1,145 @@
+---
+title: "VAE의 모든 설계 결정은 하나의 질문에서 나온다"
+description: "ELBO 유도부터 β-VAE의 disentanglement, Normalizing Flow의 정확한 likelihood, Amortized Inference의 gap, IWAE의 단조 수렴까지 — VAE 계열 생성모델의 통일 원리를 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [vae, elbo, normalizing-flow, amortized-inference, generative-model]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+VAE를 처음 공부하면 수식이 너무 많아서 각 챕터가 독립된 이야기처럼 느껴진다. ELBO 유도, β 가중, Normalizing Flow의 Jacobian, Amortization gap, IWAE의 단조성 — 이것들이 하나의 맥락 안에 있다는 것을 어떻게 보여줄 수 있을까?
+
+## 출발점: ELBO는 왜 두 항으로 쪼개지는가
+
+VAE의 목표는 $\log p_\theta(x)$를 최대화하는 것이다. 그런데 $\log p_\theta(x) = \int p_\theta(x|z)p(z)\,dz$는 적분이 닫힌 형태로 풀리지 않는다. 여기서 variational inference가 개입한다.
+
+$$
+\log p_\theta(x) \geq \underbrace{\mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]}_{\text{reconstruction}} - \underbrace{\text{KL}(q_\phi(z|x)\|p(z))}_{\text{regularization}} =: \mathcal{L}(x;\theta,\phi)
+$$
+
+등호는 $q_\phi(z|x) = p_\theta(z|x)$일 때, 즉 approximate posterior가 true posterior와 일치할 때 성립한다. 이 gap이 $\text{KL}(q_\phi\|p_\theta(\cdot|x))$이고, ELBO를 최대화한다는 것은 이 gap을 줄이는 동시에 $\log p_\theta(x)$를 높이는 것이다.
+
+Gaussian prior $p(z)=\mathcal{N}(0,I)$와 diagonal Gaussian encoder $q_\phi(z|x)=\mathcal{N}(\mu_\phi(x),\text{diag}(\sigma_\phi^2(x)))$를 선택하면 KL 항이 해석해를 갖는다.
+
+$$
+\text{KL}(q_\phi\|p) = \frac{1}{2}\sum_{j=1}^d (\mu_j^2 + \sigma_j^2 - \log\sigma_j^2 - 1)
+$$
+
+이 닫힌 형태가 VAE를 학습 가능하게 만드는 결정적 이유다. Reconstruction 항은 Monte Carlo로, KL 항은 해석해로 — 두 항의 역할이 명확히 분리된다.
+
+<Aside label="선형 VAE와 PCA">
+Decoder가 $\text{dec}_\theta(z) = Wz$인 선형 VAE는 Probabilistic PCA(Tipping & Bishop 1999)와 동치다. VAE는 이 선형 구조를 신경망으로 비선형화한 것 — "비선형 stochastic PCA"로 볼 수 있다.
+</Aside>
+
+## 유연성의 세 방향 — β-VAE, CVAE, VQ-VAE
+
+표준 VAE를 출발점으로 삼으면, 세 가지 변종이 각각 다른 제약을 풀려는 시도임을 알 수 있다.
+
+**β-VAE**는 KL 항에 가중치 $\beta > 1$을 준다.
+
+$$
+\mathcal{L}_\beta = \mathbb{E}_q[\log p_\theta(x|z)] - \beta\,\text{KL}(q_\phi(z|x)\|p(z))
+$$
+
+Alemi et al.(2018)은 이것이 rate-distortion Lagrangian과 동치임을 보였다. $\beta$는 "latent가 담을 수 있는 정보량"의 상한을 조절하는 Lagrange multiplier다. 큰 $\beta$는 각 latent 차원을 독립적이고 interpretable하게 만드는 압력을 가한다. 단, $\beta \neq 1$이면 $\mathcal{L}_\beta$는 $\log p(x)$의 lower bound가 아니라 "다른 목적함수의 lower bound"가 된다(Locatello et al. 2019는 unsupervised disentanglement가 inductive bias 없이 불가능함도 증명했다).
+
+**CVAE**는 label $y$를 encoder와 decoder 양쪽에 주입해 controllable generation을 가능하게 한다. ELBO는 $\log p_\theta(x|y)$의 lower bound가 된다. **VQ-VAE**는 continuous latent를 discrete codebook으로 대체한다. Quantization의 argmin은 미분 불가능하므로 straight-through estimator를 쓴다 — $z_q = z_e + \text{sg}[z_q - z_e]$. Forward pass는 $z_q$를, backward pass는 $\nabla z_q = \nabla z_e$를 쓴다. 이 discrete token이 transformer의 next-token prediction과 호환되어 DALL-E 계열의 기반이 됐다.
+
+## Gaussian encoder의 한계를 넘어 — Normalizing Flow
+
+mean-field Gaussian $q_\phi(z|x)$는 multimodal이나 skewed posterior를 표현하지 못한다. Normalizing Flow는 이 제약을 정면으로 돌파한다.
+
+역가능 함수 $f_k$를 순차적으로 적용하면 밀도가 추적 가능하다.
+
+$$
+\log p_K(z_K) = \log p_0(z_0) - \sum_{k=1}^K \log|\det J_{f_k}(z_{k-1})|
+$$
+
+<Theorem kind="proposition" number="1" title="Composition의 Jacobian">
+$f = f_K \circ \cdots \circ f_1$이면 $\log|\det J_f| = \sum_{k=1}^K \log|\det J_{f_k}(z_{k-1})|$. Chain rule과 $\det$의 multiplicativity에서 즉시 따라온다.
+</Theorem>
+
+문제는 $d \times d$ Jacobian의 det 계산이 일반적으로 $O(d^3)$라는 것이다. Real NVP(Dinh et al. 2017)는 coupling layer로 이 계산을 $O(d)$로 줄인다.
+
+```
+y₁ = z₁
+y₂ = z₂ ⊙ exp(s(z₁)) + t(z₁)
+```
+
+Jacobian이 하삼각행렬이 되어 det가 대각 원소의 곱 $\sum_i s_i(z_1)$으로 계산된다. $s, t$는 임의의 신경망이어도 되므로 표현력은 유지된다. Flow의 핵심 장점은 **exact likelihood** 계산이다 — VAE와 Diffusion이 ELBO만 주는 것과 달리.
+
+<Callout type="note" title="트레이드오프">
+Flow는 exact likelihood를 주지만 $\mathbb{R}^d \to \mathbb{R}^d$ bijection이어야 하므로 차원 변경이 불가능하고, 수십~수백 layer가 필요해 parameter efficiency가 낮다. 이미지 생성은 현재 Diffusion이 우세하고, Flow는 likelihood 정확도가 중요한 niche(anomaly detection, small-dim posterior 근사)에서 강점을 보인다.
+</Callout>
+
+## 공유와 정확도의 딜레마 — Amortization Gap
+
+VAE의 encoder가 하는 일은 각 $x_i$마다 최적의 $q^*(z|x_i)$를 구하는 대신 **하나의 신경망 $q_\phi(z|x)$를 공유**해 inference 비용을 상수 시간으로 만드는 것이다. 이것이 amortized inference다.
+
+그런데 공유에는 대가가 따른다.
+
+$$
+\log p(x) - \mathcal{L}_{\text{amortized}}(x) = \underbrace{a(x)}_{\text{approximation gap}} + \underbrace{g(x;\phi)}_{\text{amortization gap}}
+$$
+
+Approximation gap $a(x)$는 variational family 자체의 제약 — Gaussian $q$가 true posterior를 표현하지 못하는 부분이다. Amortization gap $g(x;\phi)$는 encoder NN의 capacity 부족 — 모든 $x$에 공통 파라미터를 쓰는 대가다. Cremer et al.(2018)은 이 gap이 VAE 생성 품질의 주요 제약임을 실증했다.
+
+Semi-amortized VAE(Kim et al. 2018)는 amortized encoder를 초기값으로 쓰고 몇 스텝의 local gradient ascent로 refinement한다. 이 구조는 MAML의 "shared initialization + few-step adaptation"과 철학적으로 동일하다.
+
+## Tighter Bound의 수학 — IWAE
+
+IWAE(Burda, Grosse, Salakhutdinov 2016)는 $K$개 샘플로 ELBO를 직접 tight하게 만드는 방법이다.
+
+$$
+\mathcal{L}_K = \mathbb{E}_{z_1,\ldots,z_K \sim q}\left[\log\frac{1}{K}\sum_{k=1}^K \frac{p(x,z_k)}{q(z_k|x)}\right]
+$$
+
+<Theorem kind="theorem" number="2" title="IWAE Monotonicity">
+$\mathcal{L}_1 \leq \mathcal{L}_2 \leq \cdots \leq \log p(x)$.
+</Theorem>
+
+<Proof>
+$K$-샘플 평균 $\bar w_K$는 서로 다른 $(K-1)$-샘플 평균들의 평균으로 쓸 수 있다. $\log$의 concavity(Jensen)를 적용하면 $\mathbb{E}[\log \bar w_K] \geq \mathbb{E}[\log \bar w_{K-1}]$. Strong LLN으로 $\bar w_K \to p(x)$ a.s., 수렴율은 $O(1/K)$. $\square$
+</Proof>
+
+단, 이 단조성이 항상 더 나은 학습을 의미하지는 않는다. Rainforth et al.(2018)은 $K$가 매우 크면 encoder gradient의 SNR이 $O(1/\sqrt{K})$로 감소함을 보였다. Decoder는 개선되지만 encoder는 오히려 악화될 수 있다. 실전에서는 $K \in \{5, 10, 50\}$이 균형점이고, evaluation 시에만 $K = 1000 \sim 10000$을 쓴다.
+
+## 정리
+
+다섯 챕터를 관통하는 단일 질문은 이것이다 — **어떻게 하면 $\log p_\theta(x)$를 더 정확히, 더 효율적으로, 더 유연하게 최대화할 수 있는가?**
+
+- **ELBO**: Jensen gap을 감수하고 tractable lower bound로 대체
+- **β-VAE / CVAE / VQ-VAE**: reconstruction과 regularization의 균형을 목적에 맞게 재조정
+- **Normalizing Flow**: bijective 변환으로 exact likelihood를 달성하되, 차원 제약을 수용
+- **Amortized Inference**: inference 비용을 상수로 만들되, approximation gap과 amortization gap의 합산을 수용
+- **IWAE**: $K$ 샘플로 gap을 줄이되, encoder gradient의 SNR 저하를 주의
+
+각 설계 결정은 독립된 아이디어가 아니라 같은 trade-off의 다른 해법이다.
+
+<Reference
+  title="Auto-Encoding Variational Bayes"
+  authors="Kingma, D.P. and Welling, M."
+  year={2013}
+  venue="ICLR 2014"
+  url="https://arxiv.org/abs/1312.6114"
+/>
+
+<Reference
+  title="Importance Weighted Autoencoders"
+  authors="Burda, Y., Grosse, R., and Salakhutdinov, R."
+  year={2016}
+  venue="ICLR 2016"
+  url="https://arxiv.org/abs/1509.00519"
+/>

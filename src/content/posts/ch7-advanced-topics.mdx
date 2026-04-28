@@ -1,0 +1,127 @@
+---
+title: "Bayesian Deep Learning은 불확실성을 어떻게 다루는가"
+description: "Diffusion Model의 Hierarchical VAE 해석부터 PPL, Epistemic/Aleatoric 분해, OOD Calibration까지 — Bayesian 프레임워크가 현대 딥러닝을 관통하는 하나의 언어임을 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [bayesian-deep-learning, diffusion, uncertainty, calibration, probabilistic-programming]
+difficulty: advanced
+series:
+  slug: bayesian-ml-deep-dive
+  title: Bayesian Ml Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Diffusion Model, Probabilistic Programming, 불확실성 분해, OOD Calibration — 이 네 주제는 겉으로는 무관해 보인다. 그러나 이것들은 모두 하나의 질문에서 출발한다. **"모델이 무엇을 모르는지를 어떻게 정량화하는가?"** 이 글은 그 질문을 Bayesian 언어로 추적한다.
+
+## DDPM은 Hierarchical VAE다
+
+Diffusion Model의 forward process는 다음과 같이 정의된다.
+
+$$q(x_t | x_{t-1}) = \mathcal{N}(\sqrt{1-\beta_t}\,x_{t-1},\; \beta_t I)$$
+
+데이터 $x_0$에서 출발해 $T$번 Gaussian noise를 더하면 $x_T \sim \mathcal{N}(0, I)$에 도달한다. Reverse process는 learnable한 NN $\epsilon_\theta$가 이를 거슬러 올라간다.
+
+이 구조의 ELBO는 telescoping 전개를 거쳐 다음으로 분해된다.
+
+$$-\mathcal{L} = \underbrace{\text{KL}(q(x_T|x_0)\|p(x_T))}_{L_T} + \sum_{t=1}^T \underbrace{\text{KL}(q(x_{t-1}|x_t, x_0)\|p_\theta(x_{t-1}|x_t))}_{L_{t-1}} - \underbrace{\log p_\theta(x_0|x_1)}_{L_0}$$
+
+$T$개의 KL 항이 있다. 이것은 곧 $T$-level hierarchical VAE다 — encoder는 forward process(고정), decoder는 reverse process(학습), latent hierarchy는 $x_1, \ldots, x_T$다. Ho et al.은 이 KL 항들을 Gaussian conjugate로 closed form 계산한 뒤, 최종 손실을 다음으로 단순화했다.
+
+$$\mathcal{L}_{\text{simple}} = \mathbb{E}_{t,\, x_0,\, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+
+이 MSE 손실은 동시에 **denoising score matching**과 동치다. $\epsilon$-prediction이 곧 score $\nabla_{x_t}\log p_t(x_t)$를 학습하는 것이다. $T \to \infty$ 극한에서 DDPM은 연속시간 VP-SDE로 수렴한다.
+
+<Callout type="note" title="트레이드오프">
+이론적 ELBO는 $t$마다 다른 가중치를 부여한다. 하지만 Ho et al.은 상수 가중치($L_{\text{simple}}$)가 실전 이미지 품질(FID)에서 더 낫다는 것을 경험적으로 발견했다. 이론적 log-likelihood 최적화와 지각적 품질 사이의 gap이다.
+</Callout>
+
+## PPL — 모델 선언이 곧 추론이다
+
+Bayesian 추론을 직접 코딩하려면 prior, likelihood, posterior sampler를 모두 손으로 구현해야 한다. Probabilistic Programming Language(PPL)는 이 부담을 "모델 선언"으로 압축한다. 사용자는 prior와 likelihood만 작성하고, 추론 엔진(NUTS, ADVI)은 프레임워크가 자동으로 호출한다.
+
+4대 PPL의 포지셔닝은 명확하게 갈린다.
+
+| | Stan | PyMC | NumPyro | Pyro |
+|---|---|---|---|---|
+| Backend | C++ | PyTensor | JAX | PyTorch |
+| 주 강점 | 정밀한 통계 | Pythonic | GPU 속도 | Deep 확률 모델 |
+| Neural net 통합 | 제한적 | 가능 | 자연 | **자연** |
+
+**ADVI(Kucukelbir et al. 2017)**는 모든 PPL이 공유하는 자동 VI 엔진이다. 제약 파라미터를 $\mathbb{R}^d$로 unconstrain한 뒤, mean-field Gaussian $q(\theta) = \mathcal{N}(\mu, \text{diag}(\sigma^2))$를 reparameterization trick으로 ELBO 최적화한다. 이 구조는 Ch2에서 다룬 VI 아이디어의 자동화다.
+
+<Aside label="선택 기준">
+통계학자·clinical trial → Stan. 데이터 사이언티스트 → PyMC. GPU가 필요한 대규모 Bayesian → NumPyro. VAE·BNN을 Bayesian 프레임워크로 표현하고 싶다면 → Pyro.
+</Aside>
+
+## 불확실성의 두 근원
+
+Bayesian DL에서 가장 실용적인 분해는 법칙 총분산(law of total variance)에서 직접 나온다.
+
+$$\text{Var}[y^*|x^*, D] = \underbrace{\mathbb{E}_{W|D}[\text{Var}(y^*|x^*, W)]}_{\text{aleatoric}} + \underbrace{\text{Var}_{W|D}[\mathbb{E}(y^*|x^*, W)]}_{\text{epistemic}}$$
+
+<Theorem kind="proposition" number="1" title="Epistemic의 감소 가능성">
+Bernstein-von Mises 조건 하에서 $N \to \infty$이면 posterior $p(W|D_N) \to \mathcal{N}(W^*, F^{-1}/N)$이고, 따라서 epistemic 항은 $O(1/N) \to 0$이다.
+</Theorem>
+
+<Proof>
+Posterior 분산이 $O(1/N)$이므로 $\mathbb{E}(y^*|x^*, W)$의 분산(delta method)도 $O(1/N)$. 반면 첫 번째 항 $\mathbb{E}_W[\text{Var}(y^*|W)]$는 $N \to \infty$에서 true parameter의 noise $\text{Var}(y^*|W^*)$로 수렴하며 데이터로 줄어들지 않는다. $\square$
+</Proof>
+
+이 구분은 응용에서 결정적이다. **Epistemic**(모델 불확실성)은 훈련 데이터가 부족한 영역에서 높고, 데이터를 늘리면 줄어든다. **Aleatoric**(관측 노이즈)은 같은 $x$에서도 $y$가 다양한 본질적 랜덤성이며 데이터로 줄어들지 않는다.
+
+MC Dropout으로 $T$개 posterior sample을 뽑으면 per-input 분해를 추정할 수 있다.
+
+$$\text{aleatoric} \approx \frac{1}{T}\sum_t \sigma_{W^{(t)}}^2(x^*), \qquad \text{epistemic} \approx \frac{1}{T}\sum_t \mu_{W^{(t)}}^2(x^*) - \left(\frac{1}{T}\sum_t \mu_{W^{(t)}}(x^*)\right)^2$$
+
+OOD 입력에서는 epistemic이 급증한다. 학습 영역 밖 $x^*$는 posterior $p(W|D)$를 거의 좁히지 못했으므로, 모델 출력의 variance가 크다. 이것이 OOD detection의 Bayesian 원리다. Active learning의 BALD acquisition도 같은 epistemic 항(mutual information $I(y^*, W | x^*, D)$)을 최대화하는 입력을 선택한다.
+
+## Calibration — 모델은 얼마나 정직한가
+
+모델의 confidence가 실제 accuracy와 일치하는지를 측정하는 것이 calibration이다. Expected Calibration Error(ECE)는 이를 bin 단위로 정량화한다.
+
+$$\text{ECE} = \sum_m \frac{|B_m|}{n}|\,\text{acc}(B_m) - \text{conf}(B_m)\,|$$
+
+Guo et al.(2017)은 현대 NN(ResNet, Transformer)이 capacity 증가·batch norm·weight decay로 인해 심각하게 over-confident함을 보였다. 해결책으로 제안된 **temperature scaling**은 logit $z$를 scalar $T > 0$으로 나눈다.
+
+$$\hat{p} = \text{softmax}(z / T)$$
+
+$T$는 validation NLL을 최소화해 학습하며, argmax를 변경하지 않으므로 accuracy 손실 없이 calibration만 개선한다. 실전에서 ECE를 0.01 내외로 줄이는 간단한 post-hoc fix다.
+
+<Callout type="note" title="트레이드오프">
+Temperature scaling은 in-distribution validation set에서 학습된다. OOD shift가 발생하면 그 $T$는 OOD 영역의 confidence를 올바르게 수정하지 못한다. OOD detection은 calibration과 별도의 도구가 필요하다 — Bayesian epistemic uncertainty 또는 deep ensembles의 disagreement가 그 역할을 한다.
+</Callout>
+
+Bayesian은 이 문제에 원리적 답을 갖는다. BvM 정리 하에서 Bayesian predictive의 credible interval이 frequentist CI와 asymptotically 일치하므로, 충분한 데이터에서 자동으로 calibrated된다. Deep ensembles는 다중 모드 posterior 근사로 single NN보다 calibration이 실증적으로 더 낫다.
+
+## 정리
+
+- DDPM = $T$-step hierarchical VAE. $L_{\text{simple}}$은 KL denoising 항의 MSE 근사이며 동시에 denoising score matching이다.
+- PPL(Stan·PyMC·NumPyro·Pyro)은 Bayesian workflow를 "모델 선언 → posterior 자동 추론"으로 추상화한다.
+- 예측 분산은 aleatoric(irreducible)과 epistemic(reducible, $O(1/N)$)으로 분해된다.
+- Modern NN은 over-confident하며 temperature scaling이 가장 단순한 post-hoc calibration이다. Bayesian은 BvM 하에서 자동으로 calibrated된다.
+
+Bayesian DL의 핵심 통찰은 한 문장이다 — **uncertainty는 예측의 오류가 아니라, 모델이 얼마나 정직한지를 나타내는 신호다.**
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
+/>
+
+<Reference
+  title="On Calibration of Modern Neural Networks"
+  authors="Guo et al."
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1706.04599"
+/>
