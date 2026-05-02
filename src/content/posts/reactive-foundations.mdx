@@ -1,0 +1,158 @@
+---
+title: "WebFlux는 왜 스레드를 8개만 쓰는가"
+description: "Thread-per-Request 모델이 I/O 앞에서 무너지는 이유부터 epoll 이벤트 루프, Reactive Streams 스펙, 그리고 WebFlux vs MVC 선택 기준까지 하나의 흐름으로 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, event-loop, epoll, reactive-streams, netty]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring WebFlux는 CPU 코어 수만큼의 스레드로 수천 개의 동시 요청을 처리한다. Tomcat이 기본 200개 스레드로 200개를 처리하는 것과 비교하면, 숫자가 말이 안 되는 것처럼 보인다. 어떻게 가능한가? 그리고 이것이 항상 더 좋은 것인가?
+
+## Thread-per-Request의 구조적 함정
+
+Spring MVC + Tomcat은 요청 하나에 스레드 하나를 배정한다. 외부 결제 API를 호출하는 주문 서비스를 생각해보자. API 응답 시간이 300ms라면, 그 300ms 동안 스레드는 `WAITING` 상태로 머문다. CPU는 다른 일을 할 수 있지만, 그 스레드는 소켓이 응답할 때까지 아무것도 못한다.
+
+```
+요청 처리 시간 분해 (외부 API 300ms 응답):
+  0ms   ~ 1ms:   요청 직렬화, 소켓 write → CPU 사용
+  1ms   ~ 299ms: 네트워크 I/O 대기 → CPU 유휴 (99.7% 시간)
+  299ms ~ 300ms: 응답 역직렬화 → CPU 사용
+```
+
+스레드 생애의 99%가 대기다. 이 상태에서 APM을 보면 CPU 사용률 15%, 그런데 응답 지연이 발생한다. "서버 여유 있는데 왜 느리지?"라고 진단한다면, Thread-per-Request 모델의 구조적 함정에 빠진 것이다.
+
+스레드 200개가 모두 외부 API 응답을 기다리고 있으면, 201번째 요청은 큐에서 대기한다. `server.tomcat.threads.max=500`으로 늘리면? 500MB 스택 메모리가 추가되고, 컨텍스트 스위칭 비용이 늘어난다. 근본은 해결되지 않는다.
+
+## C10K와 epoll — OS가 준비한 답
+
+이 문제는 1999년에 이미 제기됐다. Dan Kegel의 C10K 문제: "단일 서버에서 동시 연결 10,000개를 처리할 수 있는가?" 당시 Apache prefork 모델(연결당 프로세스)은 수백 개에서 한계를 보였다.
+
+해답은 Linux `epoll`이다. 기존 `select()`는 감시할 소켓 목록 전체를 매번 커널에 복사하고 스캔했다. 10,000 소켓 중 이벤트가 10개뿐이어도 10,000개를 스캔한다 — O(N).
+
+`epoll`은 다르다.
+
+```bash
+# epoll 3단계 API
+epoll_create1(0)              # epoll 인스턴스 한 번 생성
+epoll_ctl(epfd, ADD, fd, ev)  # 소켓 등록 — O(log N)
+epoll_wait(epfd, events, ...)  # 준비된 것만 반환 — O(이벤트 수)
+```
+
+`epoll_wait`는 "읽기/쓰기 준비된 소켓이 생길 때까지 대기"한다. 10,000 소켓 중 10개에 이벤트가 발생하면, 그 10개만 반환한다. 나머지 9,990개는 파일 디스크립터만 커널에 등록되어 있을 뿐, 스레드를 점유하지 않는다.
+
+2004년 Nginx는 이 원리로 동일 하드웨어에서 Apache 대비 10~100배 더 많은 동시 연결을 처리했다. Spring WebFlux + Netty는 같은 철학을 Java 애플리케이션 레이어에 가져온 것이다.
+
+<Aside label="Netty EventLoop 구조">
+Netty는 Boss EventLoopGroup(연결 수락 전담, 1~2스레드)과 Worker EventLoopGroup(I/O 이벤트 처리, CPU 코어 수)으로 역할을 분리한다. Boss가 `accept()`에만 집중하므로, 기존 연결의 I/O가 아무리 바빠도 새 연결 수락은 지연되지 않는다.
+</Aside>
+
+## Reactive Streams — 이벤트 루프 위의 언어
+
+epoll이 OS 레벨의 답이라면, Reactive Streams는 애플리케이션 레벨의 언어다. 이벤트 루프 위에서 비동기 데이터 흐름을 다루기 위한 표준 계약이다.
+
+핵심은 네 개의 인터페이스다.
+
+```java
+// 데이터 생산자
+interface Publisher<T> {
+    void subscribe(Subscriber<? super T> subscriber);
+}
+
+// 데이터 소비자
+interface Subscriber<T> {
+    void onSubscribe(Subscription s);  // 구독 시작
+    void onNext(T t);                  // 데이터 하나 수신
+    void onError(Throwable t);         // 에러 — 이후 onNext 없음
+    void onComplete();                 // 완료 — 이후 onNext 없음
+}
+
+// 생산-소비 계약
+interface Subscription {
+    void request(long n);  // "n개 보내도 된다"
+    void cancel();
+}
+```
+
+중요한 것은 `request(n)`이다. 소비자가 명시적으로 요청해야만 생산자가 데이터를 보낸다. `subscribe()`를 호출하기 전까지 파이프라인은 실행되지 않는다. WebFlux 코드에서 `subscribe()`를 빠뜨려 HTTP 요청이 전혀 전송되지 않는 버그가 생기는 이유가 여기에 있다.
+
+신호 흐름은 두 방향이다.
+
+```
+구독 설정 (아래 → 위):
+  subscribe() → 연산자 체인 거슬러 올라가 최상위 Publisher까지
+
+데이터 흐름 시작 (아래 → 위):
+  Subscriber: subscription.request(n)
+  → 체인 거슬러 올라가 최상위 Publisher에 전달
+  → Publisher: n개 이하 onNext() 발행 시작
+
+데이터 흐름 (위 → 아래):
+  Publisher: onNext(item) → 연산자 체인 통과 → 최종 Subscriber
+```
+
+이 `request(n)` 메커니즘이 Backpressure의 실체다. 소비자가 처리할 수 있는 만큼만 요청하면, 생산자는 그만큼만 발행한다. 메모리 폭발 없이 무한 스트림도 다룰 수 있다.
+
+Project Reactor의 `Mono`(0~1개)와 `Flux`(0~N개)는 이 스펙의 구현체다. Java 9의 `Flow` API도 동일한 스펙을 표준화했다.
+
+## 이벤트 루프 스레드를 막으면 무슨 일이 생기는가
+
+<Callout type="warning" title="EventLoop 스레드는 단일 차선 도로다">
+EventLoop 스레드에서 블로킹 코드가 실행되는 순간, 그 스레드가 담당하는 모든 연결의 이벤트 처리가 멈춘다. `Thread.sleep(100)`이 100ms 동안 수천 연결을 마비시킬 수 있다.
+</Callout>
+
+WebFlux에서 JPA를 그대로 사용하면 정확히 이 문제가 생긴다. JDBC는 블로킹 소켓으로 DB 응답을 기다린다. EventLoop 스레드에서 `jdbcTemplate.query()`를 호출하면 그 스레드 전체가 DB 응답을 기다리며 멈춘다.
+
+`Schedulers.boundedElastic()`으로 오프로딩하면 EventLoop는 보호되지만, 결국 boundedElastic 스레드가 DB를 기다린다. Thread-per-Request와 본질적으로 동일하고, Reactive 복잡도만 추가된 셈이다.
+
+완전한 논블로킹은 R2DBC, Reactive Redis(Lettuce), Reactive MongoDB처럼 논블로킹 드라이버가 있어야 한다. 드라이버가 I/O를 커널에 위임하고 완료 이벤트가 오면 epoll이 EventLoop에 알린다.
+
+```java
+// 논블로킹 HTTP 클라이언트의 흐름
+webClient.get().uri("/api").retrieve().bodyToMono(String.class)
+// 1. subscribe() → HTTP 요청 직렬화, 소켓 write
+// 2. EventLoop는 즉시 다른 이벤트 처리로 복귀
+// 3. 서버 응답 도착 → epoll이 EventLoop에 알림
+// 4. Reactor 파이프라인 재개 → onNext(response)
+// 스레드는 1번과 4번에서만 실행됨
+```
+
+## 트레이드오프 — WebFlux가 항상 답은 아니다
+
+WebFlux가 MVC보다 항상 나은 것은 아니다. 선택 기준은 명확하다.
+
+| 조건 | 선택 |
+|:---|:---|
+| 외부 API/DB I/O가 응답 시간의 주요 부분 | WebFlux |
+| 동시 연결 수천 개 이상 (C10K+) | WebFlux |
+| SSE, WebSocket, 스트리밍 데이터 | WebFlux |
+| R2DBC 등 논블로킹 드라이버 사용 가능 | WebFlux |
+| CPU 집약적 서비스 (계산, 이미지 처리) | MVC |
+| JPA 의존 + R2DBC 전환 불가 | MVC |
+| 단순 CRUD, 동시 연결 수백 개 이하 | MVC |
+| 팀의 Reactive 익숙도 낮음 | MVC 또는 학습 투자 판단 |
+
+CPU 집약적 서비스는 EventLoop가 아무리 효율적이어도 CPU 코어 수가 병목이다. 스레드 8개나 200개나 처리량은 같다. 복잡도만 늘어난다.
+
+WebFlux 도입의 숨은 비용도 있다. 팀이 Reactive 패러다임에 익숙해지려면 최소 1~3개월, 숙달까지는 6개월이 걸린다. 그 기간 동안 디버깅은 더 어렵고, 스택 트레이스는 파편화된다. `Hooks.onOperatorDebug()`나 `checkpoint()`를 쓰지 않으면 에러 위치를 찾기가 막막해진다.
+
+"WebFlux = 무조건 빠름"은 틀린 명제다. "I/O 집약적 + 높은 동시성에서 WebFlux가 유리하다"가 올바른 이해다.
+
+## 정리
+
+- Thread-per-Request는 I/O 대기 시간에 스레드를 낭비한다. 스레드를 늘리는 것은 증상 완화일 뿐이다.
+- epoll은 준비된 소켓만 이벤트로 알려준다. Netty EventLoop는 이를 이용해 소수의 스레드로 수천 소켓을 감시한다.
+- Reactive Streams의 `request(n)` 계약이 Backpressure의 실체다. `subscribe()` 없이는 파이프라인이 실행되지 않는다.
+- EventLoop 스레드에서 블로킹 코드는 절대 금지다. 블로킹이 필요하면 `Schedulers.boundedElastic()`으로 오프로딩하고, 가능하면 논블로킹 드라이버로 전환한다.
+- WebFlux가 이득인 경우는 I/O 집약적이고 동시 연결이 많을 때다. JPA 기반 단순 CRUD에 WebFlux를 도입하면 복잡도만 늘어난다.
+
+스레드 8개로 수천 요청을 처리하는 것은 마법이 아니다. I/O 대기 시간에 스레드를 다른 연결에 재사용하는 구조적 선택이고, 그 대가로 프로그래밍 모델이 복잡해진다.

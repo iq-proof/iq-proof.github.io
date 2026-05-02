@@ -1,0 +1,109 @@
+---
+title: "WebFlux는 언제 써야 하고 언제 쓰지 말아야 하는가"
+description: "I/O 집약 고동시성 환경에서 WebFlux가 MVC를 압도하는 조건부터, 블로킹 의존성·팀 역량·도메인 복잡도가 만드는 함정까지, 도입 판단의 기준을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, spring-mvc, reactive, event-loop, performance]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"WebFlux가 무조건 빠르다"는 믿음으로 MVC를 WebFlux로 전환했다가 성능이 오히려 나빠지는 경우가 있다. 반대로, WebFlux 없이는 도저히 감당할 수 없는 서비스도 있다. 이 두 결과를 가르는 기준은 무엇인가?
+
+## 처리량 차이가 나타나는 조건
+
+MVC는 스레드 수가 동시 처리 한계를 결정한다. 기본 200 스레드라면, 각 스레드가 외부 API 응답을 100ms 동안 기다리는 동안 다른 요청은 큐에 대기한다. 이론 상한은 `200 / 0.1s = 2,000 req/s`이고, 실측도 이 근방이다.
+
+WebFlux의 EventLoop는 I/O 대기 중에 다른 연결의 이벤트를 처리한다. 16개 스레드가 수천 개 연결을 순회하므로, 동시 연결 수가 스레드 수를 크게 넘어서는 순간부터 처리량 격차가 벌어진다.
+
+```
+VU 수  | MVC req/s | WebFlux req/s | 배율
+───────┼───────────┼───────────────┼──────
+100    | 900       | 920           | 1.0x
+500    | 1,500     | 4,100         | 2.7x
+1,000  | 1,800     | 6,200         | 3.4x
+5,000  | 1,800 (+에러) | 11,000   | 6.1x
+```
+
+동시 100명 수준에서는 차이가 없다. 500명을 넘어서면서 MVC는 스레드 큐 대기가 쌓이고 p95 레이턴시가 급등한다. CPU 집약 작업(SHA-256 해시 등)에서는 어느 지점에서도 두 프레임워크의 처리량이 거의 동일하다 — CPU가 병목이기 때문이다.
+
+## Reactive 스택의 운영 함정
+
+WebFlux를 선택했다면 MVC에서 보기 힘든 세 가지 운영 문제를 만난다.
+
+**블로킹 코드의 침투.** `Schedulers.parallel()`에서 JDBC를 호출하면 CPU 코어 수(예: 8개)만큼의 스레드가 모두 I/O 대기에 묶인다. CPU 사용률은 낮은데 처리량도 낮은 역설적 증상이 나타난다. BlockHound를 CI에 통합하면 이 침투를 조기에 잡을 수 있다.
+
+**구독 해제 누락.** Hot Publisher를 `subscribe()`로 구독하고 `Disposable`을 무시하면, 앱이 재배포되어도 구독이 힙에 살아남는다. Heap 사용량이 시간에 따라 선형으로 증가하는 패턴이 나타나면 먼저 이 지점을 의심해야 한다.
+
+```java
+// 올바른 패턴
+private final CompositeDisposable disposables = new CompositeDisposable();
+
+@PostConstruct
+public void init() {
+    disposables.add(hotPublisher.subscribe(this::process));
+}
+
+@PreDestroy
+public void destroy() {
+    disposables.dispose();
+}
+```
+
+**스택 트레이스 파편화.** MVC에서는 NPE가 발생하면 파일명과 줄 번호가 즉시 보인다. WebFlux에서는 Reactor 내부 프레임 20~30줄이 쌓여 원인을 가린다. 개발 환경에서는 `Hooks.onOperatorDebug()`, 운영 환경에서는 `-javaagent:reactor-tools.jar`로 완화할 수 있지만 각각 오버헤드(20~40%, 3~8%)가 따라붙는다.
+
+## MSA에서의 방어 레이어
+
+서비스 간 호출 체인에서 한 서비스의 지연은 상위 서비스의 연결 풀을 고갈시키고, 이것이 전체 시스템으로 번진다. WebFlux 파이프라인에는 세 층의 방어가 필요하다.
+
+```java
+ReactiveCircuitBreaker cb = cbFactory.create("payment-service");
+
+return cb.run(
+    paymentWebClient.post()
+        .uri("/charge")
+        .bodyValue(order)
+        .retrieve()
+        .bodyToMono(PaymentResult.class)
+        .timeout(Duration.ofSeconds(3))                          // 1. 타임아웃
+        .retryWhen(Retry.backoff(1, Duration.ofMillis(300))),   // 2. 재시도
+    throwable -> Mono.just(PaymentResult.pending(order.getId())) // 3. 폴백
+);
+```
+
+타임아웃 계층은 반드시 하위 서비스가 상위보다 짧아야 한다. A→B→C 체인에서 B의 타임아웃이 A보다 길면, A가 먼저 연결을 끊어도 B는 계속 C를 기다리며 자원을 낭비한다.
+
+Reactive의 취소 신호는 파이프라인을 역방향으로 전파한다. 클라이언트가 연결을 끊으면 Netty가 감지하고, 진행 중인 WebClient 요청도 자동으로 취소된다. 이것이 MVC 대비 WebFlux가 가진 구조적 장점이다 — 불필요한 작업이 자동으로 정리된다.
+
+<Callout type="note" title="트레이드오프">
+Circuit Breaker 임계값을 너무 민감하게 설정하면 일시적 장애에도 OPEN 상태가 되어 정상 요청을 차단한다. 반대로 너무 둔감하면 장애 서비스에 요청을 계속 보내 연결 풀을 고갈시킨다. 실측 정상 실패율의 5~10배를 threshold 출발점으로 삼는 것이 통상적이다.
+</Callout>
+
+## WebFlux를 쓰지 말아야 할 때
+
+"WebFlux가 좋다"는 사실이 "우리 서비스에도 좋다"를 의미하지 않는다. 아래 조건 중 하나라도 해당하면 MVC 유지를 먼저 검토해야 한다.
+
+**JPA 의존성이 높을 때.** 모든 `userRepository.findById()` 호출을 `Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())`으로 감싸야 한다. 코드 전체에 이 패턴이 퍼지고, `@Transactional`과 Reactor Context의 불일치 문제가 따라붙는다. R2DBC로 전환하지 않는 한, WebFlux를 씌운다고 성능이 좋아지지 않는다.
+
+**팀이 준비되지 않았을 때.** Reactive 패러다임 학습에는 현실적으로 3~6개월이 걸리고, 그 기간 동안 생산성은 30~50%로 떨어진다. 팀원 5명이면 7.5개월 분량의 개발 일정이 증발한다. 이 비용을 상쇄할 성능·확장성 이득이 확실한가를 먼저 계산해야 한다.
+
+**동시 접속이 수백 명 이하인 단순 CRUD일 때.** 벤치마크 데이터는 냉정하다. 동시 100명 수준에서 MVC와 WebFlux의 p95 레이턴시 차이는 2ms 내외다. 이 서비스에서 WebFlux 도입 비용은 이득을 초과한다.
+
+<Aside label="도구 선택의 원칙">
+WebFlux는 "더 나은 MVC"가 아니라 "다른 도구"다. 고동시성 I/O 집약 서비스와 실시간 스트리밍 서비스에서는 MVC로 대체할 수 없는 이점을 제공한다. 그 외 서비스에서는 MVC의 직관성과 생태계가 더 큰 자산이다.
+</Aside>
+
+## 정리
+
+- WebFlux의 처리량 이득은 동시 연결 수가 스레드 수를 크게 넘어서고, I/O 대기 비율이 높을 때 나타난다. CPU 집약 작업에서는 어느 시점에서도 차이가 없다.
+- 운영 중 주의할 세 함정: 블로킹 코드 침투(BlockHound로 예방), 구독 해제 누락(CompositeDisposable로 관리), 스택 트레이스 파편화(ReactorDebugAgent로 완화).
+- MSA 서비스 간 호출에는 타임아웃→재시도→Circuit Breaker 세 층을 계층적으로 적용하고, 하위 서비스 타임아웃을 상위보다 짧게 설정한다.
+- WebFlux 도입 판단 기준은 "이 서비스에서 이득이 비용을 초과하는가"다. JPA 의존성이 높거나, 팀 준비가 없거나, 동시성 문제가 없다면 MVC가 더 나은 선택이다.

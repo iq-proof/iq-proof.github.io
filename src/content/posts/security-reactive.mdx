@@ -1,0 +1,158 @@
+---
+title: "Spring WebFlux Security는 왜 다시 배워야 하는가"
+description: "MVC Security의 ThreadLocal 기반 설계가 Reactor Context로 대체되는 과정부터, JWT 필터 체인·Method Security·OAuth2 Client Credentials 흐름까지, Reactive Security 전체를 관통하는 설계 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, spring-security, reactive, jwt, oauth2]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Security를 알고 있다고 생각했는데 WebFlux 프로젝트에서 `WebSecurityConfigurerAdapter`가 동작하지 않는다. `SecurityContextHolder.getContext()`는 `null`을 반환한다. 익숙했던 개념들이 전부 다른 이름을 달고 나타난다. 왜 WebFlux Security는 처음부터 다시 배워야 하는가?
+
+## ThreadLocal에서 Reactor Context로
+
+MVC Security의 모든 설계는 **하나의 전제** 위에 서 있다. 요청 하나가 스레드 하나를 전담한다. 그래서 `SecurityContextHolder`는 `ThreadLocal`에 `SecurityContext`를 저장하고, 어느 코드에서든 `getContext()`를 호출하면 현재 요청의 인증 정보를 꺼낼 수 있다.
+
+Reactor는 이 전제를 깨뜨린다. 하나의 요청이 처리되는 동안 스레드가 여러 번 바뀐다. `flatMap` 이전과 이후의 스레드가 다를 수 있다. `ThreadLocal`에 저장된 정보는 스레드를 넘어가는 순간 사라진다.
+
+WebFlux Security의 답은 **Reactor Context**다. `SecurityContext`를 `ThreadLocal`이 아닌 파이프라인에 묶인 불변 맵에 저장하고, `contextWrite`로 주입하면 `flatMap`이 몇 번 일어나든 동일한 컨텍스트에 접근할 수 있다.
+
+```java
+// MVC: ThreadLocal 기반 (WebFlux에서 null 반환)
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+// WebFlux: Reactor Context 기반
+ReactiveSecurityContextHolder.getContext()
+    .map(SecurityContext::getAuthentication)
+    .flatMap(auth -> userService.findById(auth.getName()));
+```
+
+이 교체가 단순한 API 변경이 아니다. `FilterChainProxy` → `WebFilterChainProxy`, `HttpSecurity` → `ServerHttpSecurity`, `AuthenticationManager` → `ReactiveAuthenticationManager`. 동기 반환을 `Mono` 반환으로 바꾼 것이 연쇄적으로 모든 인터페이스를 교체했다.
+
+## SecurityWebFilterChain — 필터 체인의 재설계
+
+`SecurityWebFilterChain`은 `FilterChainProxy`의 Reactive 버전이다. `WebFilter`들이 `Mono<Void>`를 반환하며 순서대로 연결된다. 필터 순서는 `SecurityWebFiltersOrder` enum으로 관리하고, JWT 인증 필터는 `AUTHENTICATION(-900)` 위치에 끼워 넣는다.
+
+```java
+@Bean
+public SecurityWebFilterChain securityChain(ServerHttpSecurity http) {
+    return http
+        .csrf(ServerHttpSecurity.CsrfSpec::disable)
+        .authorizeExchange(auth -> auth
+            .pathMatchers("/actuator/health").permitAll()
+            .pathMatchers("/api/admin/**").hasRole("ADMIN")
+            .anyExchange().authenticated()
+        )
+        .addFilterAt(jwtAuthFilter, SecurityWebFiltersOrder.AUTHENTICATION)
+        .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())
+        .build();
+}
+```
+
+복잡한 서비스는 체인을 여러 개 선언한다. `/api/**`에는 JWT 체인, `/actuator/**`에는 IP 제한 체인을 `@Order`로 우선순위를 정해 등록한다. 매칭되는 첫 번째 체인만 적용된다.
+
+## JWT WebFilter — contextWrite가 핵심이다
+
+JWT 필터의 올바른 구현은 단락(short-circuit) 처리와 `contextWrite` 위치에 달려 있다.
+
+```java
+@Override
+public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+    return Mono.justOrEmpty(extractToken(exchange))
+        .flatMap(token -> jwtService.validateToken(token))
+        .flatMap(authentication ->
+            chain.filter(exchange)
+                .contextWrite(ReactiveSecurityContextHolder
+                    .withAuthentication(authentication))  // chain.filter() 뒤에
+        )
+        .switchIfEmpty(chain.filter(exchange))    // 토큰 없음 → 다음 필터에 위임
+        .onErrorResume(JwtException.class, e -> {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();  // 즉시 단락
+        });
+}
+```
+
+<Callout type="warning" title="contextWrite 위치">
+`contextWrite`는 반드시 `chain.filter(exchange)` **뒤**에 붙여야 한다. Reactor Context는 subscribe 방향(아래에서 위)으로 전파된다. `chain.filter()`가 실행되는 파이프라인에 Context를 전달하려면 그 Mono의 하위(downstream)에 `contextWrite`가 위치해야 한다.
+</Callout>
+
+JWT 파싱 자체(HS256, RS256 서명 검증)는 CPU 연산이므로 블로킹이 없다. 블랙리스트 확인을 위한 Redis 조회만 비동기로 처리하면 된다. MSA 환경에서는 각 서비스가 공개키만 보유하는 RS256이 비밀키를 공유해야 하는 HS256보다 안전하다.
+
+## Method Security — @PreAuthorize와 SpEL
+
+URL 기반 인가(`pathMatchers`)는 "로그인했는가", "ADMIN 역할인가"까지만 표현할 수 있다. "자신의 주문만 조회 가능"은 URL로 표현할 수 없다. 여기서 `@PreAuthorize`가 필요하다.
+
+```java
+@Configuration
+@EnableReactiveMethodSecurity  // 없으면 @PreAuthorize 무시됨
+public class MethodSecurityConfig {}
+```
+
+```java
+// 역할 기반
+@PreAuthorize("hasRole('ADMIN')")
+Mono<List<User>> getAllUsers();
+
+// 소유자 확인 (파라미터 접근)
+@PreAuthorize("#id.toString() == authentication.name")
+Mono<Order> getMyOrder(Long id);
+
+// 커스텀 SpEL 빈 (비동기 DB 조회 포함)
+@PreAuthorize("@orderSecurity.canAccess(#orderId, authentication)")
+Mono<Order> getOrder(Long orderId);
+```
+
+커스텀 SpEL 빈의 메서드는 `Mono<Boolean>`을 반환할 수 있다. `@Component("orderSecurity")`로 등록하면 SpEL에서 `@orderSecurity.method()`로 접근한다. `@PostFilter`는 `Flux`에서 완전히 지원되지 않으므로 명시적 `.filter()` 연산자를 쓰는 편이 안전하다.
+
+계층 구조가 권장 패턴이다. URL 기반으로 조잡한 인가(빠름)를 처리하고, Method 기반으로 세밀한 소유자 확인(유연함)을 처리한다.
+
+## OAuth2 — ReactiveOAuth2AuthorizedClientManager
+
+서비스 간 통신(M2M)에 OAuth2 Client Credentials 흐름을 쓸 때, MVC 버전 `OAuth2AuthorizedClientManager`를 그대로 사용하면 블로킹이 발생한다. Reactive 버전은 `ReactiveOAuth2AuthorizedClientManager`다.
+
+```java
+@Bean
+public WebClient paymentWebClient(
+        ReactiveOAuth2AuthorizedClientManager authorizedClientManager) {
+
+    var oauth2 = new ServerOAuth2AuthorizedClientExchangeFilterFunction(
+        authorizedClientManager);
+    oauth2.setDefaultClientRegistrationId("payment-service");
+
+    return WebClient.builder()
+        .baseUrl("https://payment-service.example.com")
+        .filter(oauth2)  // 자동 토큰 첨부 + 만료 시 자동 갱신
+        .build();
+}
+```
+
+`ExchangeFilterFunction`이 요청마다 유효한 토큰을 확인하고, 만료 30초 전(`clockSkew`)에 미리 갱신하며, 갱신 실패 시 신규 발급을 시도한다. 개발자는 토큰 만료 처리 코드를 직접 작성하지 않아도 된다.
+
+<Callout type="note" title="트레이드오프">
+**JWT vs 세션**: JWT는 수평 확장이 쉽지만 즉각 무효화가 어렵다(블랙리스트 필요). 세션은 즉각 로그아웃이 가능하지만 Redis 같은 세션 저장소가 필요하다. 절충점으로 15분 Access Token + 30일 Refresh Token 조합을 많이 사용한다.
+
+**HS256 vs RS256**: HS256은 빠르지만 모든 서비스가 비밀키를 공유해야 한다. RS256은 인증 서버만 비밀키를 보유하고 각 서비스는 공개키로 독립 검증한다. MSA에서는 RS256이 권장된다.
+
+**NoOp vs WebSession 저장소**: JWT 무상태 방식은 `NoOpServerSecurityContextRepository`를 쓴다. 요청마다 토큰을 파싱하지만 외부 저장소 조회가 없어 세션 기반보다 빠른 경우가 많다.
+</Callout>
+
+## 정리
+
+- MVC Security와 WebFlux Security의 근본 차이는 **ThreadLocal → Reactor Context** 교체다. 이 교체가 모든 인터페이스를 바꿨다.
+- JWT 필터에서 `contextWrite`는 `chain.filter()` 뒤에 위치해야 하고, 토큰 검증 실패는 `onErrorResume`으로 즉시 단락 처리한다.
+- `@EnableReactiveMethodSecurity`가 없으면 `@PreAuthorize`는 조용히 무시된다. URL 기반(조잡) + Method 기반(세밀) 계층 조합이 권장 패턴이다.
+- OAuth2 Client Credentials는 `ServerOAuth2AuthorizedClientExchangeFilterFunction`을 WebClient에 필터로 등록하면 토큰 생애주기 전체가 자동화된다.
+
+<Aside label="설계 철학">
+Reactive Security의 모든 변경은 한 문장으로 요약된다. "동기 블로킹을 허용하지 않는 환경에서 동일한 보안 보장을 제공하라." 인터페이스 이름이 바뀌고 위치가 달라졌지만, FilterChain → Authentication → Authorization의 흐름 자체는 MVC와 동일하다. 이 원칙을 알면 낯선 API도 어디서 찾아야 하는지 보인다.
+</Aside>

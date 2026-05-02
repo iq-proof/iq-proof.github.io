@@ -1,0 +1,97 @@
+---
+title: "WebFlux의 모든 설계는 하나의 질문에서 시작된다"
+description: "Mono/Flux의 지연 평가부터 Backpressure 전략, Reactor Context까지 — WebFlux가 왜 이 방식으로 동작하는지, 그 근본 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, reactor, reactive-streams, event-loop, backpressure]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring WebFlux를 처음 쓰면 누구나 같은 버그를 만난다. `userRepository.save(newUser)`를 호출했는데 아무것도 저장되지 않는다. `KEYS *` 대신 `KEYS`라고 치는 실수와 비슷하지만 이유는 다르다. 파이프라인을 선언만 했고 실행은 시작하지 않았기 때문이다. 그렇다면 WebFlux는 왜 이렇게 설계됐는가?
+
+## 지연 평가 — 설계도와 실행의 분리
+
+`Mono`와 `Flux`는 데이터 흐름의 **설계도**다. `Mono.fromCallable(() -> jdbcTemplate.query(...))`는 JDBC 쿼리를 실행하지 않는다. 쿼리를 "언제, 어떻게 실행할지"에 대한 명세만 저장한다.
+
+실행은 `subscribe()` 호출 시 시작된다. WebFlux 컨트롤러에서 `Mono<User>`를 반환하면 직접 `subscribe()`를 호출할 필요가 없다 — `DispatcherHandler`가 컨트롤러 메서드를 호출해 `Mono`를 받은 뒤, HTTP 응답 직렬화 파이프라인을 연결하고 내부적으로 한 번만 구독한다.
+
+이 구조에서 가장 흔한 실수는 두 가지다. 첫째, `subscribe()`를 빠뜨려 실행이 아예 일어나지 않는 경우. 둘째, 동일한 `Mono`를 두 번 구독해 DB 쿼리가 두 번 발생하는 경우. 두 번째 문제는 `doOnNext()`로 부수 효과를 파이프라인 안에 넣으면 해결된다.
+
+<Callout type="note" title="Cold Publisher의 의미">
+`Mono`와 `Flux`는 기본적으로 Cold Publisher다. `subscribe()`마다 완전히 독립적인 실행이 시작된다. 동일 `Mono`를 N번 구독하면 N번 실행된다. `Mono.cache()`나 `share()`는 이 기본값을 바꾼다.
+</Callout>
+
+## 연산자 선택 — map, flatMap, concatMap의 차이
+
+지연 평가를 이해했다면 다음 질문은 "어떤 연산자를 써야 하는가"다. `map`과 `flatMap`의 차이는 반환 타입만의 문제가 아니다.
+
+`map`은 동기 변환이다. `T → R` 함수를 EventLoop 스레드에서 즉시 실행한다. 블로킹 코드를 여기에 넣으면 EventLoop가 멈춘다.
+
+`flatMap`은 비동기 변환이다. 각 항목에 대해 `Publisher<R>`을 생성하고 동시에 구독한다. 기본 동시성은 `Integer.MAX_VALUE`지만 내부 prefetch 버퍼(256)가 실질적인 상한이다. 외부 API를 호출할 때 `flatMap(fn, 10)`처럼 동시성을 제한하지 않으면 수백 개의 동시 HTTP 요청이 외부 서비스에 쏟아진다.
+
+`concatMap`은 순서를 보장하지만 순차 실행이다. 5개 항목을 각 200ms로 처리하면 `flatMap`은 ~200ms, `concatMap`은 ~1000ms가 걸린다. **순서가 필요할 때만 `concatMap`을 쓴다**는 원칙을 지키지 않으면 성능이 예상보다 훨씬 나쁘다.
+
+## 에러 처리 — try-catch가 작동하지 않는 이유
+
+동기 코드에서 `try-catch`는 예외를 잡는다. WebFlux 파이프라인에서는 예외가 `subscribe()` 시점에 발생한다 — 선언 시점의 `try-catch`가 아무리 감싸도 잡히지 않는다. 예외는 `onError` 신호로 변환되어 파이프라인을 타고 흘러내려간다.
+
+```java
+// 이 try-catch는 아무것도 잡지 못한다
+try {
+    return userRepository.findById(id);  // 비동기 실행
+} catch (Exception e) {
+    return Mono.just(User.empty());  // 절대 실행 안 됨
+}
+```
+
+올바른 패턴은 파이프라인 내 연산자를 사용하는 것이다. `doOnError`는 로깅만 하고 에러를 전파한다. `onErrorReturn`은 고정 값으로 대체한다. `onErrorResume`은 다른 Publisher로 대체한다 — DB가 실패하면 캐시에서 읽는 fallback 패턴이 여기에 해당한다.
+
+재시도는 `retry(n)` 대신 `retryWhen(Retry.backoff(...))`을 써야 한다. 즉시 재시도는 이미 과부하인 외부 서비스를 더 망가뜨린다. jitter를 포함한 지수 백오프가 실무 표준이다.
+
+## 스레드 전환 — subscribeOn과 publishOn
+
+WebFlux의 가장 큰 함정은 블로킹 코드를 EventLoop 스레드에서 실행하는 것이다. Netty의 EventLoop는 수천 개의 연결을 순환하며 처리한다. 여기서 JDBC 쿼리가 200ms 동안 블로킹되면 그 EventLoop가 담당하는 모든 연결이 200ms 동안 응답하지 못한다.
+
+`subscribeOn(Schedulers.boundedElastic())`은 블로킹 코드를 EventLoop 밖으로 오프로딩하는 표준 패턴이다. 위치에 관계없이 전체 upstream 파이프라인의 실행 스레드를 결정한다. `publishOn`은 다르다 — 해당 연산자 이후의 코드만 지정한 스케줄러로 전환한다.
+
+<Callout type="warning" title="블로킹 감지">
+`BlockHound.install()`을 테스트 환경에 추가하면 EventLoop 스레드에서 블로킹 호출이 발생할 때 즉시 `BlockingOperationError`를 던진다. 개발 초기에 이 문제를 잡지 못하면 프로덕션에서 간헐적인 응답 지연으로 나타난다.
+</Callout>
+
+이상적인 설계는 `subscribeOn`/`publishOn` 자체가 필요 없는 것이다 — R2DBC, Reactive Redis처럼 완전한 논블로킹 드라이버를 쓰면 모든 I/O가 EventLoop 안에서 처리된다. 스케줄러는 블로킹 코드를 써야 할 때의 차선책이다.
+
+## Hot Publisher와 Backpressure — 공유와 속도 제어
+
+모든 `Mono`/`Flux`가 Cold Publisher라고 가정하면 함정이 생긴다. SSE 엔드포인트에서 100명의 클라이언트가 주식 가격 스트림을 구독할 때, Cold Publisher라면 외부 API 연결이 100개 생긴다. `share()`로 Hot Publisher로 변환하면 하나의 스트림을 100명이 공유한다.
+
+Backpressure는 다른 문제다. 생산자가 소비자보다 빠르면 내부 큐가 무한히 쌓인다. Reactor의 기본 prefetch는 256개지만, `subscribe()` 람다는 `request(Long.MAX_VALUE)`를 자동으로 보내므로 실질적으로 무제한이다.
+
+전략은 상황에 따라 다르다. 데이터 유실이 허용되지 않으면 `onBackpressureBuffer(n)`으로 크기 제한을 둔다. 실시간 센서 데이터처럼 최신 값만 필요하면 `onBackpressureLatest()`가 적합하다. Cold Publisher라면 `limitRate(n)`으로 생산자 속도 자체를 소비자에 맞추는 것이 가장 깔끔하다.
+
+## Context — ThreadLocal이 사라지는 이유
+
+요청마다 고유한 `requestId`를 로그에 남기는 패턴은 MVC에서 자연스럽다. `MDC.put("requestId", id)`를 필터에 한 번 설정하면 요청 스레드 전체에서 작동한다. WebFlux에서 `publishOn`으로 스레드가 바뀌는 순간 MDC 값이 사라진다. ThreadLocal은 스레드에 묶여 있기 때문이다.
+
+Reactor Context는 파이프라인의 **불변 메타데이터 맵**이다. `contextWrite(Context.of("requestId", id))`로 값을 추가하면 스레드 전환과 무관하게 파이프라인 전체에서 `Mono.deferContextual(ctx -> ...)`로 읽을 수 있다. Spring Security의 `ReactiveSecurityContextHolder`도 같은 원리로 동작한다 — `SecurityContext`를 Reactor Context에 저장하고 파이프라인 어디서든 꺼낸다.
+
+<Aside label="전파 방향 주의">
+`contextWrite`는 subscribe 방향(아래→위)으로 전파된다. WebFlux 필터에서 `chain.filter(exchange).contextWrite(...)`처럼 파이프라인 **끝에** 붙이는 패턴이 올바른 이유다. 중간에 넣으면 그 위의 upstream 연산자는 Context를 볼 수 없다.
+</Aside>
+
+## 정리
+
+WebFlux의 설계 결정들은 하나의 전제에서 나온다 — **EventLoop 스레드를 절대 블로킹하지 않는다**. 지연 평가는 구독 전까지 아무 I/O도 발생시키지 않는다. 연산자 선택은 동시성과 순서 보장의 트레이드오프다. 에러는 신호로 흐른다. 스레드 전환은 명시적으로 제어한다. Backpressure는 소비자가 감당할 수 있는 속도를 생산자에게 알린다. Context는 스레드 경계를 넘어 메타데이터를 전달한다.
+
+- `subscribe()` 없이는 아무것도 실행되지 않는다 — WebFlux 컨트롤러가 구독을 대신한다.
+- `flatMap`은 빠르지만 순서를 보장하지 않는다. 동시성 제한(`flatMap(fn, n)`)을 명시하라.
+- 블로킹 코드는 `subscribeOn(Schedulers.boundedElastic())`으로 오프로딩하거나, 처음부터 논블로킹 드라이버를 써라.
+- ThreadLocal 대신 Reactor Context를 써야 스레드 전환 후에도 요청 메타데이터가 살아있다.

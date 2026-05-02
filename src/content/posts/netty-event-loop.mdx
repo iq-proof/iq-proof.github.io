@@ -1,0 +1,116 @@
+---
+title: "WebFlux의 처리량은 Netty 구조에서 온다"
+description: "Boss/Worker EventLoopGroup 분리부터 ChannelPipeline, EventLoop 블로킹 위험, ConnectionProvider 연결 풀 튜닝까지, Spring WebFlux의 성능 설계를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, netty, event-loop, reactive, connection-pool]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring WebFlux를 도입하고도 성능이 기대만큼 나오지 않는다면, 원인은 대부분 Netty 내부에 있다. EventLoop 스레드에 블로킹 코드 하나가 숨어 있거나, 연결 풀 크기가 잘못 설정되어 있거나. WebFlux가 왜 이 구조 위에 있고, 어디서 무엇이 망가지는가?
+
+## 두 개의 EventLoopGroup
+
+Netty는 TCP 연결을 수락하는 일(Boss)과 실제 I/O를 처리하는 일(Worker)을 처음부터 분리한다. Boss EventLoopGroup은 스레드 1~2개로 `accept()` 시스템 콜만 담당하고, 새 소켓이 만들어지면 Worker EventLoopGroup에 등록한 뒤 다시 대기로 돌아간다. Worker EventLoopGroup은 기본적으로 `CPU 코어 × 2`개 스레드로 구성되며, 각 스레드(EventLoop)는 여러 채널을 `epoll`로 감시한다.
+
+Spring Boot의 WebFlux는 이 구조를 `NettyReactiveWebServerFactory`를 통해 자동으로 구성한다. 로그에 보이는 `reactor-http-epoll-1` 같은 스레드 이름이 바로 Worker EventLoop 스레드다.
+
+<Callout type="note" title="Boss와 Worker를 분리하는 이유">
+두 역할을 같은 스레드 풀로 묶으면, 대량 연결이 들어올 때 accept 처리와 I/O 처리가 같은 자원을 두고 경쟁한다. Boss는 가볍고 빠르게 accept만 해야 수만 TPS도 버틴다.
+</Callout>
+
+## EventLoop 루프의 세 단계
+
+각 Worker EventLoop는 단일 스레드에서 세 단계를 무한 반복한다.
+
+1. `selector.select()` — I/O 이벤트가 올 때까지 대기 (Linux에서는 `epoll_wait`)
+2. `processSelectedKeys()` — 준비된 채널의 읽기/쓰기 처리
+3. `runAllTasks()` — 태스크 큐 처리
+
+`ioRatio`(기본 50)는 2단계와 3단계 사이의 시간 비율을 결정한다. I/O 처리에 100ms를 쓰면 태스크 처리에도 최대 100ms를 할당한다. WebSocket 브로드캐스트처럼 태스크가 많은 서비스는 이 값을 30~40으로 낮추는 것을 고려할 수 있다.
+
+채널이 EventLoop에 한 번 등록되면 이후 모든 I/O 처리는 동일한 스레드에서만 일어난다. 이 덕분에 채널 상태에 대한 `synchronized` 없이 Thread-safe가 보장된다.
+
+## ChannelPipeline — 요청이 지나는 경로
+
+각 채널에는 `ChannelPipeline`이 붙어 있다. HeadContext에서 TailContext까지 이어진 이중 연결 리스트로, Inbound(네트워크 → 앱) 방향과 Outbound(앱 → 네트워크) 방향으로 핸들러 체인이 실행된다.
+
+```
+[HeadContext] → HttpRequestDecoder → HttpObjectAggregator
+             → ReactorBridgeHandler → [TailContext]
+```
+
+`ReactorBridgeHandler`가 Netty와 WebFlux 사이의 어댑터다. Netty의 `HttpRequest`를 `ServerWebExchange`로 변환하고, WebFlux 핸들러가 반환한 `Mono<Void>`가 완료되면 Netty의 응답 플러시를 트리거한다.
+
+핸들러를 커스터마이징할 때 가장 흔한 실수는 `ctx.fireChannelRead(msg)` 호출을 빼먹는 것이다. 이 한 줄이 없으면 파이프라인이 거기서 멈추고 응답이 사라진다.
+
+<Callout type="warning" title="Inbound 핸들러의 불변 규칙">
+`channelRead`를 오버라이드했다면 반드시 `ctx.fireChannelRead(msg)`를 호출해야 한다. 누락하면 TailContext에 도달하지 못해 파이프라인이 조용히 중단된다.
+</Callout>
+
+## EventLoop 블로킹 — 전체 채널이 멈추는 이유
+
+EventLoop 스레드에서 블로킹 코드가 실행되면 해당 스레드가 담당하는 **모든 채널**이 그 시간 동안 응답을 못 한다. JDBC 쿼리 하나가 200ms를 잡아먹으면, 같은 EventLoop에 묶인 채널 수백 개가 200ms씩 지연된다.
+
+블로킹으로 분류되는 코드는 분명하다 — `JdbcTemplate`, `RestTemplate`, `Files.readAllBytes()`, `Thread.sleep()`, `Future.get()`. 이것들을 EventLoop 스레드에서 그대로 실행하는 것이 "WebFlux를 도입했는데 더 느리다"의 가장 흔한 원인이다.
+
+```java
+// 잘못된 패턴: EventLoop에서 블로킹 JDBC
+@GetMapping("/users")
+public Flux<User> getUsers() {
+    return Flux.fromIterable(jdbcTemplate.query("SELECT * FROM users", rowMapper));
+}
+
+// 올바른 패턴: boundedElastic으로 오프로딩
+public Flux<User> getUsers() {
+    return Mono.fromCallable(() -> jdbcTemplate.query("SELECT * FROM users", rowMapper))
+               .subscribeOn(Schedulers.boundedElastic())
+               .flatMapMany(Flux::fromIterable);
+}
+```
+
+개발 환경에서는 `BlockHound.install()`을 활성화하면 NonBlocking 스레드에서 블로킹 호출이 발생하는 즉시 예외가 터진다. 프로덕션에서 처음 발견하는 것보다 훨씬 낫다.
+
+<Aside label="근본적 해결">
+오프로딩은 임시방편이다. JDBC → R2DBC, RestTemplate → WebClient로 교체하면 EventLoop에서 직접 논블로킹 I/O를 쓸 수 있어 처리량이 한 단계 더 올라간다.
+</Aside>
+
+## ConnectionProvider — 연결 풀 튜닝
+
+`WebClient`가 외부 API를 호출할 때 연결은 `ConnectionProvider`가 관리하는 풀에서 가져온다. 기본 `maxConnections`는 500으로 과도하게 크다. 외부 API가 허용하는 연결 수를 기준으로 좁게 잡아야 한다.
+
+```java
+ConnectionProvider provider = ConnectionProvider.builder("api-pool")
+    .maxConnections(50)
+    .maxIdleTime(Duration.ofSeconds(20))      // 서버 Keep-Alive보다 짧게
+    .maxLifeTime(Duration.ofSeconds(60))
+    .pendingAcquireTimeout(Duration.ofSeconds(30))
+    .metrics(true)
+    .build();
+```
+
+`maxIdleTime`을 서버의 Keep-Alive 타임아웃보다 길게 설정하면 서버가 먼저 연결을 닫고, 클라이언트가 죽은 연결로 요청을 보내 "Connection reset by peer"가 발생한다. 서버 설정을 모른다면 보수적으로 10~15초로 잡는다.
+
+HTTP/2를 사용하면 단일 TCP 연결에서 여러 스트림을 동시에 처리하므로 `maxConnections`를 HTTP/1.1보다 훨씬 낮게 설정해도 된다. 연결 1개로 수십~수백 개의 동시 요청을 처리할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+`maxConnections`를 높이면 대기가 줄지만 외부 API에 부하가 간다. `pendingAcquireTimeout`을 설정하지 않으면 풀 고갈 시 요청이 무한 대기한다. Micrometer의 `reactor.netty.connection.provider.pending.connections` 메트릭을 모니터링하고, pending이 `maxConnections`의 20%를 넘으면 경보를 설정하라.
+</Callout>
+
+## 정리
+
+- WebFlux의 처리량은 EventLoop가 I/O 대기 없이 계속 돌 수 있는가에 달려 있다.
+- Boss/Worker 분리, 채널-EventLoop 고정, ChannelPipeline은 모두 이 단일 원칙의 구현이다.
+- EventLoop 스레드에서 블로킹 코드를 실행하는 순간 그 원칙이 깨진다. `BlockHound`로 조기에 발견하라.
+- `WebClient`의 `ConnectionProvider`를 `@Bean`으로 한 번만 구성하고, `maxIdleTime`을 서버 Keep-Alive보다 짧게 유지하라.
+
+다음 글에서는 WebFlux의 `Mono`와 `Flux`가 EventLoop 위에서 어떻게 스케줄링되는지, `publishOn`과 `subscribeOn`이 실제로 스레드를 어떻게 전환하는지 추적한다.

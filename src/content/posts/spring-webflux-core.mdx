@@ -1,0 +1,123 @@
+---
+title: "WebFlux 아키텍처는 왜 이렇게 설계됐는가"
+description: "DispatcherHandler의 Reactive 위임 구조부터 WebClient 병렬 호출, SSE/WebSocket 스트리밍, WebFilter 불변 패턴까지 — WebFlux 설계 철학의 일관된 흐름을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, reactive, webclient, event-loop, dispatcher-handler]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring WebFlux를 MVC처럼 쓰면 동작은 한다. 하지만 `DispatcherHandler`가 왜 `Mono<Void>`를 반환하는지, `ServerWebExchange`가 왜 불변인지, `WebFilter`에서 왜 `exchange.mutate()`를 써야 하는지 모르면 커스터마이징이 막히고 버그의 원인을 찾지 못한다. 이 일곱 챕터를 관통하는 질문은 하나다 — WebFlux의 모든 설계 결정은 어디서 나오는가?
+
+## 하나의 철학: "Reactive 파이프라인 안에서만 동작한다"
+
+WebFlux의 모든 설계는 단일 원칙에서 출발한다. **블로킹 없는 단일 EventLoop에서 수만 개의 요청을 처리한다.** 이 원칙이 다른 모든 결정을 강제한다.
+
+`DispatcherServlet`은 Thread-per-Request 모델이다. 요청마다 하나의 스레드가 HandlerMapping 조회, 핸들러 실행, 뷰 렌더링을 동기로 처리한다. `DispatcherHandler`는 다르다.
+
+```
+public Mono<Void> handle(ServerWebExchange exchange) {
+    return Flux.fromIterable(this.handlerMappings)
+        .concatMap(mapping -> mapping.getHandler(exchange))
+        .next()
+        .switchIfEmpty(createNotFoundError())
+        .flatMap(handler -> getHandlerAdapter(handler).handle(exchange, handler))
+        .flatMap(result -> getResultHandler(result).handleResult(exchange, result));
+}
+```
+
+각 단계가 `Mono`/`Flux`를 반환한다. 조회, 실행, 응답 변환 — 전부 논블로킹 체인이다. 이 하나의 메서드가 WebFlux의 아키텍처 전체를 요약한다.
+
+## ServerWebExchange가 불변인 이유
+
+`ServerWebExchange`는 요청/응답 쌍의 컨테이너다. 여러 `WebFilter`와 핸들러가 같은 exchange를 공유한다. 만약 mutable이라면 하나의 필터가 다른 필터의 상태를 덮어쓸 수 있다. Reactive 파이프라인에서는 여러 연산자가 동시에 같은 객체를 참조하기 때문에 공유 상태 변경이 치명적이다.
+
+해결책은 `mutate()`다.
+
+```java
+ServerWebExchange mutated = exchange.mutate()
+    .request(r -> r.header("X-Request-ID", requestId))
+    .build();
+return chain.filter(mutated);
+```
+
+기존 exchange는 그대로 두고 새 exchange를 만들어 체인에 전달한다. 이 패턴은 `WebFilter`에서 요청 헤더를 추가할 때마다 반복된다. 불변성은 제약이 아니라 Reactive 파이프라인의 Thread-safety를 보장하는 설계다.
+
+<Callout type="warning" title="흔한 실수">
+`exchange.getRequest().getHeaders().add("X-Custom", "value")`는 `UnsupportedOperationException`을 던진다. `ServerHttpRequest`는 불변이다. 헤더를 추가하려면 반드시 `exchange.mutate()`를 써야 한다.
+</Callout>
+
+## WebClient — RestTemplate과 근본적으로 다른 이유
+
+`RestTemplate`은 외부 API 응답을 기다리는 동안 스레드를 블로킹한다. 스레드 200개, 응답 시간 100ms이면 초당 2,000 req/s가 한계다. `WebClient`는 다르다.
+
+요청을 Netty에 비동기로 위임하고 즉시 반환한다. EventLoop는 응답을 기다리는 동안 다른 요청을 처리한다. 응답이 도착하면 이벤트로 다시 파이프라인을 실행한다. 16개 EventLoop로 수만 req/s를 처리할 수 있다.
+
+`retrieve()`와 `exchangeToMono()`의 차이도 이 맥락에서 이해해야 한다. `retrieve()`는 바디 소비를 프레임워크가 관리한다. `exchangeToMono()`는 원시 `ClientResponse`를 직접 다루는 대신, **반드시 바디를 소비해야 한다.** 소비하지 않으면 HTTP 연결이 풀에 반환되지 않아 연결 고갈이 일어난다.
+
+독립적인 외부 API 세 개를 조회할 때 순차 `flatMap` 체인은 300+200+150=650ms다. `Mono.zip`은 max(300,200,150)=300ms다. 코드 한 줄의 차이가 응답 시간을 54% 단축한다.
+
+## SSE와 WebSocket — Flux가 프로토콜이 되는 순간
+
+```java
+@GetMapping(value = "/prices/stream", produces = TEXT_EVENT_STREAM_VALUE)
+public Flux<ServerSentEvent<StockPrice>> streamPrices() {
+    return stockPriceService.getPriceFlux()
+        .map(price -> ServerSentEvent.<StockPrice>builder()
+            .id(String.valueOf(price.getSequence()))
+            .event("price-update")
+            .data(price)
+            .build())
+        .doOnCancel(() -> log.info("SSE 연결 해제"));
+}
+```
+
+`Flux`를 반환하면 WebFlux가 이를 SSE 프로토콜로 직렬화한다. `onNext` 신호마다 HTTP 청크로 전송된다. 클라이언트가 연결을 끊으면 Netty가 감지하고 `Flux`에 `cancel` 신호를 보낸다. `doOnCancel`로 정리 로직을 실행할 수 있다.
+
+WebSocket은 방향이 양쪽이다. `session.receive()`는 클라이언트→서버, `session.send()`는 서버→클라이언트다. 두 `Mono<Void>`를 `Mono.zip`으로 묶으면 어느 한쪽이 완료될 때 세션이 종료된다.
+
+<Callout type="note" title="트레이드오프">
+SSE는 HTTP 기반이라 프록시 친화적이고 자동 재연결을 지원하지만 단방향이다. WebSocket은 양방향이지만 로드 밸런서 설정이 복잡하고 재연결을 직접 구현해야 한다. 알림/피드는 SSE, 채팅/게임은 WebSocket이 기본 선택이다.
+</Callout>
+
+## DataBuffer — 메모리 관리의 책임
+
+`DataBuffer`는 Netty의 `ByteBuf`를 스프링이 래핑한 추상화다. 풀링 기반이라 사용 후 반드시 해제해야 한다.
+
+```java
+DataBufferUtils.join(filePart.content())
+    .map(buffer -> {
+        try {
+            byte[] bytes = new byte[buffer.readableByteCount()];
+            buffer.read(bytes);
+            return bytes;
+        } finally {
+            DataBufferUtils.release(buffer); // 반드시 해제
+        }
+    });
+```
+
+`release()`를 빠뜨리면 `ByteBuf`의 참조 카운트가 0이 되지 않아 메모리 풀에 반환되지 않는다. 시간이 지나면 "LEAK: ByteBuf.release() was not called" 경고가 뜨고 메모리가 고갈된다. 대용량 파일은 `FilePart.transferTo()`로 청크 스트리밍을 쓰면 메모리 제한 없이 처리할 수 있다.
+
+<Aside label="설계 철학">
+WebFlux가 어렵게 느껴지는 이유 중 하나는 이 DataBuffer 해제 책임이다. `bodyToMono()`, `bodyToFlux()` 같은 상위 API는 내부에서 자동 처리한다. 직접 `getBody()`나 `content()`로 `DataBuffer`를 구독할 때만 수동 해제가 필요하다. 상위 API를 쓸 수 있으면 쓰는 게 안전하다.
+</Aside>
+
+## 정리
+
+- `DispatcherHandler`는 HandlerMapping → HandlerAdapter → HandlerResultHandler를 `Mono` 체인으로 연결한다. 동기 MVC와 구조는 같지만 모든 단계가 논블로킹이다.
+- `ServerWebExchange`의 불변성은 Reactive 파이프라인의 Thread-safety를 보장하는 설계 결정이다. 수정은 `mutate()`로 새 인스턴스를 만든다.
+- `WebClient`는 EventLoop 비동기 I/O 위에서 동작한다. 독립 API는 `Mono.zip`으로 병렬화하고, 외부 서비스에는 서킷 브레이커를 붙여야 연쇄 장애를 막는다.
+- SSE는 `Flux`가 HTTP 스트리밍 프로토콜로 변환되는 가장 직접적인 예시다. `doOnCancel`로 연결 해제를 감지한다.
+- `WebFilter`에서 요청을 수정할 때는 항상 `exchange.mutate()`를 써야 한다. `DataBuffer`를 직접 다룰 때는 `release()`가 책임이다.
+
+이 다섯 원칙은 하나로 수렴한다 — **모든 것이 Reactive 파이프라인 안에서 구독될 때만 실행된다.** 이 사실을 체화하면 WebFlux의 나머지는 그 귀결이다.

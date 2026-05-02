@@ -1,0 +1,116 @@
+---
+title: "WebFlux에서 JPA를 쓰면 왜 성능이 오히려 나빠지는가"
+description: "JPA의 블로킹 JDBC가 EventLoop를 점유하는 원리부터 R2DBC의 논블로킹 구조, Reactor Context 기반 트랜잭션, N+1 해결 패턴까지 WebFlux 데이터 계층의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-webflux, r2dbc, reactive, jpa, event-loop]
+difficulty: intermediate
+series:
+  slug: spring-webflux-deep-dive
+  title: Spring Webflux Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"WebFlux로 마이그레이션했는데 왜 성능이 오히려 나빠졌지?" — 이 질문의 가장 흔한 원인은 JPA다. 프레임워크만 바꾸고 데이터 계층을 그대로 두면, EventLoop 스레드 위에서 JDBC 소켓이 블로킹 대기하는 구조가 된다. 왜 이 조합이 문제이고, 진짜 논블로킹 스택은 내부에서 어떻게 다른가?
+
+## JPA는 왜 EventLoop를 막는가
+
+JPA는 결국 JDBC 위에 있다. `userRepository.findById(id)`를 호출하면 Hibernate → JDBC `PreparedStatement.executeQuery()` → `InputStream.read()` 순서로 내려간다. 마지막 `read()`는 DB가 응답할 때까지 현재 스레드를 점유한다. 이것이 블로킹의 실체다.
+
+WebFlux의 EventLoop 스레드에서 이 호출이 발생하면, 해당 EventLoop가 담당하는 모든 채널의 이벤트 처리가 JDBC 응답이 돌아올 때까지 멈춘다. 8코어 서버의 EventLoop 16개 중 하나가 50ms짜리 쿼리를 기다리는 동안 수백 개의 다른 요청이 함께 기다린다.
+
+`Schedulers.boundedElastic()`으로 오프로딩하면 당장은 EventLoop가 풀리지만, 이번엔 boundedElastic 스레드(기본 최대 CPU×10개)가 JDBC 스레드 역할을 떠맡는다. 8코어 서버에서 80개 스레드로 줄어든 동시 처리 한계는 Spring MVC의 기본 200 스레드보다 오히려 낮다. WebFlux의 복잡성만 가져오고 이점은 없다.
+
+<Callout type="warning" title="WebFlux + JPA 오프로딩의 역설">
+동시 요청 1000개, 쿼리 50ms 환경에서 Spring MVC + JPA(200 스레드)는 ~2,000 req/s를 달성하지만, WebFlux + JPA + boundedElastic(80 스레드)은 ~1,600 req/s에 그친다. 프레임워크를 바꾸면서 성능이 후퇴한다.
+</Callout>
+
+## R2DBC는 무엇이 다른가
+
+R2DBC는 소켓 모델이 근본적으로 다르다. JDBC가 `java.net.Socket`(블로킹)을 쓰는 반면, R2DBC 드라이버(r2dbc-postgresql, r2dbc-mysql 등)는 Netty 기반의 `java.nio.SocketChannel`(논블로킹)을 사용한다.
+
+쿼리를 전송한 직후 제어권이 즉시 반환되고, Netty EventLoop가 DB 소켓을 감시하다가 응답이 도착하면 Reactive 파이프라인에 `onNext` 신호를 보낸다. DB 응답을 기다리는 동안 EventLoop는 다른 요청을 처리한다.
+
+```java
+// JPA (블로킹): 결과가 올 때까지 스레드 점유
+User user = userRepository.findById(id).orElseThrow();
+
+// R2DBC (논블로킹): Mono를 반환하고 즉시 반환
+Mono<User> user = userRepository.findById(id);
+```
+
+이 구조에서 연결 풀 크기도 달라진다. JDBC는 스레드마다 연결을 점유하므로 스레드 수(~200개)만큼 연결이 필요하다. R2DBC는 쿼리 실행 중에만 연결을 사용하고 완료 즉시 반환하므로, 8코어 DB 서버 기준 16~32개 연결로 동일한 처리량을 낼 수 있다.
+
+## @Transactional이 Reactive에서 동작하는 방식
+
+JPA에서 `@Transactional`은 ThreadLocal에 DB 연결을 바인딩한다. 같은 스레드라면 어디서든 같은 연결을 꺼내 쓴다. WebFlux에서 스레드가 전환되는 순간 ThreadLocal은 사라지고 트랜잭션 컨텍스트도 함께 유실된다.
+
+R2DBC의 `ReactiveTransactionManager`는 대신 Reactor `Context`를 사용한다. `@Transactional` AOP 프록시가 subscribe 시점에 트랜잭션을 시작하면서 연결 정보를 `contextWrite()`로 파이프라인에 주입한다. `publishOn`, `subscribeOn`으로 스레드가 몇 번 바뀌든 Context는 파이프라인을 따라 전파된다.
+
+```java
+@Transactional
+public Mono<Order> createOrder(CreateOrderRequest req) {
+    return orderRepo.save(Order.from(req))
+        .flatMap(order ->
+            inventoryRepo.decrease(req.itemId(), req.quantity())
+                .filter(affected -> affected > 0)
+                .switchIfEmpty(Mono.error(new InsufficientStockException()))
+                .thenReturn(order)
+        )
+        .flatMap(order ->
+            paymentRepo.save(Payment.from(order))
+                .map(payment -> OrderResult.of(order, payment))
+        );
+    // 어느 단계에서든 onError → 전체 롤백
+}
+```
+
+트랜잭션 롤백은 파이프라인의 `onError` 신호가 트리거한다. `onErrorResume`으로 에러를 삼키면 롤백이 발생하지 않는다. 에러를 처리할 때는 반드시 `Mono.error()`로 재방출하거나 다른 에러 타입으로 변환해야 한다.
+
+## N+1은 R2DBC에서 더 명시적이다
+
+JPA의 지연 로딩은 N+1을 코드에서 숨긴다. `order.getUser().getName()`처럼 자연스럽게 쓰다 보면 루프 안에서 N번 쿼리가 날아간다. R2DBC에는 지연 로딩이 없다. 연관 데이터가 필요하면 개발자가 명시적으로 조회해야 한다.
+
+```java
+// N+1 발생 (flatMap + findById 반복)
+orderRepo.findAll()
+    .flatMap(order -> userRepo.findById(order.userId())); // N번 호출
+
+// IN 조건 배치 로딩 (2번으로 해결)
+orderRepo.findAll()
+    .collectList()
+    .flatMapMany(orders -> {
+        Set<Long> userIds = orders.stream()
+            .map(Order::userId).collect(toSet());
+        return userRepo.findAllById(userIds)    // IN (:ids) 단 1번
+            .collectMap(User::id)
+            .flatMapMany(userMap ->
+                Flux.fromIterable(orders)
+                    .map(o -> OrderDto.of(o, userMap.get(o.userId())))
+            );
+    });
+```
+
+JOIN이 가능하면 `DatabaseClient`로 SQL을 직접 써서 단 1번 쿼리로 끝내는 것이 가장 효율적이다. 서비스 경계를 넘는 경우(마이크로서비스)에는 IN 조건 배치 로딩이 현실적이다.
+
+<Callout type="note" title="트레이드오프 — JPA vs R2DBC">
+R2DBC로 전환하면 지연 로딩, Dirty Checking, JPQL/QueryDSL, 복잡한 연관관계 자동 처리를 모두 잃는다. 얻는 것은 완전한 논블로킹과 높은 동시 처리 효율이다. CRUD 중심의 단순한 엔티티 구조와 높은 동시 접속이 요구되는 서비스에는 R2DBC가 맞다. 복잡한 도메인 모델이라면 MVC + JPA를 유지하는 편이 낫다.
+</Callout>
+
+<Aside label="현실적인 마이그레이션 전략">
+동일 JVM에서 MVC와 WebFlux를 혼합하는 것은 불가능하다. 현실적인 방법은 MSA 경계로 나누는 것이다 — 레거시 도메인 서비스는 MVC + JPA 유지, 신규 I/O 집약 서비스와 API 게이트웨이는 WebFlux + R2DBC로 작성한다. 점진적 전환이 필요하다면 `boundedElastic` 오프로딩으로 시작하되 복잡한 트랜잭션은 MVC 서비스에 남겨두는 것이 안전하다.
+</Aside>
+
+## 정리
+
+- JPA는 JDBC 블로킹 소켓 때문에 구조적으로 논블로킹이 될 수 없다. EventLoop에서 직접 호출하면 전체 채널이 멈춘다.
+- `boundedElastic` 오프로딩은 임시방편이다. 스레드 수 한계로 MVC보다 성능이 낮아질 수 있다.
+- R2DBC는 Netty NIO 소켓으로 DB 통신을 논블로킹하게 만들고, Reactor Context로 스레드 독립적 트랜잭션을 제공한다.
+- N+1은 R2DBC에서 숨겨지지 않는다. `collectList()` → `findAllById(IN)` 패턴이나 JOIN SQL로 명시적으로 해결해야 한다.
+
+WebFlux의 이점은 데이터 계층까지 논블로킹이 될 때 비로소 나타난다. 프레임워크만 바꾸는 것은 복잡성만 더하는 결과로 끝난다.
