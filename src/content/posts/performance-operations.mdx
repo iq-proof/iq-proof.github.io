@@ -1,13 +1,13 @@
 ---
-title: "RabbitMQ 운영의 모든 실패는 어디서 오는가"
-description: "처리량 병목부터 Flow Control, 모니터링 맹점, 운영 장애 패턴, 클러스터 복구까지 — RabbitMQ 실무 운영의 다섯 가지 핵심 축을 추적한다."
+title: "REST에서 gRPC로 — 점진적 전환의 설계 원칙"
+description: "모니터링부터 분산 추적, 연결 튜닝, 성능 비교, 마이그레이션까지 gRPC 운영의 핵심 패턴을 하나의 관통 철학으로 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [rabbitmq, message-queue, operations, cluster, monitoring]
+tags: [grpc, protobuf, observability, migration, spring-boot]
 difficulty: intermediate
 series:
-  slug: rabbitmq-deep-dive
-  title: Rabbitmq Deep Dive
+  slug: grpc-deep-dive
+  title: Grpc Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,76 +16,144 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-"RabbitMQ가 느리다"는 말은 대부분 "설정이 잘못됐다"는 뜻이다. 그런데 잘못된 설정은 한 곳에서 오지 않는다. Publisher 측, Consumer 측, 브로커 메모리, 모니터링 부재, 클러스터 구조 — 다섯 곳 중 어느 하나라도 어긋나면 전체가 흔들린다. 왜 RabbitMQ 장애는 항상 "갑자기" 발생하는 것처럼 느껴지는가?
+gRPC를 도입하는 팀이 가장 먼저 마주치는 문제는 성능이 아니다. **"지금 무슨 일이 일어나고 있는가"를 알 수 없다는 것**이다. REST는 브라우저, curl, 로그 한 줄로 디버깅이 가능하지만, gRPC는 바이너리 프로토콜 위에서 돌아간다. 이 불투명함을 해결하지 않으면 성능 이점은 의미가 없다. 그렇다면 gRPC를 운영 가능한 시스템으로 만드는 설계 원칙은 무엇인가?
 
-## 처리량은 Publisher와 Consumer 양쪽의 문제다
+## 관찰 가능성 — 보이지 않으면 제어할 수 없다
 
-Publisher 쪽 병목은 대부분 Confirm 처리 방식에서 온다. 매 메시지마다 `waitForConfirmsOrDie()`로 동기 대기하면 1,000개 메시지에 10ms RTT 기준으로 약 10초가 걸린다. 비동기 `ConfirmCallback`으로 바꾸면 같은 1,000개를 100ms 수준에서 처리할 수 있다 — 100배 차이다.
+gRPC 서비스의 첫 번째 운영 과제는 메트릭 수집이다. `grpc-spring-boot-starter`는 Micrometer를 통해 세 가지 핵심 메트릭을 자동으로 노출한다.
 
-Consumer 쪽 병목은 concurrency와 prefetch 설정에서 온다. 처리 시간이 50ms인 Consumer를 단일 스레드(`concurrency=1`)로 운영하면 초당 최대 20개 처리가 한계다. 목표 처리량이 초당 1,000개라면 필요한 스레드 수는 `1000 / (1/0.05) = 50`개다. Prefetch는 `처리시간 / RTT` 비율로 설정하는 것이 기준점이다.
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  metrics:
+    tags:
+      application: my-grpc-service
+      environment: production
+```
 
-압축은 조건부다. 메시지가 1KB를 넘고 네트워크가 병목일 때만 이득이다. 1KB 미만 메시지에 GZIP을 걸면 압축 결과가 원본보다 커지고 CPU만 낭비한다.
+자동 수집되는 메트릭의 구조는 다음과 같다.
 
-복합 튜닝 순서는 Prefetch 증가 → Concurrency 증가 → 비동기 Confirm → 배치 소비다. 앞 단계의 효과를 확인하고 다음 단계로 넘어가야 한다.
+```
+grpc_server_calls_total (Counter)
+├─ service: UserService
+├─ method: GetUser
+└─ status: OK | INVALID_ARGUMENT | INTERNAL | ...
 
-## Flow Control은 버그가 아니라 설계다
+grpc_server_processing_duration_seconds (Timer/Histogram)
+├─ le: 0.005, 0.01, 0.025, 0.05, 0.1, ...
+└─ p50, p90, p99 계산 가능
+```
 
-Publisher가 갑자기 차단된다. 연결은 살아있다. 팀은 RabbitMQ를 재시작한다. 재시작 후 5분이 지나면 또 차단된다. 이것이 Flow Control을 모를 때 생기는 패턴이다.
+에러율과 p99 지연시간은 가장 먼저 설정해야 할 알람이다.
 
-RabbitMQ는 메모리 사용량이 `vm_memory_high_watermark`(기본 40%)를 초과하면 모든 Publisher Connection에 `Connection.Blocked` 프레임을 보내 발행을 차단한다. Consumer는 계속 동작한다 — Consumer가 메시지를 소비해서 메모리를 회수해야 차단이 풀리기 때문이다.
+```promql
+# 에러율 (5분 윈도우)
+rate(grpc_server_calls_total{status!="OK"}[5m]) /
+  rate(grpc_server_calls_total[5m])
 
-<Callout type="warning" title="Flow Control 오진 패턴">
-재시작은 해결책이 아니다. Consumer 처리 속도가 발행 속도보다 느린 구조적 문제가 남아있으면, 재시작 후 메모리가 다시 임계값에 도달하는 순간 똑같이 차단된다.
+# p99 응답시간
+histogram_quantile(0.99,
+  rate(grpc_server_processing_duration_seconds_bucket[5m]))
+```
+
+`p50 = 10ms`이고 `p99 = 1000ms`라면, 평균만 보는 팀은 문제를 인지하지 못한다. **p99가 치솟는 순간이 바로 이벤트 루프나 스레드 풀이 포화되는 신호**다.
+
+## 분산 추적 — TraceID가 서비스 경계를 넘는 방법
+
+메트릭이 "무엇이 잘못됐는가"를 알려준다면, 분산 추적은 "어디서 잘못됐는가"를 알려준다. OpenTelemetry는 gRPC 메타데이터에 `traceparent` 헤더를 자동으로 주입해 A → B → C 서비스 체인을 하나의 Trace로 묶는다.
+
+```
+Frontend (TraceID: abc123)
+  │ HTTP Header: traceparent: abc123
+  ▼
+Service A (SpanID: span1)
+  │ gRPC Metadata: traceparent: abc123
+  ▼
+Service B (SpanID: span2, Parent: span1)
+  │ gRPC Metadata: traceparent: abc123
+  ▼
+Service C (SpanID: span3, Parent: span2)
+  │
+  ▼
+Jaeger: Trace abc123 → Total: 250ms (A: 50ms, B: 100ms, C: 80ms + DB: 20ms)
+```
+
+Baggage는 TraceID와 별개로 비즈니스 컨텍스트(예: `user_id`, `request_correlation_id`)를 체인 전체에 전파하는 메커니즘이다. 단, Baggage는 Jaeger UI를 비롯한 모든 추적 인프라에 노출되므로 **민감한 정보는 절대 담지 않는다**.
+
+<Callout type="warning" title="Baggage 보안 주의">
+`user_password`나 세션 토큰을 Baggage에 저장하면 모든 추적 시스템과 로그에 평문으로 노출된다. Baggage에는 `user_id`, `request_id`처럼 식별 가능하되 민감하지 않은 값만 담는다.
 </Callout>
 
-Lazy Queue는 이 문제의 예방책이다. 일반 Queue는 메시지를 메모리에 먼저 올리고 임계값 초과 시 디스크로 내리는(Paging) 반면, Lazy Queue는 메시지 도착 즉시 디스크에 저장하고 메타데이터만 메모리에 유지한다. 100만 개 메시지 기준으로 일반 Queue는 수백 MB에서 수 GB의 메모리를 쓰지만 Lazy Queue는 메타데이터 크기인 수백 MB 수준에 머문다.
+Sampling 전략은 시스템 부하와 가시성의 트레이드오프다. 고트래픽 환경에서 `always_on`(100% 샘플링)을 설정하면 Jaeger가 스팬을 감당하지 못해 드롭이 발생한다. `ParentBasedSampler + 10%`가 권장 출발점이다 — 부모 스팬이 샘플링되면 자식도 함께 샘플링되어 체인의 일관성이 유지된다.
 
-권장 설정은 `vm_memory_high_watermark=0.4`, `paging_ratio=0.5`(20%에서 미리 Paging 시작), `disk_free_limit=메모리×1.5`다. 디스크 여유 공간이 임계값 아래로 내려가도 Publisher가 차단된다는 점을 간과하지 말 것.
+## 연결 관리 — 프록시가 연결을 끊는 이유
 
-## 모니터링 없이는 장애가 항상 "갑자기" 온다
+AWS ALB, Nginx는 기본적으로 60초간 트래픽이 없는 연결을 종료한다. gRPC는 HTTP/2 위에서 장기 연결을 유지하므로, keepAlive를 설정하지 않으면 유휴 연결이 프록시에 의해 끊기고 `ECONNRESET` 에러가 발생한다.
 
-핵심 지표는 세 가지다.
+```yaml
+grpc:
+  server:
+    enable-keep-alive: true
+    keep-alive-time: 30s        # 프록시 타임아웃보다 짧게
+    keep-alive-timeout: 10s     # PONG 대기 시간
+    keep-alive-without-calls: true  # 유휴 상태에서도 PING
+    max-connection-age: 5m      # 5분마다 연결 교체 (LB 재분배)
+    max-connection-idle: 2m
+```
 
-**Queue Depth**는 Ready와 Unacked를 구분해서 봐야 한다. Ready가 증가하면 Consumer 처리 속도 부족이다. Unacked가 증가하면 Consumer가 메시지를 받았지만 처리를 완료하지 못하는 상태다 — 보통 외부 I/O 블로킹이 원인이다.
+`keepAliveTime: 30s`는 30초마다 HTTP/2 PING 프레임을 서버에 전송한다. 서버가 10초 내에 PONG을 응답하지 않으면 연결을 강제 종료한다. 이 메커니즘이 프록시의 유휴 타임아웃(60초)보다 먼저 작동해 연결을 갱신한다.
 
-**Publish Rate vs Deliver Rate**의 차이가 지속적으로 양수면 Queue가 쌓이고 있다는 신호다. `ack/s`가 실질적인 처리량 지표다.
+`maxConnectionAge: 5m`은 다른 이유로 중요하다. 연결이 수 시간 동안 유지되면, 로드밸런서가 새 인스턴스를 추가해도 기존 연결들은 계속 이전 인스턴스로만 향한다. 주기적 연결 교체는 **로드밸런서 재분배를 강제**해 인스턴스 간 트래픽 불균형을 방지한다.
 
-**Consumer Utilisation**이 50% 미만이면 Consumer가 Prefetch 대기 시간 때문에 놀고 있다는 뜻이다. Prefetch를 늘리거나 Consumer 수를 줄일 수 있다. 100%에 가까우면 Scale Out을 검토해야 한다.
-
-DLQ 메시지는 0이어야 정상이다. 0에서 1이 되는 순간이 가장 중요한 시점이다.
-
-<Callout type="note" title="트레이드오프: Management UI vs Prometheus+Grafana">
-Management UI는 기본 내장이고 실시간 상태 확인에 충분하지만 알림 기능과 이력 저장이 없다. 프로덕션에서는 `rabbitmq_prometheus` 플러그인 + Grafana 조합이 필수다. 알림은 P1(즉각)/P2(30분)/P3(일일) 계층으로 나눠야 알림 피로를 피할 수 있다.
+<Callout type="note" title="트레이드오프">
+keepAliveTime을 짧게(10초) 설정하면 연결 문제를 빠르게 감지하지만 PING/PONG 오버헤드가 증가한다. 길게(300초) 설정하면 오버헤드가 줄지만 장애 감지가 느려진다. **30~60초가 대부분의 ALB 환경에서 적합한 균형점**이다. Channel Pool은 단일 연결로는 병렬 처리가 어려울 때(처리량 > 500 req/s) 도입하며, 크기는 CPU 코어 수를 기준으로 잡는다.
 </Callout>
 
-## 운영 장애는 세 가지 패턴으로 수렴한다
+## 성능 비교 — 수치가 말하는 것과 말하지 않는 것
 
-**패턴 A — Queue 적체**: Queue Depth Ready가 급증하고 Consumer는 있다. Consumer Utilisation이 100%이면 Scale Out이 답이다. Consumer가 특정 메시지에서 루프를 돌며 `requeue=true`로 반복 실패하는 경우에는 DLX 설정이 없으면 해당 메시지가 계속 순환한다.
+gRPC가 REST보다 빠른 이유는 두 가지다. **Protobuf의 바이너리 직렬화**(같은 메시지 대비 30~50% 크기 절감)와 **HTTP/2 멀티플렉싱**(하나의 연결로 병렬 요청 처리). 동일 하드웨어 단일 머신 기준으로 Unary RPC는 REST(HTTP/1.1) 대비 약 5배의 처리량(2,000 → 10,000 req/s)과 절반 이하의 p99 지연시간을 보인다.
 
-**패턴 B — Unacked 누적**: Ready는 0인데 Unacked가 수만 건이다. Consumer는 살아있지만 Ack을 보내지 않는다. 외부 API 타임아웃이 없어서 스레드가 무한 대기 중인 경우가 가장 흔하다. Consumer를 재시작하면 Connection이 끊기며 Unacked가 모두 Ready로 복귀한다 — 임시 처치다. 근본 해결은 모든 외부 I/O에 타임아웃을 설정하는 것이다.
+그러나 벤치마크는 함정이 많다. JVM 워밍업 없이 측정하면 JIT 컴파일 전 수치가 섞여 결과가 왜곡된다. localhost에서만 측정하면 네트워크 RTT가 0ms인 비현실적 환경이 된다. 실제 운영 메시지 크기(보통 1~10KB)가 아닌 100B짜리 테스트 메시지로 측정하면 직렬화 오버헤드가 과소 계산된다.
 
-**패턴 C — 연결 폭풍**: RabbitMQ 재시작 후 서비스 100개가 동시에 재연결을 시도한다. 고정 간격 재연결(`sleep(1000)`)은 모든 서비스가 1초 후 동시에 재시도해서 폭풍을 증폭시킨다. Exponential Backoff + Jitter가 답이다. 지수 증가(1, 2, 4, 8... 최대 30초)에 ±30% 랜덤 지터를 더하면 재연결 시도가 시간적으로 분산된다.
+JMH를 사용할 때는 `@Warmup(iterations = 5)` 이후 측정값만 신뢰하고, 실제 운영 메시지 크기를 `@State`로 준비해 사용해야 한다.
 
-## 클러스터는 홀수 노드와 Quorum Queue가 기본이다
+gRPC가 REST보다 느릴 수 있는 경우도 있다. 낮은 처리량(< 100 req/s) 환경에서는 Protobuf 역직렬화 오버헤드가 JSON 파싱보다 크게 느껴질 수 있다. HTTP 캐싱이 중요한 시나리오나 웹 브라우저가 직접 호출하는 공개 API에서는 REST가 여전히 더 적합하다.
 
-단일 노드 RabbitMQ는 SPOF다. 3노드 클러스터 + Quorum Queue를 구성하면 노드 1개 장애에서 자동으로 복구된다.
+## 마이그레이션 — Strangler Fig와 Feature Flag
 
-Quorum Queue는 Raft 합의 알고리즘 기반이다. Leader 노드가 다운되면 Election Timeout(기본 5초) 후 Follower들이 투표를 시작하고, 과반수가 새 Leader를 선출한다. 총 다운타임은 보통 5~15초다. 인간 개입 없이 자동 복구된다.
+REST에서 gRPC로 한 번에 전환하는 "빅뱅" 방식은 실패 시 전체 서비스가 다운된다. Strangler Fig 패턴은 gRPC API를 기존 REST API와 **병렬로 구축**하고, 트래픽을 점진적으로 이동시키는 전략이다.
 
-홀수 노드를 권장하는 이유는 Split-Brain 처리 방식에 있다. 4노드 클러스터가 2+2로 분리되면 어느 쪽도 과반수(>2)를 달성하지 못해 전체 쓰기가 불가능해진다. 3노드에서 2+1로 분리되면 2가 과반수를 유지해 부분 가용성이 보존된다.
+핵심은 클라이언트 코드를 인터페이스로 추상화해 Feature Flag 하나로 전환할 수 있게 만드는 것이다.
 
-Rolling Upgrade는 노드 하나씩 `stop_app` → 업그레이드 → `start_app` 순서로 진행한다. 메이저 버전 업그레이드는 한 단계씩만 허용된다 — 3.9에서 3.12로 직접 올리면 클러스터가 분열된다. 기능 플래그는 모든 노드가 신버전이 된 후에 활성화해야 한다.
+```java
+// 추상화 인터페이스
+public interface UserServiceClient {
+    User getUser(String id);
+}
 
-<Aside label="설계 철학">
-RabbitMQ의 모든 운영 문제는 결국 하나의 질문으로 수렴한다 — "발행 속도와 소비 속도의 균형이 깨졌을 때 어디서, 어떻게 신호가 나타나는가?" Flow Control, Queue 적체, Unacked 누적은 모두 그 불균형의 다른 표현이다. 클러스터는 그 불균형이 하드웨어 장애로 확장될 때를 대비하는 구조다.
-</Aside>
+// Feature Flag 기반 주입
+@Bean
+public UserServiceClient userServiceClient(
+        @Value("${featureFlags.useGrpc.enabled}") boolean useGrpc) {
+    return useGrpc
+        ? new GrpcUserServiceClient(createGrpcStub())
+        : new RestUserServiceClient(new RestTemplate());
+}
+```
+
+롤아웃 순서는 위험도 기준으로 Tier를 나눈다. 내부 관리 도구(Tier 1, 트래픽 10%) → 모바일 앱(Tier 2, 트래픽 30%) → 핵심 공개 API(Tier 3, 트래픽 100%). 각 단계에서 에러율이 임계값(1%)을 넘으면 Feature Flag를 자동으로 비활성화해 REST로 롤백한다.
+
+Proto-First 설계는 마이그레이션 전에 반드시 거쳐야 하는 단계다. `.proto` 파일을 먼저 팀 간 합의하고 `reserved` 필드로 확장 공간을 확보해야, 구현 중간에 메시지 구조가 바뀌는 Breaking Change를 방지할 수 있다.
 
 ## 정리
 
-- 처리량은 Publisher(비동기 Confirm, 배치)와 Consumer(concurrency, prefetch) 양쪽을 함께 튜닝해야 한다.
-- Flow Control은 메모리 임계값 초과 시 Publisher를 차단하는 설계다. 재시작이 아니라 Consumer 처리량 증가 또는 Lazy Queue가 해결책이다.
-- 핵심 지표는 Queue Depth(Ready/Unacked 구분), Publish-Deliver Rate 차이, Consumer Utilisation, DLQ 메시지 수다.
-- 운영 장애는 적체/Unacked 누적/연결 폭풍 세 패턴으로 수렴한다. 각각 임시 처치(Consumer 재시작, Scale Out, 순차 재시작)와 근본 해결(타임아웃 설정, Backoff+Jitter)이 다르다.
-- 3노드 이상 홀수 클러스터 + Quorum Queue는 선택이 아니라 프로덕션의 기본값이다.
+- 메트릭(Micrometer)과 분산 추적(OpenTelemetry)은 선택이 아니라 gRPC 운영의 전제 조건이다.
+- keepAlive는 ALB/프록시 환경에서 필수다. `keepAliveTime < 프록시 타임아웃`으로 설정하고 여유 마진을 둔다.
+- gRPC의 성능 이점은 높은 처리량과 대역폭 제약 환경에서 두드러진다. 낮은 트래픽이나 공개 API에서는 REST가 더 실용적일 수 있다.
+- 마이그레이션은 Proto-First 설계 → Strangler Fig 구축 → Feature Flag 롤아웃 → 자동 롤백 순서로 진행한다.
 
-다음 글에서는 RabbitMQ와 Kafka의 아키텍처 차이 — Push 기반 vs Pull 기반, 메시지 삭제 vs 로그 보존 — 를 구체적인 설계 결정으로 추적한다.
+gRPC 도입의 핵심은 성능이 아니라 **운영 가능성(operability)**이다. 보이고, 추적되고, 안전하게 전환할 수 있어야 성능 이점이 비로소 의미를 갖는다.

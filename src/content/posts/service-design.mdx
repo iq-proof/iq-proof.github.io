@@ -1,0 +1,101 @@
+---
+title: "gRPC를 제대로 쓴다는 것의 의미"
+description: "proto 설계 원칙부터 에러 처리, 메타데이터, Deadline 전파, 로드밸런싱, Schema Registry까지 — gRPC 시스템이 실제로 무너지는 지점을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [grpc, protobuf, http2, distributed-systems, buf]
+difficulty: intermediate
+series:
+  slug: grpc-deep-dive
+  title: Grpc Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+gRPC는 "그냥 HTTP/2 위의 RPC"가 아니다. 서비스 명명 규칙, 에러 코드 선택, Deadline 전파, 로드밸런서 선택, Schema 버전 관리 — 각 결정이 수백 ms 지연이나 프로덕션 장애로 이어진다. 왜 이렇게 많은 결정이 필요한가? 그리고 어디서 가장 자주 틀리는가?
+
+## proto 파일은 계약이다
+
+gRPC를 처음 쓰는 팀이 가장 먼저 저지르는 실수는 proto를 "그냥 스키마 파일"로 취급하는 것이다. proto 파일은 클라이언트와 서버 사이의 계약이다. 계약이 깨지면 클라이언트는 런타임에 조용히 죽는다.
+
+Google이 제안하는 명명 규칙은 이 계약의 가독성을 지키기 위한 최소 기준이다. Service는 `CamelCase`, 메서드는 `CamelCase`, 메시지 필드는 `snake_case`, Enum 값은 `UPPER_SNAKE`. 이 규칙을 따르면 protoc가 각 언어의 관례에 맞게 자동 변환한다 — Java는 `getUserId()`, Python은 `user.user_id`, Go는 `user.UserId`. 규칙을 어기면 변환이 예측 불가능해진다.
+
+모든 RPC에 전용 `Request`/`Response` 메시지를 만드는 것도 같은 이유다. `rpc GetUser(string)` 대신 `rpc GetUser(GetUserRequest)`를 쓰면, 1년 후 `include_deleted: bool` 필드 하나를 추가할 때 기존 클라이언트를 손대지 않아도 된다. 첫날의 사소한 결정이 API의 진화 경로를 결정한다.
+
+## 에러 코드는 클라이언트의 재시도 정책이다
+
+gRPC는 13가지 Status Code를 정의한다. 이 코드들이 중요한 이유는 단순히 "에러를 표현"해서가 아니다 — 클라이언트가 재시도를 해야 하는지 말아야 하는지를 결정하는 신호이기 때문이다.
+
+`INVALID_ARGUMENT`(코드 3)는 재시도해도 의미 없다. 입력이 잘못된 것이니까. `UNAVAILABLE`(코드 14)은 재시도할 수 있다. 서비스가 일시적으로 내려간 것이니까. `INTERNAL`(코드 13)은 재시도하면 안 된다. 서버 버그이므로 똑같이 실패할 것이다.
+
+`google.rpc.Status`의 `details` 필드는 이 신호를 더 정교하게 만든다. `RetryInfo`를 담으면 클라이언트는 몇 초 후 재시도해야 하는지 정확히 안다. `BadRequest.FieldViolation`을 담으면 어느 필드가 왜 틀렸는지 구조화된 형태로 전달된다.
+
+<Callout type="warning" title="보안: 에러 메시지의 두 얼굴">
+클라이언트에게 보내는 에러 메시지와 로그에 기록하는 에러 메시지는 달라야 한다. DB 연결 문자열, 내부 호스트명, 스택 트레이스 — 전부 로그에만 남겨라. 클라이언트에게는 `"Internal server error"` 한 줄이면 충분하다.
+</Callout>
+
+## 메타데이터는 HTTP/2 헤더다
+
+gRPC 메타데이터는 HTTP/2 `HEADERS` 프레임에 실려 전송되는 key-value 쌍이다. 인증 토큰, 요청 ID, Trace ID — 이런 횡단 관심사(cross-cutting concern)는 메시지 필드가 아닌 메타데이터로 전달해야 한다.
+
+왜 분리하는가? 첫째, HTTP/2는 헤더 압축(HPACK)을 제공하므로 반복되는 메타데이터는 네트워크 비용이 거의 없다. 둘째, `ServerInterceptor` 하나로 모든 RPC에서 자동으로 처리할 수 있다 — 매 메서드마다 토큰 파싱 코드를 반복하지 않아도 된다.
+
+분산 추적에서 메타데이터의 역할은 특히 중요하다. A → B → C 체인에서 `x-trace-id`를 메타데이터로 자동 전파하면, 세 서비스의 로그를 하나의 trace ID로 묶어 조회할 수 있다. 구현하지 않으면 마이크로서비스 장애의 원인을 찾는 데 수 시간이 걸린다.
+
+## Deadline은 전파된다
+
+Deadline과 Timeout의 차이를 먼저 잡자. Timeout은 "지금부터 N초"라는 상대적 기간이고, Deadline은 "T 시각까지"라는 절대 시점이다. gRPC의 `withDeadlineAfter(5, SECONDS)`는 Deadline을 설정하는 것이고, 이 Deadline은 HTTP/2 `grpc-timeout` 헤더로 변환되어 downstream 호출에 자동으로 전파된다.
+
+A가 5초 Deadline을 설정하고 B를 호출하면, B는 `Context.current().getDeadline()`으로 남은 시간을 알 수 있다 — 네트워크 왕복에 소요된 100ms가 이미 차감된 상태로. B가 다시 C를 호출하면 C에는 더 차감된 값이 전달된다. 클라이언트가 처음 설정한 Deadline 하나가 전체 체인의 타임아웃 예산이 되는 것이다.
+
+<Callout type="note" title="트레이드오프: Deadline 길이">
+너무 짧은 Deadline(1초)은 정상 요청도 타임아웃시킨다. 너무 긴 Deadline(30초)은 느린 서비스가 전체 스레드 풀을 점유하도록 방치한다. API 복잡도에 따라 차등 설정이 필요하다 — 단순 조회는 1-2초, 복합 DB 쿼리는 3-5초, 배치 작업은 30초 이상.
+</Callout>
+
+서버 측에서는 오래 걸리는 작업 중간에 `deadline.isExpired()`를 주기적으로 확인해야 한다. Deadline이 만료되었는데 서버가 계속 계산하고 있으면, 클라이언트는 이미 포기했는데 서버만 CPU와 메모리를 낭비하는 상황이 된다.
+
+## L4 로드밸런서는 gRPC에 통하지 않는다
+
+HTTP/2는 하나의 TCP 연결 위에서 여러 스트림을 멀티플렉싱한다. AWS NLB 같은 L4(TCP) 로드밸런서는 연결 수준에서만 분산을 결정하므로, 첫 연결이 서버 A에 할당되면 그 클라이언트의 모든 요청이 서버 A로만 간다. 서버를 3개 배포해도 실제로는 1개만 부하를 받는다.
+
+해결책은 두 가지다. 첫째, **L7 로드밸런서(Envoy)**를 쓰면 HTTP/2 스트림 단위로 분산할 수 있다. 클라이언트는 Envoy와 단일 연결을 유지하고, Envoy가 각 RPC를 다른 백엔드로 라우팅한다. 둘째, **클라이언트 사이드 로드밸런싱** — Kubernetes headless service와 DNS를 사용하면 클라이언트가 여러 Pod IP를 직접 발견하고 `round_robin` 정책으로 분산할 수 있다. 프록시가 없으므로 지연이 가장 낮다.
+
+```java
+ManagedChannel channel = ManagedChannelBuilder
+    .forTarget("dns:///order-service.default.svc.cluster.local")
+    .usePlaintext()
+    .defaultLoadBalancingPolicy("round_robin")
+    .build();
+```
+
+## buf는 계약 파기를 배포 전에 잡는다
+
+팀 A가 `User` 메시지에서 `age` 필드(번호 3)를 삭제하고 배포하면, 팀 B의 클라이언트는 런타임에 조용히 망가진다. 컴파일 에러가 없으므로 CI를 통과한다.
+
+`buf`는 이 문제를 배포 전에 잡는다. `buf lint`는 명명 규칙을 자동으로 검사하고, `buf breaking --against-input HEAD~1`은 이전 커밋과 비교해 `FIELD_NO_DELETE` 같은 하위 호환성 위반을 감지한다.
+
+```bash
+$ buf breaking protos/ --against-input HEAD~1
+# protos/user.proto:3:1: field "age" on message "User" was deleted
+# Failure: FIELD_NO_DELETE
+```
+
+필드를 삭제해야 한다면 `reserved 3;`으로 번호를 예약해두면 된다 — 나중에 같은 번호를 다른 타입으로 재사용하는 사고를 막기 위해.
+
+<Aside label="설계 철학">
+gRPC의 모든 설계 결정은 하나의 명제로 수렴한다 — "변경은 항상 호환성을 깨지 않아야 한다". proto의 필드 번호 예약, 전용 Request/Response 메시지, Deadline 전파, buf의 breaking change 검사 — 전부 이 명제의 다른 표현이다.
+</Aside>
+
+## 정리
+
+- proto 파일은 API 계약이다. 명명 규칙과 전용 Request/Response 패턴은 미래의 확장 경로를 열어둔다.
+- gRPC Status Code는 단순 에러 표현이 아니라 클라이언트의 재시도 정책 신호다. `UNAVAILABLE`은 재시도, `INTERNAL`은 재시도 금지.
+- Deadline은 자동으로 전파된다. 클라이언트 하나의 설정이 A→B→C 체인 전체의 타임아웃 예산이 된다.
+- L4 로드밸런서는 HTTP/2 멀티플렉싱과 충돌한다. Envoy(L7)나 클라이언트 사이드 로드밸런싱으로 해결해야 한다.
+- `buf breaking`을 CI에 넣으면 하위 호환성 위반을 배포 전에 잡을 수 있다.
+
+다음 글에서는 gRPC 스트리밍 패턴 — Server Streaming, Client Streaming, Bidirectional Streaming 각각이 실제로 어떤 문제를 해결하고 어떤 함정을 갖는지 추적한다.

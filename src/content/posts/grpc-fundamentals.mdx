@@ -1,0 +1,112 @@
+---
+title: "gRPC는 왜 REST보다 마이크로서비스에 맞는가"
+description: "JSON 직렬화 비용과 HTTP/1.1 연결 오버헤드부터 HTTP/2 멀티플렉싱, 4가지 통신 패턴, 생태계 조합까지 — gRPC의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [grpc, protobuf, http2, microservices, rest]
+difficulty: intermediate
+series:
+  slug: grpc-deep-dive
+  title: Grpc Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+REST는 단순하고 강력하다. 그런데 서비스가 10개, 20개로 늘어나면 서비스 간 통신의 비용이 서서히 드러난다. Breaking Change가 프로덕션에서 터지거나, 응답 시간이 누적 지연으로 올라가거나, 실시간 데이터를 위해 Polling을 돌리다 서버 부하가 쌓인다. gRPC는 이 문제들을 어떤 설계 결정으로 해결하는가?
+
+## REST가 MSA에서 보이는 한계
+
+REST의 계약은 느슨하다. URL과 메서드, 그리고 "문서 참고"로 이루어진 계약은 컴파일러가 검증하지 않는다. 상품 서비스가 `price` 필드를 `priceKrw`로 바꾸는 순간, 주문·결제·배송 서비스가 모두 `null`을 받는다. 계약서가 없었기 때문이다.
+
+연결 비용도 누적된다. HTTP/1.1은 기본적으로 요청마다 TCP 연결을 수립한다. TLS 핸드쉐이크까지 포함하면 연결 하나당 1~2ms, 초당 1,000 요청이면 연결 비용만 최대 2,000ms가 누적된다. Keep-Alive로 재사용할 수 있지만 프록시와 로드밸런서를 거치면 타임아웃이 짧아진다.
+
+JSON 직렬화 비용도 있다. 필드 이름이 데이터에 포함되고, Reflection으로 필드를 런타임에 읽는다. 같은 데이터를 Protobuf로 인코딩하면 크기는 50% 이상 줄고, 직렬화 속도는 3~5배 빠르다.
+
+## .proto — 코드가 곧 계약이다
+
+gRPC는 `.proto` 파일로 계약을 코드에 고정한다.
+
+```protobuf
+service ProductService {
+  rpc GetProduct(GetProductRequest) returns (GetProductResponse);
+}
+
+message GetProductRequest {
+  string product_id = 1;
+}
+
+message GetProductResponse {
+  string product_id = 1;
+  string name       = 2;
+  int64  price_krw  = 3;
+}
+```
+
+`protoc`이 이 파일로부터 클라이언트 Stub과 서버 ImplBase를 생성한다. 필드 이름은 바꿀 수 있어도 필드 번호(1, 2, 3)는 바꾸면 컴파일 오류 또는 `buf breaking` CI 차단이 발생한다. Breaking Change가 런타임이 아니라 빌드 타임에 잡힌다.
+
+Protobuf의 TLV(Tag-Length-Value) 인코딩은 필드 이름 대신 번호를 전선에 싣는다. `product_id = "prod-1"`은 JSON에서 17바이트지만 Protobuf에서는 8바이트다. 키가 값보다 큰 JSON의 구조적 낭비가 사라진다.
+
+## HTTP/2 멀티플렉싱 — 연결 하나에 스트림 N개
+
+gRPC가 HTTP/2를 선택한 핵심 이유는 **멀티플렉싱**이다.
+
+HTTP/1.1은 연결 하나에서 요청을 직렬로 처리한다. 느린 요청 A가 끝나야 빠른 요청 B가 응답을 받는다. 이것이 Head-of-Line Blocking이다. 브라우저는 이를 우회하려 도메인당 6개 TCP 연결을 맺지만, 서버 입장에서는 연결 폭발이다.
+
+HTTP/2는 단일 TCP 연결 위에 여러 스트림을 논리적으로 분리한다. 스트림 1(GetProduct), 스트림 3(ListProducts), 스트림 5(CreateOrder)가 동시에 진행된다. 스트림 5가 먼저 끝나면 스트림 1을 기다리지 않고 즉시 응답을 받는다.
+
+```
+TCP 연결 1개:
+  ├── Stream 1  → GetProduct    ← 응답 10ms
+  ├── Stream 3  → ListProducts  ← 응답 100ms (스트리밍)
+  └── Stream 5  → CreateOrder   ← 응답 5ms ← 먼저 완료
+```
+
+gRPC Channel은 이 HTTP/2 연결을 관리하는 객체다. **Channel은 비싸고, Stub은 싸다.** Channel은 애플리케이션 생명주기 동안 싱글톤으로 유지하고, Stub은 Channel 위의 경량 래퍼로 재사용한다. 매 요청마다 Channel을 생성하면 HTTP/2의 연결 재사용 이점이 완전히 사라진다.
+
+<Callout type="warning" title="가장 흔한 gRPC 실수">
+`ManagedChannel`을 매 요청마다 생성하면 TCP + TLS 핸드쉐이크 비용이 매 요청에 발생한다. gRPC를 쓰면서 HTTP/1.1보다 느린 결과가 나오는 원인의 대부분이 여기에 있다. Channel은 `@Bean` 싱글톤으로, Stub은 그 위에 재사용 래퍼로 구성해야 한다.
+</Callout>
+
+## 4가지 통신 패턴 — 상황에 맞는 선택
+
+gRPC는 HTTP/2 스트림을 기반으로 4가지 통신 패턴을 제공한다.
+
+**Unary** — 요청 1개, 응답 1개. REST와 동일한 사고방식으로 쓸 수 있다. 대부분의 CRUD 작업에 적합하다.
+
+**Server Streaming** — 요청 1개, 응답 N개. 서버가 이벤트가 발생할 때마다 클라이언트에 즉시 푸시한다. 1초마다 Polling하던 주문 상태 조회를 Server Streaming으로 바꾸면, 변경이 없는 동안 네트워크 트래픽이 0이 되고 변경 감지 지연은 수 ms로 줄어든다.
+
+**Client Streaming** — 요청 N개, 응답 1개. 100MB 파일을 Unary로 한 번에 보내면 gRPC 기본 4MB 제한을 초과한다. Client Streaming으로 1MB 청크를 100번 나눠 보내면 메모리 스파이크 없이 전송할 수 있다.
+
+**Bidirectional Streaming** — 요청 N개, 응답 N개. 채팅이나 게임 상태 동기화처럼 양방향 실시간 통신이 필요한 경우, 서비스 간 내부 통신에서 WebSocket의 역할을 대체한다.
+
+<Aside label="패턴 선택 기준">
+"Polling을 아직 쓰고 있다" → Server Streaming 검토. "파일 업로드가 4MB 제한에 걸린다" → Client Streaming. "두 개의 연결로 채팅을 구현했다" → Bidirectional Streaming.
+</Aside>
+
+## 트레이드오프
+
+gRPC가 치르는 비용은 명확하다.
+
+**브라우저 직접 호출 불가.** gRPC는 HTTP/2 Trailer 헤더를 사용하는데, 브라우저의 Fetch API는 Trailer에 접근할 수 없다. gRPC-Web + Envoy Proxy를 통해 우회할 수 있지만 운영 복잡도가 추가된다.
+
+**디버깅 불편.** `curl`로 바로 확인하던 REST와 달리 Protobuf 바이너리는 `grpcurl`이나 별도 도구가 필요하다. gRPC Reflection을 개발 환경에서 활성화하면 `grpcurl`로 proto 파일 없이 서비스를 탐색할 수 있지만, 프로덕션에서는 서비스 구조가 외부에 노출되므로 반드시 비활성화해야 한다.
+
+**학습 곡선.** `.proto` 문법, `protoc` 빌드 설정, Channel/Stub 생명주기, 4가지 통신 패턴 — REST보다 진입 장벽이 높다.
+
+<Callout type="note" title="gRPC vs REST 선택 기준">
+gRPC가 유리한 경우: 서비스 간 내부 통신, 고빈도/대용량 호출, 실시간 스트리밍, 다언어 팀.
+REST가 유리한 경우: 외부 공개 API, 브라우저/모바일 직접 호출, 단순 CRUD, 초기 개발 단계.
+둘 다 필요하다면 내부 gRPC + gRPC-Gateway로 외부 REST 노출이 가장 실용적인 조합이다.
+</Callout>
+
+## 정리
+
+- REST의 MSA 한계는 느슨한 계약(런타임 Breaking Change), JSON 직렬화 비용, HTTP/1.1 연결 오버헤드, 스트리밍 부재다.
+- gRPC는 `.proto` 파일로 계약을 빌드 타임에 강제하고, Protobuf로 직렬화 비용을 줄이며, HTTP/2로 연결을 재사용한다.
+- Channel은 싱글톤, Stub은 경량 래퍼다. 이 관계를 모르면 gRPC 도입 효과가 사라진다.
+- 4가지 패턴(Unary, Server/Client/Bidirectional Streaming)은 HTTP/2 스트림의 각기 다른 활용이다. 패턴을 잘못 선택하면 Polling을 없애려다 더 복잡한 코드가 된다.
+- 브라우저 지원이 필요하면 gRPC-Web + Envoy, 외부 REST가 필요하면 gRPC-Gateway — 내부는 gRPC, 외부는 상황에 맞게 변환하는 아키텍처가 현실적이다.
