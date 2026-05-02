@@ -1,0 +1,113 @@
+---
+title: "마이그레이션 버전 충돌은 왜 배포 직전까지 보이지 않는가"
+description: "두 개발자가 동시에 같은 버전 번호를 생성하는 순간부터 MSA의 Database per Service 분리까지, DB 마이그레이션 전략의 핵심 결정들을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [flyway, db-migration, multi-module, msa, schema-management]
+difficulty: intermediate
+series:
+  slug: db-migration-deep-dive
+  title: Db Migration Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+두 개발자가 각자 `V3__Add_users_table.sql`과 `V3__Add_orders_table.sql`을 작성해 main에 머지한다. Git은 아무 충돌도 잡지 못한다. 파일이 다르기 때문이다. 그러나 배포 파이프라인에서 Flyway가 폭발한다. 이 문제는 버그가 아니라 **버전 관리 설계의 공백**에서 비롯된다. 그리고 이 공백은 멀티 모듈, MSA로 갈수록 훨씬 복잡한 형태로 반복된다.
+
+## 버전 충돌의 구조
+
+Flyway는 `flyway_schema_history` 테이블에서 버전 번호로 중복을 감지한다. Git 수준에서는 파일명이 다르면 머지 충돌이 없다. 즉, **문제는 런타임에야 드러난다**. 배포 파이프라인 후반에서 발견하는 비용은 개발 단계에서 발견하는 것보다 수십 배 크다.
+
+근본 해결은 버전 번호를 자동으로 유일하게 만드는 것이다. 타임스탬프를 접미사로 붙이면 된다.
+
+```
+# ❌ 충돌 가능
+V3__Add_users_table.sql
+V3__Add_orders_table.sql
+
+# ✅ 자동 정렬
+V3__20240415_143000__Add_users_table.sql
+V3__20240415_144530__Add_orders_table.sql
+```
+
+Flyway는 버전 문자열을 사전순으로 비교한다. `143000 < 144530`이므로 실행 순서가 자동으로 결정된다. 충돌이 zero가 되고, `out-of-order: false` 설정을 유지하면서도 여러 개발자가 동시에 같은 major 버전을 사용할 수 있다.
+
+<Callout type="warning" title="out-of-order: true는 최후의 수단">
+이 옵션을 켜면 충돌은 무시되지만 실행 순서가 예측 불가능해진다. 외래 키 의존성이 있는 마이그레이션에서는 데이터 손상으로 이어질 수 있다. 타임스탬프 기반 이름이 근본 해결책이다.
+</Callout>
+
+## 브랜치 수명과 스키마 드리프트
+
+버전 충돌보다 더 은밀한 문제가 장기 브랜치에서 발생한다. 개발자가 2월에 `feature/user-management`를 생성해 `V6__Add_users_table.sql`을 작성한다. 3개월 후 PR을 열면 main은 이미 V15까지 진행됐고, `users` 테이블 스키마는 6번 바뀌어 있다. `V6`에서 예상하는 테이블 구조와 현재 프로덕션 구조가 불일치한다. 이 브랜치를 머지하는 순간 마이그레이션이 실패하거나, 더 나쁘게는 잘못된 스키마 상태로 조용히 진행된다.
+
+규칙은 단순하다. **브랜치 수명은 최대 1주일, PR 머지 전 반드시 `git rebase origin/main`**. 그리고 마이그레이션 포함 PR은 Squash Merge 금지다. Squash하면 파일은 남지만 `migration:` 커밋 메시지가 사라져 CI/CD가 마이그레이션 실행 여부를 추적하지 못한다.
+
+```bash
+# PR 머지 직전 체크
+git fetch origin
+git rebase origin/main
+mvn flyway:validate
+mvn flyway:info
+```
+
+## 코드 리뷰의 안전망
+
+마이그레이션은 일단 프로덕션에 적용되면 되돌리기 어렵다. 코드 리뷰가 실질적으로 마지막 방어선이다. 리뷰어가 반드시 잡아야 할 패턴이 있다.
+
+**DDL Lock**: `ALTER TABLE users ADD COLUMN status VARCHAR(50) NOT NULL`은 MySQL에서 전체 테이블 복사를 유발한다. 10억 건이면 5~10분간 `users` 테이블이 완전히 잠긴다. `ALGORITHM=INSTANT`(MySQL 8.0.12+)와 `DEFAULT` 값을 함께 붙이면 메타데이터만 변경해 즉시 완료된다.
+
+**배치 처리 없는 대량 UPDATE**: `UPDATE users SET status = 'ACTIVE' WHERE created_at < '2024-01-01'`은 단일 쿼리로 수억 건을 메모리에 올리려다 OOM으로 마이그레이션이 실패한다. LIMIT으로 쪼개거나, DDL만 마이그레이션에 두고 데이터 채우기는 애플리케이션 배치로 분리해야 한다.
+
+**하위 호환성**: `DROP COLUMN phone_number`가 포함된 마이그레이션이 배포되면, 그 순간부터 이전 버전 앱이 `phone_number`를 읽으려다 에러가 난다. 롤링 배포 환경에서는 두 버전이 동시에 실행된다는 것을 항상 전제해야 한다.
+
+<Callout type="note" title="트레이드오프: 자동화 vs 수동 리뷰">
+sqlfluff + 커스텀 검사 스크립트로 DDL Lock 패턴, 배치 없는 UPDATE, 중복 인덱스를 자동 감지할 수 있다. 하지만 자동화의 감지율은 60~70%다. 나머지 30%는 비즈니스 컨텍스트를 아는 사람의 수동 리뷰가 필요하다. 둘을 조합할 때 감지율이 95%에 수렴한다.
+</Callout>
+
+## 멀티 모듈에서의 버전 조율
+
+`user-service`, `order-service`, `payment-service`가 같은 DB를 공유하면서 각자 `V1`, `V2`, `V3`을 정의하면, 첫 배포에서 `V1` 충돌이 세 개가 발생한다. 중앙화 마이그레이션 모듈로 모으면 충돌은 해결되지만 모듈 간 결합이 생긴다.
+
+타임스탬프 기반 버전을 모듈별로 독립 관리하는 것이 균형점이다.
+
+```
+V1__20240101_100000__Create_users.sql        (user-service)
+V1__20240102_100000__Create_orders.sql       (order-service)
+V1__20240103_100000__Create_payments.sql     (payment-service)
+V2__20240415_143000__Add_user_roles.sql      (user-service)
+V2__20240415_144000__Add_order_status.sql    (order-service)
+```
+
+Flyway는 클래스패스를 스캔해 버전 문자열로 정렬한 후 실행한다. 파일이 어느 모듈에서 왔는지 관계없다. 타임스탬프가 실행 순서를 결정하기 때문에 배포 순서가 자유로워진다.
+
+외래 키 의존성이 있을 때는 타임스탬프 순서로 의존성을 표현하면 된다. `order-service`의 `V2`가 `users`를 참조해야 한다면, 타임스탬프를 `user-service`의 `V1`보다 이후로 설정한다. Flyway가 자동으로 `users` 생성 후 `orders`에 FK를 추가하는 순서로 실행한다.
+
+<Aside label="테이블 소유권">
+멀티 모듈에서 스키마 혼란의 핵심은 "누가 이 테이블을 소유하는가"다. 각 테이블은 정확히 하나의 모듈이 생성하고 수정해야 한다. `order-service`가 `users` 테이블을 수정하는 마이그레이션을 작성하는 순간, 추적이 불가능해지기 시작한다.
+</Aside>
+
+## MSA로의 전환
+
+Database per Service는 MSA의 핵심 원칙이지만, 공유 DB에서 분리하는 과정이 가장 위험하다. 한 번에 자르면 반드시 데이터 손실이나 서비스 중단이 발생한다. 5단계 점진적 전환이 안전한 경로다.
+
+준비(새 DB 생성 + 데이터 복제) → 이중 쓰기(Trigger 또는 앱 레벨 동시 저장) → 읽기 전환(새 DB에서 읽기 시작) → 쓰기 전환(공유 DB 쓰기 중단) → 정리(공유 DB에서 테이블 삭제).
+
+분리 후 서비스 간 JOIN은 불가능해진다. 두 가지 패턴이 있다. **API 호출**은 강한 일관성을 제공하지만 latency가 늘어난다. **데이터 복제**는 `orders` 테이블에 `user_name`을 함께 저장해두고 이벤트로 동기화하는 방식이다. 조회가 빠르고 `user-service`가 다운되어도 `order-service`는 동작한다. 대신 일시적 불일치를 수용해야 한다.
+
+<Callout type="note" title="트레이드오프: 강한 일관성 vs 가용성">
+금융 트랜잭션처럼 즉시 일관성이 필요한 경우에는 API 호출 + Saga 패턴으로 분산 트랜잭션을 조율한다. 전자상거래 주문 이력 같은 경우에는 이벤트 기반 최종 일관성으로 충분하며 성능이 훨씬 좋다. 시스템 전체를 같은 기준으로 맞추려 하면 모든 서비스가 가장 엄격한 요구사항의 비용을 지불하게 된다.
+</Callout>
+
+## 정리
+
+- 버전 충돌은 Git이 아니라 Flyway 실행 시점에 드러난다. 타임스탬프 기반 파일명이 유일한 예방책이다.
+- 장기 브랜치는 스키마 드리프트를 만든다. 1주일 이내 브랜치 + PR 전 rebase가 원칙이다.
+- 코드 리뷰에서 DDL Lock, 배치 없는 대량 UPDATE, 하위 호환성을 반드시 검토해야 한다. 자동화와 수동 리뷰의 조합이 95% 감지율을 달성한다.
+- 멀티 모듈에서는 테이블 소유권을 명확히 하고, 타임스탬프로 모듈 간 실행 순서를 표현한다.
+- MSA 분리는 5단계 점진적 전환으로만 안전하게 할 수 있다. 서비스 간 데이터 통합은 API 호출과 이벤트 복제 중 일관성 요구사항에 따라 선택한다.
+
+마이그레이션의 모든 문제는 결국 "변경이 언제 어디서 실행되는가"와 "누가 무엇을 소유하는가"라는 두 질문으로 수렴한다.

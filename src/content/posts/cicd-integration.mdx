@@ -1,0 +1,119 @@
+---
+title: "DB 마이그레이션은 배포 파이프라인의 어디에 있어야 하는가"
+description: "마이그레이션 타이밍 결정부터 Kubernetes Job 분리, GitHub Actions 승인 게이트, Flyway 감사 이력 추적까지 — 배포 전략과 스키마 변경의 교차점을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [db-migration, flyway, kubernetes, github-actions, zero-downtime]
+difficulty: intermediate
+series:
+  slug: db-migration-deep-dive
+  title: Db Migration Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+DB 마이그레이션은 코드 배포보다 훨씬 위험하다. 코드는 롤백하면 되지만, 스키마 변경은 이미 존재하는 데이터와 얽혀 있다. 그렇다면 마이그레이션은 배포 파이프라인의 정확히 어느 시점에 실행되어야 하는가?
+
+## 타이밍이 전략이다
+
+가장 흔한 선택지는 두 가지다. 애플리케이션이 시작할 때 자동으로 실행하거나, 배포와 완전히 분리된 Job으로 실행하거나.
+
+"앱 시작 시 자동"의 대표 구현은 Spring Boot + Flyway의 기본 설정이다. `spring.flyway.enabled: true`만 있으면 애플리케이션이 뜨면서 미적용 마이그레이션을 자동으로 실행한다. 편리하지만 Pod이 10개 동시에 시작되면 9개가 Flyway Lock 대기에 걸린다. Flyway는 `flyway_schema_history`에 Lock 레코드를 삽입해 동시 실행을 막는데, 많은 인스턴스가 동시에 시작되면 대부분 Lock 타임아웃으로 `CrashLoopBackOff` 상태에 빠진다.
+
+"Job 분리"는 파이프라인을 두 단계로 나눈다. 먼저 마이그레이션 Job을 완료하고, 그다음 Deployment를 시작한다. Lock 경합이 사라지고, 마이그레이션 실패가 앱 배포를 차단하는 명확한 실패 격리가 생긴다.
+
+<Callout type="note" title="트레이드오프">
+앱 시작 시 자동 마이그레이션은 파이프라인이 단순하지만 인스턴스 수가 늘수록 Lock 경합이 커진다. Job 분리는 확장성과 실패 격리를 얻는 대신 파이프라인 복잡도가 증가한다. 초기 단일 인스턴스 환경이라면 자동으로 시작해도 무방하지만, 다중 인스턴스 또는 Blue-Green 배포로 전환하는 시점에 Job 분리로 이전해야 한다.
+</Callout>
+
+## Blue-Green 배포에서 스키마의 위치
+
+Blue-Green 배포에서 마이그레이션 타이밍을 잘못 잡으면 구버전 앱이 신스키마를 만나 에러를 낸다. 올바른 순서는 다음과 같다.
+
+```
+T0: Blue (앱 v1.0) + Schema V1 — 100% 트래픽
+T1: 마이그레이션 실행 (Schema V1 → V2, 하위 호환)
+    Blue (v1.0)가 새 스키마에서도 작동해야 함
+T2: Green (앱 v2.0) 배포 — 새 스키마 활용
+T3: 트래픽 50/50 전환 — Blue와 Green 모두 V2 이해
+T4: 100% Green, Blue 제거
+```
+
+핵심은 **마이그레이션이 Green 배포 전에** 실행되어야 하며, 구 앱이 새 스키마에서도 작동해야 한다는 것이다. 이것이 스키마 하위 호환성의 요구사항이다.
+
+```sql
+-- 안전: 기본값이 있는 컬럼 추가
+ALTER TABLE users ADD COLUMN status VARCHAR(50) DEFAULT 'ACTIVE';
+-- 구 앱은 status를 무시하고 계속 작동
+
+-- 위험: 컬럼 이름 변경
+ALTER TABLE users RENAME COLUMN email TO user_email;
+-- 구 앱의 SELECT email FROM users가 즉시 실패
+```
+
+## GitHub Actions로 환경별 게이트 만들기
+
+마이그레이션 파이프라인에서 가장 중요한 설계 결정은 "어느 환경까지 자동화하고, 어디서 수동 승인을 요구할 것인가"다.
+
+권장 구조는 `validate → test → dev 자동 → staging 자동 → prod 수동 승인`이다. `on: push: paths: db/migrations/**`로 마이그레이션 파일 변경 시에만 워크플로를 트리거하고, prod Job에는 `environment: production`을 선언해 GitHub의 `required_reviewers` 게이트를 활성화한다.
+
+```yaml
+deploy-prod:
+  needs: test
+  environment:
+    name: production   # 필수 검토자 2명 승인 대기
+  steps:
+    - name: Final validate
+      run: flyway -url="${{ secrets.PROD_DB_URL }}" validate
+    - name: Migrate
+      run: flyway -url="${{ secrets.PROD_DB_URL }}" migrate
+```
+
+프로덕션에 `flyway validate`를 항상 먼저 실행한다. Validate는 로컬 파일과 `flyway_schema_history`의 MD5 checksum을 비교해 이미 적용된 마이그레이션 파일이 수정되었는지 감지한다. 1초도 걸리지 않으면서 가장 위험한 실수를 사전에 잡는다.
+
+## Kubernetes에서 마이그레이션 패턴 세 가지
+
+Kubernetes 환경에서는 세 가지 패턴이 실용적으로 사용된다.
+
+**Init Container**: Deployment의 `initContainers`에 Flyway를 넣는다. Init Container가 성공해야만 앱 컨테이너가 시작되므로, 마이그레이션 실패가 자동으로 앱 시작을 차단한다. 설정이 단순하지만, 마이그레이션 시간이 길면 Pod 시작 전체가 지연된다.
+
+**Job 분리**: `kubectl wait --for=condition=complete job/db-migration`으로 Job 완료를 확인한 후 Deployment를 적용한다. Lock 경합 없이 여러 인스턴스를 동시에 시작할 수 있다.
+
+**Helm Hook**: `annotations: helm.sh/hook: pre-upgrade`로 선언하면 Helm이 Deployment 업데이트 전에 마이그레이션 Job을 자동으로 실행하고 완료를 기다린다. 순서 보장이 자동화된다.
+
+<Aside label="멱등성">
+어떤 패턴을 써도 Flyway의 `flyway_schema_history` 테이블이 멱등성을 보장한다. Pod이 재시작되어 Init Container가 다시 실행되어도, 이미 적용된 마이그레이션은 건너뛰고 미적용된 것만 실행한다.
+</Aside>
+
+## 감사 이력은 기술 문제가 아니다
+
+`flyway_schema_history`는 단순한 마이그레이션 추적 테이블이 아니다. PCI-DSS, SOC2, HIPAA 같은 규제에서 DB 스키마 변경 이력 보존을 명시적으로 요구한다.
+
+`installed_by` 필드는 마이그레이션을 실행한 DB 사용자명이다. 환경별로 다른 DB 사용자를 사용하면 이 필드로 어느 환경에서 배포가 이루어졌는지 구분할 수 있다.
+
+```sql
+-- 환경별 배포 현황
+SELECT
+  installed_by   AS environment,
+  MAX(version)   AS latest_version,
+  MAX(installed_on) AS last_deployment
+FROM flyway_schema_history
+GROUP BY installed_by;
+```
+
+Git 커밋 이력과 Flyway 이력을 조합하면 "누가 작성하고(Git author), 언제 프로덕션에 배포했는지(installed_on)"를 연결할 수 있다. 이 두 이력의 결합이 규제 감사에서 요구하는 완전한 추적성이다.
+
+`flyway_schema_history`는 절대 삭제하면 안 된다. DELETE 권한을 마이그레이션 사용자에서 제거하고, DBA만 SELECT할 수 있도록 권한을 설정해야 한다.
+
+## 정리
+
+- 마이그레이션 타이밍은 배포 전략과 분리할 수 없다. 다중 인스턴스 환경에서는 Job 분리가 필수다.
+- Blue-Green과 롤링 배포 모두에서 스키마 하위 호환성이 먼저다. 컬럼 이름 변경은 가장 위험한 마이그레이션이다.
+- `flyway validate`는 비용이 없다. 모든 배포 전에 항상 실행하라.
+- `flyway_schema_history`는 기술 이력이자 규제 증거다. 보존 정책과 접근 권한을 명시적으로 설계해야 한다.
+
+DB 마이그레이션을 배포 파이프라인의 부속물로 보는 순간, 가장 예측 불가능한 장애의 씨앗이 심어진다.

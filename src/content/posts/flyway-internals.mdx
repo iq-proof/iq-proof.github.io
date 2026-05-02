@@ -1,0 +1,137 @@
+---
+title: "Flyway는 어떻게 마이그레이션을 신뢰하는가"
+description: "flyway_schema_history의 체크섬 원리부터 동시성 Lock, 마이그레이션 유형 선택, Callback 자동화, 체크섬 불일치 해결까지 — Flyway 설계 철학의 다섯 층을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [flyway, db-migration, spring-boot, schema-history]
+difficulty: intermediate
+series:
+  slug: db-migration-deep-dive
+  title: Db Migration Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Flyway를 쓴다는 건 마이그레이션 파일 하나를 두 곳에 동시에 "기억"시킨다는 뜻이다. 하나는 파일 시스템이고, 다른 하나는 `flyway_schema_history` 테이블이다. 이 두 기억이 어긋나는 순간 Flyway는 앱 시작을 거부한다. 왜 이런 설계를 선택했고, 어디서 어긋날 수 있는가?
+
+## flyway_schema_history — 마이그레이션의 기억
+
+Flyway의 모든 신뢰는 `flyway_schema_history` 테이블에서 출발한다. 이 테이블에는 10개 컬럼이 있는데, 실질적으로 중요한 것은 세 가지다: `version`, `checksum`, `success`.
+
+Spring Boot가 시작하면 `FlywayAutoConfiguration`이 `flyway.migrate()`를 호출한다. 이 순간 Flyway는 다음 순서를 밟는다.
+
+```
+classpath:db/migration 스캔
+    ↓
+각 파일의 CRC32 체크섬 계산
+    ↓
+flyway_schema_history와 비교
+    ↓
+미적용 마이그레이션만 실행
+```
+
+테이블이 없으면 자동으로 생성한다. 있으면 기록된 체크섬과 현재 파일의 체크섬을 비교한다. 일치하면 스킵, 불일치하면 즉시 오류를 던진다. `flyway_schema_history`는 읽기 전용 원장에 가깝다 — 한 번 기록된 마이그레이션은 Flyway의 정상 경로로는 수정되지 않는다.
+
+<Callout type="warning" title="흔한 실수">
+`DELETE FROM flyway_schema_history`를 실행하면 Flyway는 모든 마이그레이션이 미적용 상태라고 판단한다. 이미 존재하는 테이블을 다시 만들려고 시도하면서 앱 시작이 실패한다.
+</Callout>
+
+## CRC32 — 파일의 지문
+
+체크섬은 `java.util.zip.CRC32`로 계산한 32비트 정수다. 파일 내용이 1비트라도 바뀌면 값이 달라진다. Java의 `int`는 부호 있는 정수이므로 결과가 음수로 나올 수 있는데, 이는 정상이다.
+
+```java
+CRC32 crc = new CRC32();
+crc.update(content.getBytes(StandardCharsets.UTF_8));
+int checksum = (int) crc.getValue(); // 음수 가능
+```
+
+문제는 "내용"의 정의가 생각보다 넓다는 점이다. 줄바꿈 방식(LF vs CRLF), BOM(Byte Order Mark), 공백과 탭 — 전부 체크섬에 영향을 준다. Windows 개발자와 Linux CI/CD 서버가 같은 파일을 다른 방식으로 저장하면, 코드는 동일해 보여도 체크섬이 다르다.
+
+```
+LF 버전:   ...0A 44 45 46...   → 체크섬: 111111
+CRLF 버전: ...0D 0A 44 45 46... → 체크섬: 222222
+```
+
+이 문제의 근본 해결책은 `.gitattributes`로 줄바꿈을 통일하는 것이다.
+
+```
+*.sql text eol=lf
+```
+
+한 줄로 팀 전체의 CRLF 문제를 막는다.
+
+## Lock — 여러 Pod이 동시에 시작할 때
+
+마이크로서비스 환경에서 Kubernetes Pod 10개가 동시에 뜨면 어떻게 되는가? Flyway는 `flyway_schema_history_lock` 테이블을 자동으로 생성하고, `SELECT ... FOR UPDATE`로 상호 배제를 구현한다.
+
+```
+Pod1: Lock 획득 → V1 실행 → Commit → Lock 해제
+Pod2: Lock 대기 중...
+Pod3: Lock 대기 중...
+Pod2: Lock 획득 → V1 이미 적용됨 확인 → 스킵
+Pod3: Lock 획득 → V1 이미 적용됨 확인 → 스킵
+```
+
+기본 재시도 횟수는 50회다. `lock-retry-count`를 너무 낮게 설정하면 GC pause처럼 일시적인 지연에도 Lock 획득에 실패해 앱 시작이 거부된다.
+
+<Aside label="설계 철학">
+Flyway의 Lock은 추가 인프라 없이 DB만으로 분산 락을 구현한다. Redis나 ZooKeeper 없이 이미 갖고 있는 DB로 충분하다는 선택이다.
+</Aside>
+
+## V, R, U — 마이그레이션의 세 가지 성격
+
+Versioned(V), Repeatable(R), Undo(U)는 서로 다른 질문에 답한다.
+
+**V 마이그레이션**은 "이 변경은 한 번만 일어난다"는 선언이다. 테이블 생성, 컬럼 추가, 인덱스 생성이 여기 속한다. 한 번 적용되면 파일 수정이 불가능하다 — 수정하면 체크섬이 달라지고 앱 시작이 거부된다.
+
+**R 마이그레이션**은 "이 내용은 항상 최신 상태여야 한다"는 선언이다. 뷰, 함수, 권한 부여가 여기 속한다. 파일을 수정하면 체크섬이 달라지고, 다음 migrate 실행 시 자동으로 재실행된다. 단, 멱등성이 필수다 — `CREATE OR REPLACE VIEW`처럼.
+
+```sql
+-- R__create_views.sql
+-- CREATE VIEW가 아니라 CREATE OR REPLACE VIEW
+CREATE OR REPLACE VIEW user_summary AS
+SELECT COUNT(*) as total FROM users;
+```
+
+실행 순서는 항상 `V1 → V2 → V3 → R__a → R__b`다. R은 모든 V가 끝난 뒤에 실행된다.
+
+**Undo(U)**는 Flyway Teams 전용이다. 커뮤니티 버전을 쓴다면 Undo 개념 자체를 포기하고 "정방향만 진행"하는 편이 낫다. 실수한 마이그레이션은 새로운 V 마이그레이션으로 역처리한다.
+
+<Callout type="note" title="트레이드오프">
+V 마이그레이션은 순서와 불변성을 보장하는 대신 수정 불가라는 제약을 수반한다. R 마이그레이션은 유연하지만 멱등성을 개발자가 직접 보장해야 한다. 뷰와 권한은 R, 스키마 변경은 V — 이 구분이 무너지면 예측 불가능한 실행이 발생한다.
+</Callout>
+
+## Callback과 체크섬 불일치 — 자동화와 방어
+
+`afterMigrate.sql`이라는 파일을 `db/migration/`에 두면, 모든 마이그레이션이 끝난 뒤 자동으로 실행된다. 권한 부여, 통계 갱신, Materialized View 새로고침을 여기 배치하면 수동 작업을 없앨 수 있다.
+
+Java Callback(`FlywayCallback` 구현체)은 Slack 알림이나 캐시 초기화처럼 외부 시스템 연동이 필요할 때 쓴다. 단, Callback은 Spring Context 초기화 전에 실행되므로 `@Autowired`로 Bean을 주입받을 수 없다. 생성자 주입만 가능하다.
+
+체크섬 불일치가 발생했을 때 `flyway repair`를 무작정 실행하는 건 위험하다. 올바른 순서는 다음과 같다.
+
+```
+원인 파악 (git diff)
+    ↓
+파일 복구 (git checkout)
+    ↓
+flyway validate 확인
+    ↓
+필요하면 flyway migrate
+```
+
+`repair`는 파일 내용과 DB 스키마가 실제로 일치한다고 확인한 뒤에만 쓴다. 모르는 상태에서 repair를 실행하면 flyway_schema_history의 체크섬만 갱신되고 실제 스키마 불일치는 남는다.
+
+## 정리
+
+- `flyway_schema_history`는 마이그레이션의 원장이다. 수동으로 건드리면 다음 실행이 망가진다.
+- CRC32 체크섬은 파일의 지문이다. CRLF, BOM, 공백 변경도 감지한다. `.gitattributes`로 줄바꿈을 통일하라.
+- Lock은 DB만으로 분산 동시성 문제를 해결한다. `lock-retry-count`는 기본값(50)을 유지하라.
+- V는 불변, R은 재실행 가능 — 이 원칙이 무너지면 예측 불가능한 마이그레이션이 발생한다.
+- `flyway repair`는 원인 파악 없이 실행하지 마라. 항상 `git diff`로 확인 먼저.
+
+다음 글에서는 DDL이 DB 내부에서 Lock을 거는 원리와, 무중단 마이그레이션을 위해 어떤 순서로 DDL을 작성해야 하는지 추적한다.

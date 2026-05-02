@@ -1,0 +1,120 @@
+---
+title: "DB 마이그레이션은 왜 되돌릴 수 없는가"
+description: "MySQL DDL의 암묵적 COMMIT부터 Forward-Only 전략, Flyway Undo의 한계, 실패 복구 절차, 백업까지 — 마이그레이션이 일방통행인 이유를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [database, migration, flyway, mysql, postgresql]
+difficulty: intermediate
+series:
+  slug: db-migration-deep-dive
+  title: Db Migration Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`BEGIN; ALTER TABLE users ADD COLUMN age INT; ROLLBACK;` — 이 코드를 실행하면 컬럼이 사라질까? MySQL에서는 사라지지 않는다. DDL은 롤백되지 않고, 그 사실이 마이그레이션의 모든 설계 결정을 강제한다. 왜 그런가, 그리고 이 제약 위에서 어떻게 안전하게 스키마를 바꾸는가?
+
+## DDL이 롤백되지 않는 이유
+
+MySQL은 DDL 실행 시 **암묵적으로 COMMIT**한다. `ALTER TABLE`, `CREATE`, `DROP`, `TRUNCATE` 같은 문장은 트랜잭션 안에 있어도 실행 즉시 커밋된다. 이후 `ROLLBACK`은 그 DDL 이후의 DML만 되돌린다.
+
+```sql
+BEGIN;
+ALTER TABLE orders ADD COLUMN shipping_address VARCHAR(255);
+-- ↑ 이 순간 자동 COMMIT. 트랜잭션 경계가 여기서 끊긴다.
+
+UPDATE orders SET shipping_address = 'Seoul' WHERE id = 1;
+-- ❌ 오류 발생
+
+ROLLBACK;
+-- UPDATE는 롤백됨. 하지만 shipping_address 컬럼은 남아 있다.
+```
+
+PostgreSQL은 다르다. DDL도 트랜잭션에 포함되며, `ROLLBACK` 시 컬럼 추가 자체가 취소된다. 이 차이는 설계 철학의 차이다 — MySQL은 DDL 속도를 위해 In-place 알고리즘과 저수준 최적화를 택했고, 그 대가로 트랜잭션 보장을 포기했다. PostgreSQL은 MVCC로 스키마까지 버전 관리해 ACID를 DDL에까지 확장했다.
+
+<Callout type="note" title="트레이드오프">
+MySQL의 DDL 암묵적 COMMIT은 버그가 아니라 성능 선택이다. 덕분에 대용량 테이블 ALTER가 빠르지만, 마이그레이션 실패 시 스키마 상태가 불명확해진다. PostgreSQL은 DDL 롤백을 지원하지만 MVCC 오버헤드가 따른다.
+</Callout>
+
+## Forward-Only — 되돌리는 대신 앞으로 간다
+
+DDL이 롤백되지 않는다면, 마이그레이션 전략은 근본부터 달라져야 한다. **Forward-Only**는 "실패해도 되돌리지 않고 다음 버전에서 고친다"는 철학이다.
+
+이 전략의 핵심 요구사항은 **하위 호환성**이다. 새 컬럼은 반드시 `NULL` 허용이거나 `DEFAULT` 값을 가져야 한다.
+
+```sql
+-- ❌ 이렇게 추가하면 V1.0 앱의 INSERT가 실패한다
+ALTER TABLE users ADD COLUMN phone VARCHAR(20) NOT NULL;
+
+-- ✅ V1.0 앱은 phone을 모르지만, NULL로 들어가므로 안전하다
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+```
+
+Blue-Green 배포 중에는 구 버전과 신 버전 앱이 같은 DB를 동시에 사용한다. 스키마가 양쪽 앱 모두와 호환되지 않으면 구 버전 앱의 INSERT가 프로덕션에서 실패한다. 실수로 추가한 컬럼은 즉시 `DROP`하지 않는다 — 1~2 버전 뒤, 모든 앱이 새 버전으로 전환된 후에 제거한다.
+
+<Aside label="설계 철학">
+Forward-Only는 "마이그레이션을 완벽하게 만들어야 한다"는 부담을 없애준다. 실수가 생기면 V{n+1}에서 고치면 된다. 대신 "각 버전이 전 버전과 호환되는가"를 항상 묻게 만든다.
+</Aside>
+
+## Flyway Undo — 개발 환경의 편의 도구
+
+Flyway Teams(유료)는 `U` 파일을 통한 Undo를 지원한다. `flyway undo`를 실행하면 마지막 성공한 마이그레이션에 대응하는 `U{n}` 파일이 실행되고, `flyway_schema_history`에서 해당 버전 레코드가 제거된다.
+
+하지만 Undo는 **완전한 롤백이 아니다**.
+
+```sql
+-- V002__add_status.sql
+ALTER TABLE orders ADD COLUMN status VARCHAR(50);
+UPDATE orders SET status = 'COMPLETED' WHERE created_at < '2024-01-01';
+-- 1000만 건 업데이트 완료
+
+-- U002__add_status.sql
+ALTER TABLE orders DROP COLUMN status;
+-- ← status 컬럼과 함께 1000만 건의 상태 정보가 사라진다
+```
+
+Undo는 개발자가 직접 작성한 역방향 SQL을 실행할 뿐이다. DML로 옮긴 데이터를 Undo가 복원해주지는 않는다. 프로덕션에서 Undo를 실행한다는 것은 앱이 이미 새 컬럼을 사용 중인 상태에서 그 컬럼을 지운다는 뜻이다 — 곧바로 런타임 오류가 따라온다.
+
+**Undo의 적절한 사용처는 로컬 개발과 스테이징이다.** `flyway undo` 후 SQL 파일을 수정해 다시 `flyway migrate`하는 빠른 반복 개발에는 유용하다. 프로덕션은 항상 Forward-Only.
+
+## 마이그레이션 실패 시 복구 절차
+
+Flyway는 마이그레이션 실패 시 `flyway_schema_history`에 `success = false` 레코드를 남긴다. 다음 `flyway migrate` 호출은 이 레코드를 보고 진행을 거부한다.
+
+복구 순서는 명확하다:
+
+1. **오류 원인 파악** — 로그와 `flyway_schema_history`의 에러 메시지 분석
+2. **현재 스키마 상태 확인** — `DESCRIBE`, `SHOW CREATE TABLE`로 어디까지 적용됐는지 확인
+3. **수동으로 DB 문제 해결** — 제약 조건 위반 데이터 정제, 또는 마이그레이션 파일 수정
+4. **`flyway repair` 실행** — `success = false` 레코드를 히스토리에서 제거
+5. **`flyway migrate` 재실행**
+
+`flyway repair`는 DB를 고치지 않는다. 히스토리 레코드만 정리한다. 3단계의 수동 작업 없이 repair만 실행하고 migrate를 다시 돌리면 같은 오류가 반복된다.
+
+MySQL의 DDL 특성으로 인해 마이그레이션이 중간에 실패하면 "일부는 커밋, 일부는 미적용"인 상태가 된다. 이 상태에서 Forward-Only로 수정하거나, 수동으로 부분 적용된 DDL을 정리한 뒤 재시도해야 한다.
+
+## 백업 — 최후의 보루
+
+DDL 롤백 불가 → Forward-Only → flyway repair — 이 모든 것이 실패했을 때 남은 선택지는 백업 복원이다. 따라서 마이그레이션 직전 백업은 선택이 아니다.
+
+백업 타이밍이 중요하다. "어제 새벽 00:00 백업"에서 복원하면 오전 내내 쌓인 주문 데이터가 사라진다. 마이그레이션 직전 5분 안에 백업을 만들어야 손실을 최소화할 수 있다.
+
+RDS 환경에서는 스냅샷과 Binlog를 조합한 **Point-in-Time Recovery**로 마이그레이션 실패 직전 시점으로 정확히 복원할 수 있다. 온프레미스에서는 `mysqldump --single-transaction`이 가장 간단한 선택이고, 대용량 테이블에서는 `xtrabackup`의 증분 백업이 현실적이다.
+
+<Callout type="warning" title="백업 복원의 부작용">
+DB를 과거 시점으로 복원하면 Redis 캐시, 외부 결제 시스템, 검색 인덱스와의 불일치가 생긴다. 복원 후에는 캐시 전체 무효화, 외부 API 재동기화, 영향받은 사용자 알림이 필요하다.
+</Callout>
+
+## 정리
+
+- MySQL은 DDL 실행 시 암묵적으로 COMMIT한다. PostgreSQL만이 DDL을 트랜잭션에 포함한다.
+- Forward-Only는 "실패해도 되돌리지 않는다"는 철학이다. 새 컬럼은 NULL 허용 또는 DEFAULT가 필수다.
+- Flyway Undo는 로컬·스테이징 전용이다. 프로덕션에서 Undo는 더 큰 장애를 만든다.
+- 마이그레이션 실패 복구 순서: 원인 파악 → 수동 DB 정리 → `flyway repair` → 재실행.
+- 마이그레이션 직전 백업은 협상 불가다. 모든 전략이 실패했을 때 유일한 탈출구다.
+
+마이그레이션이 일방통행인 것은 제약이 아니라 설계다. 이 제약을 알고 설계하는 것과 모르고 맞닥뜨리는 것은 완전히 다르다.

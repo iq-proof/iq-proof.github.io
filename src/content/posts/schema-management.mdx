@@ -1,0 +1,124 @@
+---
+title: "스키마도 코드다 — DB 마이그레이션은 왜 필수인가"
+description: "수동 DDL 실행이 팀 단위에서 반드시 무너지는 이유부터, Flyway 내부 추적 메커니즘과 ddl-auto=update의 위험, 환경별 전략까지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [flyway, db-migration, schema-as-code, jpa, flyway-internals]
+difficulty: intermediate
+series:
+  slug: db-migration-deep-dive
+  title: Db Migration Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+애플리케이션 코드는 Git이 지켜준다. 모든 변경은 커밋으로 남고, 문제가 생기면 되돌릴 수 있다. 그런데 DB 스키마는 DBeaver를 열고, `ALTER TABLE`을 직접 실행하고, Slack으로 공유하는 팀이 아직 많다. 이 간극은 팀원이 늘고 환경이 많아질수록 반드시 장애로 이어진다. 스키마를 코드로 관리한다는 것은 정확히 어떤 의미이고, 그 결정이 어떤 메커니즘 위에서 작동하는가?
+
+## 수동 DDL이 무너지는 세 가지 지점
+
+수동 DDL 실행은 세 가지 방향에서 동시에 무너진다.
+
+첫째, **팀원 누락**이다. 개발자 A가 `ALTER TABLE users ADD COLUMN phone VARCHAR(20)`을 로컬에서 실행하고 Slack에 공유한다. 휴가 중이던 개발자 B는 복귀 후 앱을 실행하다 `Unknown column 'phone'` 에러를 마주하고 30분을 디버깅한다. 팀원이 늘수록 이 시나리오는 더 자주 반복된다.
+
+둘째, **환경 불일치**다. 개발 서버 배포는 성공한다. 스테이징도 통과한다. 프로덕션 배포에서 `Column 'status' cannot be null`로 실패한다. 개발 서버에만 `ALTER TABLE`이 적용됐고, 스테이징은 다른 개발자가 임시 패치를 올렸으며, 프로덕션은 두 달 전 상태 그대로였다. 누구도 전체 스키마 상태를 모른다.
+
+셋째, **이력 부재**다. 프로덕션 장애 중 "이 컬럼이 언제 추가됐지?"를 아는 사람이 없다. Slack 히스토리 3개월치를 뒤지기 시작한다. 장애 원인 파악에만 1시간이 소요된다.
+
+이 세 문제는 모두 같은 뿌리에서 나온다 — 스키마 변경이 코드 외부에서, 추적 불가능한 방식으로 이루어진다.
+
+## Schema as Code — 철학과 메커니즘
+
+IaC(Infrastructure as Code)가 서버 설정을 `.tf` 파일로 선언하듯, Schema as Code는 스키마 변경을 SQL 파일로 선언한다. 핵심 원칙은 동일하다 — **시스템의 실제 상태는 코드(선언)에서 파생된다**.
+
+Flyway가 이 철학을 구현하는 방식은 단순하다. `flyway_schema_history` 테이블 하나로 모든 것을 추적한다.
+
+```
+installed_rank | version          | description        | checksum    | success
+1              | 20240101000000   | create users       | -1234567890 | 1
+2              | 20240115120000   | add email to users | 987654321   | 1
+3              | 20240315120000   | add phone to users | 456789012   | 1
+```
+
+Spring Boot가 시작될 때 Flyway는 `classpath:db/migration/*.sql` 파일을 스캔하고, 각 파일의 CRC32 체크섬을 계산한 뒤 이 테이블과 비교한다. DB에 없는 버전은 실행하고, 이미 있는 버전은 건너뛰며, 체크섬이 다른 버전은 오류를 던진다. 이 세 분기가 "적용된 마이그레이션은 절대 수정하지 않는다"는 규칙의 근거다.
+
+결과적으로 개발자 B가 복귀 후 `git pull`만 하면 앱 실행 시 Flyway가 누락된 마이그레이션을 자동으로 적용한다. "이 컬럼이 언제 추가됐지?"는 `git log db/migration/`으로 즉시 확인된다.
+
+## Flyway vs Liquibase — 같은 문제, 다른 접근
+
+두 도구는 동일한 문제를 서로 다른 철학으로 해결한다.
+
+Flyway는 **버전 기반**이다. SQL 파일을 직접 작성하고, 파일명의 버전 번호로 실행 순서를 결정한다. `V20240315120000__add_phone_to_users.sql` 안에는 실행될 SQL 그대로가 들어있다. 학습 비용이 낮고, SQL에 익숙한 팀이라면 진입 장벽이 없다.
+
+Liquibase는 **변경셋(ChangeSet) 기반**이다. XML이나 YAML로 변경을 선언하면, Liquibase가 대상 DB에 맞는 SQL을 생성한다. `<addColumn tableName="users">` 하나가 MySQL에서는 `ALTER TABLE ... ADD COLUMN`으로, PostgreSQL에서는 해당 문법으로 변환된다. 멀티 DB를 단일 코드베이스로 지원해야 하는 경우에 유리하다.
+
+롤백에 대한 접근도 다르다. Flyway Community는 공식 롤백이 없다. "DDL은 되돌리지 않는다"는 철학으로 Forward-Only 전략을 강제한다. Liquibase는 `<rollback>` 태그로 롤백 SQL을 명시할 수 있다. 그러나 현실에서 롤백이 실제로 사용 가능한 수준인지는 다른 문제다. 데이터가 이미 변환됐다면, 컬럼이 이미 삭제됐다면, 롤백 SQL은 데이터 손실을 막지 못한다. 많은 팀이 Liquibase를 쓰면서도 롤백 기능을 사실상 사용하지 않는 이유다.
+
+<Callout type="note" title="도구 선택 기준">
+SQL에 익숙하고 단일 DB 환경이라면 Flyway. 멀티 DB SaaS나 복잡한 감사(Audit) 요구사항이 있다면 Liquibase. 어떤 도구를 선택하든 Forward-Only 전략이 더 안전한 경우가 많다.
+</Callout>
+
+## `ddl-auto=update` — 편리함의 함정
+
+`spring.jpa.hibernate.ddl-auto=update`는 Hibernate가 Entity를 분석해 스키마를 자동으로 맞춰준다는 뜻처럼 들린다. 실제로는 단방향 부분 동기화에 가깝다.
+
+Hibernate SchemaUpdate가 하는 것: DB에 없는 테이블 생성, DB에 없는 컬럼 추가, 일부 타입 변경.  
+Hibernate SchemaUpdate가 하지 않는 것: DB에 있지만 Entity에서 삭제된 컬럼 제거, 인덱스 삭제, 의존성 있는 변경의 순서 보장.
+
+더 위험한 것은 DDL Lock을 개발자가 전혀 인식하지 못한다는 점이다. `Integer` 필드를 `Long`으로 바꾸면 Hibernate가 `ALTER TABLE ... MODIFY COLUMN amount BIGINT`를 실행한다. 수천만 건 테이블에서 이 DDL은 수십 분간 Write Lock을 건다. 로그에는 한 줄이 찍히고, 그동안 서비스는 멈춘다.
+
+올바른 조합은 `ddl-auto=validate` + Flyway다. Flyway가 먼저 스키마를 최신 상태로 만들고, Hibernate는 검증만 수행한다. Entity에 있는 컬럼이 DB에 없으면 앱 시작이 실패한다 — 마이그레이션 파일을 빠뜨렸다는 신호를 배포 전에 받는다.
+
+```yaml
+# 프로덕션 권장 설정
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    clean-disabled: true
+```
+
+## 파일명이 계약이다 — 명명 규칙
+
+마이그레이션 파일명은 Flyway가 실행 순서를 결정하는 기준이자, 이후 이력을 읽는 문서다. 형식은 `V{버전}__{설명}.sql`이다.
+
+순차 번호(`V1`, `V2`, `V3`) 방식은 팀 협업에서 충돌을 만든다. 두 브랜치가 동시에 `V3__*.sql`을 만들면, 먼저 머지된 쪽이 이기고 나머지는 파일명을 수동으로 바꿔야 한다. 이미 개발 서버에 적용됐다면 `flyway_schema_history`의 레코드까지 손으로 수정해야 한다.
+
+타임스탬프 방식(`V20240315120000`)은 이 문제를 자연스럽게 해결한다. 두 개발자가 정확히 같은 초에 파일을 만들 확률은 실용적으로 무시 가능하다. 파일명에서 날짜 정보도 읽을 수 있다.
+
+설명 작성 기준: `{동사}_{대상}_{내용}`. `V20240315__add_phone_to_users.sql`, `V20240316__add_index_on_orders_status.sql`. `V3__fix.sql`이나 `V4__update.sql`은 6개월 후 장애 상황에서 파일을 열기 전까지 내용을 알 수 없다.
+
+## 환경별 전략 — clean-disabled는 협상 불가
+
+모든 환경에 동일한 설정을 쓰면 두 가지 사고가 발생한다.
+
+`flyway clean`이 프로덕션에서 실행되는 경우다. `clean` 명령어는 DB의 모든 테이블, 뷰, 프로시저를 DROP하고 `flyway_schema_history`까지 제거한다. CI/CD 파이프라인에 복붙 실수로 포함되거나, `clean-on-validation-error=true`가 프로덕션에 적용되면 프로덕션 데이터 전체가 사라진다.
+
+테스트 시드 데이터가 프로덕션에 삽입되는 경우다. `R__seed_dev_data.sql` 경로가 `locations` 설정에 잘못 포함되면 더미 계정과 더미 주문이 프로덕션에 들어간다.
+
+두 사고를 막는 설계는 명확하다.
+
+```
+db/migration/         ← 모든 환경 적용
+db/seed/dev/          ← 개발 서버만
+db/seed/local/        ← 로컬만
+```
+
+Spring Profile별로 `locations`를 분리하고, 프로덕션 profile에는 `clean-disabled: true`를 명시한다. 이 설정이 있으면 `flyway clean` 호출 시 즉시 오류가 발생한다. 협상의 여지가 없다.
+
+<Aside label="스테이징의 역할">
+대형 마이그레이션(수천만 건 백필, 컬럼 타입 변경)은 스테이징에서 먼저 실행 시간을 측정한다. 프로덕션 데이터가 스테이징의 10배라면 예상 Lock 시간도 10배다. 이 수치 없이 프로덕션에 직접 적용하는 것은 운에 맡기는 행위다.
+</Aside>
+
+## 정리
+
+- 스키마 변경을 SQL 파일로 선언하고 Git으로 관리하면, 환경 불일치와 이력 부재 문제가 원천 차단된다.
+- Flyway는 `flyway_schema_history`의 CRC32 체크섬으로 상태를 추적한다. 적용된 파일은 수정도, 삭제도 불가하다.
+- `ddl-auto=update`는 프로덕션에서 통제 불가능한 DDL Lock을 유발한다. `validate` + Flyway 조합으로 역할을 분리한다.
+- 파일명 타임스탬프 방식은 팀 협업에서 버전 충돌을 실용적으로 제거한다.
+- `clean-disabled=true`는 협상 불가 원칙이다. 개발 속
