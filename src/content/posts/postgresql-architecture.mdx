@@ -1,0 +1,138 @@
+---
+title: "PostgreSQL은 왜 연결마다 프로세스를 fork하는가"
+description: "연결당 프로세스 fork가 만드는 메모리 구조부터 MVCC의 Heap 내부 버전, WAL의 단일 로그 철학, XID Wraparound까지 — PostgreSQL 설계 결정의 공통 뿌리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [postgresql, mvcc, wal, process-model, connection-pooling]
+difficulty: intermediate
+series:
+  slug: postgresql-deep-dive
+  title: Postgresql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+PostgreSQL은 클라이언트가 연결할 때마다 OS 프로세스를 하나씩 fork한다. MySQL이 스레드를 재사용하는 것과 정반대의 선택이다. 이 하나의 결정이 메모리 구조, MVCC 구현, WAL 설계, 심지어 XID 관리 방식까지 일관된 방향으로 이어진다. 왜 PostgreSQL은 이렇게 설계됐고, 그 대가는 무엇인가?
+
+## 프로세스 모델 — 격리를 위한 선택
+
+PostgreSQL의 `postmaster`는 클라이언트 연결이 들어오면 `fork()`를 호출해 `backend` 프로세스를 생성한다. 이 프로세스는 해당 클라이언트 전담으로 소켓을 인계받아 처리하고, 연결이 끊기면 `exit()`한다.
+
+```
+postmaster (슈퍼바이저)
+  ├── checkpointer
+  ├── walwriter
+  ├── autovacuum launcher
+  ├── backend (PID 2001) ← 클라이언트 1 연결 시 fork()
+  ├── backend (PID 2002) ← 클라이언트 2 연결 시 fork()
+  └── backend (PID 2003) ← 클라이언트 3 연결 시 fork()
+```
+
+프로세스당 최소 5~10MB의 고정 오버헤드가 발생한다. 1,000개 연결이면 프로세스 오버헤드만 5~10GB다. 반면 MySQL은 단일 프로세스 내 스레드를 사용하므로 연결당 오버헤드가 ~1MB에 그친다.
+
+이 선택의 이유는 **격리성**이다. 하나의 backend가 Segfault를 일으켜도 다른 연결과 postmaster는 영향을 받지 않는다. MySQL의 스레드 모델에서는 잘못된 플러그인 하나가 전체 `mysqld`를 크래시시킬 수 있다. PostgreSQL은 "데이터 안전성 > 연결 효율성"이라는 철학을 프로세스 경계로 구현했다.
+
+<Callout type="note" title="트레이드오프">
+프로세스 모델의 격리 이점은 **Connection Pooler 없이는 확장이 불가능하다**는 대가와 함께 온다. `max_connections`를 높이면 메모리 압박이 심해지고, context switch 오버헤드로 throughput이 오히려 떨어진다. 실측 기준으로 연결 100개 대비 1,000개에서 처리량이 ~40% 감소한다. PgBouncer Transaction Mode는 이 구조의 사실상 필수 보완재다.
+</Callout>
+
+## Heap 구조와 MVCC — 이전 버전을 어디에 둘 것인가
+
+프로세스 모델과 같은 철학이 MVCC 구현에도 나타난다. PostgreSQL은 UPDATE 시 기존 튜플을 수정하지 않는다. 대신 OLD 튜플에 `t_xmax`를 설정(Dead Tuple)하고, NEW 튜플을 같은 Heap 페이지에 삽입한다. 두 버전이 공존한다.
+
+```
+UPDATE 후 Heap 페이지:
+
+  OLD Tuple: t_xmin=100, t_xmax=200, status='PENDING'  ← Dead
+  NEW Tuple: t_xmin=200, t_xmax=0,   status='SHIPPED'  ← Alive
+```
+
+MySQL InnoDB는 반대다. 현재 레코드를 직접 수정하고, 이전 버전을 별도 Undo Log에 저장한다. Purge Thread가 비동기로 정리한다.
+
+| 항목 | PostgreSQL (Heap) | MySQL InnoDB (Undo) |
+|:---|:---|:---|
+| 이전 버전 위치 | Heap 페이지 | Undo Tablespace |
+| 정리 주체 | VACUUM (명시적) | Purge Thread (자동) |
+| 테이블 크기 | UPDATE/DELETE 시 증가 | 안정적 |
+| 오래된 버전 읽기 | 같은 페이지 직접 접근 | Undo 체인 순회 |
+
+PostgreSQL이 Heap 방식을 선택한 이유는 구현 단순성이다. Undo Log 관리 시스템이 불필요하고, 크래시 복구도 WAL 하나로 처리된다. 대신 사용자에게 **VACUUM 운영**이라는 책임을 요구한다.
+
+Dead Tuple이 쌓이면 SeqScan 비용이 선형으로 증가한다. `dead_ratio`가 80%를 넘으면 실제 데이터보다 죽은 데이터를 더 많이 읽는 상황이 발생한다. Autovacuum이 따라오지 못하는 고빈도 DML 테이블에는 테이블별 설정을 적용해야 한다.
+
+```sql
+ALTER TABLE orders SET (
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_vacuum_threshold = 100
+);
+```
+
+## WAL — 단일 로그로 모든 것을
+
+Heap에 이전 버전을 두는 선택은 WAL 설계에도 이어진다. PostgreSQL은 **WAL 하나로 크래시 복구, Streaming Replication, PITR을 모두 처리**한다.
+
+Write-Ahead의 원칙은 단순하다. 데이터 페이지를 디스크에 쓰기 전에 WAL을 먼저 `fsync`한다. WAL이 디스크에 있으면 데이터 페이지가 메모리에만 있어도 크래시 후 복구할 수 있다. WAL 쓰기는 순차 I/O, 데이터 페이지 쓰기는 임의 I/O다. 순차 쓰기를 선행함으로써 성능과 내구성을 동시에 달성한다.
+
+```
+크래시 복구 흐름:
+
+  pg_control → 마지막 Checkpoint LSN 읽기
+  → Checkpoint 이후 WAL 레코드 순서대로 재실행 (Redo Phase)
+  → 정상 상태 복구
+```
+
+MySQL은 다르다. InnoDB Redo Log(물리 복구)와 Binary Log(복제, PITR)가 분리돼 있다. 같은 트랜잭션이 두 로그에 모두 기록되며, 원자성 보장을 위해 2PC(Two-Phase Commit)가 필요하다. PostgreSQL은 이 이중 쓰기 증폭이 없다.
+
+Streaming Replication도 WAL 기반이다. WAL Sender가 Standby의 WAL Receiver로 WAL을 스트리밍하고, Standby의 Startup 프로세스가 순서대로 재실행한다. Replication Slot이 없으면 Standby가 느릴 때 Primary가 WAL을 삭제해버릴 수 있다. Slot이 있으면 반대로 Standby가 장시간 중단됐을 때 `pg_wal` 디렉토리가 무한히 커질 수 있다.
+
+```sql
+-- 복제 지연 및 보존 WAL 모니터링
+SELECT slot_name,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots;
+```
+
+## XID와 가시성 — 스냅샷이 결정하는 것
+
+MVCC의 "어떤 버전을 볼 것인가"는 스냅샷(Snapshot)이 결정한다. 스냅샷은 세 값으로 구성된다.
+
+- `xmin`: 이 값 미만의 XID는 모두 완료됨
+- `xmax`: 이 값 이상의 XID는 아직 없음
+- `xip`: 그 사이에서 아직 진행 중인 XID 목록
+
+튜플의 `t_xmin`이 스냅샷의 `xmin`보다 작고, `xip`에 없고, 커밋됐으면 — 그 튜플은 보인다. `t_xmax`가 0이거나, 아직 진행 중이거나, 롤백됐으면 — 살아있다.
+
+`READ COMMITTED`는 SQL 문장마다 스냅샷을 새로 획득한다. `REPEATABLE READ`는 트랜잭션 첫 문장에서 스냅샷을 고정한다. PostgreSQL의 `REPEATABLE READ`는 MySQL과 달리 Phantom Read도 자동으로 방지한다. 스냅샷 격리가 넥스트 키 락 없이도 이를 보장한다.
+
+XID는 32비트 정수다. 모든 튜플 헤더에 `t_xmin`, `t_xmax`가 있어 64비트로 늘리면 저장 공간이 커진다. 대신 PostgreSQL은 **VACUUM Freeze**로 오래된 튜플의 `t_xmin`을 `FrozenTransactionId(2)`로 교체한다. Freeze된 튜플은 어떤 XID와 비교해도 항상 "과거"로 판단된다.
+
+`age(datfrozenxid)`가 2.1억에 도달하면 경고, 15억을 넘으면 PostgreSQL이 스스로 쓰기를 거부한다. Wraparound는 운영 실수 중 가장 치명적인 것 중 하나다.
+
+```sql
+SELECT datname,
+       age(datfrozenxid) AS xid_age,
+       CASE
+           WHEN age(datfrozenxid) > 1000000000 THEN '즉시 VACUUM FREEZE 필요'
+           WHEN age(datfrozenxid) > 200000000  THEN 'Autovacuum 점검'
+           ELSE '정상'
+       END AS status
+FROM pg_database
+ORDER BY xid_age DESC;
+```
+
+<Aside label="설계 철학">
+프로세스 격리, Heap 내부 버전 관리, WAL 단일 로그, 32비트 XID + Freeze — 이 결정들은 각각 독립적으로 보이지만 같은 방향을 가리킨다. **구현 단순성을 유지하면서 데이터 안전성을 최우선으로**. 그 대가는 운영자에게 전가된다. PgBouncer, VACUUM 튜닝, Autovacuum 모니터링, Wraparound 감시는 PostgreSQL 운영의 필수 지식이지, 선택 사항이 아니다.
+</Aside>
+
+## 정리
+
+- PostgreSQL의 연결당 프로세스 fork는 격리성을 위한 선택이다. 그 대가로 Connection Pooler가 필수가 된다.
+- MVCC는 Heap에 이전 버전을 남기는 방식으로 구현된다. Dead Tuple 관리가 운영 부담이 되는 이유다.
+- WAL 하나로 복구, 복제, PITR을 처리한다. MySQL의 이중 로그 구조와 달리 쓰기 증폭이 없다.
+- 32비트 XID는 Freeze로 관리한다. `age(datfrozenxid)` 모니터링을 소홀히 하면 DB가 스스로 멈춘다.
+
+다음 글에서는 Dead Tuple이 실제로 어떻게 쌓이고, VACUUM이 어떤 경우에도 테이블 파일 크기를 줄이지 못하는 이유를 추적한다.

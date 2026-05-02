@@ -1,13 +1,13 @@
 ---
-title: "DB 성능 문제는 어디서 시작되는가"
-description: "Slow Query 분석부터 N+1 탐지, 페이징 함정, 파티셔닝 설계, Connection Pool 튜닝까지 — DB 성능 저하의 다섯 가지 뿌리를 하나의 흐름으로 추적한다."
+title: "PostgreSQL 운영에서 설정이 먼저인가, 진단이 먼저인가"
+description: "postgresql.conf 메모리 설정의 원리부터 pg_stat_statements 기반 진단, 인덱스 Bloat 해소, Long Transaction 차단, Spring HikariCP 최적화까지 — PostgreSQL 운영의 다섯 레이어를 하나의 흐름으로 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [mysql, performance, slow-query, connection-pool, pagination]
+tags: [postgresql, performance-tuning, hikaricp, vacuum, index]
 difficulty: intermediate
 series:
-  slug: database-internals
-  title: Database Internals
+  slug: postgresql-deep-dive
+  title: Postgresql Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,124 +16,91 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-DB 성능 문제는 대부분 서버 스펙 부족이 아니다. CPU, 메모리, 네트워크가 정상인데 P99 응답 시간이 200ms에서 3초로 치솟는 상황의 원인은 거의 항상 쿼리 레벨에 있다. 그렇다면 어떤 쿼리가 문제이고, 그 쿼리는 왜 느린가?
+PostgreSQL을 설치하고 기본값 그대로 운영하는 팀이 있다. `shared_buffers = 128MB`, `work_mem = 4MB`, `max_connections = 100`. 64GB RAM 서버에서. 이 설정이 얼마나 큰 손실인지 알려면, 설정 하나하나가 어떤 내부 동작을 통제하는지부터 이해해야 한다. 그리고 문제가 생겼을 때 — 갑자기 느려졌을 때, 테이블이 폭증했을 때, 연결이 터졌을 때 — 어디서부터 손을 대야 하는가?
 
-## 총 비용이 가장 큰 쿼리를 찾아라
+## 메모리 설정의 구조
 
-Slow Query 분석의 흔한 착각은 "임계값을 초과한 쿼리만 문제"라는 믿음이다. `long_query_time = 1초`로 설정하면 0.5초짜리 쿼리는 기록되지 않는다. 하지만 0.5초 쿼리가 초당 1000번 실행된다면 DB가 이 쿼리에만 쏟는 시간은 초당 500초다.
+PostgreSQL의 메모리 설정은 세 개의 독립된 층으로 나뉜다.
 
-진짜 지표는 `SUM_TIMER_WAIT` — 총 소비 시간이다.
+첫 번째는 `shared_buffers`. 모든 백엔드 프로세스가 공유하는 페이지 캐시다. 데이터를 읽을 때 먼저 여기를 확인하고, 없으면 OS Page Cache, 그 다음이 디스크 순이다. 권장값이 RAM의 25%인 이유는 PostgreSQL이 `O_DIRECT`를 지원하지 않아 OS Page Cache와 이중으로 캐시가 쌓이기 때문이다. 50%를 넘기면 OS가 메모리 부족으로 페이지 스왑을 시작한다.
 
-```sql
-SELECT
-    LEFT(DIGEST_TEXT, 100) AS query_pattern,
-    COUNT_STAR AS exec_count,
-    ROUND(AVG_TIMER_WAIT / 1e9, 2) AS avg_ms,
-    ROUND(SUM_TIMER_WAIT / 1e9, 2) AS total_ms,
-    ROUND(SUM_ROWS_EXAMINED / NULLIF(SUM_ROWS_SENT, 0), 0) AS examine_send_ratio
-FROM performance_schema.events_statements_summary_by_digest
-WHERE SCHEMA_NAME = DATABASE()
-  AND COUNT_STAR > 10
-ORDER BY SUM_TIMER_WAIT DESC
-LIMIT 20;
-```
+두 번째는 `effective_cache_size`. 실제 메모리를 할당하지 않는다. 플래너에게 "이만큼의 캐시가 있다고 가정하라"는 힌트만 준다. 이 값이 크면 플래너가 더 적극적으로 Index Scan을 선택하고, 작으면 Sequential Scan으로 기울어진다. RAM의 75%가 권장값이다.
 
-`examine_send_ratio`가 1000을 넘는다면 10만 행을 읽어 100행을 반환하고 있다는 뜻이다. 인덱스가 없거나 함수 조건으로 인덱스가 무력화된 경우다. 이 비율이 높은 쿼리에 인덱스를 추가하면 실행 시간이 수백 배 단축되기도 한다.
-
-<Aside label="진단 워크플로우">
-문제 쿼리를 찾은 뒤에는 EXPLAIN → EXPLAIN ANALYZE → Handler 변수 순서로 파고든다. EXPLAIN의 `type: ALL`은 Full Table Scan, `key: NULL`은 인덱스 미사용이다. EXPLAIN ANALYZE의 `actual rows` vs `estimated rows` 차이가 크면 통계가 오래된 것이므로 `ANALYZE TABLE`이 필요하다.
-</Aside>
-
-## N+1 — 보이지 않기 때문에 더 위험하다
-
-N+1 문제는 코드에서 전혀 눈에 띄지 않는다. `order.getUser().getName()` 한 줄이 루프 안에 있으면, 주문 100건을 조회할 때 사용자 테이블에 100번의 추가 쿼리가 발생한다. 개발 환경에서 데이터가 10건이면 11번 쿼리는 눈에 띄지 않는다. 프로덕션에서 초당 10명이 주문 목록을 조회하면 초당 1010번의 쿼리가 된다.
-
-`performance_schema`에서 N+1은 명확한 패턴을 보인다.
-
-```
-DIGEST_TEXT: SELECT * FROM users WHERE id = ?
-COUNT_STAR:  10,000   ← 같은 패턴이 1만 번
-AVG_TIMER_WAIT: 3ms
-SUM_TIMER_WAIT: 30,000ms
-```
-
-해결 전략은 관계 유형에 따라 다르다. N:1 또는 1:1 관계는 Fetch Join 또는 `@EntityGraph`로 1번의 JOIN 쿼리로 해결한다. 1:N 컬렉션은 Fetch Join에 페이징을 함께 쓸 수 없어서(메모리 페이징 위험) Batch Size가 올바른 대안이다.
-
-```yaml
-spring.jpa.properties.hibernate.default_batch_fetch_size: 100
-```
-
-이 설정 하나로 N번의 단건 조회가 `WHERE order_id IN (1, 2, ..., 100)` 한 번으로 바뀐다. 코드 수정 없이 대부분의 N+1을 완화하는 가장 빠른 첫 조치다.
-
-<Callout type="warning" title="1:N Fetch Join + 페이징은 함께 쓰지 마라">
-`@Query("SELECT o FROM Order o JOIN FETCH o.items")` + `Pageable`은 SQL에 LIMIT을 적용할 수 없어 전체를 메모리에 올린 뒤 페이징한다. 수백만 건이면 OOM이다. 컬렉션 페이징은 Batch Size로 해결한다.
-</Callout>
-
-## OFFSET은 버리는 행 수다
-
-`LIMIT 10 OFFSET 100000`은 100010행을 읽고 100000행을 버린 뒤 10행을 반환한다. OFFSET이 클수록 비용은 선형으로 증가한다.
-
-```
-LIMIT 10 OFFSET 0:        0.001s
-LIMIT 10 OFFSET 100000:   0.5s
-LIMIT 10 OFFSET 1000000:  5.0s
-```
-
-커서 기반 페이징은 이 문제를 근본적으로 해결한다. `WHERE id > last_id ORDER BY id LIMIT 10`은 B-Tree에서 `last_id` 이후 위치로 직접 이동해 10행만 읽는다. 100만 번째 페이지나 1번째 페이지나 실행 시간이 같다.
-
-배치 처리에서 OFFSET을 쓰면 O(N²)이 된다. 1000페이지를 순회하면 마지막 페이지에서 100만 행을 읽고 버린다. 배치에서는 반드시 커서 기반을 써야 한다.
-
-페이지 번호 이동 UI가 필요한 관리자 기능에서는 지연 JOIN이 절충안이다. 서브쿼리로 ID만 먼저 추출(Covering Index 활용)하고 외부 쿼리로 나머지 컬럼을 조회하면 직접 OFFSET 대비 2~5배 빠르다.
-
-## 파티셔닝은 파티션 키 조건이 있어야 효과가 있다
-
-단일 테이블이 수억 건을 넘으면 인덱스가 있어도 버퍼 풀에 모든 Leaf Node를 올릴 수 없어 디스크 I/O가 증가한다. Range 파티셔닝은 이 문제를 특정 범위 쿼리에서 해결한다.
-
-```sql
-PARTITION BY RANGE (TO_DAYS(order_date)) (
-    PARTITION p2023 VALUES LESS THAN (TO_DAYS('2024-01-01')),
-    PARTITION p2024 VALUES LESS THAN (TO_DAYS('2025-01-01')),
-    PARTITION p_future VALUES LESS THAN MAXVALUE
-);
-```
-
-`WHERE order_date BETWEEN '2024-01-01' AND '2024-03-31'` — 파티션 키가 조건에 포함되면 p2024만 스캔한다(Partition Pruning). 조건에 포함되지 않으면 모든 파티션을 스캔한다. 파티셔닝이 오히려 오버헤드가 되는 상황이다.
+세 번째는 `work_mem`. 정렬, 해시 조인, 집계에서 각 실행 노드마다 할당된다. 위험한 이유는 곱셈이다. 100개 동시 연결 × 쿼리당 평균 3개 정렬 노드 × `work_mem` = 최대 메모리 요구량. 전역값으로 크게 설정하면 OOM이 현실이 된다. 분석 쿼리가 필요할 때는 세션 수준에서 일시적으로 올리고 반드시 `RESET work_mem`으로 돌려놓는다.
 
 <Callout type="note" title="트레이드오프">
-파티셔닝의 핵심 이점은 오래된 파티션 삭제다. `DELETE FROM orders WHERE order_date < '2023-01-01'`은 수백만 건 × 인덱스 갱신으로 수십 분이 걸린다. `ALTER TABLE orders DROP PARTITION p2022`는 파일 삭제로 1초 안에 끝난다. 단, 글로벌 인덱스가 없고 외래키를 쓸 수 없으며 UNIQUE 제약에 파티션 키를 포함해야 하는 제약이 따른다. 수평 샤딩은 단일 DB 한계가 명확할 때만 고려하는 최후의 수단이다.
+`shared_buffers`를 크게 올리면 캐시 히트율이 높아지지만 OS 메모리가 줄어든다. `work_mem`을 크게 올리면 디스크 정렬이 사라지지만 OOM 위험이 동시 연결 수에 비례해 올라간다. 두 설정 모두 "더 크면 더 좋다"가 아니라 서버 전체 메모리 예산 안에서의 균형이다.
 </Callout>
 
-## Connection Pool — 풀 크기보다 쿼리 속도가 먼저다
+WAL 쪽에서는 `checkpoint_completion_target = 0.9`가 가장 즉각적인 효과를 낸다. 기본값 0.5는 Checkpoint 간격의 절반 시간에 Dirty Page를 집중적으로 쓴다는 의미다. I/O 스파이크가 그 시점에 몰린다. 0.9로 바꾸면 90% 시간에 걸쳐 분산되어 쿼리 지연이 눈에 띄게 줄어든다.
 
-`HikariPool-1 - Connection is not available, request timed out after 30000ms` 에러는 DB 서버 다운이 아니다. Pool의 모든 Connection이 사용 중이라 새 요청이 30초를 기다리다 포기한 것이다.
+## 문제를 숫자로 보는 도구들
 
-HikariCP가 권장하는 Pool 크기 공식은 단순하다.
+설정이 맞더라도 실제 병목은 어디서 오는지 모르면 손을 쓸 수 없다. PostgreSQL은 세 개의 뷰로 거의 모든 진단을 커버한다.
 
+`pg_stat_statements`는 누적 쿼리 통계다. `total_exec_time DESC`로 정렬하면 "이 서비스에서 가장 많은 DB 시간을 소비한 쿼리"가 바로 나온다. 애플리케이션 로그에서 "이 쿼리가 2초 걸렸다"는 정보와 달리, 하루에 10만 번 실행되어 총 83분을 소비한 쿼리를 찾아낸다. `shared_preload_libraries = 'pg_stat_statements'`를 설정하고 재시작한 뒤 `CREATE EXTENSION`으로 활성화한다.
+
+`pg_stat_activity`는 현재 실행 중인 프로세스 상태를 보여준다. `state = 'idle in transaction'`이 오래 유지되는 연결이 있다면 즉시 주목해야 한다. 트랜잭션이 열려있지만 아무 것도 하지 않는 상태 — 이 연결이 VACUUM을 차단하고 Lock을 보유하며 연결 풀을 점유한다.
+
+`pg_locks`와 `pg_blocking_pids()`의 조합은 잠금 대기 체인을 SQL로 시각화한다. ALTER TABLE 하나가 AccessExclusiveLock을 잡지 못하고 대기 중이면 그 뒤로 오는 모든 SELECT와 UPDATE도 줄을 선다. 연결 수백 개가 순식간에 쌓이는 그 시나리오의 원인은 항상 이 체인에서 나온다.
+
+```sql
+-- 잠금 대기 체인 한 번에 파악
+SELECT
+    waiting.pid AS waiting_pid,
+    left(w.query, 60) AS waiting_query,
+    blocking.pid AS blocking_pid,
+    left(b.query, 60) AS blocking_query
+FROM pg_stat_activity w
+JOIN pg_stat_activity b ON b.pid = ANY(pg_blocking_pids(w.pid))
+WHERE w.wait_event_type = 'Lock';
 ```
-Pool Size = Ncpu × 2 + Neff_disk
+
+## 인덱스는 적을수록 쓰기가 빠르다
+
+"인덱스는 많을수록 좋다"는 오해가 실무에서 꾸준히 등장한다. 현실은 정반대다. 사용하지 않는 인덱스는 모든 INSERT/UPDATE/DELETE마다 갱신 비용을 추가하고, HOT Update 기회를 빼앗으며, 디스크 공간을 낭비한다.
+
+`pg_stat_user_indexes.idx_scan = 0`인 인덱스가 있다면 미사용이다. 단, 판단 기간이 충분해야 한다. 분기 보고서 쿼리에만 쓰이는 인덱스는 3개월 내내 `idx_scan = 0`일 수 있다. 최소 2주, 이상적으로 한 분기 이상의 통계가 쌓인 뒤 확인한다.
+
+인덱스 Bloat도 방치하면 문제다. 대량 DELETE 이후 인덱스 파일 크기는 줄지 않는다. `pgstatindex()`의 `avg_leaf_density`가 50% 미만이면 REINDEX가 필요하다. 운영 중에는 반드시 `REINDEX INDEX CONCURRENTLY`를 써야 한다. 일반 REINDEX는 AccessExclusiveLock을 잡는다.
+
+<Aside label="INVALID 인덱스 주의">
+`REINDEX CONCURRENTLY`가 실패하면 `_ccnew` 접미사가 붙은 INVALID 인덱스가 남는다. 이 인덱스는 쿼리에 사용되지 않지만 쓰기 시에는 갱신을 시도해 성능을 떨어뜨린다. `DROP INDEX CONCURRENTLY`로 제거한 뒤 재시도한다.
+</Aside>
+
+## Long Transaction이 VACUUM을 막는 경로
+
+운영 중 테이블이 갑자기 수십 GB로 불어났다면 첫 번째 용의자는 Long Running Transaction이다.
+
+VACUUM이 Dead Tuple을 회수하려면 그 튜플의 `t_xmax`가 현재 모든 활성 트랜잭션의 `xmin` 최솟값(OldestXmin)보다 작아야 한다. 8시간 전에 시작된 트랜잭션이 하나 살아있다면 OldestXmin이 8시간 전 XID에 고정된다. 그 이후 생성된 Dead Tuple은 전부 회수 불가 — VACUUM을 아무리 돌려도 크기가 줄지 않는다.
+
+```sql
+-- OldestXmin을 낮추고 있는 연결 찾기
+SELECT pid, now() - xact_start AS duration,
+       age(backend_xmin) AS xmin_age, state, left(query, 80)
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC;
 ```
 
-AWS RDS db.m5.large(2 vCPU)이면 `2 × 2 + 1 = 5`. 놀랍게 작아 보이지만 DB CPU가 병목이면 Connection을 늘려도 처리량은 같고 Context Switching 오버헤드만 증가한다.
+`xmin_age`가 수백만을 넘는 연결이 있다면 `pg_terminate_backend(pid)`로 종료한 뒤 VACUUM을 다시 돌린다. 재발 방지는 설정으로 한다: `idle_in_transaction_session_timeout = '10min'`.
 
-Connection Pool이 포화되는 두 번째 원인은 트랜잭션 내 외부 호출이다.
+DDL이 유발하는 잠금 폭탄도 같은 맥락이다. `lock_timeout = '5s'`를 설정하면 DDL이 Lock을 5초 안에 얻지 못하면 대기하는 대신 오류를 반환한다. 그 뒤로 밀려드는 쿼리들이 연쇄 대기에 빠지는 상황을 막는다.
 
-```java
-@Transactional
-public void placeOrder(OrderRequest req) {
-    Product product = productRepo.findById(req.getProductId());
-    paymentGateway.pay(req.getUserId(), req.getAmount());  // 3초!
-    orderRepo.save(new Order(product));
-}
-```
+## Spring과 연결되는 지점
 
-이 메서드는 시작부터 끝까지 Connection을 붙잡는다. 결제 API 3초 동안 Connection이 점유된다. Pool 10개면 초당 최대 3.3 TPS만 처리된다. 트랜잭션 범위를 DB 작업만으로 축소하면 Connection 점유 시간이 50ms로 줄고 처리량이 60배 증가한다.
+애플리케이션 레이어에서 가장 자주 틀리는 것은 HikariCP `maximumPoolSize`다. 너무 작으면 `connectionTimeout` 예외가, 너무 크면 PostgreSQL 연결 폭발이 발생한다. Percona의 경험 공식은 `core_count × 2 + effective_spindle_count`다. 4코어 SSD 서버라면 9개가 출발점이다. PgBouncer를 앞에 두고 있다면 HikariCP는 5~10으로 작게 유지하고 PgBouncer가 수천 클라이언트를 수십 PostgreSQL 연결로 압축하도록 한다.
+
+PgBouncer Transaction Mode를 쓸 때는 JDBC URL에 `prepareThreshold=0`을 추가해야 한다. Prepared Statement를 세션 수준에서 캐시하는 동작이 Transaction Mode와 충돌하기 때문이다.
+
+JSONB와 배열 컬럼을 JPA로 다룰 때는 Hibernate Types 라이브러리가 필요하다. 네이티브 쿼리로 `@>`, `?` 연산자를 직접 쓰는 경우가 많다. Flyway를 쓸 때 `CREATE INDEX CONCURRENTLY`는 트랜잭션 블록 안에서 실행할 수 없으므로 Java Migration에서 `canExecuteInTransaction() = false`를 선언해야 한다.
 
 ## 정리
 
-- `SUM_TIMER_WAIT` 기준으로 총 비용이 가장 큰 쿼리를 찾는다. 빠른 쿼리도 빈도가 높으면 진짜 병목이다.
-- N+1은 `performance_schema`에서 `COUNT_STAR` 높고 `AVG` 낮은 패턴으로 드러난다. `default_batch_fetch_size=100`이 가장 빠른 첫 조치다.
-- 배치 처리와 무한 스크롤에서 OFFSET은 금지다. 커서 기반 페이징으로 O(log N)을 유지한다.
-- 파티셔닝은 파티션 키가 WHERE 조건에 있어야 효과가 있고, 오래된 데이터 DROP에서 가장 빛난다.
-- Connection Pool 포화의 근본 해결은 Pool 크기 증가가 아니라 Slow Query 개선과 트랜잭션 범위 축소다.
+- `shared_buffers = RAM × 0.25`, `checkpoint_completion_target = 0.9`가 설치 직후 적용해야 할 두 가지 설정이다.
+- 병목 진단 순서: `pg_stat_statements`로 누적 슬로우 쿼리 → `pg_stat_activity`로 현재 상태 → `pg_blocking_pids()`로 잠금 체인.
+- 인덱스는 `idx_scan = 0` 기준으로 주기적으로 정리한다. Bloat은 `pgstatindex()`로 측정하고 `REINDEX CONCURRENTLY`로 해소한다.
+- Long Transaction이 VACUUM을 차단하는 경로를 이해하면, 테이블 폭증 문제의 90%는 원인을 바로 찾을 수 있다.
+- HikariCP `maximumPoolSize`는 코어 수 기반으로 계산하고, PgBouncer와 함께 쓸 때는 5~10으로 시작한다.
 
-다음 글에서는 MySQL Replication의 Binlog 구조와 Read Replica 지연이 발생하는 원리를 추적한다.
+다음 글에서는 EXPLAIN ANALYZE의 각 노드를 읽는 방법과 실행 계획이 예상과 다를 때 플래너 통계를 어떻게 교정하는지 추적한다.

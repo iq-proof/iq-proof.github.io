@@ -1,0 +1,127 @@
+---
+title: "PostgreSQL은 8KB 페이지를 어떻게 넘는가"
+description: "TOAST부터 JSONB 바이너리 포맷, 배열 GIN 인덱스, 전문 검색, Large Object까지 — PostgreSQL의 대용량 값 저장 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [postgresql, toast, jsonb, full-text-search, large-object]
+difficulty: intermediate
+series:
+  slug: postgresql-deep-dive
+  title: Postgresql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+PostgreSQL의 모든 행은 8KB 페이지 안에 산다. 그런데 현대 서비스는 50KB짜리 JSONB 페이로드를, 1MB짜리 PDF를, 수만 개의 태그 배열을 저장한다. 8KB 한계를 어떻게 넘는가? 그리고 그 방법을 모르면 왜 "이 쿼리만 느린지" 영원히 이해할 수 없는가?
+
+## 8KB를 넘는 기본 메커니즘 — TOAST
+
+행 크기가 2KB를 넘는 순간 PostgreSQL은 TOAST(The Oversized-Attribute Storage Technique)를 작동시킨다. 대상 컬럼을 약 2KB 청크로 분할해 별도의 `pg_toast` 테이블에 저장하고, Heap 페이지에는 18바이트짜리 포인터만 남긴다. 1MB 값이라면 약 512개 청크가 TOAST 테이블에 들어간다.
+
+컬럼마다 저장 전략을 다르게 설정할 수 있다.
+
+| 전략 | 압축 | 분리 | 적합한 경우 |
+|------|------|------|------------|
+| PLAIN | 없음 | 없음 | INT, CHAR 등 고정 타입 |
+| EXTENDED | 있음 | 있음 | 대부분의 가변 타입 (기본값) |
+| EXTERNAL | 없음 | 있음 | 부분 읽기(`substring`)가 잦은 컬럼 |
+| MAIN | 있음 | 최후 | 가능하면 인라인 유지하고 싶은 컬럼 |
+
+EXTERNAL 전략의 이점이 결정적인 순간이 있다. `substring(content FROM 1 FOR 100)`을 실행할 때 EXTENDED라면 모든 청크를 읽고 decompress한 뒤에야 앞 100바이트를 꺼낼 수 있다. EXTERNAL이라면 첫 번째 청크만 읽으면 끝난다.
+
+PostgreSQL 14부터는 압축 알고리즘도 선택할 수 있다. pglz는 압축률이 높지만 느리고, lz4는 압축률이 약간 낮지만 5배 빠르다. 고빈도로 TOAST 컬럼을 읽는 테이블이라면 `ALTER TABLE t ALTER COLUMN c SET COMPRESSION lz4`가 의미 있는 차이를 만든다.
+
+<Callout type="warning" title="SELECT *의 숨은 비용">
+TOAST 컬럼이 있는 테이블에서 `SELECT *`는 모든 TOAST 청크를 읽고 decompress한다. payload JSONB가 평균 50KB인 테이블에서 10만 건을 조회하면, 조회 시간의 80%가 TOAST 해제 비용일 수 있다. 필요한 컬럼만 명시적으로 선택하라.
+</Callout>
+
+## JSONB — 바이너리 포맷이 빠른 이유
+
+JSON은 텍스트다. 필드에 접근할 때마다 전체 문자열을 파싱한다. JSONB는 INSERT 시점에 한 번 파싱해 바이너리로 변환하고, 키를 알파벳 순으로 정렬해 저장한다. `data->'name'` 접근이 O(N) 선형 탐색이 아니라 O(log N) 이진 탐색이 되는 이유다.
+
+연산자 선택이 성능을 결정한다.
+
+```sql
+-- GIN 인덱스 미활용 (SeqScan)
+WHERE data->>'event_type' = 'click'
+
+-- GIN 인덱스 활용 (Index Scan)
+WHERE data @> '{"event_type": "click"}'
+```
+
+`->>`는 값을 꺼내는 연산자라 GIN이 개입할 자리가 없다. `@>`는 포함 여부를 묻는 연산자라 GIN 역색인과 직결된다. 같은 결과를 반환하지만 실행 경로가 완전히 다르다.
+
+JSONB를 자주 업데이트하는 컬럼은 주의가 필요하다. PostgreSQL은 JSONB를 부분 수정하지 않는다. 키 하나를 추가해도 전체 JSONB를 새로 직렬화해 새 TOAST 청크를 생성한다. 구 청크는 Dead 상태로 남아 VACUUM을 기다린다. 자주 변경되는 카운터나 상태 값은 일반 컬럼으로 분리하는 것이 낫다.
+
+## 배열 — 정규화 vs 인라인의 분기점
+
+PostgreSQL 배열은 GIN 인덱스와 만날 때 강력해진다.
+
+```sql
+CREATE INDEX ON articles USING GIN(tags);
+
+-- 이 태그들을 모두 포함
+WHERE tags @> ARRAY['postgresql', 'performance']
+
+-- 이 태그들 중 하나라도 포함
+WHERE tags && ARRAY['mysql', 'redis']
+```
+
+GIN은 역색인을 만든다. 'postgresql'이라는 토큰이 어떤 행의 TID를 가리키는지 미리 기록해두고, 쿼리가 오면 교집합이나 합집합 연산으로 응답한다. 인덱스 없이 `ANY(tags)` 검색을 하면 매 행의 배열을 순회하는 SeqScan이 발생한다.
+
+<Callout type="note" title="트레이드오프 — 배열 vs 정규화 테이블">
+배열은 "태그 이름은 변경되지 않고, FK 관계가 필요 없으며, 전체를 함께 읽는" 경우에 적합하다. 카테고리처럼 속성이 붙거나 자주 단독으로 업데이트되는 데이터라면 정규화 테이블이 맞다. 원소 하나를 추가하는 `UPDATE`도 전체 배열을 재작성하기 때문이다.
+</Callout>
+
+`unnest()`와 `array_agg()`는 배열과 관계형 세계를 연결한다. `unnest(tags)`는 배열을 행으로 펼쳐 `GROUP BY`를 가능하게 하고, `array_agg(tag ORDER BY tag)`는 행을 배열로 다시 접는다.
+
+## 전문 검색 — tsvector가 LIKE와 다른 이유
+
+`LIKE '%postgresql%'`는 인덱스를 쓸 수 없고, 단어 변형을 처리할 수 없다. `to_tsvector`는 세 단계를 거친다: 토큰화 → 불용어 제거 → 어간 추출. 'running'은 'run'으로, 'databases'는 'databas'로 압축된다. 검색 시 'running'으로 질의해도 'run', 'runs', 'runner'가 포함된 문서를 찾는다.
+
+tsvector도 GIN 인덱스 위에 역색인으로 동작한다. 'postgresql'이라는 렉심이 어떤 문서에 있는지 미리 기록해두고, `@@` 연산자 쿼리가 오면 포스팅 리스트의 교집합으로 결과를 반환한다.
+
+```sql
+-- GENERATED STORED 컬럼으로 tsvector 미리 계산
+ALTER TABLE articles ADD COLUMN search_vec TSVECTOR
+GENERATED ALWAYS AS (
+    to_tsvector('english', coalesce(title,'') || ' ' || coalesce(content,''))
+) STORED;
+
+CREATE INDEX ON articles USING GIN(search_vec);
+
+-- 관련도 순위 포함 검색
+SELECT id, title, ts_rank(search_vec, q) AS rank
+FROM articles, to_tsquery('english', 'postgresql & performance') q
+WHERE search_vec @@ q
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+한국어는 영어 어간 추출 사전이 동작하지 않는다. `pg_bigm`은 2글자씩 분리하는 bigram 방식으로 한국어 검색을 가능하게 한다. 하지만 형태소 분석 기반의 정확한 한국어 검색, 자동완성, 오타 교정이 필요하다면 Elasticsearch가 필요한 지점이다. PostgreSQL FTS는 "데이터가 이미 PostgreSQL에 있고, 영어 기반이며, 검색이 부가 기능인 경우"의 출발점이다.
+
+## Large Object — TOAST의 한계를 넘어야 할 때
+
+BYTEA로 100MB PDF를 저장하면 TOAST 테이블에 약 5만 개 청크가 생긴다. `SELECT content FROM files WHERE id = 1`은 5만 청크를 읽고 재조합해 100MB를 메모리에 올린다. 스트리밍은 불가능하다.
+
+Large Object는 다르다. `pg_largeobject` 시스템 테이블에 2KB 페이지로 저장하고, `lo_get(loid, offset, len)`으로 필요한 구간만 읽는다. 최대 4TB까지 지원하며, Spring에서는 `PGConnection.getLargeObjectAPI()`를 통해 64KB 버퍼 단위로 스트리밍할 수 있다.
+
+<Aside label="실용적 선택">
+대부분의 현대 서비스에서 실용적인 답은 S3나 GCS 같은 오브젝트 스토리지다. DB에는 URL이나 키만 저장하고, 파일 자체는 CDN과 연동 가능한 전문 저장소에 맡긴다. BYTEA는 1MB 미만의 소형 바이너리, Large Object는 트랜잭션 일관성이 필요한 중형 파일에 의미가 있다.
+</Aside>
+
+Large Object의 함정은 고아(orphan) LO다. `lo_create()`로 LO를 만들었지만 참조 테이블 INSERT가 실패하면, `pg_largeobject`에는 데이터가 남고 참조는 없다. 반드시 `@Transactional` 안에서 LO 생성과 참조 INSERT를 묶어야 한다. 정기적인 `vacuumlo` 실행도 필요하다.
+
+## 정리
+
+- PostgreSQL은 행 크기가 2KB를 넘으면 TOAST로 자동 분리한다. 투명하지만 `SELECT *`는 모든 TOAST 청크를 읽는다.
+- JSONB는 바이너리 포맷 + 키 정렬로 O(log N) 접근을 제공한다. `@>` 연산자와 GIN 인덱스의 조합이 핵심이다.
+- 배열 GIN 인덱스는 태그 시스템을 단순하게 만든다. 단, FK가 필요하거나 빈번한 단독 업데이트가 있으면 정규화가 낫다.
+- PostgreSQL FTS는 Elasticsearch 없이 시작할 수 있는 출발점이다. 한국어 형태소와 대규모 집계가 필요하면 전환을 검토한다.
+- 대용량 파일은 S3가 먼저다. BYTEA는 소형, Large Object는 트랜잭션이 필요한 중형 파일에 한정된다.
+
+다음 글에서는 PostgreSQL이 이 값들을 어떻게 인덱싱하는지 — B-Tree가 아닌 GIN, GIST, BRIN의 내부 구조와 언제 어느 인덱스를 선택해야 하는지 추적한다.

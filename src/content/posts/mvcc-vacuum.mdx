@@ -1,0 +1,148 @@
+---
+title: "PostgreSQL은 왜 삭제해도 테이블이 줄지 않는가"
+description: "Dead Tuple 생성부터 VACUUM 내부 흐름, HOT Update 최적화, XID Wraparound 위기까지 — PostgreSQL MVCC가 치르는 비용과 그 관리 전략을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [postgresql, mvcc, vacuum, dead-tuple, xid-wraparound]
+difficulty: intermediate
+series:
+  slug: postgresql-deep-dive
+  title: Postgresql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`DELETE FROM orders WHERE created_at < NOW() - INTERVAL '30 days'`를 매일 실행하는데 테이블은 줄지 않는다. `UPDATE users SET last_login = NOW()`를 초당 500번 실행하면 테이블이 매일 수십 GB씩 불어난다. PostgreSQL의 MVCC는 이전 버전의 튜플을 즉시 삭제하지 않고 페이지에 남겨두기 때문이다. 왜 이런 설계를 선택했고, 그 비용을 어떻게 관리해야 하는가?
+
+## Dead Tuple — MVCC가 치르는 공간 비용
+
+PostgreSQL에서 `DELETE`는 행을 지우지 않는다. 해당 튜플의 `t_xmax`에 현재 트랜잭션 XID를 기록할 뿐이다. `UPDATE`는 더 명확하다 — OLD 버전의 `t_xmax`를 설정하고 NEW 버전을 같은 페이지(또는 다른 페이지)에 삽입한다. 커밋이 완료된 후 OLD 버전은 "Dead Tuple"이 된다.
+
+```
+UPDATE orders SET status = 'SHIPPED' WHERE id = 1;
+(트랜잭션 XID=502, 커밋 후)
+
+┌────────────────────────────────────────┐
+│ ItemId[1] → OLD Tuple                  │
+│   t_xmin=500, t_xmax=502              │ ← DEAD
+│   status='PENDING'                    │
+│ ItemId[2] → NEW Tuple                  │
+│   t_xmin=502, t_xmax=0               │ ← ALIVE
+│   status='SHIPPED'                    │
+└────────────────────────────────────────┘
+```
+
+즉시 삭제하지 않는 이유는 Long Running Transaction 때문이다. XID 500으로 시작한 트랜잭션이 아직 실행 중이라면 OLD 버전을 참조할 수 있다. VACUUM은 모든 활성 트랜잭션 중 가장 오래된 XID(`OldestXmin`)보다 낮은 `t_xmax`를 가진 튜플만 회수한다.
+
+Dead Tuple이 쌓이면 SeqScan 비용이 선형으로 증가한다. Live Tuple이 10만 건인데 Dead Tuple이 30만 건이면 `dead_ratio = 75%`다. 테이블 전체를 스캔할 때 읽어야 할 페이지가 4배가 되고, 인덱스도 헛된 Heap Fetch를 반복한다.
+
+<Callout type="warning" title="dead_ratio 임계값">
+`dead_ratio > 20%`이면 Autovacuum 설정을 재검토하고, `50%`를 넘으면 즉시 수동 `VACUUM`을 실행한다. `pgstattuple` 확장으로 정확한 비율을 확인할 수 있다.
+</Callout>
+
+## VACUUM 내부 — 5단계 파이프라인
+
+VACUUM은 단순히 Dead Tuple을 지우는 것이 아니다. 5단계의 파이프라인을 순서대로 실행한다.
+
+1. **Heap Scan**: 페이지를 순서대로 읽으며 회수 가능한 Dead Tuple의 TID를 `maintenance_work_mem` 한도 내에서 수집한다.
+2. **Index Vacuum**: 수집한 TID 목록으로 각 인덱스를 스캔해 Dead 엔트리를 제거한다. 인덱스가 먼저여야 한다 — Heap에서 튜플을 먼저 제거하면 인덱스가 존재하지 않는 위치를 가리키는 dangling pointer가 된다.
+3. **Heap Vacuum**: Dead Tuple을 `LP_UNUSED`로 표시하고 페이지 내 살아있는 튜플을 앞으로 당겨 압축한다.
+4. **FSM 업데이트**: 각 페이지의 여유 공간을 Free Space Map에 기록한다. 다음 INSERT가 이 정보를 사용해 공간 있는 페이지를 O(log N)으로 찾는다.
+5. **Visibility Map 업데이트**: 페이지 내 모든 튜플이 모든 트랜잭션에게 보이는 상태가 되면 All-Visible 비트를 설정한다. 이 비트가 있어야 Index-Only Scan이 Heap Fetch를 생략할 수 있다.
+
+VACUUM이 획득하는 잠금은 `ShareUpdateExclusiveLock` — `SELECT`, `INSERT`, `UPDATE`, `DELETE`와 동시에 실행 가능하다. VACUUM 중에도 일반 DML은 차단되지 않는다.
+
+**VACUUM은 OS에 공간을 반환하지 않는다.** 파일 크기는 유지되고, 비워진 공간은 "재사용 가능"으로 표시될 뿐이다. 파일 자체를 줄이려면 `VACUUM FULL`(AccessExclusiveLock, 운영 중 전체 차단)이 필요하다. 운영 환경에서는 `pg_repack`이 대안이다 — 테이블 교체 직전 수 초만 `AccessExclusiveLock`을 잡고 나머지 과정은 DML과 동시에 진행한다.
+
+## HOT Update — 인덱스를 건드리지 않는 UPDATE
+
+인덱스가 10개인 테이블에서 UPDATE 1건은 최소 11번의 페이지 수정(Heap 1 + 인덱스 10)을 발생시킨다. HOT(Heap Only Tuple) Update는 이 인덱스 갱신 비용을 제거하는 최적화다.
+
+두 조건이 동시에 충족되면 HOT Update가 발동한다:
+
+1. 변경된 컬럼이 **어떤 인덱스에도** 포함되지 않을 것
+2. NEW 버전을 **같은 Heap 페이지**에 삽입할 수 있을 것 (여유 공간)
+
+조건 2를 보장하는 것이 `fillfactor`다. 기본값 100이면 페이지를 꽉 채워 여유 공간이 없다. `fillfactor = 70`으로 설정하면 30%를 비워두어 같은 페이지에 NEW 버전을 삽입할 수 있다.
+
+```sql
+-- UPDATE 빈번한 테이블에 적용
+ALTER TABLE users SET (fillfactor = 70);
+
+-- HOT 비율 확인
+SELECT
+    relname,
+    n_tup_upd AS total_updates,
+    n_tup_hot_upd AS hot_updates,
+    round(n_tup_hot_upd * 100.0 / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 0;
+```
+
+HOT Update가 발생해도 Dead Tuple은 생긴다. 이점은 쓰기 시점의 인덱스 I/O 제거다. 인덱스는 OLD 버전의 위치를 계속 가리키지만, `t_ctid` 체인을 따라 최신 버전으로 이동한다. VACUUM은 이 체인을 정리하며 `LP_REDIRECT`로 단축한다.
+
+## Autovacuum 튜닝 — 대형 테이블의 함정
+
+Autovacuum 실행 조건 공식:
+
+```
+n_dead_tup > autovacuum_vacuum_threshold(50)
+           + autovacuum_vacuum_scale_factor(0.2) × n_live_tup
+```
+
+1,000만 행 테이블에서 기본값을 적용하면 threshold = 2,000,050이다. Dead Tuple이 **200만 개**가 쌓여야 Autovacuum이 실행된다. 초당 500 UPDATE면 이 상태에 도달하는 데 약 67분, 각 실행에서 처리해야 할 Dead Tuple이 200만 개다.
+
+`vacuum_cost_limit = 200` 기준으로 초당 약 10페이지를 처리하면 완료까지 수십 시간이 걸린다. 다음 실행 주기가 도래하면 또 200만 개가 쌓인다 — Autovacuum이 영원히 따라오지 못하는 상태가 된다.
+
+해결은 테이블별 파라미터 오버라이드다:
+
+```sql
+ALTER TABLE users SET (
+    autovacuum_vacuum_scale_factor = 0.01,  -- 1%마다 실행
+    autovacuum_vacuum_cost_limit = 800       -- 더 빠르게 처리
+);
+-- 새 threshold: 1000 + 0.01 × 10,000,000 = 101,000
+-- → 약 3분마다 실행
+```
+
+<Callout type="note" title="트레이드오프">
+`scale_factor`를 낮추면 Autovacuum이 자주 실행되어 I/O 부하가 증가한다. `cost_limit`을 높이면 처리 속도는 빨라지지만 VACUUM이 디스크 I/O를 독점할 수 있다. 균형점은 `cost_limit = 400~800`, `scale_factor = 0.01~0.05`(대형 테이블 기준)다.
+</Callout>
+
+## XID Wraparound — 쓰기가 멈추는 날
+
+PostgreSQL의 트랜잭션 ID(XID)는 32비트다. 약 42억을 넘으면 XID가 0으로 돌아가고, 모듈 산술에 의해 과거 XID가 "미래"로 인식된다. 해당 XID 트랜잭션이 삽입한 튜플이 보이지 않게 되는 — 데이터 손상이다.
+
+VACUUM Freeze는 이를 예방한다. 오래된 튜플의 `t_xmin`을 `FrozenTransactionId(2)`로 교체하면 어떤 XID와 비교해도 항상 "과거"로 인식된다. PostgreSQL은 `age(datfrozenxid)`가 21억을 초과하면 스스로 **모든 쓰기 쿼리를 거부**한다.
+
+```sql
+-- 위험도 모니터링
+SELECT
+    datname,
+    age(datfrozenxid) AS xid_age,
+    CASE
+        WHEN age(datfrozenxid) > 1500000000 THEN 'CRITICAL'
+        WHEN age(datfrozenxid) > 1000000000 THEN 'WARNING'
+        WHEN age(datfrozenxid) >  500000000 THEN 'NOTICE'
+        ELSE 'OK'
+    END AS status
+FROM pg_database
+ORDER BY age(datfrozenxid) DESC;
+```
+
+Wraparound를 유발하는 주요 원인은 세 가지다: 장기 트랜잭션(`BEGIN` 후 수십 시간 방치), 비활성 Replication Slot(`catalog_xmin`이 낮은 슬롯이 Freeze를 차단), Autovacuum 비활성화. 각각 `idle_in_transaction_session_timeout` 설정, 미사용 슬롯 삭제(`pg_drop_replication_slot`), Autovacuum 활성화로 예방한다.
+
+<Aside label="설계 철학">
+PostgreSQL이 32비트 XID를 유지하는 이유는 모든 튜플 헤더에 `t_xmin`, `t_xmax`가 포함되기 때문이다. 64비트로 바꾸면 튜플당 8바이트가 추가되어 테이블 크기가 늘어난다. VACUUM Freeze로 예방 가능하므로 공간 효율을 선택한 것이다. MySQL은 64비트 트랜잭션 ID를 사용해 Wraparound 걱정이 없지만, 대신 Undo Log라는 별도 공간 비용을 지불한다.
+</Aside>
+
+## 정리
+
+- PostgreSQL MVCC는 Dead Tuple을 즉시 삭제하지 않는다. 잠금 없는 읽기와 빠른 쓰기를 위해 공간과 VACUUM 운영 비용을 지불한다.
+- VACUUM은 5단계 파이프라인으로 동작하며 일반 DML과 동시 실행된다. 파일 크기는 줄지 않는다 — 공간 회수가 필요하면 `pg_repack`을 사용한다.
+- HOT Update는 인덱스를 건드리지 않는 UPDATE 최적화다. `fillfactor = 70~80` + 비인덱스 컬럼 업데이트 조건에서 활성화된다.
+- 대형 테이블은 `autovacuum_vacuum_scale_factor`를 `

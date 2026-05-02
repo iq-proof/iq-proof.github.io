@@ -1,13 +1,13 @@
 ---
-title: "Redis 복제는 왜 데이터를 잃는가"
-description: "비동기 복제의 구조적 한계부터 PSYNC backlog 계산, Sentinel Failover, Cluster 리샤딩, WAIT 명령어까지 — Redis 고가용성 설계의 트레이드오프를 추적한다."
-pubDate: 2026-04-27
+title: "PostgreSQL 복제는 하나의 철학이다"
+description: "WAL 스트리밍부터 Logical Decoding, Patroni Split-Brain 방지, PgBouncer Transaction Mode까지 — PostgreSQL 복제 생태계 전체를 관통하는 설계 원칙을 추적한다."
+pubDate: 2026-05-02
 category: dev
-tags: [redis, replication, sentinel, cluster, consistency]
+tags: [postgresql, replication, wal, patroni, pgbouncer]
 difficulty: intermediate
 series:
-  slug: redis-deep-dive
-  title: Redis Deep Dive
+  slug: postgresql-deep-dive
+  title: Postgresql Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,92 +16,104 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-Redis는 Master-Replica 복제를 기본으로 제공한다. 그런데 `SET order:123 "paid"`에서 OK를 받은 직후 Failover가 발생하면, 그 데이터가 사라질 수 있다. 비동기 복제가 성능을 위해 일관성을 포기하는 구조이기 때문이다. 그렇다면 언제 얼마나 잃고, 어떻게 줄일 수 있는가?
+PostgreSQL의 복제 스택은 넓다. Streaming Replication, Hot Standby, Logical Replication, Patroni, PgBouncer — 이것들은 독립된 기능처럼 보이지만 하나의 질문에서 출발한다. **"Primary가 쓴 것을 어떻게, 얼마나 빠르게, 어디까지 전달할 것인가?"** 이 질문에 답하는 방식이 곧 각 컴포넌트의 설계 결정이다.
 
-## 복제의 출발점 — PSYNC와 두 가지 경로
+## WAL이 모든 것의 출발점이다
 
-Replica가 Master에 처음 연결하면 `PSYNC ? -1`을 보낸다. Master는 두 가지 중 하나를 선택한다.
+Streaming Replication의 흐름은 단순하다. Primary가 트랜잭션을 커밋하면 WAL 레코드가 `pg_wal/`에 기록되고, WAL Sender 프로세스가 이를 TCP로 Standby에 밀어 넣는다. Standby의 WAL Receiver는 받은 WAL을 로컬에 저장하고, Startup 프로세스가 이를 Heap에 Redo한다.
 
-**Full Resync**: Master가 `BGSAVE`로 RDB를 생성해 전송한다. 수 GB 인스턴스라면 수 분이 걸린다. 이 시간 동안 Replica는 구버전 데이터를 서빙하고, Master는 fork() 비용과 네트워크 대역폭을 소비한다.
-
-**Partial Resync**: Replica가 가진 `replid`와 `offset`이 `repl_backlog_buffer` 범위 안에 있으면 밀린 명령어만 전송한다. 수 ms~수 초로 재동기화가 끝난다.
-
-문제는 `repl_backlog_size`의 기본값이 1 MB라는 것이다. 초당 5 MB를 쓰는 서버에서 Replica가 30초 재배포로 내려가면, 밀린 데이터는 150 MB다. 이 경우 Full Resync로 폴백한다.
-
-```bash
-# 적절한 backlog 계산: 쓰기 속도 × 최대 단절 시간 × 2
-# 5 MB/s × 60초 × 2 = 600 MB
-redis-cli CONFIG SET repl-backlog-size 629145600
-```
-
-## 비동기 복제의 구조적 한계
-
-Master는 Replica ACK 없이 즉시 OK를 반환한다. Redis가 낮은 지연을 핵심 가치로 삼기 때문이다. 동기 복제를 하면 응답 시간이 최소 10배 이상 늘어난다.
-
-대신 타임라인에는 틈이 생긴다.
+이 파이프라인에는 4개의 LSN 체크포인트가 있다.
 
 ```
-t=0ms:  Master SET order:123 "paid" → 클라이언트에게 OK
-t=1ms:  복제 스트림으로 Replica에 전송 시작
-t=2ms:  Replica에 적용 완료
+sent_lsn   → write_lsn  → flush_lsn  → replay_lsn
+(TCP 전송)   (OS 버퍼)    (디스크 fsync)  (Heap 적용)
 ```
 
-`t=0`과 `t=2` 사이에 Master가 죽으면 `order:123`은 Replica에 없다. Sentinel이 Replica를 새 Master로 승격시키고, 클라이언트가 `GET order:123`을 보내면 `nil`이 돌아온다.
+복제 지연은 `pg_current_wal_lsn() - replay_lsn`이다. 숫자가 클수록 Standby가 뒤처진다. `pg_stat_replication`의 `replay_lag` 컬럼이 이를 시간 단위로 보여준다.
 
-<Callout type="warning" title="비동기 복제의 데이터 유실">
-`INFO replication`의 `master_repl_offset`과 `slave0: offset` 차이가 유실 범위다. Sentinel과 Cluster 모두 offset이 가장 높은 Replica를 새 Master로 선택하므로, 이 차이를 최소화하는 것이 유실 최소화의 핵심이다.
+동기/비동기 선택은 이 파이프라인의 어느 단계에서 Primary가 "OK"를 반환하느냐의 문제다. `synchronous_commit = on`이면 `flush_lsn`까지, `remote_apply`이면 `replay_lsn`까지 기다린다. 비동기는 로컬 fsync 후 즉시 반환한다. 네트워크 RTT만큼의 지연을 감수할 수 있는가 — 금융 거래라면 `remote_apply`, 웹 서비스라면 비동기가 합리적이다.
+
+<Callout type="warning" title="Replication Slot의 양날">
+Slot은 Standby가 따라잡을 때까지 WAL을 보존한다. Standby가 영구 제거됐는데 Slot을 삭제하지 않으면 `pg_wal/`이 무한히 증가해 Primary 디스크가 꽉 찬다. `pg_replication_slots`의 `retained_wal`을 항상 모니터링하고, inactive Slot은 즉시 삭제해야 한다.
 </Callout>
 
-## Sentinel — sdown에서 odown까지
+## Hot Standby — 읽기와 Redo의 충돌
 
-Sentinel은 이 비동기 복제 위에서 자동 Failover를 제공한다. 동작 방식은 2단계다.
+Standby에서 SELECT를 허용하는 것이 Hot Standby다. 여기서 첫 번째 긴장이 생긴다. Startup 프로세스가 WAL을 Redo하는 동안 읽기 쿼리가 같은 페이지에 접근하면 충돌이 발생한다.
 
-**sdown (Subjective Down)**: 단일 Sentinel이 `down-after-milliseconds` 동안 ping 응답이 없으면 "죽은 것 같다"고 판단한다. 혼자만의 주관적 판단이다.
+가장 흔한 충돌은 VACUUM이다. Primary에서 Dead Tuple을 제거하는 WAL이 Standby에 도달했을 때, Standby의 읽기 쿼리가 그 튜플을 아직 보고 있다면 Redo가 30초(`max_standby_streaming_delay` 기본값) 대기 후 쿼리를 강제 취소한다. 애플리케이션 로그에 `canceling statement due to conflict with recovery`가 보이면 이 상황이다.
 
-**odown (Objective Down)**: quorum 수 이상의 Sentinel이 sdown에 동의하면 객관적 다운으로 확정되고 Failover가 시작된다.
+`hot_standby_feedback = on`은 Standby의 활성 스냅샷 xmin을 Primary에 주기적으로 전송해 Primary VACUUM이 그 xmin 이전 Dead Tuple을 제거하지 못하게 한다. VACUUM 충돌이 대폭 줄어드는 대신, Primary의 Table Bloat가 늘어날 수 있다. Standby에서 장기 보고서 쿼리를 실행한다면 `hot_standby_feedback = on`은 사실상 필수다.
 
-Sentinel을 3개 이상 홀수로 운영해야 하는 이유가 여기 있다. 2개면 1개 장애 시 과반수 동의가 불가능하다. 3개면 1개 장애에도 2/3 동의로 Failover를 진행할 수 있다.
-
-새 Master 선택 기준은 명확하다: ① `slave-priority` 낮은 것, ② 동점이면 `replication offset` 높은 것. offset 기준이 유실 최소화를 자동으로 보장한다.
-
-<Callout type="note" title="트레이드오프">
-`down-after-milliseconds`를 낮추면 빠른 Failover지만 네트워크 순간 지연으로 오탐이 생긴다. 높이면 안전하지만 장애 시 다운타임이 그만큼 길어진다. 일반 서비스에는 15,000~30,000ms를 권장한다.
-</Callout>
-
-## Cluster — 슬롯과 리샤딩
-
-Sentinel이 단일 Master의 가용성 문제를 해결한다면, Cluster는 용량 확장을 해결한다. 16384개 해시 슬롯을 노드에 나눠 담고, 각 키는 `CRC16(key) % 16384`로 슬롯을 결정한다.
-
-16384라는 숫자는 임의가 아니다. 슬롯 비트맵 크기가 2 KB가 되어 Gossip 메시지에 넣기 적당하다. 노드 1000개 클러스터에서도 메시지 크기가 관리 가능한 수준으로 유지된다.
-
-노드를 추가할 때 리샤딩이 필요하다. 슬롯이 이동하는 동안 두 종류의 리다이렉션이 발생한다.
-
-**MOVED**: 슬롯이 완전히 다른 노드에 있다. 클라이언트는 슬롯 매핑 캐시를 영구 업데이트하고 새 노드로 재요청한다.
-
-**ASK**: 슬롯이 이동 중이다. 일부 키는 출발 노드에, 일부는 목적지 노드에 있다. 클라이언트는 캐시를 업데이트하지 않고 목적지 노드에 `ASKING`을 먼저 보낸 뒤 요청을 재전송한다. ASKING 없이 재요청하면 무한 리다이렉션 루프에 빠진다.
-
-Lettuce와 Jedis는 이 처리를 자동으로 해준다. 커스텀 클라이언트를 작성할 때 주의가 필요한 부분이다.
-
-<Aside label="hash-tag 설계">
-`MGET user:1 user:2`는 두 키가 다른 슬롯에 있으면 `CROSSSLOT` 오류가 난다. `{user}:1`, `{user}:2`처럼 `{}` 안의 내용으로만 슬롯을 결정하게 하면 같은 슬롯에 배치할 수 있다. 단, 같은 태그를 과도하게 쓰면 특정 노드에 부하가 집중되는 핫스팟이 생긴다.
+<Aside label="읽기 분산 전략">
+최신 데이터가 반드시 필요한 쿼리는 Primary로, 통계·보고서·대시보드처럼 수초의 지연이 허용되는 쿼리는 Standby로 보내는 것이 기본 원칙이다. 복제 지연이 허용 임계값을 넘으면 애플리케이션 레벨에서 Standby를 비활성화하는 로직도 필요하다.
 </Aside>
 
-## 유실을 제어하는 도구
+## Logical Replication — 물리를 넘어 논리로
 
-비동기 복제의 유실을 줄이는 도구는 두 가지다.
+Physical Replication은 WAL을 그대로 전달하므로 동일한 PostgreSQL 버전과 아키텍처가 필요하다. Logical Replication은 다르다. WAL에서 "어떤 행이 어떻게 바뀌었는가"를 추출해 행 수준의 논리적 변경으로 전달한다. `wal_level = logical`이 WAL에 컬럼 값을 포함시키고, `pgoutput` 플러그인이 이를 표준 프로토콜로 인코딩한다.
 
-**WAIT numreplicas timeout**: 현재 시점까지의 쓰기가 N개 Replica에 복제됐는지 확인한다. 반환값은 실제로 복제 확인된 Replica 수다. 0이면 타임아웃 내 복제 미완료를 의미한다.
+Publication/Subscription 모델은 명시적이다. Publisher는 어떤 테이블의 어떤 변경(INSERT/UPDATE/DELETE)을 공개할지 선언하고, Subscriber는 그것을 구독한다. PostgreSQL 15부터는 행 필터(`WHERE`)와 컬럼 목록도 지정할 수 있다.
 
-매 쓰기마다 WAIT를 쓰면 처리량이 급락한다. 여러 쓰기를 일괄 실행한 뒤 마지막에 한 번만 쓰는 것이 올바른 패턴이다. 결제, 주문처럼 "반드시 보존되어야 하는 쓰기"에만 선택적으로 적용한다.
+```sql
+-- Publisher: 활성 사용자의 변경만 공개
+CREATE PUBLICATION pub_active FOR TABLE users WHERE (status = 'ACTIVE');
 
-**min-replicas-to-write + min-replicas-max-lag**: Replica가 N개 이상 T초 이하 지연으로 연결돼 있지 않으면 쓰기를 거부한다. Split-Brain 시 구 Master의 Replica가 새 Master로 이동하면, 구 Master는 조건 미달로 쓰기를 거부하게 되어 데이터 충돌을 막는다. 단, Replica 장애 시 Master도 쓰기 불가가 된다 — 일관성을 위해 가용성을 희생하는 선택이다.
+-- Subscriber: 구독 (테이블은 미리 수동 생성 필요)
+CREATE SUBSCRIPTION sub_active
+  CONNECTION 'host=pub-host dbname=mydb user=repl_user'
+  PUBLICATION pub_active;
+```
+
+**DDL은 복제되지 않는다.** `ALTER TABLE`을 Publisher에서 실행하면 Subscriber에는 수동으로 적용해야 한다. Sequence도 복제되지 않는다. 이 제약이 Logical Replication의 핵심 운영 부담이다.
+
+반면 이기종 버전 복제가 가능하다는 점이 강력하다. 메이저 버전 업그레이드(예: PG 14 → PG 16)를 무중단으로 수행할 수 있다. 구버전에서 Publication을 만들고, 신버전 인스턴스가 따라잡을 때까지 복제한 뒤, 짧은 유지보수 창에서 전환한다. 다운타임이 수 초 ~ 수 분으로 줄어든다.
+
+CDC(Change Data Capture) 파이프라인도 Logical Replication 위에서 동작한다. Debezium이 `pgoutput` 플러그인으로 Logical Slot에 연결해 변경 이벤트를 Kafka 토픽으로 흘려보내고, Elasticsearch나 Redis가 이를 소비한다.
+
+## Patroni — 합의가 곧 고가용성이다
+
+Streaming Replication은 복제를 제공하지만 자동 Failover는 제공하지 않는다. Primary가 다운되면 누군가 수동으로 Standby를 Promote해야 한다. Patroni는 이 문제를 etcd 같은 분산 합의 시스템으로 해결한다.
+
+Leader Election의 핵심은 etcd의 Compare-And-Swap이다. 각 노드가 `/service/<cluster>/leader` 키에 자신을 등록하려 하고, 첫 번째로 성공한 노드만 Primary가 된다. Leader는 TTL(기본 30초) 내에 Heartbeat를 보내야 하고, 실패하면 키가 만료된다. Follower가 키의 사라짐을 감지하면 새 Leader Election이 시작된다.
+
+```
+T+0초:   Primary 다운
+T+30초:  etcd Lease 만료, 새 Leader 선출 시작
+T+35초:  최신 WAL을 가진 Standby가 Promote
+T+40초:  HAProxy/PgBouncer가 새 Primary 감지 → 트래픽 전환
+```
+
+총 다운타임은 30~40초다. 설정에 따라 10~20초까지 줄일 수 있다.
+
+Split-Brain 방지가 핵심이다. 네트워크 파티션으로 구 Primary가 etcd와 연결을 잃었을 때, 구 Primary가 계속 쓰기를 받으면 두 Primary가 생긴다. Patroni는 Watchdog으로 이를 막는다. etcd와 연결이 끊기면 Patroni가 자신의 PostgreSQL을 즉시 중단한다. `mode: required`로 설정하면 이 동작이 강제된다.
+
+<Callout type="note" title="트레이드오프">
+etcd 클러스터 전체가 다운되면 Patroni는 보수적으로 동작한다 — PostgreSQL을 읽기 전용으로 전환하거나 중단한다. "etcd 없이는 Primary도 없다"는 원칙이다. 데이터 안전을 위해 가용성을 희생하는 선택이다. 따라서 etcd 클러스터도 반드시 3노드 이상으로 운영해야 한다.
+</Callout>
+
+## PgBouncer — 연결은 비싸다
+
+PostgreSQL은 연결당 프로세스를 fork한다. 연결 1000개면 프로세스 1000개다. 프로세스당 메모리가 10MB라면 10GB가 연결 오버헤드에만 쓰인다. PgBouncer는 애플리케이션과 PostgreSQL 사이에 서서 수천 개 클라이언트 연결을 수십 개 PostgreSQL 프로세스로 압축한다.
+
+세 가지 모드가 있다. **Session Mode**는 클라이언트 세션 동안 PostgreSQL 연결이 고정된다. 세션 상태가 완전히 유지되지만 idle 연결도 PostgreSQL 프로세스를 점유한다. **Transaction Mode**는 트랜잭션이 끝나면 즉시 연결을 반환한다. 풀링 효과가 가장 크다. **Statement Mode**는 각 문장 실행 후 반환한다 — 트랜잭션을 지원하지 않으므로 실무에서 거의 쓰지 않는다.
+
+Transaction Mode의 함정이 있다. PostgreSQL JDBC 드라이버는 같은 쿼리가 5번(`prepareThreshold=5`) 실행되면 서버 사이드 Prepared Statement를 생성한다. 트랜잭션이 끝나 연결이 교체되면 다른 연결에는 그 Prepared Statement가 없다. 결과는 `prepared statement "S_1" does not exist` 오류다.
+
+해결은 간단하다. JDBC URL에 `prepareThreshold=0`을 추가해 서버 사이드 Prepared Statement를 비활성화하면 된다.
+
+```
+jdbc:postgresql://pgbouncer:5432/mydb?prepareThreshold=0
+```
+
+HikariCP와 함께 쓸 때 `maximumPoolSize`는 작게 설정한다. PgBouncer가 여러 앱 인스턴스의 연결을 통합 관리하므로, 앱 인스턴스당 5~10이면 충분하다. `SHOW POOLS`에서 `cl_waiting > 0`이 지속되면 `default_pool_size`를 늘려야 한다는 신호다.
 
 ## 정리
 
-- Full Resync는 비싸다. `repl-backlog-size = 쓰기 속도 × 최대 단절 시간 × 2`로 Partial Resync를 보장하라.
-- 비동기 복제는 Failover 시 최근 쓰기를 잃을 수 있다. `INFO replication`의 offset 차이가 유실 범위다.
-- Sentinel은 3개 이상 홀수로, quorum = 과반수로. 클라이언트는 Master 주소를 하드코딩하지 않고 Sentinel을 통해 조회한다.
-- Cluster에서 MOVED는 캐시를 업데이트하고, ASK는 업데이트하지 않는다. 둘을 혼동하면 무한 루프가 생긴다.
-- WAIT는 중요한 쓰기에만 선택적으로. min-replicas-to-write는 가용성 희생을 감수할 수 있을 때만.
+- WAL은 PostgreSQL 복제의 단일 진실 원천이다. Physical이든 Logical이든 모든 복제는 WAL에서 시작한다.
+- 동기 복제는 "커밋 지연"과 "데이터 손실 없음"의 교환이다. `synchronous_commit` 레벨로 그 균형을 조정한다.
+- Logical Replication은 이기종 복제와 CDC를 열어준다. 대신 DDL과 Sequence는 수동 관리가 필요하다.
+- Patroni는 etcd를 통해 "한 번에 하나의 Primary"를 보장한다. Split-Brain 방지가 핵심이고, etcd 고가용성이 전제 조건이다.
+- PgBouncer Transaction Mode + `prepareThreshold=0`이 현대 PostgreSQL 스택의 표준 조합이다.
 
-Redis 복제의 모든 설정은 결국 하나의 질문으로 귀결된다 — "이 서비스에서 데이터 유실과 서비스 중단, 어느 쪽이 더 비싼가?"
+복제 스택의 각 컴포넌트는 독립적으로 보이지만, 실제로는 "어디까지 신뢰할 것인
