@@ -1,0 +1,143 @@
+---
+title: "Spring Data 테스트는 왜 이렇게 설계됐는가"
+description: "@DataJpaTest 슬라이스 컨텍스트의 제약부터 Testcontainers 컨테이너 공유 전략까지, Spring 데이터 계층 테스트의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, jpa, testing, testcontainers, data-jpa]
+difficulty: intermediate
+series:
+  slug: spring-data-transaction
+  title: Spring Data Transaction
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Data 계층 테스트에는 하나의 반복되는 질문이 있다 — "얼마나 실제처럼 테스트할 것인가?" `@SpringBootTest`는 너무 많이 로딩하고, 순수 단위 테스트는 너무 많이 생략한다. `@DataJpaTest`는 그 중간 어딘가에 있다. 그런데 이 중간 지점은 정확히 어디이며, 그 경계가 만들어내는 함정은 무엇인가?
+
+## 슬라이스 컨텍스트 — 무엇을 로딩하고 무엇을 자르는가
+
+`@DataJpaTest`는 전체 컨텍스트를 포기하는 대신 JPA 계층만 살린다. `@OverrideAutoConfiguration(enabled=false)`로 전체 자동 설정을 끄고, `DataJpaTypeExcludeFilter`가 `@Entity`, `@Repository`, `@Embeddable`만 통과시킨다. `@Service`와 `@Controller`는 필터에서 걸린다.
+
+결과는 극적이다. `@SpringBootTest`가 300~600개 빈을 로딩하며 15~30초 걸리는 동안, `@DataJpaTest`는 20~60개 빈으로 1~3초 만에 준비된다.
+
+하지만 이 격리에는 비용이 따른다. `@Service`가 필요하면 `@Import(UserDomainService.class)`로 직접 추가해야 한다. 더 중요한 것은 H2 인메모리 DB가 기본으로 주입된다는 점이다. `@AutoConfigureTestDatabase`가 `Replace.ANY` 모드로 `application.yml`의 실제 DataSource를 H2로 교체한다. 빠르지만, 실제 DB가 아니다.
+
+## @Transactional 테스트의 세 가지 함정
+
+`@DataJpaTest`는 기본으로 `@Transactional`을 적용한다. 각 테스트 메서드가 트랜잭션 안에서 실행되고, 종료 시 자동 롤백된다. 격리는 완벽해 보인다. 그런데 이 편의가 실제 동작을 정확히 은폐하는 세 가지 방식이 있다.
+
+**첫째, `LazyInitializationException`이 숨겨진다.** 서비스 메서드가 `REQUIRED` 전파로 테스트 트랜잭션에 합류하면, 서비스 메서드가 반환된 후에도 트랜잭션이 살아있다. `user.getOrders().size()`를 테스트에서 호출하면 Lazy 로딩이 성공한다. 운영에서는 서비스 트랜잭션이 종료된 후 Controller가 Detached 엔티티에 접근해 예외가 터진다. 테스트는 통과했지만 버그는 살아있다.
+
+**둘째, `REQUIRES_NEW` 동작이 왜곡된다.** `REQUIRES_NEW`로 열린 독립 트랜잭션은 실제로 커밋된다. 하지만 바깥 테스트 트랜잭션이 롤백되는 구조에서 독립 커밋된 데이터는 남아있어 다음 테스트를 오염시킬 수 있다.
+
+**셋째, `@TransactionalEventListener(AFTER_COMMIT)`이 발행되지 않는다.** 테스트 트랜잭션은 롤백으로 끝나므로 커밋 이벤트가 발행되지 않는다. 이메일 발송 같은 `AFTER_COMMIT` 리스너를 검증하는 테스트는 항상 실패한다.
+
+<Callout type="warning" title="트랜잭션 동작 검증은 @Transactional을 제거하라">
+트랜잭션 전파, 롤백, `AFTER_COMMIT` 이벤트를 검증해야 한다면 테스트 클래스에서 `@Transactional`을 제거하고 `@AfterEach`에서 `deleteAll()`로 정리하라. 자동 롤백의 편의보다 실제 동작 검증이 더 중요하다.
+</Callout>
+
+## H2의 한계 — 호환 모드도 해결 못하는 것들
+
+`MODE=MySQL`로 H2를 MySQL 호환 모드로 실행할 수 있다. `AUTO_INCREMENT` 처리, 일부 키워드 인식이 개선된다. 하지만 다음은 여전히 실패한다.
+
+```sql
+-- JSON 함수
+SELECT * FROM products WHERE JSON_CONTAINS(tags, '"admin"');
+-- H2: Function "JSON_CONTAINS" not found
+
+-- MySQL Upsert
+INSERT INTO stats(date, count) VALUES(:date, 1)
+ON DUPLICATE KEY UPDATE count = count + 1;
+-- H2: 문법 오류
+
+-- FULLTEXT 검색
+SELECT * FROM articles WHERE MATCH(content) AGAINST(:keyword);
+-- H2: FULLTEXT INDEX 개념 없음
+```
+
+H2에서 통과한 Repository 테스트가 운영 MySQL에서 실패하는 방식이다. 이 격차를 메우는 도구가 Testcontainers다.
+
+## Testcontainers — 속도와 정확성의 균형점
+
+Testcontainers의 첫 번째 오해는 "컨테이너마다 새로 시작해서 느리다"는 것이다. 인스턴스 `@Container`를 쓰면 실제로 그렇다. 하지만 올바른 전략은 다르다.
+
+```java
+// 공통 베이스 클래스로 컨테이너 공유
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = Replace.NONE)
+@Testcontainers
+abstract class MySQLContainerBase {
+
+    @Container
+    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0")
+        .withDatabaseName("testdb")
+        .withUsername("test")
+        .withPassword("test");
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+        registry.add("spring.datasource.username", MYSQL::getUsername);
+        registry.add("spring.datasource.password", MYSQL::getPassword);
+    }
+}
+```
+
+`static @Container`는 클래스당 1회만 시작한다. `AbstractContainerBase`를 상속하는 모든 테스트 클래스가 같은 컨테이너와 `ApplicationContext`를 공유한다. Spring의 컨텍스트 캐시가 동일한 설정을 감지해 재사용하기 때문이다. 컨테이너 시작 비용은 전체 테스트 스위트에서 단 1회다.
+
+`@DynamicPropertySource`의 실행 시점이 핵심이다. 컨테이너 `start()` 완료 후, Spring `ApplicationContext` 초기화 전에 호출된다. 이 시점에 `MYSQL.getJdbcUrl()`이 Docker가 랜덤 할당한 포트를 포함한 실제 URL을 반환한다.
+
+<Callout type="note" title="트레이드오프">
+H2는 Docker 없이 가장 빠르지만 DB 방언 버그를 통과시킨다. Testcontainers는 운영과 동일한 환경을 제공하지만 Docker가 필요하다. 권장 혼합 전략: 표준 JPQL과 Query Method는 H2, DB 전용 함수와 네이티브 쿼리는 Testcontainers, 전체 통합은 `@SpringBootTest` + Testcontainers.
+</Callout>
+
+## Repository 계층별 테스트 전략
+
+Repository 테스트가 과잉인지 부족인지는 구현 방식에 따라 달라진다. Spring Data의 `findById`, `save`, `delete`는 검증할 필요가 없다. 프레임워크가 이미 검증했다.
+
+세 가지 구현 방식은 서로 다른 검증 포인트를 요구한다.
+
+**Query Method**는 명명 규칙이 의도한 조건을 올바르게 표현하는지만 확인하면 된다. `findAllByStatusOrderByAgeAsc`가 실제로 정렬된 결과를 반환하는지.
+
+**`@Query` JPQL**은 조인, 서브쿼리, Projection 정확성을 확인해야 한다. `em.flush()` + `em.clear()` 후 조회해야 1차 캐시가 아닌 실제 DB에서 결과를 가져온다는 것을 보장할 수 있다.
+
+**Custom Repository(QueryDSL)**는 동적 조건 조합이 핵심이다. 조건이 `null`일 때, 단독일 때, 복합일 때 각각 올바른 SQL이 생성되는지. 결과가 없을 때 `null`이 아닌 빈 리스트를 반환하는지.
+
+```java
+@DataJpaTest
+@Import(QuerydslConfig.class) // JPAQueryFactory 등록
+class UserQueryRepositoryTest {
+
+    @Autowired JPAQueryFactory queryFactory;
+    @Autowired TestEntityManager em;
+    UserQueryRepository queryRepo;
+
+    @BeforeEach
+    void setUp() {
+        queryRepo = new UserQueryRepository(queryFactory);
+        // 픽스처 준비 후 flush + clear
+        em.flush(); em.clear();
+    }
+
+    @Test
+    void search_noCondition_returnsAll() { ... }
+
+    @Test
+    void search_nameNull_notFiltered() { ... } // null 조건 처리 핵심
+}
+```
+
+`@Modifying` 벌크 업데이트 후에는 반드시 `em.clear()`가 필요하다. 벌크 연산은 영속성 컨텍스트를 거치지 않으므로, 1차 캐시에는 여전히 이전 상태가 남아있다. `clear()` 없이 조회하면 DB의 변경을 보지 못한다.
+
+## 정리
+
+- `@DataJpaTest`의 슬라이스 격리는 속도를 위한 선택이다. `DataJpaTypeExcludeFilter`가 JPA 관련 빈만 통과시키고, H2가 DataSource를 교체한다.
+- 테스트 `@Transactional`은 Lazy Loading 예외, `REQUIRES_NEW` 검증, `AFTER_COMMIT` 이벤트를 은폐한다. 트랜잭션 동작을 검증할 때는 `@Transactional`을 제거하라.
+- H2 호환 모드는 DB 방언 차이를 좁히지만 JSON 함수, FULLTEXT, Upsert 구문을 해결하지 못한다. 이 경계에서 Testcontainers가 시작된다.
+- `AbstractContainerBase` 공유 패턴으로 Testcontainers의 시작 비용을 전체 스위트에서 1회로 줄일 수 있다.
+
+다음 글에서는 이 슬라이스 테스트 전략 위에서 `@Transactional` 전파 동작이 어떻게 검증되는지, 그리고 실제 커밋이 필요한 시나리오를 어떻게 다루는지 추적한다.

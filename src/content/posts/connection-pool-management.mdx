@@ -1,0 +1,135 @@
+---
+title: "HikariCP는 왜 다른 Connection Pool보다 빠른가"
+description: "Lock-free ConcurrentBag 구조부터 타임아웃 파라미터 설계 원칙까지, HikariCP가 고성능을 유지하는 내부 메커니즘을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [hikaricp, connection-pool, spring, jdbc, performance]
+difficulty: intermediate
+series:
+  slug: spring-data-transaction
+  title: Spring Data Transaction
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+DB Connection 하나를 만드는 데 TCP 핸드셰이크, 인증, 세션 초기화까지 합쳐 평균 8ms가 걸린다. 초당 1000 요청 서비스에서 매번 Connection을 새로 만들면 Connection 생성 비용만 8초다. Connection Pool이 이 문제를 해결하지만, Pool 자체도 설계 방식에 따라 성능 차이가 크다. HikariCP는 어떤 선택으로 그 차이를 만드는가?
+
+## Connection Pool의 병목은 Lock이다
+
+전통적인 Connection Pool 구현은 동기화에 `synchronized` 블록이나 `ReentrantLock`을 사용한다. 다수의 스레드가 동시에 Connection을 요청하면 한 스레드가 Lock을 잡는 동안 나머지는 대기한다. 처리량이 올라갈수록 Lock 경합이 늘고, Lock 경합이 늘수록 처리량은 감소한다.
+
+HikariCP는 이 문제를 `ConcurrentBag`이라는 자체 자료구조로 해결한다. 대여와 반환의 핵심 경로에서 Lock을 사용하지 않는다.
+
+```java
+// ConcurrentBag.borrow() — 대여 순서
+// 1단계: 스레드 로컬 캐시 (자신이 마지막 사용한 Connection)
+final List<Object> list = threadList.get();
+for (int i = list.size() - 1; i >= 0; i--) {
+    final T bagEntry = (T) list.remove(i);
+    if (bagEntry != null && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+        return bagEntry; // CAS 성공 → Lock 없이 대여, ~200ns
+    }
+}
+
+// 2단계: 전체 sharedList CAS 순회
+for (T bagEntry : sharedList) {
+    if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+        return bagEntry; // ~500ns
+    }
+}
+
+// 3단계: 모두 사용 중 → handoffQueue 대기 (connectionTimeout까지)
+```
+
+스레드 로컬 캐시가 히트하면 약 200ns, `sharedList` CAS 순회도 약 500ns다. DB 쿼리 실행 시간(수 ms)에 비해 무시할 수 있는 수준이다.
+
+반환(`requite`)도 대칭적으로 설계된다. 대기 스레드가 있으면 `handoffQueue`로 직접 전달하고, 없으면 스레드 로컬 캐시에 저장해 다음 대여 시 즉시 반환하도록 한다.
+
+## close()는 연결을 닫지 않는다
+
+HikariCP가 반환하는 Connection 객체는 실제 JDBC Connection이 아니라 `HikariProxyConnection`이다. Javassist로 바이트코드를 생성해 리플렉션 없이 동작하므로 프록시 오버헤드가 최소화된다.
+
+```java
+// 사용자 코드가 호출하는 close()
+public final void close() throws SQLException {
+    poolEntry.recycle(lastAccess); // ConcurrentBag.requite() 호출
+    // 실제 Connection은 닫히지 않고 Pool에 반환됨
+}
+```
+
+`maxLifetime`이 경과한 Connection만 실제 `close()`가 호출된다. 기본값은 30분이고, Pool 안의 Connection들이 동시에 만료되는 "Thunder Herd"를 막기 위해 ±2.5% 랜덤 지터를 추가한다.
+
+## Pool Size를 키우면 느려지는 이유
+
+직관과 반대되는 사실이 있다. Pool Size를 늘리면 처리량이 오히려 줄어드는 구간이 존재한다.
+
+```
+Pool Size:  5    10   16   20   30   50   100
+TPS:       450  750  980  1000  990  900  780
+                  ↑ 공식 기준값    ↑ 감소 시작
+```
+
+HikariCP 공식 권장 공식은 다음과 같다.
+
+```
+connections = (core_count × 2) + effective_spindle_count
+```
+
+CPU 8코어, SSD 환경: `(8 × 2) + 0 = 16`. Pool 크기가 16~20일 때 처리량이 최고치에 도달하고, 이후에는 DB 서버 CPU의 Context Switching 비용이 증가하면서 오히려 감소한다.
+
+이론적 근거는 Little's Law에서도 확인된다. 평균 쿼리 시간이 10ms이고 목표 TPS가 1000이면 필요한 Connection은 `L = λ × W = 1000 × 0.01 = 10개`다. Connection을 100개로 늘려도 DB CPU가 병목이면 처리량은 늘지 않는다.
+
+<Callout type="warning" title="MSA 환경에서의 총량 관리">
+Pod 10개 × Pool 30개 = DB Connection 300개. DB `max_connections=200`이면 일부 Pod는 Connection 획득에 실패한다. MSA에서는 `DB max_connections의 80%` 이하로 전체 Pool 합계를 유지해야 한다.
+</Callout>
+
+## Connection이 끊겼을 때 — 세 가지 시점의 검증
+
+DB 재시작이나 방화벽 타임아웃으로 Pool 안의 Connection이 무효화될 수 있다. HikariCP는 세 시점에서 이를 감지한다.
+
+**생성 시**: `initializationFailTimeout=0`으로 설정하면 DB가 준비되지 않아도 애플리케이션이 시작된다. Kubernetes 환경에서 앱이 DB보다 먼저 뜨는 경우에 권장한다.
+
+**대여 시**: JDBC 4 이상 드라이버는 `isValid()`로 드라이버 자체 ping을 수행한다(`SELECT 1`보다 10~50배 빠름). 레거시 환경에서만 `connectionTestQuery`를 설정한다.
+
+**유휴 중**: `keepaliveTime`마다 유휴 Connection에 `isValid()`를 실행한다. 방화벽 idle timeout보다 짧게 설정해야 방화벽이 끊기 전에 ping이 실행된다.
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      keepalive-time: 60000        # 방화벽 idle timeout보다 짧게
+      max-lifetime: 1800000        # DB wait_timeout보다 짧게 (필수)
+      connection-timeout: 5000     # 빠른 실패
+      validation-timeout: 3000     # connectionTimeout보다 짧게
+```
+
+`maxLifetime < DB wait_timeout`은 가장 중요한 규칙이다. 이 순서가 역전되면 DB가 Connection을 먼저 끊고 Pool은 그 사실을 모른 채 끊긴 Connection을 대여해서 첫 요청이 실패한다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프 요약">
+**Pool Size 크게**: 트래픽 스파이크 흡수 가능. 단 DB CPU Context Switching 증가로 적정값 이상은 역효과.
+
+**connectionTimeout 짧게(5초)**: 스레드 고갈을 막고 Circuit Breaker와 연계된 빠른 실패 가능. 단 일시적 DB 과부하에서 정상 요청도 실패.
+
+**고정 Pool(minimum=maximum)**: Connection 항상 준비 상태. 저트래픽 시에도 DB Connection 유지 비용 발생.
+
+**Statement 캐싱(cachePrepStmts=true)**: 반복 SQL 파싱 비용 최대 99% 절감. 단 동적 SQL(값 직접 삽입)에는 효과 없고 캐시 슬롯만 낭비.
+</Callout>
+
+<Aside label="설계 철학">
+HikariCP의 선택들은 일관된 방향을 가진다 — 불필요한 추상화를 제거하고, Lock을 CAS로 교체하고, Connection 수명을 예측 가능하게 관리한다. 사용자에게는 "Pool Size를 DB CPU에 맞춰라", "타임아웃 순서를 지켜라"는 명확한 책임을 요구한다.
+</Aside>
+
+## 정리
+
+- HikariCP의 핵심은 `ConcurrentBag`의 Lock-free 설계다. 스레드 로컬 캐시 → CAS 순회 → handoffQueue 대기 순으로 진행하며 대여 비용은 200~500ns다.
+- Pool Size의 최적값은 `core × 2 + spindle_count`. 이 이상은 DB 서버 Context Switching으로 처리량이 역전된다.
+- `maxLifetime < DB wait_timeout`을 지키지 않으면 야간 저트래픽 후 첫 요청이 간헐적으로 실패한다.
+- Statement 캐싱(`cachePrepStmts=true`)과 파라미터 바인딩은 보안(SQL Injection 방지)과 성능을 동시에 얻는 올바른 패턴이다.
+
+다음 글에서는 `@Transactional` 전파 속성이 Connection을 어떻게 공유하고 분리하는지, 그리고 `REQUIRES_NEW`가 Pool 크기와 데드락을 어떻게 만들어내는지 추적한다.

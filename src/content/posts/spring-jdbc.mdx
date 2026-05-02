@@ -1,0 +1,136 @@
+---
+title: "JdbcTemplate이 JDBC 보일러플레이트를 제거하는 방법"
+description: "Connection 획득부터 예외 변환, 결과 매핑, 배치 처리까지 — JdbcTemplate 패밀리의 설계 철학과 트레이드오프를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, jdbc, jdbctemplate, batch, transaction]
+difficulty: intermediate
+series:
+  slug: spring-data-transaction
+  title: Spring Data Transaction
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+순수 JDBC 코드를 한 번이라도 작성해본 사람이라면 안다. Connection 획득, PreparedStatement 생성, ResultSet 닫기, 예외 처리, 자원 반환 — 이 일곱 단계가 실제 SQL 한 줄을 실행하기 위해 반드시 따라붙는다. `JdbcTemplate`은 이 반복 구조를 **Template Method 패턴**으로 제거한다. 고정된 흐름을 프레임워크가 쥐고, 가변하는 부분(SQL, 파라미터 바인딩, 결과 매핑)만 사용자에게 맡기는 방식이다. 그렇다면 이 "위임" 구조는 트랜잭션과 어떻게 연결되고, 어디서 한계를 드러내는가?
+
+## Template Method 패턴의 뼈대
+
+`JdbcTemplate`의 모든 메서드는 결국 `execute(PreparedStatementCreator, PreparedStatementCallback)`로 수렴한다.
+
+```java
+public <T> T execute(PreparedStatementCreator psc, PreparedStatementCallback<T> action) {
+    Connection con = DataSourceUtils.getConnection(obtainDataSource()); // [1] Connection 획득
+    PreparedStatement ps = null;
+    try {
+        ps = psc.createPreparedStatement(con);  // [2] 사용자 제공 SQL
+        applyStatementSettings(ps);             // [3] 타임아웃 등 설정
+        T result = action.doInPreparedStatement(ps); // [4] 사용자 제공 작업
+        handleWarnings(ps);
+        return result;
+    } catch (SQLException ex) {
+        // [5] DB 에러 코드 → DataAccessException 변환
+        throw translateException("PreparedStatementCallback", getSql(psc), ex);
+    } finally {
+        JdbcUtils.closeStatement(ps);
+        DataSourceUtils.releaseConnection(con, getDataSource()); // [6] Connection 반환
+    }
+}
+```
+
+`query()`, `update()`, `batchUpdate()` 어느 것을 호출하든 이 구조 안에서 실행된다. Connection 관리와 예외 변환은 고정, SQL과 파라미터 바인딩과 결과 매핑은 가변이다.
+
+## Connection은 트랜잭션을 안다
+
+`[1]`에서 호출하는 `DataSourceUtils.getConnection()`은 단순히 커넥션 풀에서 꺼내오는 것이 아니다.
+
+```java
+ConnectionHolder conHolder =
+    (ConnectionHolder) TransactionSynchronizationManager.getResource(dataSource);
+
+if (conHolder != null && conHolder.hasConnection()) {
+    conHolder.requested(); // 참조 카운트 증가
+    return conHolder.getConnection(); // 현재 트랜잭션의 Connection 반환
+}
+// 트랜잭션 없는 경우만 Pool에서 새 Connection 획득
+```
+
+`@Transactional`이 활성화된 상태라면, `TransactionSynchronizationManager`의 ThreadLocal에 이미 바인딩된 `ConnectionHolder`가 있다. `JdbcTemplate`은 그 Connection을 그대로 가져온다. JPA와 `JdbcTemplate`을 같은 메서드 안에서 혼용해도 `JpaTransactionManager`가 DataSource를 ThreadLocal에 함께 등록하기 때문에, 둘은 동일한 Connection을 공유한다.
+
+`[6]`의 `releaseConnection()` 역시 마찬가지다. 트랜잭션 중이면 실제로 Pool에 반환하지 않고 보관한다. 트랜잭션이 종료될 때 비로소 반환된다.
+
+<Callout type="warning" title="Connection 직접 닫기 금지">
+`DataSourceUtils.getConnection()`으로 가져온 Connection을 직접 `conn.close()`하면 트랜잭션 중인 Connection이 강제로 닫힌다. 항상 `DataSourceUtils.releaseConnection(conn, dataSource)`을 사용해야 한다.
+</Callout>
+
+## 결과 매핑 — RowMapper와 ResultSetExtractor의 책임 분리
+
+`JdbcTemplate`은 ResultSet 처리 방식으로 두 인터페이스를 제공한다. 책임이 명확히 다르다.
+
+**`RowMapper`**: 행(row) 하나를 객체 하나로 변환한다. JdbcTemplate이 `while (rs.next())` 루프를 제어하고, RowMapper는 현재 행만 본다.
+
+**`ResultSetExtractor`**: ResultSet 전체를 직접 제어한다. 커서 위치를 직접 움직일 수 있다.
+
+1:N 관계(팀-멤버)를 단일 JOIN 쿼리로 조회할 때 RowMapper를 쓰면 팀이 멤버 수만큼 중복 생성된다. JdbcTemplate이 행마다 RowMapper를 호출하기 때문이다. 이 경우 ResultSetExtractor가 필요하다.
+
+```java
+ResultSetExtractor<List<Team>> teamExtractor = rs -> {
+    Map<Long, Team> teamMap = new LinkedHashMap<>();
+    while (rs.next()) {
+        Long teamId = rs.getLong("id");
+        Team team = teamMap.computeIfAbsent(teamId,
+            id -> new Team(id, rs.getString("name"), new ArrayList<>()));
+        long memberId = rs.getLong("m_id");
+        if (!rs.wasNull()) {
+            team.getMembers().add(new Member(memberId, rs.getString("m_name")));
+        }
+    }
+    return new ArrayList<>(teamMap.values());
+};
+```
+
+`BeanPropertyRowMapper`는 리플렉션으로 setter를 호출하므로 컬럼명-필드명 매핑 규칙(snake_case → camelCase)을 전제한다. 10,000건 기준으로 커스텀 RowMapper 대비 40~80% 느리고, 불변 객체(setter 없음)에는 사용할 수 없다. 프로토타입이나 내부 도구 수준에서만 쓰는 편이 안전하다.
+
+## NamedParameterJdbcTemplate — 파싱 레이어의 추가
+
+`NamedParameterJdbcTemplate`은 `JdbcTemplate`을 내부에 감싸는 Wrapper다. 자신은 오직 `:name` → `?` 변환만 담당하고, Connection 관리와 예외 변환은 내부 `JdbcTemplate`에 위임한다.
+
+```
+parseSqlStatement()         :name 위치 파악
+substituteNamedParameters() :name → ? 치환
+buildValueArray()           파라미터 이름 순서로 값 배열 구성
+→ 내부 JdbcTemplate.execute() 호출
+```
+
+파싱 결과는 256개 LRU 캐시에 저장되므로 반복 호출 비용은 무시할 수준이다. 단, SQL이 매번 동적으로 다르게 조합되면 캐시 효과가 없다.
+
+IN절 컬렉션 바인딩은 `NamedParameterJdbcTemplate`만 지원하는 기능이다. `WHERE id IN (:ids)`에 `List<Long>`을 넘기면 컬렉션 크기만큼 `?`가 자동으로 확장된다. 빈 컬렉션을 넘기면 `IN ()` → SQL 오류가 발생하므로 사전 체크가 필수다.
+
+## 배치 처리 — 단건 반복의 함정
+
+1만 건을 `jdbcTemplate.update()`로 루프 돌리면 약 30초가 걸린다. 매 호출마다 PreparedStatement 생성과 네트워크 왕복이 발생하기 때문이다. `batchUpdate()`는 `addBatch()` × chunkSize → `executeBatch()` 구조로 네트워크 왕복을 chunk 수로 줄인다.
+
+MySQL에서 JDBC URL에 `rewriteBatchedStatements=true`를 추가하면 `executeBatch()`가 `INSERT INTO t VALUES (?,?),(?,?),...` 단일 문으로 재작성되어 1만 건 기준 **~150ms**까지 떨어진다. 기본값 대비 10~20배 차이다.
+
+JPA `saveAll()`은 `@GeneratedValue(strategy = IDENTITY)`(AUTO_INCREMENT) 전략에서 배치가 비활성화된다. `persist()` 시점에 ID가 필요하므로 즉시 INSERT를 실행하기 때문이다. 대용량 배치에서 IDENTITY 전략을 쓰고 있다면 `JdbcTemplate.batchUpdate()`로 교체하는 것이 현실적인 선택이다.
+
+<Callout type="note" title="트레이드오프">
+`JdbcTemplate.batchUpdate()`는 IDENTITY 전략 테이블도 배치 처리할 수 있고, 영속성 컨텍스트 오버헤드가 없어 메모리 효율이 높다. 반면 `@PrePersist` 같은 JPA 생명주기 이벤트는 실행되지 않는다. 도메인 이벤트가 필요하면 JPA, 성능이 우선이면 JdbcTemplate 배치로 역할을 나눠야 한다.
+</Callout>
+
+<Aside label="설계 철학">
+JdbcTemplate 패밀리 전체는 하나의 원칙으로 수렴한다 — "고정 흐름은 프레임워크가, 가변 로직은 사용자가". `execute()`의 Connection 관리, `DataSourceUtils`의 트랜잭션 연계, `SQLExceptionTranslator`의 예외 추상화 모두 같은 방향을 가리킨다. 사용자가 신경 써야 할 것은 SQL, 바인딩, 매핑뿐이다.
+</Aside>
+
+## 정리
+
+- `JdbcTemplate.execute()`는 Template Method 패턴으로 Connection 획득·반환·예외 변환을 고정하고, SQL과 매핑만 사용자에게 위임한다.
+- `DataSourceUtils.getConnection()`은 현재 트랜잭션의 Connection을 반환한다. JPA와 JdbcTemplate은 같은 Connection을 공유할 수 있다.
+- 1:N JOIN 결과는 `RowMapper`가 아닌 `ResultSetExtractor`로 처리해야 한다. RowMapper는 행 단위 변환 책임만 가진다.
+- `batchUpdate()` + `rewriteBatchedStatements=true`(MySQL)는 대용량 INSERT의 가장 빠른 경로다. JPA `saveAll()`은 IDENTITY 전략에서 배치가 동작하지 않는다.
+
+다음 글에서는 `@Transactional`이 이 Connection을 어떻게 ThreadLocal에 묶고, 전파 속성(propagation)이 중첩 트랜잭션에서 어떤 결정을 내리는지 추적한다.

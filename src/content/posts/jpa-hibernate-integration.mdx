@@ -1,0 +1,130 @@
+---
+title: "JPA는 어떻게 객체와 DB를 동기화하는가"
+description: "EntityManager 프록시의 정체부터 Dirty Checking, N+1 해결, Lazy 프록시, Batch INSERT까지 — JPA 내부 동기화 메커니즘의 설계 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jpa, hibernate, persistence-context, spring-data]
+difficulty: intermediate
+series:
+  slug: spring-data-transaction
+  title: Spring Data Transaction
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Data JPA를 쓰면서 `save()`를 호출하지 않아도 엔티티 수정이 DB에 반영되고, `findById()`를 두 번 호출해도 쿼리가 한 번만 나가고, `user.getTeam().getName()`이 트랜잭션 밖에서 터진다. 이 모든 현상은 하나의 구조에서 나온다 — **Persistence Context**. 이 구조가 어떻게 작동하는지 모르면, 버그를 만날 때마다 "왜 나만 안 되지?"라는 막연한 혼란에 빠진다. JPA 내부에서 실제로 무슨 일이 벌어지는가?
+
+## 주입된 EntityManager는 가짜다
+
+`@PersistenceContext`로 주입받는 `EntityManager`는 실제 `EntityManager`가 아니다. `SharedEntityManagerCreator`가 생성한 **JDK 동적 프록시**다.
+
+```java
+@PersistenceContext
+private EntityManager em;
+
+// em.getClass().getName()
+// → com.sun.proxy.$Proxy61
+```
+
+이유는 단순하다. `EntityManager`는 스레드 안전하지 않다 — 단일 트랜잭션 안에서만 써야 한다. 하지만 `@Repository` 빈은 여러 스레드가 공유한다. 실제 `EntityManager`를 공유하면 위험하므로, 프록시가 호출 시마다 현재 스레드의 `TransactionSynchronizationManager`에서 진짜 `EntityManager`를 꺼내 위임한다.
+
+Hibernate 환경에서 실제 구현체는 `SessionImpl`이다. `EntityManager`와 `Session`은 별개의 객체가 아니라 **같은 `SessionImpl` 인스턴스**다. `em.unwrap(Session.class)`는 새 객체를 만드는 것이 아니라 `this`를 반환한다.
+
+`unwrap`이 필요한 순간은 JPA 표준 API로 닿지 않는 곳에 갈 때다 — `session.enableFilter()`, `session.setDefaultReadOnly(true)`, `session.doWork()`, `session.scroll()`. 대부분의 코드는 `EntityManager`로 충분하고, 최적화가 필요한 특정 지점에서만 `unwrap`을 제한적으로 쓰는 것이 원칙이다.
+
+## Persistence Context — 1차 캐시와 변경 감지
+
+Persistence Context 내부는 두 개의 맵이다.
+
+```
+entitiesByKey:    Map<EntityKey, Object>      // ID → 엔티티 객체
+entityEntryContext: Map<EntityKey, EntityEntry> // ID → 상태 + loadedState
+```
+
+`em.find()`는 먼저 `entitiesByKey`를 조회한다. 캐시 히트면 DB를 건드리지 않는다. 같은 트랜잭션에서 동일 ID로 100번 조회해도 쿼리는 1번이고, 반환되는 참조는 항상 동일 객체다.
+
+JPQL은 다르다. **항상 DB에 쿼리를 보낸다**. 단, 결과를 처리할 때 이미 캐시에 같은 `EntityKey`가 있으면 DB 결과를 무시하고 캐시의 객체를 반환한다. 이것이 JPA의 "Repeatable Read" 보장이다 — 같은 트랜잭션 안에서 동일 엔티티는 항상 동일 객체다.
+
+변경 감지(Dirty Checking)는 여기서 나온다. 엔티티를 로드할 때 `EntityEntry`에 `loadedState`(필드값 복사본)를 저장한다. `flush()` 시점에 `DefaultFlushEntityEventListener`가 현재 필드값과 `loadedState`를 비교해 다른 필드가 있으면 UPDATE SQL을 생성한다. `save()`를 호출하지 않아도 UPDATE가 발생하는 이유가 이것이다.
+
+<Callout type="note" title="@Transactional(readOnly = true)의 효과">
+`readOnly = true`는 `FlushMode.MANUAL`로 설정되어 `flush()` 자체를 생략한다. Dirty Checking 비용 — 엔티티 수 × 필드 수만큼의 리플렉션과 값 비교 — 이 통째로 사라진다. 대량 조회 트랜잭션에서 성능 차이가 유의미하다.
+</Callout>
+
+엔티티의 4가지 상태(New → Managed → Detached → Removed) 전환도 이 구조에서 설명된다. 트랜잭션이 종료되면 `entitiesByKey`에서 제거되어 Detached 상태가 된다. Detached 엔티티를 `merge()`하면 DB에서 SELECT를 실행해 Managed 엔티티를 가져온 후 값을 복사한다 — 이 SELECT 비용을 모르고 반복 `merge()`를 호출하면 성능이 나빠진다.
+
+## N+1 — 설계의 결과이지 버그가 아니다
+
+N+1은 Lazy 컬렉션의 동작 원리에서 자연스럽게 발생한다. `team.getUsers()`가 반환하는 것은 `PersistentBag`이다. `size()`, `get()`, `iterator()` 등을 호출하는 순간 초기화가 트리거되고 `SELECT users WHERE team_id = ?`가 나간다. 팀이 100개면 100번.
+
+5가지 해결 전략의 선택 기준은 명확하다.
+
+| 상황 | 전략 |
+|:---|:---|
+| 단순 조회, 컬렉션 1개 | Fetch Join 또는 `@EntityGraph` |
+| 페이지네이션 + 컬렉션 | `@BatchSize` 전역 설정 |
+| 컬렉션 2개 이상 | `@BatchSize` 또는 DTO Projection |
+| 성능 최우선 API | QueryDSL DTO Projection |
+
+`@BatchSize(size=100)` 또는 `spring.jpa.properties.hibernate.default_batch_fetch_size=100`은 Lazy 초기화 시 IN 절로 묶어 처리한다. 팀 250개의 users를 로드할 때 250번 SELECT가 아니라 `IN (...128개...)` + `IN (...64개...)` + ... 로 분할된다. Hibernate가 IN 절 크기를 2의 거듭제곱으로 패딩하는 이유는 동일한 PreparedStatement를 재사용해 Query Plan Cache 효율을 높이기 위해서다.
+
+Fetch Join과 페이지네이션을 함께 쓰면 `HHH90003004` 경고가 뜨고 전체 데이터를 메모리에 올린 후 페이지를 자른다 — OOM의 원인이 된다. 페이지네이션이 있으면 `@BatchSize`를 쓴다.
+
+## Lazy 프록시와 LazyInitializationException
+
+`user.getTeam()`이 반환하는 것은 실제 `Team`이 아니라 `Team$HibernateProxy$XYZ`다. ByteBuddy가 `Team`을 상속해 만든 서브클래스 인스턴스다. 이 프록시는 `id`와 `SessionImpl` 참조를 가지고 있다. `getName()`을 호출하면 `ByteBuddyInterceptor`가 개입해 DB 쿼리를 실행하고 실제 `Team`을 `target`에 채운다.
+
+`getId()`는 예외다 — 프록시는 생성 시 외래키 값을 이미 알고 있으므로 초기화 없이 반환한다. `user.getTeam().getId()`는 SQL을 발생시키지 않는다.
+
+`LazyInitializationException`은 `EntityManager`가 닫힌 상태에서 프록시 초기화를 시도할 때 발생한다. 인터셉터가 `session.isOpen()`을 확인하고 닫혀있으면 예외를 던진다.
+
+<Callout type="warning" title="트레이드오프: OSIV">
+`spring.jpa.open-in-view=true`(기본값)는 HTTP 요청 전체에서 `EntityManager`를 열어둬 Controller에서도 Lazy Loading을 허용한다. 편리하지만 서비스 트랜잭션 종료 후에도 DB Connection을 점유한다. 고트래픽 환경에서 Connection Pool 고갈의 원인이 된다. 프로덕션에서는 `false`로 설정하고, 서비스 레이어에서 DTO로 변환해 반환하는 것을 권장한다.
+</Callout>
+
+프록시를 다룰 때 주의할 점이 하나 있다. `getClass() == Team.class`는 `false`다 — 프록시 클래스이기 때문이다. `instanceof Team`은 `true`다 — 상속 관계이기 때문이다. `equals()`를 ID 기반으로 구현할 때 `getClass()` 대신 `instanceof`를 써야 하는 이유다.
+
+## Batch INSERT — IDENTITY 전략의 벽
+
+`hibernate.jdbc.batch_size=100`을 설정해도 Batch INSERT가 안 된다면 `@GeneratedValue(strategy = IDENTITY)`를 쓰고 있을 가능성이 높다.
+
+IDENTITY 전략은 INSERT 직후 DB가 생성한 ID를 즉시 반환해야 한다. Batch는 여러 INSERT를 묶어 나중에 실행하는 것이다. 이 둘은 충돌한다 — Hibernate는 IDENTITY를 감지하면 Batch를 자동으로 비활성화한다.
+
+SEQUENCE 전략과 `allocationSize`가 이 문제를 해결한다. `allocationSize=50`이면 DB 시퀀스를 한 번 호출해 50개 분량의 ID 범위를 메모리에 확보한다. 각 `persist()` 호출 시 DB 왕복 없이 메모리에서 ID를 할당하므로, `ActionQueue`에 INSERT를 쌓았다가 `flush()` 시 한 번에 `executeBatch()`로 보낼 수 있다.
+
+```java
+@Entity
+@SequenceGenerator(name = "seq", sequenceName = "product_seq", allocationSize = 100)
+public class Product {
+    @Id @GeneratedValue(strategy = SEQUENCE, generator = "seq")
+    private Long id;
+}
+```
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 100
+          order_inserts: true
+          order_updates: true
+```
+
+MySQL 환경에서 IDENTITY를 바꿀 수 없다면 `JdbcTemplate.batchUpdate()`를 쓴다. JPA 추상화는 포기하지만 DB 왕복은 최소화된다. 10,000건 기준으로 건별 INSERT는 수십 초, Batch는 수백 ms — 두 자릿수 이상 차이가 난다.
+
+<Aside label="설계 철학">
+JPA의 모든 복잡성 — 프록시, 스냅샷, 플러시, 배치 — 은 하나의 목표에서 나온다: 객체 모델과 관계형 DB 사이의 간격을 최대한 투명하게 메우는 것. 그 투명함이 깨지는 지점이 바로 N+1, LazyInitializationException, IDENTITY Batch 불가다. 이 지점들은 JPA가 숨기지 못한 관계형 DB의 본질이다.
+</Aside>
+
+## 정리
+
+- `@PersistenceContext`로 주입되는 `EntityManager`는 프록시다. 실제 구현체는 `SessionImpl`이며, `EntityManager`와 `Session`은 같은 객체다.
+- Persistence Context는 1차 캐시(`entitiesByKey`)와 변경 감지(`loadedState` 비교)의 두 역할을 한다. `save()` 없이 UPDATE가 발생하고, 같은 ID를 두 번 조회해도 쿼리가 한 번인 이유가 여기에 있다.
+- N+1은 Lazy 프록시 초기화의 구조적 결과다. 기본 전략으로 `default_batch_fetch_size=100`을 전역 설정하고, 페이지네이션이 있으면 Fetch Join을 피한다.
+- Lazy 프록시는 `EntityManager`가 열려있을 때만 초기화 가능하다. 트랜잭션 밖에서 Lazy 접근이 필요하면 OSIV가 아니라 서비스 레이어에
