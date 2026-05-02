@@ -1,0 +1,120 @@
+---
+title: "RabbitMQ 메시지 유실은 왜 조용히 일어나는가"
+description: "Publisher Confirm부터 Consumer Ack, 영속성 설정, 재시도 전략, Outbox Pattern까지 — RabbitMQ 메시지 보장의 세 지점과 그 설계 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [rabbitmq, message-reliability, publisher-confirm, dead-letter, outbox-pattern]
+difficulty: intermediate
+series:
+  slug: rabbitmq-deep-dive
+  title: Rabbitmq Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"RabbitMQ를 쓰면 메시지가 보장된다"는 착각이 있다. 기본 설정만으로는 아무것도 보장되지 않는다. Publisher Confirm을 켜지 않으면 발행 실패를 모르고, `autoAck=true`이면 Consumer가 받는 순간 메시지는 삭제되며, `durable=false`이면 재시작 시 메시지가 증발한다. 왜 메시지는 조용히 사라지는가?
+
+## 유실이 발생하는 세 지점
+
+메시지 유실은 세 지점에서 독립적으로 발생한다.
+
+**지점 1 — Publisher → Broker 전송 중.** TCP ACK는 "패킷이 상대방 TCP 스택에 도달했다"는 확인이지, "RabbitMQ가 Queue에 저장했다"는 확인이 아니다. 네트워크가 끊기거나, Exchange가 존재하지 않거나, 브로커에 Flow Control이 발동되면 메시지는 조용히 사라진다. Publisher Confirm(AMQP `Basic.Ack`)이 없으면 발행 측은 성공으로 인식한다.
+
+**지점 2 — Broker 저장.** `Queue durable=true`와 `DeliveryMode=PERSISTENT`는 서로 독립적인 두 설정이다. `durable=true`는 Queue 정의(메타데이터)를 Mnesia DB에 보존하지만, 메시지 내용은 `PERSISTENT`를 따로 설정해야 디스크에 기록된다. 둘 중 하나만 설정하면 재시작 후 Queue는 있는데 메시지는 없는 상황이 생긴다.
+
+**지점 3 — Consumer 처리 중.** `autoAck=true`는 Consumer가 메시지를 받는 순간, 정확히는 브로커가 전송을 완료하는 순간 Queue에서 삭제한다. Consumer가 처리 중 예외가 발생해도 메시지는 이미 없다. 수동 Ack 모드에서도 처리 전에 `basicAck`를 호출하면 동일하다.
+
+<Callout type="warning" title="기본 설정의 함정">
+Publisher Confirm 비활성화 + `autoAck=true` + `durable=false`는 RabbitMQ의 기본에 가까운 설정이다. 개발 환경에서는 잘 동작하고, 프로덕션에서 장애가 발생한 후에야 원인을 파악하게 된다.
+</Callout>
+
+## Publisher Confirm — 브로커 수신을 증명하는 방법
+
+Publisher Confirm은 브로커가 메시지를 받아 Queue에 저장한 후 `Basic.Ack`를 Publisher에게 돌려주는 메커니즘이다. `channel.confirmSelect()`로 Confirm 모드를 활성화하면, 발행한 메시지마다 `sequenceNumber`가 부여되고 브로커의 Ack/Nack가 비동기 콜백으로 수신된다.
+
+```java
+template.setConfirmCallback((correlation, ack, cause) -> {
+    if (!ack) {
+        String messageId = correlation.getId();
+        outboxService.markFailed(messageId);
+        log.error("Publisher Nack: messageId={}, cause={}", messageId, cause);
+    }
+});
+```
+
+Confirm 시점은 Queue 유형에 따라 다르다. `durable=false` Queue는 Queue 저장 시 즉시 Ack, `durable=true + PERSISTENT`는 디스크 기록 후 Ack, Quorum Queue는 과반수 노드에 WAL(Write-Ahead Log)이 기록된 후 Ack를 반환한다. 세 가지 중 Quorum Queue가 가장 강한 보장이다.
+
+`mandatory=true`와 `ReturnsCallback`을 함께 설정하지 않으면 Exchange에서 라우팅에 실패한 메시지가 조용히 폐기될 수 있다. Exchange가 메시지를 수신했으므로 Confirm은 `ack=true`를 반환하지만, Queue에는 도달하지 않은 상태다.
+
+## Consumer Ack — 처리 완료의 신호
+
+`autoAck=false`(수동 Ack)에서 브로커는 메시지를 전달한 후 Unacked 상태로 마킹한다. `basicAck`를 수신해야 비로소 Queue에서 삭제한다. Consumer가 연결을 끊으면 Unacked 메시지는 자동으로 Ready 상태로 복귀해 다른 Consumer에게 재전달된다. 이것이 `autoAck=false`의 핵심 안전망이다.
+
+예외 처리는 예외 유형에 따라 다르게 설계해야 한다.
+
+```java
+} catch (JsonParseException e) {
+    // 메시지 자체가 잘못됨 → DLQ로 이동
+    channel.basicNack(tag, false, false);
+} catch (DataAccessException e) {
+    // 일시적 DB 오류 → 재큐 (단, 재전달된 메시지면 DLQ)
+    channel.basicNack(tag, false, !redelivered);
+}
+```
+
+`requeue=true`를 아무 조건 없이 사용하면 즉시 재큐 → 즉시 재실패 → CPU 폭발의 무한 루프가 만들어진다. Prefetch=1이면 Consumer 전체가 해당 메시지에 잠긴다.
+
+## 재시도 전략 — 무한 루프 없는 Backoff
+
+즉시 재큐의 해결책은 TTL + Dead Letter Exchange(DLX) 체인이다. Consumer 없이 TTL만 설정된 대기 Queue를 이용해 지수 백오프를 RabbitMQ 레벨에서 구현한다.
+
+```
+order.queue (실패) → Nack(requeue=false) → retry.dlx.exchange
+  → wait.1s.queue  (TTL=1초)  → 만료 → order.queue (1차 재시도)
+  → wait.10s.queue (TTL=10초) → 만료 → order.queue (2차 재시도)
+  → wait.60s.queue (TTL=60초) → 만료 → order.queue (3차 재시도)
+  → order.permanent.dlq       (최종 실패, 수동 처리)
+```
+
+재시도 횟수는 `x-death` 헤더의 `count` 필드로 추적한다. 이 방식의 핵심 장점은 Consumer 스레드를 블로킹하지 않는다는 점이다. Spring AMQP의 `RetryTemplate`은 `Thread.sleep()`으로 대기하므로 Prefetch 슬롯을 점유하고, 긴 대기 시간에서는 Heartbeat 누락 위험이 생긴다. 반면 TTL+DLX는 메시지가 Queue에 물리적으로 존재하므로 재시작 후에도 재시도 상태가 보존된다.
+
+<Callout type="note" title="트레이드오프">
+완전한 메시지 보장(Publisher Confirm + `PERSISTENT` + Manual Ack)은 처리량을 약 30~50% 낮춘다. Publisher Confirm 단독은 약 10%, `PERSISTENT` 단독은 약 20%, Manual Ack는 약 5%. 로그나 메트릭처럼 유실이 허용되는 경우에는 `autoAck=true + TRANSIENT`로 최고 처리량을 선택할 수 있다. 어떤 메시지가 어느 보장 수준이 필요한지는 사용자가 결정해야 한다.
+</Callout>
+
+## Outbox Pattern — DB와 메시지 발행의 원자성
+
+`@Transactional`은 DB 트랜잭션만 관리한다. DB 저장과 RabbitMQ 발행은 2PC(Two-Phase Commit) 없이는 원자적으로 처리할 수 없다. DB는 성공했지만 메시지 발행이 실패하면 Consumer는 해당 주문을 처리하지 못한다.
+
+Outbox Pattern은 이 문제를 DB 트랜잭션 내에서 해결한다.
+
+```java
+@Transactional
+public Order placeOrder(OrderRequest req) {
+    Order order = orderRepository.save(new Order(req));
+    // 같은 트랜잭션 안에서 outbox에 저장
+    outboxRepository.save(OutboxEvent.of(order));
+    return order;
+    // 커밋 → 두 저장이 원자적으로 완료
+}
+```
+
+별도 스케줄러가 `outbox` 테이블의 `PENDING` 이벤트를 조회해 RabbitMQ로 발행하고, Publisher Confirm Ack를 받으면 `PUBLISHED`로 업데이트한다. 발행 실패 시 `outbox`에 남아 있으므로 재발행이 가능하다. Consumer 멱등성(중복 메시지 무시)을 함께 구현해야 At-Least-Once + 안전한 중복 처리가 완성된다.
+
+<Aside label="설계 철학">
+RabbitMQ의 메시지 보장은 "켜면 되는 기능"이 아니라 "세 지점을 각각 방어하는 설계 결정"이다. Publisher Confirm, 영속성 설정, Consumer Ack, 재시도 전략, Outbox Pattern — 각각은 독립적인 장애 시나리오에 대응한다. 하나라도 빠지면 그 지점에서 메시지는 조용히 사라진다.
+</Aside>
+
+## 정리
+
+- 메시지 유실은 세 지점에서 독립적으로 발생한다: Publisher→Broker, Broker 저장, Consumer 처리.
+- Publisher Confirm과 `mandatory=true + ReturnsCallback`을 함께 설정해야 발행 측 유실을 완전히 감지할 수 있다.
+- `Queue durable=true`와 `DeliveryMode=PERSISTENT`는 반드시 둘 다 설정해야 재시작 후 메시지가 보존된다.
+- 즉시 `requeue=true`는 무한 루프를 만든다. TTL+DLX Exponential Backoff로 대체하라.
+- DB + 메시지 발행의 원자성이 필요하면 Outbox Pattern이 실용적인 해결책이다.
+
+다음 글에서는 Prefetch Count가 처리량과 공정 분배에 어떤 영향을 주는지, Consumer Utilisation 지표로 병목을 어떻게 진단하는지 추적한다.

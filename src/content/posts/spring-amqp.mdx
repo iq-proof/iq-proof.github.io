@@ -1,0 +1,87 @@
+---
+title: "Spring AMQP의 컴포넌트들은 어떻게 연결되는가"
+description: "RabbitTemplate의 Channel 재사용 원리부터 SMLC/DMLC 선택, 직렬화 타입 별칭, 재시도 전략, Testcontainers 통합 테스트까지, Spring AMQP 전체 설계를 관통하는 계층 구조를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [rabbitmq, spring-amqp, message-queue, testcontainers]
+difficulty: intermediate
+series:
+  slug: rabbitmq-deep-dive
+  title: Rabbitmq Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring AMQP를 쓰면서 `@RabbitListener` 오류가 왜 나는지, Channel이 왜 고갈되는지, 배포 후 "Unknown type id" 예외가 왜 터지는지 설명하지 못한다면 컴포넌트 구조를 모르고 쓰고 있는 것이다. RabbitTemplate, Container, RabbitAdmin은 각자 독립된 것처럼 보이지만, 하나의 `CachingConnectionFactory`를 중심으로 긴밀하게 연결된다. 이 연결 구조를 따라가면 설정 선택의 이유가 보인다.
+
+## 연결 관리의 중심 — CachingConnectionFactory
+
+모든 컴포넌트는 `CachingConnectionFactory`를 통해 RabbitMQ와 대화한다. 기본 모드(CHANNEL)에서는 Connection 하나를 유지하고 그 위에 Channel을 최대 `channelCacheSize`개(기본 25)까지 캐싱한다.
+
+`RabbitTemplate.send()`가 호출될 때 흐름은 단순하다. Channel Cache에서 유효한 Channel을 하나 꺼내 `basicPublish`를 실행한 뒤 Cache에 돌려놓는다. `close()`가 아니라 반납(return)이다. 동시 발행 스레드가 캐시 크기를 초과하면 새 Channel을 생성하고, 처리가 끝나면 Cache가 가득 찰 경우 실제로 닫힌다.
+
+```
+Connection (1개)
+  └── Channel Cache (최대 25개)
+        ├── Channel 1 ← RabbitTemplate이 꺼내 사용 후 반납
+        ├── Channel 2 ← 사용 중
+        └── ...
+```
+
+`channelCacheSize`를 예상 동시 발행 스레드 수 × 1.5 수준으로 잡는 이유가 여기 있다. 너무 작으면 Channel 생성/해제가 반복되고, 너무 크면 메모리만 낭비된다.
+
+## Consumer Container — SMLC vs DMLC
+
+`@RabbitListener`는 선언만 할 뿐, 실제 메시지 수신은 `MessageListenerContainer`가 담당한다. Spring Boot 기본값은 `SimpleMessageListenerContainer(SMLC)`다.
+
+SMLC는 스레드와 Channel을 1:1로 대응시킨다. `concurrency=5`면 5개 스레드가 5개 Channel에 각각 `basicConsume`을 등록한다. 설정이 단순하고 동적 Concurrency(`min~max`)를 지원하지만, 높은 동시성에서 Channel 수가 선형으로 늘어난다.
+
+`DirectMessageListenerContainer(DMLC)`는 이벤트 루프 기반이라 Channel 수가 스레드 수와 같지 않다. `consumersPerQueue`로 설정하고, 스레드 효율이 중요한 고처리량(concurrency > 20) 환경에 적합하다. 동적 Concurrency를 지원하지 않으므로 상황에 맞게 선택해야 한다.
+
+<Callout type="note" title="트레이드오프">
+**SMLC**: Spring Boot 기본, 동적 Concurrency 지원. 스레드 수 = Channel 수라 높은 동시성에서 비효율.  
+**DMLC**: 이벤트 루프 기반으로 Channel 절약. 동적 Concurrency 미지원, 설정 방식이 다름(`consumersPerQueue`).  
+일반 서비스라면 SMLC를 유지하고, 처리량이 한계에 닿았을 때 DMLC를 검토하라.
+</Callout>
+
+## 직렬화와 타입 별칭 — __TypeId__의 함정
+
+`Jackson2JsonMessageConverter`는 객체를 JSON으로 변환하면서 `__TypeId__` 헤더에 클래스 정보를 담는다. 기본값은 fully-qualified class name(FQN)이다.
+
+문제는 패키지 구조가 다른 두 서비스가 메시지를 주고받을 때, 또는 리팩토링으로 패키지명이 바뀔 때 발생한다. Consumer는 `com.order.service.event.OrderPlacedEvent`를 찾으려 하지만 그런 클래스가 없다 — `ClassNotFoundException`.
+
+해결책은 타입 별칭이다. `DefaultJackson2JavaTypeMapper`에 `"order.placed" → OrderPlacedEvent.class` 매핑을 등록하면, 헤더에 FQN 대신 `"order.placed"`가 담긴다. Producer와 Consumer가 서로 다른 클래스 구조를 가져도 같은 별칭을 공유하면 역직렬화가 성공한다.
+
+버전 호환을 위해서는 `@JsonIgnoreProperties(ignoreUnknown = true)` 또는 ObjectMapper 수준에서 `FAIL_ON_UNKNOWN_PROPERTIES = false` 설정이 필수다. 이 설정 하나가 롤링 배포를 가능하게 한다. Producer가 새 필드를 추가해도 구버전 Consumer는 해당 필드를 무시하고 정상 처리한다.
+
+## 에러 처리 계층 — 무한 루프를 막는 설계
+
+`defaultRequeueRejected`의 기본값이 `true`라는 사실이 가장 위험한 함정이다. 예외가 Container로 전파되면 `basicNack(requeue=true)`가 발생하고, 메시지는 즉시 Queue 앞으로 돌아온다. 같은 메시지, 같은 예외, 무한 반복이다.
+
+실무 권장 설정은 `defaultRequeueRejected=false`로 기본 requeue를 끊고, 재시도 가능한 예외(일시적 DB 오류 등)는 `RetryTemplate`으로, 재시도 의미 없는 예외(비즈니스 규칙 위반 등)는 `AmqpRejectAndDontRequeueException`으로 즉시 DLQ로 보내는 것이다.
+
+`RetryTemplate`의 한계도 알아야 한다. Stateless 방식은 재시도 사이에 스레드를 블로킹하고, 앱 재시작 시 카운트가 초기화된다. 재시도 간격이 길거나(수십 초 이상) 처리량이 높은 환경에서는 TTL+DLX 방식이 더 적합하다. 메시지 자체가 대기 Queue에 머무르므로 재시작에 무관하게 상태가 보존된다.
+
+<Aside label="최종 실패 처리">
+`RejectAndDontRequeueRecoverer`는 RabbitMQ DLX 설정에 위임한다. `DeadLetterPublishingRecoverer`는 직접 발행하면서 예외 스택 트레이스를 헤더에 담는다. 실패 원인을 나중에 추적하려면 후자가 유리하다.
+</Aside>
+
+## Auto-configuration과 테스트 전략
+
+Spring Boot의 `RabbitAutoConfiguration`은 `CachingConnectionFactory`, `RabbitTemplate`, `SimpleRabbitListenerContainerFactory`, `RabbitAdmin`을 자동으로 생성한다. `application.yml`의 `spring.rabbitmq.*` 설정이 이 Bean들을 구성한다.
+
+커스터마이징할 때는 Bean 전체를 재선언하거나, `RabbitTemplateCustomizer`를 등록해 자동 생성된 Bean에 속성만 추가하는 두 가지 방법이 있다. 전자는 Auto-configuration의 나머지 설정을 무시할 수 있으니 주의가 필요하다.
+
+테스트 전략은 계층을 나눠야 한다. 발행 로직 단위 테스트는 `@MockBean RabbitTemplate`으로 충분하다. Consumer 로직은 `spring-rabbit-test`의 `@RabbitListenerTest`와 `RabbitListenerTestHarness`로 실제 메시지 수신을 검증한다. 실제 브로커가 필요한 통합 테스트는 `Testcontainers RabbitMQContainer`와 `@DynamicPropertySource`의 조합으로 구성한다.
+
+## 정리
+
+- `CachingConnectionFactory`가 Connection과 Channel Pool을 관리한다. `channelCacheSize`는 예상 동시 발행 스레드 수에 맞게 설정하라.
+- Consumer Container는 기본적으로 SMLC. 처리량 한계에 닿았을 때 DMLC를 검토한다.
+- 직렬화는 타입 별칭(`setIdClassMapping`)으로 패키지 독립성을 확보하고, `@JsonIgnoreProperties`로 롤링 배포를 가능하게 한다.
+- `defaultRequeueRejected=false`로 설정하고 재시도 가능/불가 예외를 명시적으로 분류하라. 무한 루프는 기본값이 만드는 함정이다.
+- 테스트는 단위(MockBean) + Consumer(@RabbitListenerTest) + 통합(Testcontainers) 세 층으로 나눈다.

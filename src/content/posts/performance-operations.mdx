@@ -1,13 +1,13 @@
 ---
-title: "Redis 운영의 모든 병목은 단일 스레드에서 시작된다"
-description: "SLOWLOG 진단부터 Lua 원자성, 메모리 인코딩, 모니터링 지표, OOM·복제·fork 장애 패턴까지, Redis 운영 지식의 공통 뿌리를 추적한다."
-pubDate: 2026-04-27
+title: "RabbitMQ 운영의 모든 실패는 어디서 오는가"
+description: "처리량 병목부터 Flow Control, 모니터링 맹점, 운영 장애 패턴, 클러스터 복구까지 — RabbitMQ 실무 운영의 다섯 가지 핵심 축을 추적한다."
+pubDate: 2026-05-02
 category: dev
-tags: [redis, event-loop, slowlog, lua-scripting, monitoring]
+tags: [rabbitmq, message-queue, operations, cluster, monitoring]
 difficulty: intermediate
 series:
-  slug: redis-deep-dive
-  title: Redis Deep Dive
+  slug: rabbitmq-deep-dive
+  title: Rabbitmq Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,90 +16,76 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-Redis 운영에서 마주치는 문제들 — 응답 시간 폭등, Race Condition, 메모리 낭비, 장애 진단 지연 — 은 겉으로 보면 전혀 다른 이슈처럼 보인다. 하지만 하나의 공통 구조에서 나온다. **Redis는 단일 스레드로 모든 명령어를 직렬 처리한다.** 이 사실을 이해하지 못하면, 각 문제를 개별 버그로 오해하게 된다. 왜 `KEYS *` 하나가 서비스를 멈추고, Lua 스크립트가 Race Condition을 원천 차단하며, fork() 350ms가 수백 개 타임아웃을 만드는가?
+"RabbitMQ가 느리다"는 말은 대부분 "설정이 잘못됐다"는 뜻이다. 그런데 잘못된 설정은 한 곳에서 오지 않는다. Publisher 측, Consumer 측, 브로커 메모리, 모니터링 부재, 클러스터 구조 — 다섯 곳 중 어느 하나라도 어긋나면 전체가 흔들린다. 왜 RabbitMQ 장애는 항상 "갑자기" 발생하는 것처럼 느껴지는가?
 
-## 이벤트 루프가 곧 병목의 지도다
+## 처리량은 Publisher와 Consumer 양쪽의 문제다
 
-Redis의 단일 이벤트 루프는 모든 병목 분석의 출발점이다. 한 명령어가 실행되는 동안 다른 모든 요청은 큐에서 기다린다. 이 구조에서 `O(N)` 명령어는 단순히 느린 게 아니라 **전체 서비스를 N에 비례하는 시간 동안 정지**시킨다.
+Publisher 쪽 병목은 대부분 Confirm 처리 방식에서 온다. 매 메시지마다 `waitForConfirmsOrDie()`로 동기 대기하면 1,000개 메시지에 10ms RTT 기준으로 약 10초가 걸린다. 비동기 `ConfirmCallback`으로 바꾸면 같은 1,000개를 100ms 수준에서 처리할 수 있다 — 100배 차이다.
 
-`SLOWLOG`는 이 구조를 데이터로 증명하는 도구다. 측정 대상은 명령어 파싱부터 실행 완료까지의 시간이다. 소켓 I/O 대기나 클라이언트 처리 시간은 포함되지 않는다.
+Consumer 쪽 병목은 concurrency와 prefetch 설정에서 온다. 처리 시간이 50ms인 Consumer를 단일 스레드(`concurrency=1`)로 운영하면 초당 최대 20개 처리가 한계다. 목표 처리량이 초당 1,000개라면 필요한 스레드 수는 `1000 / (1/0.05) = 50`개다. Prefetch는 `처리시간 / RTT` 비율로 설정하는 것이 기준점이다.
 
-```bash
-redis-cli CONFIG SET slowlog-log-slower-than 1000  # 1ms 이상 기록
-redis-cli SLOWLOG GET 20
-```
+압축은 조건부다. 메시지가 1KB를 넘고 네트워크가 병목일 때만 이득이다. 1KB 미만 메시지에 GZIP을 걸면 압축 결과가 원본보다 커지고 CPU만 낭비한다.
 
-출력의 세 번째 필드가 실행 시간(마이크로초)이다. `450234`가 나왔다면 이벤트 루프가 450ms 동안 독점됐다는 의미다. 이 시간 동안 다른 모든 클라이언트는 대기한다. 기본 임계값(10ms)은 중간 수준 병목을 놓친다. 1ms로 낮추면 2~5ms짜리 누적 문제도 잡힌다.
+복합 튜닝 순서는 Prefetch 증가 → Concurrency 증가 → 비동기 Confirm → 배치 소비다. 앞 단계의 효과를 확인하고 다음 단계로 넘어가야 한다.
 
-`KEYS *`를 `SCAN`으로 교체하는 것도 같은 이유다. `SCAN`은 매 호출마다 이벤트 루프를 짧게 사용하고 커서를 반환해 다음 호출로 넘긴다. 전체 완료까지 수 초가 걸려도 서비스에 영향을 주지 않는다. `commandstats`의 `usec_per_call`이 높은 명령어를 찾아 `SCAN` 계열로 교체하는 것이 병목 제거의 첫 번째 루틴이다.
+## Flow Control은 버그가 아니라 설계다
 
-## Lua 스크립트 — 단일 스레드의 역설적 활용
+Publisher가 갑자기 차단된다. 연결은 살아있다. 팀은 RabbitMQ를 재시작한다. 재시작 후 5분이 지나면 또 차단된다. 이것이 Flow Control을 모를 때 생기는 패턴이다.
 
-단일 스레드는 약점이지만 동시에 **원자성의 근거**다. Lua 스크립트가 실행되는 동안 다른 어떤 명령어도 끼어들 수 없다.
+RabbitMQ는 메모리 사용량이 `vm_memory_high_watermark`(기본 40%)를 초과하면 모든 Publisher Connection에 `Connection.Blocked` 프레임을 보내 발행을 차단한다. Consumer는 계속 동작한다 — Consumer가 메시지를 소비해서 메모리를 회수해야 차단이 풀리기 때문이다.
 
-"잔액 확인 후 차감"을 두 번의 별도 명령어로 구현하면 GET과 DECRBY 사이에 다른 클라이언트가 개입해 음수 잔액이 생긴다. Lua 스크립트는 이 두 단계를 하나의 원자적 단위로 실행한다.
-
-```lua
-local balance = tonumber(redis.call('GET', KEYS[1]))
-if balance == nil then return -1 end
-if balance >= tonumber(ARGV[1]) then
-    redis.call('DECRBY', KEYS[1], ARGV[1])
-    return 1
-end
-return 0
-```
-
-`EVALSHA`는 네트워크 최적화다. `SCRIPT LOAD`로 스크립트를 한 번 등록하면 SHA1 해시(40자)만 전송해 실행한다. 2KB짜리 스크립트를 매번 전송하는 대신 50바이트만 쓴다.
-
-<Callout type="warning" title="Lua 스크립트와 이벤트 루프">
-Lua 스크립트도 이벤트 루프를 독점한다. 스크립트 안에서 `KEYS *` 같은 O(N) 명령어를 호출하면 이중 블로킹이 발생한다. `lua-time-limit`(기본 5000ms)을 초과해도 즉시 중단되지 않으므로, Lua 스크립트는 항상 짧고 O(1) 명령어만 사용해야 한다.
+<Callout type="warning" title="Flow Control 오진 패턴">
+재시작은 해결책이 아니다. Consumer 처리 속도가 발행 속도보다 느린 구조적 문제가 남아있으면, 재시작 후 메모리가 다시 임계값에 도달하는 순간 똑같이 차단된다.
 </Callout>
 
-## 메모리 인코딩 — 설계 단계의 결정이 운영 비용을 바꾼다
+Lazy Queue는 이 문제의 예방책이다. 일반 Queue는 메시지를 메모리에 먼저 올리고 임계값 초과 시 디스크로 내리는(Paging) 반면, Lazy Queue는 메시지 도착 즉시 디스크에 저장하고 메타데이터만 메모리에 유지한다. 100만 개 메시지 기준으로 일반 Queue는 수백 MB에서 수 GB의 메모리를 쓰지만 Lazy Queue는 메타데이터 크기인 수백 MB 수준에 머문다.
 
-Redis 자료구조는 크기에 따라 내부 인코딩을 자동으로 바꾼다. Hash가 `hash-max-listpack-entries`(기본 128) 이하면 `listpack`으로 저장된다. 임계값을 초과하는 순간 `hashtable`로 전환되고 메모리가 3~8배 증가한다.
+권장 설정은 `vm_memory_high_watermark=0.4`, `paging_ratio=0.5`(20%에서 미리 Paging 시작), `disk_free_limit=메모리×1.5`다. 디스크 여유 공간이 임계값 아래로 내려가도 Publisher가 차단된다는 점을 간과하지 말 것.
 
-```bash
-redis-cli OBJECT ENCODING myhash   # listpack 또는 hashtable
-redis-cli MEMORY USAGE myhash      # 실제 RAM 바이트
-```
+## 모니터링 없이는 장애가 항상 "갑자기" 온다
 
-필드 10개짜리 Hash 100만 개를 `listpack`으로 유지하면 약 300MB다. `hashtable`로 전환되면 1.5GB가 된다. 설계 단계에서 임계값 이내로 데이터를 유지하는 전략(Hash Sharding 등)이 인프라 비용을 직접 결정한다.
+핵심 지표는 세 가지다.
 
-인코딩 전환은 단방향이다. `hashtable`로 전환된 키는 임계값을 올려도 자동으로 `listpack`으로 돌아오지 않는다. 재시작 시 RDB에서 로드할 때 현재 임계값 기준으로 재결정된다.
+**Queue Depth**는 Ready와 Unacked를 구분해서 봐야 한다. Ready가 증가하면 Consumer 처리 속도 부족이다. Unacked가 증가하면 Consumer가 메시지를 받았지만 처리를 완료하지 못하는 상태다 — 보통 외부 I/O 블로킹이 원인이다.
 
-## INFO 지표 — 장애 신호는 항상 먼저 수치로 나타난다
+**Publish Rate vs Deliver Rate**의 차이가 지속적으로 양수면 Queue가 쌓이고 있다는 신호다. `ack/s`가 실질적인 처리량 지표다.
 
-Redis 장애는 대부분 예고 없이 오지 않는다. 수치가 먼저 움직인다.
+**Consumer Utilisation**이 50% 미만이면 Consumer가 Prefetch 대기 시간 때문에 놀고 있다는 뜻이다. Prefetch를 늘리거나 Consumer 수를 줄일 수 있다. 100%에 가까우면 Scale Out을 검토해야 한다.
 
-| 지표 | 경고 기준 | 의미 |
-|---|---|---|
-| `used_memory / maxmemory` | > 0.85 | eviction 임박 |
-| `mem_fragmentation_ratio` | > 2.0 또는 < 1.0 | 단편화 또는 스왑 |
-| `rdb_last_bgsave_status` | `err` | 데이터 손실 위험 |
-| `connected_slaves` | 0 (Master) | 복제 단절 |
-| `latest_fork_usec` | > 200000 | BGSAVE 지연 |
+DLQ 메시지는 0이어야 정상이다. 0에서 1이 되는 순간이 가장 중요한 시점이다.
 
-`evicted_keys`가 증가한다면 `maxmemory`에 근접해 데이터가 삭제되고 있다는 신호다. `mem_fragmentation_ratio < 1.0`은 Redis 데이터 일부가 디스크 스왑으로 내려갔다는 의미로, 즉각 대응이 필요한 긴급 상황이다.
-
-`redis_exporter` + Prometheus + Grafana(대시보드 ID 11835) 조합이 이 지표들을 자동으로 수집하고 시각화한다.
-
-## 트레이드오프
-
-<Callout type="note" title="트레이드오프">
-단일 스레드 구조의 모든 트레이드오프는 하나의 문장으로 요약된다 — **Redis가 빠른 이유와 느려질 수 있는 이유가 동일하다.** SLOWLOG 임계값을 낮추면 더 많은 병목을 잡지만 로그가 빠르게 가득 찬다. Lua 스크립트는 Race Condition을 막지만 긴 스크립트는 서비스 전체를 멈춘다. `listpack` 유지는 메모리를 아끼지만 O(N) 탐색을 허용한다. `repl-backlog-size`를 크게 잡으면 Partial Resync 범위가 늘어나지만 메모리를 점유한다. Master에서 BGSAVE를 끄고 Replica에서 실행하면 Master의 fork() 지연이 사라지지만 RDB 파일이 최신 데이터를 반영하지 않을 수 있다. 각 결정은 단일 스레드가 만드는 제약 안에서의 균형점 선택이다.
+<Callout type="note" title="트레이드오프: Management UI vs Prometheus+Grafana">
+Management UI는 기본 내장이고 실시간 상태 확인에 충분하지만 알림 기능과 이력 저장이 없다. 프로덕션에서는 `rabbitmq_prometheus` 플러그인 + Grafana 조합이 필수다. 알림은 P1(즉각)/P2(30분)/P3(일일) 계층으로 나눠야 알림 피로를 피할 수 있다.
 </Callout>
 
-<Aside label="OOM의 두 얼굴">
-`maxmemory 8gb`를 설정해도 OOM이 발생할 수 있다. BGSAVE의 `fork()` 후 Copy-on-Write로 인해 `used_memory_rss`가 최대 2배까지 증가한다. persistence를 사용한다면 `maxmemory`를 물리 RAM의 50~60%로 설정해야 안전하다.
+## 운영 장애는 세 가지 패턴으로 수렴한다
+
+**패턴 A — Queue 적체**: Queue Depth Ready가 급증하고 Consumer는 있다. Consumer Utilisation이 100%이면 Scale Out이 답이다. Consumer가 특정 메시지에서 루프를 돌며 `requeue=true`로 반복 실패하는 경우에는 DLX 설정이 없으면 해당 메시지가 계속 순환한다.
+
+**패턴 B — Unacked 누적**: Ready는 0인데 Unacked가 수만 건이다. Consumer는 살아있지만 Ack을 보내지 않는다. 외부 API 타임아웃이 없어서 스레드가 무한 대기 중인 경우가 가장 흔하다. Consumer를 재시작하면 Connection이 끊기며 Unacked가 모두 Ready로 복귀한다 — 임시 처치다. 근본 해결은 모든 외부 I/O에 타임아웃을 설정하는 것이다.
+
+**패턴 C — 연결 폭풍**: RabbitMQ 재시작 후 서비스 100개가 동시에 재연결을 시도한다. 고정 간격 재연결(`sleep(1000)`)은 모든 서비스가 1초 후 동시에 재시도해서 폭풍을 증폭시킨다. Exponential Backoff + Jitter가 답이다. 지수 증가(1, 2, 4, 8... 최대 30초)에 ±30% 랜덤 지터를 더하면 재연결 시도가 시간적으로 분산된다.
+
+## 클러스터는 홀수 노드와 Quorum Queue가 기본이다
+
+단일 노드 RabbitMQ는 SPOF다. 3노드 클러스터 + Quorum Queue를 구성하면 노드 1개 장애에서 자동으로 복구된다.
+
+Quorum Queue는 Raft 합의 알고리즘 기반이다. Leader 노드가 다운되면 Election Timeout(기본 5초) 후 Follower들이 투표를 시작하고, 과반수가 새 Leader를 선출한다. 총 다운타임은 보통 5~15초다. 인간 개입 없이 자동 복구된다.
+
+홀수 노드를 권장하는 이유는 Split-Brain 처리 방식에 있다. 4노드 클러스터가 2+2로 분리되면 어느 쪽도 과반수(>2)를 달성하지 못해 전체 쓰기가 불가능해진다. 3노드에서 2+1로 분리되면 2가 과반수를 유지해 부분 가용성이 보존된다.
+
+Rolling Upgrade는 노드 하나씩 `stop_app` → 업그레이드 → `start_app` 순서로 진행한다. 메이저 버전 업그레이드는 한 단계씩만 허용된다 — 3.9에서 3.12로 직접 올리면 클러스터가 분열된다. 기능 플래그는 모든 노드가 신버전이 된 후에 활성화해야 한다.
+
+<Aside label="설계 철학">
+RabbitMQ의 모든 운영 문제는 결국 하나의 질문으로 수렴한다 — "발행 속도와 소비 속도의 균형이 깨졌을 때 어디서, 어떻게 신호가 나타나는가?" Flow Control, Queue 적체, Unacked 누적은 모두 그 불균형의 다른 표현이다. 클러스터는 그 불균형이 하드웨어 장애로 확장될 때를 대비하는 구조다.
 </Aside>
 
 ## 정리
 
-- 모든 Redis 병목의 뿌리는 단일 이벤트 루프다. O(N) 명령어는 N에 비례한 시간 동안 모든 요청을 멈춘다.
-- `SLOWLOG`는 이벤트 루프 독점 시간을 측정한다. 1ms 임계값으로 중간 수준 병목까지 잡아라.
-- Lua 스크립트의 원자성은 단일 스레드 덕분이다. Read-Modify-Write 패턴은 Lua로만 안전하게 구현된다.
-- 인코딩 임계값은 설계 단계의 결정이다. 전환은 단방향이므로 사후 수정은 재생성이 필요하다.
-- 장애 신호는 항상 수치로 먼저 나타난다. `evicted_keys`, `fragmentation_ratio`, `latest_fork_usec`에 알림을 설정하라.
+- 처리량은 Publisher(비동기 Confirm, 배치)와 Consumer(concurrency, prefetch) 양쪽을 함께 튜닝해야 한다.
+- Flow Control은 메모리 임계값 초과 시 Publisher를 차단하는 설계다. 재시작이 아니라 Consumer 처리량 증가 또는 Lazy Queue가 해결책이다.
+- 핵심 지표는 Queue Depth(Ready/Unacked 구분), Publish-Deliver Rate 차이, Consumer Utilisation, DLQ 메시지 수다.
+- 운영 장애는 적체/Unacked 누적/연결 폭풍 세 패턴으로 수렴한다. 각각 임시 처치(Consumer 재시작, Scale Out, 순차 재시작)와 근본 해결(타임아웃 설정, Backoff+Jitter)이 다르다.
+- 3노드 이상 홀수 클러스터 + Quorum Queue는 선택이 아니라 프로덕션의 기본값이다.
 
-Redis를 안정적으로 운영한다는 것은 단일 스레드라는 설계 결정을 이해하고, 그 제약 안에서 각 도구를 의도적으로 선택하는 것이다.
+다음 글에서는 RabbitMQ와 Kafka의 아키텍처 차이 — Push 기반 vs Pull 기반, 메시지 삭제 vs 로그 보존 — 를 구체적인 설계 결정으로 추적한다.

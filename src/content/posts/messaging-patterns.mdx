@@ -1,0 +1,95 @@
+---
+title: "RabbitMQ 메시지 패턴의 공통 철학은 무엇인가"
+description: "Work Queue의 Prefetch부터 Saga 패턴의 보상 트랜잭션까지, RabbitMQ의 여섯 가지 메시지 패턴이 공유하는 설계 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [rabbitmq, message-queue, distributed-systems, amqp]
+difficulty: intermediate
+series:
+  slug: rabbitmq-deep-dive
+  title: Rabbitmq Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+RabbitMQ는 Work Queue, Pub/Sub, RPC, Priority Queue, Delayed Message, Saga — 여섯 가지 서로 다른 패턴을 지원한다. 얼핏 보면 각각 독립된 기능처럼 보이지만, 이 패턴들을 깊이 들여다보면 하나의 질문으로 수렴한다. **"메시지가 정확히 한 번, 올바른 수신자에게, 적절한 시점에 전달되려면 무엇이 필요한가?"**
+
+## 분배의 공정성 — Work Queue와 Prefetch
+
+Work Queue 패턴의 핵심 문제는 공정한 분배다. RabbitMQ의 기본 Round-Robin은 Consumer에게 메시지를 균등하게 밀어 넣는다. 처리 시간이 균일하다면 문제없다. 그러나 10ms짜리 작업과 500ms짜리 작업이 섞여 있으면 Round-Robin은 빠른 Consumer를 놀게 하고 느린 Consumer를 과부하 상태로 만든다.
+
+`prefetch=1`은 이 문제를 해결한다. Consumer는 이전 메시지의 Ack를 보낸 뒤에야 다음 메시지를 받는다. 빠른 Consumer는 자연스럽게 더 많이 처리하고, 느린 Consumer는 덜 처리한다. 동일한 메시지 셋을 처리할 때 prefetch 없는 Round-Robin 대비 2~3배 빠른 처리량이 나온다.
+
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 1
+        concurrency: 3
+        max-concurrency: 10
+```
+
+`autoAck=false`는 공정성의 다른 축이다. Worker가 장애로 종료되면 Unacked 메시지는 Ready 상태로 복귀해 다른 Worker가 처리한다. 공정성과 신뢰성은 같은 설정에서 나온다.
+
+## 독립성의 설계 — Pub/Sub과 Queue 유형
+
+Pub/Sub 패턴에서 핵심은 **"같은 메시지를 여러 목적으로 처리한다"**는 독립성이다. 하나의 Queue를 공유하면 메시지는 한 Consumer에게만 간다. 각 서비스가 자신만의 Queue를 가져야 Fanout Exchange가 메시지 복사본을 독립적으로 전달한다.
+
+Queue 유형 선택은 독립성의 범위를 결정한다. 서비스 간 이벤트는 `durable=true`로 Consumer가 오프라인 상태여도 메시지를 보관한다. 실시간 대시보드처럼 오프라인 구간의 메시지가 필요 없는 경우는 `exclusive=true, autoDelete=true`로 Consumer가 떠나면 Queue도 함께 사라진다.
+
+<Callout type="note" title="트레이드오프">
+영구 Queue는 느린 Consumer가 메시지를 무한정 축적해 브로커 전체에 영향을 줄 수 있다. 임시 Queue는 메모리를 절약하지만 Consumer 오프라인 구간의 메시지를 잃는다. Queue 유형 선택은 "메시지를 잃을 것인가 vs 메모리를 쓸 것인가"의 선택이다.
+</Callout>
+
+## 동기성의 흉내 — RPC 패턴의 한계
+
+RabbitMQ RPC는 Reply-To Queue와 Correlation ID로 요청-응답을 구현한다. 클라이언트는 임시 Queue를 생성하고, UUID를 Correlation ID로 요청에 태운다. 서버는 처리 후 replyTo Queue로 같은 Correlation ID를 담아 응답한다.
+
+```
+Client A → [correlationId=uuid-A] → rpc.queue → Server
+Server   → [correlationId=uuid-A] → A의 replyTo Queue → Client A
+```
+
+그러나 이 패턴에는 명확한 비용이 있다. HTTP 직접 호출이 ~5ms라면 RabbitMQ RPC는 브로커를 경유하므로 ~20~50ms다. `DirectReplyTo`(`amq.rabbitmq.reply-to`)를 사용하면 실제 Queue를 생성하지 않고 Connection 채널로 응답을 주입해 오버헤드를 줄일 수 있지만, 여전히 브로커 경유 비용은 존재한다.
+
+RabbitMQ RPC가 정당화되는 조건은 좁다 — Worker 자동 확장이 필요하고, 처리 시간이 길어 HTTP 타임아웃이 문제가 되며, 이미 RabbitMQ 인프라가 있을 때. 그 외엔 HTTP/gRPC가 더 단순하고 빠르다.
+
+## 우선순위의 대가 — Priority Queue와 Starvation
+
+`x-max-priority=N`은 N+1개의 내부 서브큐를 생성한다. Consumer 요청이 오면 높은 우선순위 서브큐부터 순서대로 소비한다. 그러나 우선순위가 의미를 가지려면 Queue에 여러 우선순위의 메시지가 **동시에 쌓여 있어야** 한다. Consumer가 발행 속도보다 빠르면 Queue가 비어 있어 우선순위를 비교할 대상이 없다. 사실상 FIFO처럼 동작한다.
+
+더 큰 위험은 Starvation이다. 높은 우선순위 메시지 발행량이 Consumer 처리량을 초과하면, 낮은 우선순위 메시지는 영원히 처리되지 않을 수 있다. `x-max-priority`는 5 이하로 유지하고, 처리량 비율 보장이 중요하다면 Priority Queue 대신 Queue를 분리하는 것이 더 예측 가능한 설계다.
+
+## 시간의 위임 — Delayed Message의 두 가지 방법
+
+지연 메시지는 두 가지 방법으로 구현한다. TTL + DLX는 Plugin 없이 구현 가능하다. Consumer 없는 대기 Queue에 TTL을 설정하고, 만료되면 DLX를 통해 원본 Queue로 라우팅한다. 단순하지만 Queue 레벨 TTL은 FIFO 특성으로 인해 앞 메시지가 만료되기 전까지 뒤 메시지의 만료 처리가 지연될 수 있다.
+
+Delayed Message Plugin은 Mnesia DB에 메시지와 만료 시각을 저장하고 타이머 스레드가 만료 시각에 Exchange로 라우팅한다. 메시지마다 다른 지연 시간을 `x-delay` 헤더로 지정할 수 있다. 대신 대량의 지연 메시지는 Mnesia 성능을 저하시키고, 클러스터 환경에서 지원이 제한적이다.
+
+<Aside label="정확도의 한계">
+두 방법 모두 완벽한 ms 단위 정확도를 보장하지 않는다. 수십 ms에서 수 초의 추가 지연이 발생할 수 있다. 비즈니스 요구가 분 단위라면 충분하지만, ms 정밀도가 필요하다면 다른 도구를 고려해야 한다.
+</Aside>
+
+## 분산의 복원력 — Saga 패턴의 보상 트랜잭션
+
+Saga 패턴은 여러 서비스에 걸친 트랜잭션을 독립된 로컬 트랜잭션의 연쇄로 처리한다. 실패 시 이전 단계를 되돌리는 보상 트랜잭션이 필수다. RabbitMQ는 각 단계의 이벤트/명령을 전달하고, Publisher Confirm과 DLX로 메시지 유실을 방지한다.
+
+Choreography는 각 서비스가 이벤트를 발행하고 구독하는 방식으로 중앙 조율자가 없다. Orchestration은 Orchestrator가 각 서비스에 명령을 발행하고 응답을 받아 다음 단계를 결정한다. Choreography는 서비스 수가 적을 때 단순하고, Orchestration은 복잡한 조건 분기와 상태 추적이 필요할 때 유리하다.
+
+Saga의 신뢰성은 Outbox Pattern으로 보강한다. DB 트랜잭션 안에서 이벤트를 outbox 테이블에 저장하고, 별도 퍼블리셔가 발행 후 Ack를 받으면 상태를 갱신한다. 서버 장애가 발행 직전에 발생해도 재시작 후 outbox에서 이벤트를 재발행할 수 있다.
+
+## 정리
+
+여섯 패턴을 관통하는 공통 원칙은 세 가지다.
+
+- **정확한 한 번 처리**: `autoAck=false` + 수동 Ack + DLX. 패턴과 무관하게 메시지 유실과 중복 처리 방지는 동일한 메커니즘에서 나온다.
+- **발행자와 수신자의 분리**: Exchange가 라우팅 결정을 담당해 Publisher는 수신자를 몰라도 된다. Pub/Sub의 새 구독자 추가, Saga의 보상 라우팅 모두 이 분리에서 가능해진다.
+- **트레이드오프의 명시성**: Prefetch=1은 공정성과 처리량을 맞교환하고, 영구 Queue는 신뢰성과 메모리를 맞교환한다. RabbitMQ의 모든 설정은 "무엇을 포기하고 무엇을 얻는가"를 명시적으로 요구한다.
+
+패턴을 고르는 것보다, 각 패턴이 강제하는 트레이드오프를 이해하고 받아들이는 것이 더 중요하다.
