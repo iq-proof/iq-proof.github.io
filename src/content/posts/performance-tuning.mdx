@@ -1,0 +1,115 @@
+---
+title: "JVM 튜닝의 철학 — 덜 건드릴수록 더 잘 돌아간다"
+description: "플래그 분류부터 힙 산정 공식, GC Ergonomics, 프로파일링, 메모리 누수 추적, JMH 벤치마킹까지 — JVM 성능 최적화의 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jvm, gc, profiling, memory-leak, jmh]
+difficulty: intermediate
+series:
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+JVM은 수십 개의 플래그, 네 가지 GC, 두 개의 프로파일러, 그리고 수십 가지 메모리 누수 패턴을 품고 있다. 이 모든 복잡성을 관통하는 원칙이 하나 있다. **JVM이 알아서 하도록 두고, 측정한 다음에 개입하라.** 왜 이 원칙이 옳은가?
+
+## JVM 플래그의 두 계층
+
+JVM 플래그는 크게 두 계층으로 나뉜다. 항상 설정해야 하는 것과, 측정 결과가 나온 뒤에야 건드려야 하는 것이다.
+
+항상 설정해야 하는 플래그는 네 가지뿐이다.
+
+```bash
+-Xms8g -Xmx8g                            # 힙 고정 (Xms = Xmx)
+-Xlog:gc*:file=/var/log/gc.log:time,uptime
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/heapdump.hprof
+```
+
+`Xms`와 `Xmx`를 다르게 설정하면 힙이 확장될 때마다 Full GC가 트리거될 수 있다. GC 로그와 힙 덤프는 문제가 생겼을 때 유일한 단서다. 이 네 가지 이외의 플래그는 **측정 결과를 보고 나서** 추가한다.
+
+<Callout type="warning" title="과도한 튜닝의 역설">
+플래그를 30개 나열하면 JVM의 자동 최적화(Ergonomics)가 방해받는다. 나머지는 JVM에 맡기고, 필수만 설정하는 것이 Best Practice다.
+</Callout>
+
+## 힙 크기 — 공식은 단순하다
+
+적절한 힙 크기를 구하는 공식은 하나다.
+
+```
+Heap = Live Data × 3~4
+```
+
+`Live Data`는 Full GC 직후 남아 있는 객체의 크기다. 여기에 3~4를 곱하면 GC 후 힙 사용률이 25~33% 수준으로 유지된다. GC 로그에서 After GC 사용률이 30~70% 사이면 적절하고, 70%를 넘으면 힙을 늘려야 하며, 30% 미만이면 메모리를 낭비하고 있다는 신호다.
+
+컨테이너 환경에서는 규칙이 하나 추가된다. `Xmx`가 컨테이너 메모리 한도를 초과하면 OOM Killer가 프로세스를 강제 종료한다.
+
+```bash
+# 컨테이너 2GB 기준
+-XX:MaxRAMPercentage=75.0   # 2GB × 75% = 1.5GB
+-XX:+UseContainerSupport    # Java 10+, 기본 활성화
+```
+
+Young/Old 비율은 대부분의 경우 기본값(1:2)으로 충분하다. 웹 서버처럼 객체 수명이 짧은 워크로드는 Young을 키우고(1:1.5), 캐시처럼 장수 객체가 많은 워크로드는 Old를 키운다(1:3).
+
+## GC Ergonomics — JVM이 스스로 조정한다
+
+Java 9부터 기본 GC는 G1이다. JVM은 시작할 때 힙 크기, GC 스레드 수, Young/Old 비율을 자동으로 설정한다.
+
+```bash
+java -XX:+PrintFlagsFinal -version | grep ergonomic
+# bool UseG1GC             = true  {ergonomic}
+# uintx MaxHeapSize        = 4294967296 {ergonomic}
+# uintx ParallelGCThreads  = 8     {ergonomic}
+```
+
+`{ergonomic}` 태그가 붙은 플래그는 JVM이 하드웨어를 읽어 자동으로 설정한 값이다. 16GB RAM 서버에서 JVM을 기본 설정으로 띄우면 힙은 4GB(RAM/4), GC 스레드는 13개(8+(16-8)×5/8)로 자동 설정된다.
+
+G1 GC의 Adaptive Sizing은 실행 중에도 동작한다. `MaxGCPauseMillis=200`을 설정하면 G1은 목표를 달성하기 위해 Young Gen 크기를 실시간으로 조정한다. Pause가 목표를 초과하면 Young을 줄이고, 여유가 생기면 늘린다.
+
+<Aside label="언제 수동 튜닝이 필요한가">
+Ergonomics는 일반적인 워크로드에서 충분하다. 예외는 두 가지다 — 레이턴시 목표가 10ms 미만이면 ZGC를 명시해야 하고, 컨테이너 환경에서는 힙 크기를 명시하는 것이 Ergonomics에만 의존하는 것보다 안전하다.
+</Aside>
+
+## 프로파일링 — 측정 없이 최적화 없다
+
+병목을 찾는 도구는 두 가지다. **JFR**은 프로덕션에서 항상 켜둘 수 있는 도구(오버헤드 < 1%)이고, **async-profiler**는 더 정확하지만 오버헤드가 약간 더 크다(< 5%).
+
+JFR은 연속 레코딩 모드로 운영하고, 문제가 생겼을 때 덤프를 뜨는 방식이 실무적이다.
+
+```bash
+jcmd <pid> JFR.start name=continuous maxage=1h maxsize=500M
+# 문제 발생 시
+jcmd <pid> JFR.dump name=continuous filename=snapshot.jfr
+```
+
+async-profiler는 SafePoint Bias 없이 정확한 CPU 샘플을 수집한다. Flame Graph에서 **가장 넓은 블록**이 CPU를 가장 많이 소비하는 코드 경로다. CPU 프로파일에서 GC 관련 메서드가 30% 이상 나온다면 `alloc` 모드로 전환해 과도한 메모리 할당의 원인 메서드를 추적한다.
+
+## 메모리 누수와 JMH — 두 가지 함정
+
+메모리 누수의 전형적인 패턴은 네 가지다: static 컬렉션, ThreadLocal 미제거, Listener 미해제, ClassLoader 누수. GC 로그에서 Full GC 이후 힙 사용량이 꾸준히 증가하면 누수를 의심한다.
+
+```bash
+# After GC 추이 — 누수 신호
+0h: 100M → 1h: 150M → 2h: 200M → 3h: 300M
+```
+
+Eclipse MAT의 Dominator Tree는 "어떤 객체가 얼마나 많은 메모리를 붙잡고 있는가"를 직접 보여준다. 가장 흔한 해결책은 세 가지다 — WeakHashMap 사용, 크기 제한(LRU Cache), 그리고 ThreadLocal을 반드시 try-finally로 감싸 `remove()`를 호출하는 것이다.
+
+<Callout type="note" title="트레이드오프">
+JMH 없는 마이크로벤치마크는 JIT의 Dead Code Elimination과 Constant Folding 때문에 신뢰할 수 없다. `System.nanoTime()`으로 측정한 수치가 "빠르다"고 보여도, JIT가 코드를 통째로 제거했을 수 있다. JMH의 Blackhole과 Fork 모드가 이 함정을 막는다. 대신 JMH 벤치마크를 작성하고 실행하는 비용은 일반 단위 테스트보다 훨씬 크다 — 마이크로초 단위 차이가 실제 비즈니스 임팩트를 가져올 때만 투자할 가치가 있다.
+</Callout>
+
+## 정리
+
+- **필수 플래그 4개**(힙 고정, GC 로그, 힙 덤프)만 먼저 설정하고 나머지는 측정 후 결정한다.
+- **힙 크기**는 `Live Data × 3~4` 공식으로 산정하고, GC 후 사용률 30~70%를 목표로 조정한다.
+- **Ergonomics**가 기본 설정을 처리한다 — `PrintFlagsFinal`로 확인하고, 문제가 생길 때만 수동으로 개입한다.
+- **프로파일링**은 JFR 연속 레코딩으로 항상 준비하고, 병목이 의심되면 async-profiler Flame Graph로 정확하게 찾는다.
+
+JVM 튜닝의 역설은 간단하다 — 덜 건드릴수록, 더 정확하게 측정할수록, 결과가 더 좋다.

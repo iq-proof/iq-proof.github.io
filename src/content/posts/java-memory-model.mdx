@@ -1,168 +1,95 @@
 ---
-title: "Java 동시성의 모든 규칙은 하나의 질문에서 나온다"
-description: "CPU 캐시 가시성 문제부터 JMM 추상화, happens-before 전이성, volatile 메모리 펜스, 명령어 재정렬, DCL 함정까지 — Java 동시성 설계의 단일 원리를 추적한다."
+title: "Java Memory Model은 무엇을 추상화하는가"
+description: "CPU 캐시 불일치와 명령어 재정렬이 만드는 가시성 문제부터, Happens-Before·volatile·final·Memory Barrier가 이를 해결하는 방식까지, JMM 전체 철학을 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [java, concurrency, jmm, volatile, happens-before]
-difficulty: advanced
+tags: [java, jvm, memory-model, concurrency, happens-before]
+difficulty: intermediate
 series:
-  slug: java-concurrency-deep-dive
-  title: Java Concurrency Deep Dive
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
   order: 1
 draft: false
 featured: false
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
-import Theorem from '@/components/mdx/Theorem.astro';
-import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-`volatile`을 왜 써야 하는가? `synchronized`가 가시성을 왜 보장하는가? `count++`에 왜 `AtomicInteger`가 필요한가? 이 질문들은 표면적으로 달라 보이지만 하나의 뿌리에서 나온다 — **"다른 코어에서 쓴 값을, 내 코어는 언제 보는가?"** Java 동시성의 모든 규칙은 이 질문에 대한 답이다.
+다음 코드는 직관적으로 안전해 보인다. Thread 1이 `value = 42`를 쓴 뒤 `ready = true`를 세팅하고, Thread 2는 `ready`가 `true`일 때만 `value`를 읽는다. 그런데 `value`가 0으로 출력될 수 있고, Thread 2가 영원히 루프를 빠져나오지 못할 수도 있다. Java Memory Model(JMM)은 왜 이런 일을 허용하는가?
 
-## 문제의 출발: CPU는 거짓말을 한다
+## 하드웨어가 만드는 혼돈
 
-현대 CPU는 단일 스레드 성능을 극대화하기 위해 두 가지 트릭을 쓴다.
+CPU는 느린 RAM 대신 빠른 L1/L2 캐시에서 데이터를 읽고 쓴다. L1은 1ns, RAM은 100ns — 100배 차이다. 멀티코어 환경에서 CPU 0이 `x = 1`을 쓰면, 그 값은 즉시 CPU 0의 L1 캐시에 들어간다. CPU 1의 캐시에는 아직 `x = 0`이 남아 있다. 이것이 **Visibility Problem**의 물리적 기원이다.
 
-첫 번째는 **캐시 계층**이다. RAM 접근(~100ns)은 L1 캐시 접근(~1ns)보다 100배 느리다. 그래서 CPU는 변수를 L1/L2/L3 캐시에 복사해 두고 그것을 읽는다. 64바이트 단위(캐시 라인)로 움직인다.
+MESI 프로토콜은 이를 해결하려 한다. CPU 0이 캐시 라인을 수정(Modified)하면, CPU 1의 해당 라인을 무효화(Invalid)하는 메시지를 보낸다. 그러나 이 메시지는 수십 나노초의 지연이 있고, Invalidation Queue에 쌓여 즉시 처리되지 않을 수 있다. 여기에 컴파일러와 CPU의 **명령어 재정렬**까지 더해진다. 파이프라인 최적화를 위해 CPU는 의존성 없는 명령어를 재배치한다 — 단일 스레드에서는 관찰 불가능하지만, 멀티스레드에서는 다른 스레드가 "중간 상태"를 포착할 수 있다.
 
-두 번째는 **Write Buffer(스토어 버퍼)**다. 쓰기 연산을 즉시 캐시에 반영하지 않고 버퍼에 쌓아뒀다가 나중에 일괄 처리한다. 쓰기 지연을 숨겨 파이프라인 스톨을 막는다.
+JMM은 이 하드웨어 복잡성 전체를 개발자에게 감춘다. 대신 **Happens-Before**라는 단일 추상화를 제공한다.
 
-이 두 트릭이 멀티코어에서 충돌한다. Core 0이 `x = 1`을 쓰면 Store Buffer에 기록되고, Core 1은 자신의 캐시에서 여전히 `x = 0`을 읽는다. **같은 변수를 두 코어가 다른 값으로 보는 것이 하드웨어의 정상 동작이다.**
+## Happens-Before — 가시성의 규칙
 
-MESI 프로토콜은 캐시 일관성을 제공하지만, Invalidate 신호가 전달되는 데 시간이 걸린다. 그 사이 간격이 가시성 문제의 물리적 원인이다.
+"A happens-before B"는 A의 모든 변경을 B가 반드시 본다는 의미다. 실행 순서가 아니라 **가시성 보장**이다. 재정렬은 여전히 일어날 수 있지만, 관찰 시점에 A의 결과가 B에게 보인다.
 
-## JMM: 하드웨어 복잡성을 두 계층으로 추상화
+JMM이 정의하는 규칙 8가지 중 실무에서 가장 중요한 네 가지는 다음과 같다.
 
-Java는 이 복잡한 하드웨어를 개발자에게 직접 노출하지 않는다. 대신 **Java Memory Model(JMM)**이라는 추상화를 제공한다.
+- **Volatile Variable Rule**: `volatile` 쓰기 → `volatile` 읽기. 쓰기 전 모든 변경이 읽기 후에 보인다.
+- **Monitor Lock Rule**: `synchronized` unlock → lock. 이전 블록의 모든 변경이 다음 블록에 보인다.
+- **Thread Start/Join Rule**: `start()` 전 모든 변경이 새 스레드에 보인다. 스레드 종료 후 `join()`이 반환되면 그 스레드의 모든 변경이 보인다.
+- **Transitivity**: A→B, B→C이면 A→C.
 
-JMM은 두 계층만 정의한다. **주 메모리** — 모든 스레드가 공유하는 인스턴스/정적 변수. **작업 메모리** — 각 스레드가 독립적으로 가지는 복사본 (하드웨어의 레지스터+캐시에 대응). 스레드는 작업 메모리를 통해서만 변수를 읽고 쓰며, 두 스레드의 작업 메모리는 서로 직접 접근할 수 없다.
+전이성이 핵심이다. `x = 42; ready = true;`(Thread 1)에서 Program Order Rule로 `x = 42` happens-before `ready = true`이고, Volatile Rule로 `ready = true` happens-before `if (ready)`(Thread 2)이다. Transitivity에 의해 Thread 2는 `x = 42`도 반드시 본다. `volatile` 하나가 연쇄 보장을 만든다.
 
-이 추상화의 결론은 단순하다: **happens-before 관계가 없으면, 어떤 값이든 나타날 수 있다.**
+## volatile과 final — 두 가지 경량 해법
 
-<Theorem kind="proposition" number="1" title="JMM 가시성 보장 조건">
-스레드 A의 쓰기 결과가 스레드 B의 읽기에 반드시 보이려면, A의 쓰기 →HB→ B의 읽기 (happens-before) 관계가 성립해야 한다. 관계가 없으면 JMM은 어떤 값도 보장하지 않는다.
-</Theorem>
+`volatile`은 두 가지를 보장한다: **가시성**과 **재정렬 금지**. 내부적으로 Memory Barrier를 삽입한다. 쓰기 전 StoreStore Barrier로 이전 쓰기가 먼저 완료되게 하고, 쓰기 후 StoreLoad Barrier로 그 값이 모든 코어에 전파된 뒤 다음 읽기가 실행되게 한다. x86에서 이 StoreLoad Barrier의 비용은 약 20ns(mfence 명령)이고, 일반 변수 대비 5~10배 느리다.
 
-<Proof>
-JMM은 작업 메모리가 주 메모리와 언제 동기화될지를 명시하지 않는다. 따라서 happens-before 관계 없이는 B가 A의 쓰기 이전 값을 볼 수도, 이후 값을 볼 수도 있으며, 둘 다 스펙 위반이 아니다. happens-before가 성립할 때만 "B는 A의 모든 쓰기를 볼 수 있음"이 JLS에 의해 보장된다.
-</Proof>
+`volatile`이 보장하지 않는 것이 있다: **원자성**. `counter++`는 읽기→증가→쓰기의 3단계 복합 연산이다. `volatile int counter`여도 두 스레드가 동시에 실행하면 증가분이 사라진다. 복합 연산에는 `AtomicInteger` 또는 `synchronized`가 필요하다.
 
-## happens-before의 8가지 규칙과 전이성
-
-happens-before는 실행 순서가 아니라 **논리적 인과관계**다. JMM은 이를 8가지 규칙으로 정의한다.
-
-실무에서 가장 중요한 4가지:
-
-- **프로그램 순서 규칙**: 같은 스레드 내 앞의 작업 →HB→ 뒤의 작업
-- **volatile 규칙**: volatile 쓰기 →HB→ 이후 volatile 읽기
-- **모니터 락 규칙**: `synchronized` unlock →HB→ 이후 lock
-- **스레드 종료 규칙**: 스레드 모든 작업 →HB→ `Thread.join()` 반환
-
-그리고 **전이성**: A →HB→ B이고 B →HB→ C이면 A →HB→ C.
-
-전이성이 핵심이다. 이것이 `volatile` 하나로 일반 변수까지 가시성을 보장하는 원리다:
+`final`은 다른 방식으로 안전성을 제공한다. 생성자가 완료되는 시점에 JVM은 StoreStore Barrier를 삽입해 모든 `final` 필드 값을 캐시에서 플러시한다 — **Freeze**. 이후 어떤 스레드도 `final` 필드의 기본값(0, null)을 관찰할 수 없다. `volatile` 없이도 불변 객체를 안전하게 공개할 수 있는 이유다.
 
 ```java
-int data = 0;
-volatile boolean flag = false;
+// volatile 없이도 안전
+class ImmutablePoint {
+    private final int x;
+    private final int y;
 
-// Thread A
-data = 42;      // (1)
-flag = true;    // (2) volatile 쓰기
+    ImmutablePoint(int x, int y) {
+        this.x = x;
+        this.y = y;
+    } // ← StoreStore Barrier (Freeze)
+}
 
-// Thread B
-if (flag) {     // (3) volatile 읽기
-    print(data); // (4)
+// Thread 1
+point = new ImmutablePoint(1, 2);
+
+// Thread 2
+if (point != null) {
+    System.out.println(point.x); // 1 보장
 }
 ```
 
-체인: `(1) →HB→ (2) →HB→ (3) →HB→ (4)`. 전이성으로 `(1) →HB→ (4)`. Thread B는 `data = 42`를 반드시 본다.
+`final`의 함정은 **생성자 탈출**이다. 생성자 안에서 `this`를 외부로 넘기면(리스너 등록, 내부 클래스 생성 등), Freeze 전에 다른 스레드가 미완성 객체에 접근할 수 있다. 생성자는 초기화만 하고 `this` 노출을 금지해야 한다. Spring에서 `@PostConstruct`가 존재하는 이유가 바로 이것이다.
 
-## volatile: 메모리 펜스 4종의 조합
+## synchronized — 완전한 동기화의 비용
 
-`volatile`이 실제로 하는 일은 **메모리 펜스(barrier) 삽입**이다.
+`synchronized`는 원자성과 가시성을 동시에 제공한다. 진입 시 LoadLoad + LoadStore Barrier, 종료 시 StoreStore + StoreLoad Barrier를 삽입해 Critical Section 안팎의 모든 재정렬을 차단한다.
 
-```
-volatile 읽기:
-  [LoadLoad 펜스]
-  v = volatileVar;
-  [LoadStore 펜스]
-
-volatile 쓰기:
-  [StoreStore 펜스]
-  volatileVar = v;
-  [StoreLoad 펜스]  ← 가장 비싸다
-```
-
-x86에서 `volatile` 쓰기는 `lock addl $0x0, (%rsp)`로 구현된다. Store Buffer를 강제로 플러시한다. 비용은 약 100~300사이클. 반면 `volatile` 읽기는 x86 TSO 모델 덕분에 추가 명령어 없이 거의 무료다.
-
-<Callout type="warning" title="volatile이 보장하지 않는 것">
-`volatile`은 단일 읽기/쓰기의 가시성과 재정렬 제한만 보장한다. `count++`는 read → increment → write의 3단계이고, 두 스레드가 동시에 `count=5`를 읽고 각자 `6`을 쓰면 결과는 `6`이다(7이어야 함). 복합 연산에는 `AtomicInteger` 또는 `synchronized`가 필요하다.
+<Callout type="note" title="트레이드오프">
+`synchronized`의 성능은 경쟁 여부에 크게 달라진다. JVM은 단일 스레드 독점 시 **Biased Lock**(~10ns), 경쟁 없을 때 **Lightweight Lock**(~50ns), 경쟁 심할 때 **Heavyweight Lock**(~1μs)으로 전환한다. "synchronized는 항상 느리다"는 오해다. 문제는 경쟁 시의 OS Mutex 비용이다. 임계 영역을 최소화하고 락을 분할하면 대부분의 상황에서 충분히 빠르다.
 </Callout>
 
-## 재정렬: 컴파일러·JIT·CPU의 3단계
+`volatile`과 `synchronized`의 선택 기준은 단순하다. 단순 플래그나 단일 변수 읽기/쓰기는 `volatile`로 충분하다. 복합 연산(`i++`), 다중 변수 원자성, Check-Then-Act 패턴은 `synchronized` 또는 `Atomic` 계열이 필요하다.
 
-가시성 문제는 하드웨어만의 문제가 아니다. **명령어 재정렬**이 3단계에서 발생한다.
+## Memory Barrier — 하드웨어 추상화의 밑바닥
 
-**JIT(HotSpot C2)**: 루프 내 변수를 레지스터에 캐시한다. `while (running) {}` — `running`이 레지스터에 올라가면 주 메모리 변경을 읽지 않는다. `volatile`은 이 레지스터 캐싱을 금지한다.
+JMM의 모든 보장은 결국 CPU 명령어 수준의 Memory Barrier로 구현된다. x86(TSO 모델)에서는 Load-Load, Store-Store, Load-Store 재정렬이 하드웨어에서 이미 금지되어 있어 대부분의 Barrier가 무비용이다. 유일하게 Store-Load 재정렬이 허용되므로, `volatile` 쓰기 후에만 `mfence`(~20ns)가 삽입된다. ARM은 Weak Ordering 모델이라 모든 종류의 재정렬이 가능하고, `dmb` 명령이 매번 필요해 x86 대비 4배 이상 비용이 든다.
 
-**CPU(Out-of-Order Execution)**: 의존성 없는 명령어는 순서를 바꿔 실행된다. x86에서는 StoreLoad 재정렬이 발생한다 — 쓰기가 Store Buffer에 있는 동안 이후 읽기가 먼저 완료된다.
-
-**False Sharing**: 다른 변수가 같은 64바이트 캐시 라인에 있을 때, 한 스레드의 쓰기가 다른 스레드의 무관한 변수 캐시를 Invalidate한다. JDK의 `LongAdder`가 `@Contended`를 쓰는 이유다.
-
-<Aside label="x86 vs ARM">
-x86의 TSO 모델은 StoreLoad 재정렬만 허용한다. ARM은 더 약한 모델로 LoadLoad, StoreStore 재정렬도 허용한다. JVM은 플랫폼별로 다른 펜스 명령어를 삽입해 JMM 스펙을 보장한다. `volatile`과 `synchronized`를 올바르게 쓴 코드는 x86에서도 ARM에서도 동일하게 동작한다.
-</Aside>
-
-## DCL: 재정렬이 만드는 함정
-
-Double-Checked Locking은 이 모든 개념이 교차하는 지점이다.
-
-```java
-// 잘못된 DCL (volatile 없음)
-private static Singleton instance;
-
-public static Singleton getInstance() {
-    if (instance == null) {
-        synchronized (Singleton.class) {
-            if (instance == null) {
-                instance = new Singleton(); // 재정렬 위험!
-            }
-        }
-    }
-    return instance; // 부분 초기화된 객체 반환 가능
-}
-```
-
-`instance = new Singleton()`은 세 단계다: ① 힙 메모리 할당, ② 생성자 실행, ③ `instance`에 참조 저장. JIT/CPU가 ① → ③ → ②로 재정렬하면, Thread B가 `instance != null`을 봤을 때 생성자가 아직 실행 중이다. 필드는 기본값(0, null)이다.
-
-`volatile instance`를 추가하면 StoreStore 펜스가 ③ 이전에 삽입되어, ② 생성자 완료 전에 ③이 실행될 수 없다.
-
-더 나은 해결책은 **Initialization-on-demand Holder 패턴**이다:
-
-```java
-class HolderSingleton {
-    private HolderSingleton() {}
-
-    private static class Holder {
-        static final HolderSingleton INSTANCE = new HolderSingleton();
-    }
-
-    public static HolderSingleton getInstance() {
-        return Holder.INSTANCE;
-    }
-}
-```
-
-JVM은 클래스를 처음 사용할 때 단 한 번, 스레드 안전하게 초기화한다. 클래스 초기화 락 해제 →HB→ 이후 모든 접근. `volatile`도 `synchronized`도 필요 없다.
+이 차이가 실무에서 의미하는 바는 한 가지다: JVM 위에서 올바르게 작성된 코드는 하드웨어 플랫폼이 바뀌어도 동일하게 동작해야 한다. x86에서 우연히 맞게 작동하는 코드가 ARM에서 깨지는 사례가 그래서 생긴다. JMM의 규칙을 따르지 않은 코드는 "x86에서만 우연히 동작하는 코드"일 수 있다.
 
 ## 정리
 
-- 가시성 문제의 뿌리는 하드웨어다 — Store Buffer 지연, 캐시 계층, MESI 전파 지연.
-- JMM은 이를 happens-before 관계로 추상화한다. 관계가 없으면 어떤 값도 보장되지 않는다.
-- `volatile`은 메모리 펜스(특히 StoreLoad)로 Store Buffer를 플러시하고 재정렬을 제한한다. 가시성은 보장하지만 복합 연산의 원자성은 보장하지 않는다.
-- JIT와 CPU의 재정렬을 과소평가하지 마라. `volatile` 없는 루프 플래그는 x86 `-server` 모드에서도 무한루프가 된다.
-- DCL에는 반드시 `volatile`을 추가하거나, Holder 패턴으로 교체하라.
-
-다음 글에서는 `synchronized`의 내부 구조 — Object Header, Mark Word, Thin Lock에서 Heavyweight Lock으로의 전환 과정을 추적한다.
+- JMM은 CPU 캐시, 재정렬, Store Buffer라는 하드웨어 복잡성을 **Happens-Before** 하나로 추상화한다.
+- `volatile`은 가시성과 재정렬 금지를 보장하지만 원자성은 아니다. 복합 연산에는 `synchronized` 또는 `Atomic`이 필요하다.
+- `final`은 생성자 완료 시 Freeze를 통해 동기화 없이 불변 객체를 안전하게 공개한다. 단, 생성자 탈출은 이를 무효화한다.
+- `synchronized`는 완전한 동기화를 제공하되, 경쟁이 심할 때만 실질적인 성능 비용이 발생한다.
+- JMM을 따르지 않은 코드는 x86에서 우연히 동작하고 ARM에서 깨진다.

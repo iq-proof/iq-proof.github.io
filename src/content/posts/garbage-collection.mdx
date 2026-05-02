@@ -1,0 +1,86 @@
+---
+title: "JVM GC는 어떻게 살아있는 객체를 판단하는가"
+description: "GC Roots와 Reachability Analysis부터 Serial/Parallel/CMS/G1/ZGC까지, JVM 가비지 컬렉터의 설계 결정과 그 대가를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jvm, garbage-collection, g1gc, zgc, memory]
+difficulty: intermediate
+series:
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+JVM은 객체를 직접 세지 않는다. 대신 "GC Root에서 도달할 수 있는가"라는 질문 하나로 살아있는 객체와 죽은 객체를 구분한다. 이 단순한 원칙 위에서 Serial GC부터 ZGC까지 수십 년의 진화가 이루어졌다. 왜 이 원칙은 변하지 않았고, 무엇이 바뀌었는가?
+
+## Reachability — 살아있음의 정의
+
+Reference Counting은 직관적이다. 객체마다 참조 카운터를 두고, 0이 되면 제거한다. 문제는 순환 참조다. `A → B → A` 구조에서 외부 참조가 사라져도 카운터는 1로 남는다. JVM이 Reference Counting 대신 Reachability Analysis를 선택한 이유다.
+
+GC Root는 "확실히 살아있는" 출발점이다. Stack Frame의 지역 변수, static 변수, 실행 중인 Thread 객체, JNI 참조, synchronized 락이 걸린 객체가 여기 속한다. GC는 이 Root들에서 BFS/DFS로 그래프를 순회하며 도달 가능한 객체에 Mark 비트를 찍는다. 순환 참조는 문제가 되지 않는다 — GC Root에서 닿을 수 없으면 순환이든 아니든 모두 수거 대상이다.
+
+이 메커니즘이 만드는 함정이 하나 있다. Static 컬렉션은 그 자체가 GC Root다. `static Map<String, Object> cache`에 객체를 넣으면, 명시적으로 제거하지 않는 한 영원히 살아있다. `null` 할당도 마찬가지 — 참조를 끊을 뿐, 즉시 메모리를 회수하지는 않는다.
+
+## Reference 타입 — Reachability의 세분화
+
+Java는 Strong Reference 외에 세 가지 참조 타입을 추가로 제공한다. 이들은 GC와의 상호작용 방식을 다르게 정의한다.
+
+- **Soft Reference**: 메모리가 부족할 때만 수거된다. 캐시에 적합하다.
+- **Weak Reference**: Strong Reference가 없으면 다음 GC에서 즉시 수거된다. `WeakHashMap`의 Key가 이 방식으로 동작한다.
+- **Phantom Reference**: `get()`이 항상 null을 반환한다. 객체 수거 후 `ReferenceQueue`를 통해 알림을 받아 네이티브 리소스를 정리하는 용도다. `finalize()`의 대안이며, Java 9+에서 `finalize()`가 deprecated된 이유다.
+
+<Callout type="note" title="WeakHashMap 주의점">
+WeakHashMap은 Key만 Weak Reference로 저장한다. Value는 Strong Reference다. Value가 Key를 참조하면 순환이 생겨 Key가 수거되지 않는다 — 의도한 자동 정리가 동작하지 않는다.
+</Callout>
+
+## Mark-Sweep-Compact — 수거의 비용
+
+GC Root에서 Unreachable 객체를 찾아냈다면, 다음 문제는 어떻게 제거할 것인가다. Mark-Sweep만 하면 단편화(Fragmentation)가 남는다. 총 여유 공간은 충분해도 연속된 블록이 없으면 큰 객체 할당이 실패한다.
+
+Compact 단계가 이를 해결한다. 살아있는 객체를 힙 한쪽으로 밀어 연속된 빈 공간을 만든다. 대가는 비싸다 — 객체 이동, Forwarding Address 계산, 모든 포인터 업데이트를 포함하는 Compact는 Full GC 시간의 약 절반을 차지한다.
+
+## GC 진화 — Pause Time과 Throughput의 균형
+
+모든 GC 알고리즘은 하나의 긴장 위에 서 있다. **Stop-The-World(STW)를 줄이면 Throughput이 떨어지고, Throughput을 올리면 Pause가 길어진다.**
+
+**Serial/Parallel GC**는 이 긴장을 Throughput 쪽으로 해결한다. 단일 스레드(Serial) 또는 멀티스레드(Parallel)로 Young/Old를 전부 멈추고 처리한다. 10GB 힙에서 Full GC는 수 초다. 배치 작업에는 최적이지만 웹 서버에는 맞지 않는다.
+
+**CMS**는 처음으로 Concurrent Marking을 도입했다. Initial Mark(STW)로 GC Root 직접 참조만 찍고, 나머지 Mark를 애플리케이션과 동시에 진행한 뒤, Remark(STW)로 누락분을 보정한다. 총 STW는 수십 ms 수준으로 줄었다. 하지만 Compaction이 없다. 단편화가 쌓이면 Old가 가득 차지 않아도 큰 객체 할당에 실패하고, 그 순간 Serial Old GC로 Fallback해 수 초의 STW가 발생한다 — Concurrent Mode Failure. Java 14에서 제거된 이유다.
+
+**G1**은 힙을 1~32MB Region으로 쪼갠다. "Garbage First"라는 이름처럼 Garbage 비율이 높은 Region부터 선택해 Evacuation(복사)한다. 복사 자체가 Compaction 효과를 낸다. Pause Prediction Model이 과거 통계를 기반으로 `MaxGCPauseMillis` 목표 안에서 처리할 Region 수를 결정한다. 목표는 보장이 아니라 목표지만, 수십 ms 수준의 예측 가능한 Pause를 제공한다.
+
+**ZGC**는 < 10ms를 목표로 설계되었다. 핵심은 두 가지다. 첫째, 64bit 포인터의 상위 4bit를 메타데이터(Colored Pointer)로 활용해 객체 상태를 포인터 자체에 인코딩한다. 둘째, 모든 객체 참조 로드에 Load Barrier를 삽입해 이동 중인 객체를 자동으로 새 주소로 리다이렉트한다. 덕분에 Relocation도 Concurrent하게 진행된다. STW는 Mark Start/End, Relocate Start 세 번, 각각 1ms 미만이다. 대가는 Load Barrier로 인한 약 5~10% Throughput 감소다.
+
+**Shenandoah**는 Red Hat이 독자적으로 개발한 Low Latency GC로, ZGC와 목표는 같지만 구현이 다르다. Colored Pointer 대신 객체 앞에 8바이트 Brooks Pointer를 두어 이동 시 Forwarding 정보를 기록한다. 32bit 플랫폼과 Java 8 백포트를 지원하는 것이 차이점이다.
+
+<Aside label="설계 철학">
+GC의 역사는 "무엇을 포기할 것인가"의 역사다. Serial은 단순함을, Parallel은 latency를, CMS는 compaction을, G1은 전체 힙 처리를 포기했다. ZGC는 throughput의 5%를 포기하고 pause를 얻었다. 완벽한 GC는 없다 — 애플리케이션의 요구사항이 GC를 선택한다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="GC 선택 기준">
+| GC | Pause | Throughput | 힙 | 용도 |
+|---|---|---|---|---|
+| Parallel | 수 초 | 최대 | < 4GB | 배치 |
+| G1 | 50~200ms | 약간 감소 | 6GB+ | 웹 서버 |
+| ZGC | < 10ms | 5% 감소 | 8GB+ | 초저지연 |
+| Shenandoah | < 10ms | 7~10% 감소 | 8GB+ | 32bit/Java8 필요 시 |
+
+작은 힙(< 2GB)은 Serial 또는 Parallel, 컨테이너 환경에서 CPU가 제한된 경우도 Serial이 낫다.
+</Callout>
+
+## 정리
+
+- GC의 기준은 Reference Counting이 아닌 Reachability다. GC Root에서 도달 불가능한 객체는 순환 참조가 있어도 수거된다.
+- `static` 컬렉션, 미종료 Thread, JNI GlobalRef 미해제가 메모리 누수의 3대 패턴이다.
+- Mark-Sweep의 단편화 문제를 Compact가 해결하지만, Compact는 Full GC 비용의 절반이다.
+- GC 진화의 핵심은 STW를 Concurrent 단계로 이동하는 것이었고, ZGC는 Relocation까지 Concurrent하게 만들어 < 10ms Pause를 달성했다.
+- GC 튜닝의 첫 단계는 `-Xlog:gc:gc.log`로 로그를 수집하고 Pause Time 분포와 Full GC 빈도를 확인하는 것이다.
+
+다음 글에서는 G1 GC의 Pause Prediction Model이 실제로 어떻게 동작하는지, 그리고 `MaxGCPauseMillis` 목표를 자주 초과할 때 어떤 순서로 튜닝해야 하는지 추적한다.

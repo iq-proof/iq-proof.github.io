@@ -1,0 +1,120 @@
+---
+title: "JVM 바이트코드는 어떻게 플랫폼을 초월하는가"
+description: "클래스 파일 바이너리 구조부터 invoke 명령어의 다형성 구현, 람다의 invokedynamic, 바이트코드 조작까지 — JVM 추상 기계의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jvm, bytecode, class-file, invokedynamic, asm]
+difficulty: intermediate
+series:
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 소스 코드는 컴파일되면 `.class` 파일이 된다. 이 파일은 특정 CPU의 기계어가 아니라 JVM이라는 **추상 기계**를 위한 명령어 집합이다. 그런데 이 단순해 보이는 선택 하나가 다형성 구현, 함수형 프로그래밍, 런타임 코드 주입까지 모든 설계를 결정한다. JVM 바이트코드는 어떻게 이 모든 것을 하나의 이진 형식 안에 담아냈는가?
+
+## 클래스 파일 — 플랫폼 독립성의 계약서
+
+`.class` 파일의 첫 4바이트는 `CA FE BA BE`다. Magic Number라 불리는 이 값은 JVM이 파일을 읽기 전 유효성을 확인하는 서명이다. 그 뒤로 2바이트씩 Minor Version과 Major Version이 따라온다. Major Version 52는 Java 8, 61은 Java 17을 뜻한다.
+
+```
+Offset   Bytes         의미
+0x00     CA FE BA BE   Magic Number
+0x04     00 00         Minor Version
+0x06     00 34         Major Version (52 = Java 8)
+```
+
+버전 다음에 오는 것이 **Constant Pool**이다. 클래스명, 메서드명, 문자열 리터럴, 타입 디스크립터 — 클래스 파일이 참조하는 모든 심볼릭 정보가 여기 집중된다. Fields와 Methods는 Constant Pool의 인덱스를 참조하기 때문에 파일 앞쪽에 위치해야 한다. 파일을 순차 읽기할 때 Constant Pool을 먼저 메모리에 올려야 나머지를 해석할 수 있다.
+
+`System.out.println("Hello")` 한 줄이 Constant Pool에서는 이렇게 펼쳐진다:
+
+```
+#2 = Fieldref    #16.#17   // java/lang/System.out
+#3 = String      #18       // Hello
+#4 = Methodref   #19.#20   // java/io/PrintStream.println
+#18 = Utf8       Hello
+#26 = Utf8       out
+#29 = Utf8       println
+```
+
+모든 참조가 인덱스 체인으로 연결된다. 이것이 JVM이 "심볼릭 참조"를 런타임에 실제 메모리 주소로 해석하는 기반이다.
+
+## 스택 기반 추상 기계 — 플랫폼 독립성의 대가
+
+바이트코드는 **스택 기반**이다. `int result = a + b` 연산은 이렇게 표현된다:
+
+```
+iload_1      // a → Operand Stack
+iload_2      // b → Operand Stack
+iadd         // 두 값 pop → a+b → push
+istore_3     // 결과 → Local Variable Array
+```
+
+레지스터 기반(x86의 `add eax, ebx`)과 달리 피연산자 위치가 암시적이다. 명령어에 레지스터 번호를 명시할 필요가 없으므로 바이트코드가 짧아지고, 무엇보다 레지스터 개수가 플랫폼마다 달라도 무관하다.
+
+타입 접두사(`i`, `l`, `f`, `d`, `a`)는 이 설계의 또 다른 축이다. `iload`와 `fload`를 분리해 바이트코드 수준에서 타입을 강제한다. Bytecode Verifier는 클래스 로딩 시 `iload` 후 `fadd`를 시도하면 `VerifyError`로 거부한다. JVM이 JIT 컴파일 전에 타입 안전성을 보장하는 방식이다.
+
+`max_stack`은 컴파일 타임에 고정된다. `javac`가 모든 실행 경로를 추적해 Operand Stack의 최대 깊이를 계산하고, JVM은 메서드 진입 시 그 크기만큼 Stack Frame을 할당한다. 런타임에 스택이 동적으로 커지지 않는다.
+
+<Aside label="스택 vs 레지스터">
+Android의 Dalvik/ART는 레지스터 기반을 선택했다. 단일 플랫폼(ARM)에 최적화하고 JIT 없이도 빠른 Interpreter 성능을 얻기 위해서다. JVM은 플랫폼 독립성을 우선했고, JIT가 스택 기반 바이트코드를 레지스터 기반 기계어로 변환한다.
+</Aside>
+
+## 다섯 가지 invoke — 다형성의 비용을 설계에 녹이다
+
+메서드 호출 명령어가 다섯 종류인 것은 JVM 설계에서 가장 명시적인 트레이드오프다.
+
+`invokevirtual`은 Virtual Method Table(vtable)을 사용한다. `Dog`가 `Animal.sound()`를 오버라이드하면 Dog의 vtable 인덱스 0이 `Dog.sound()`를 가리킨다. 런타임에 객체의 실제 타입을 확인하고 vtable을 조회하면 O(1)로 다형성을 구현할 수 있다.
+
+`invokeinterface`는 더 복잡하다. 클래스는 여러 인터페이스를 구현할 수 있어 고정 인덱스 방식이 불가능하다. 별도의 Interface Table(itable)에서 인터페이스를 먼저 찾고 메서드를 찾는다. Interpreter 단계에서는 `invokevirtual`보다 느리지만, JIT가 단일 구현체(Monomorphic Call Site)를 확인하면 직접 호출로 변환해 차이를 없앤다.
+
+`invokespecial`은 다형성이 없다. 생성자, `super` 메서드, `private` 메서드 — 세 경우 모두 호출 대상이 컴파일 타임에 확정된다. vtable을 거치지 않으므로 JIT 인라이닝이 가장 확실하다. `invokestatic`도 마찬가지다.
+
+<Callout type="note" title="트레이드오프">
+`final` 또는 `private` 메서드는 `invokespecial`을 사용해 JIT 인라이닝이 보장된다. 반면 10가지 이상 타입이 혼재하는 Megamorphic Call Site는 JIT가 인라이닝을 포기하고 vtable dispatch를 유지한다. 타입을 분리해 루프를 Monomorphic하게 만드는 것이 가장 효과적인 최적화다.
+</Callout>
+
+## invokedynamic — 미래를 위한 빈 슬롯
+
+Java 8의 람다는 내부 클래스로 컴파일되지 않는다. `invokedynamic` 명령어 하나로 변환된다.
+
+```java
+Runnable r = () -> System.out.println("Hello");
+// 바이트코드:
+// invokedynamic #2, 0  // run:()Ljava/lang/Runnable;
+```
+
+첫 실행 시 `LambdaMetafactory.metafactory()`라는 Bootstrap Method가 호출된다. 이 메서드가 ASM으로 람다 구현 클래스(`LambdaDemo$$Lambda$1`)를 동적 생성하고 `CallSite`를 캐시한다. 이후 호출은 캐시된 `CallSite`를 직접 사용한다.
+
+캡처 변수가 있으면 `invokedynamic`의 파라미터로 전달된다:
+
+```java
+int x = 42;
+Runnable r = () -> System.out.println(x);
+// invokedynamic #4, 0  // run:(I)Ljava/lang/Runnable;
+//                              ↑ 캡처된 x를 파라미터로 전달
+```
+
+캡처 없는 람다는 JVM이 싱글톤으로 재사용할 수 있다. 캡처 있는 람다는 매번 새 인스턴스를 만들어 필드에 저장한다. 바이트코드는 `invokedynamic` 한 줄이지만, 구현 전략은 런타임이 결정한다. Java 버전이 올라가도 바이트코드는 그대로이고 Bootstrap Method만 더 나은 전략으로 교체된다.
+
+## 예외 처리와 바이트코드 조작 — 구조의 비용
+
+`try-catch-finally`는 **Exception Table**로 구현된다. goto가 없다. 대신 `start_pc`, `end_pc`, `handler_pc`, `catch_type` 네 값이 try 블록의 범위와 catch 블록의 위치를 기록한다. 예외 발생 시 JVM은 현재 PC가 어느 범위에 있는지 확인하고 Table을 순서대로 탐색한다.
+
+`finally` 블록은 정상 경로, catch 경로, 재throw 경로 각각에 **중복 복사**된다. JVM은 goto만으로 제어 흐름을 구현하므로 서브루틴 호출이 없고 각 경로에 코드를 복사하는 것이 유일한 방법이다. `try-with-resources`는 이 복잡도를 숨기는 문법 설탕이지만 바이트코드는 100줄에 달한다.
+
+ASM은 이 바이트코드를 런타임에 직접 조작한다. Spring AOP가 `@Transactional`을 구현할 때, JaCoCo가 커버리지를 측정할 때, Mockito가 모의 객체를 만들 때 — 모두 ASM으로 바이트코드를 읽고 변환하고 새 클래스를 생성한다. Java Agent를 사용하면 클래스 로딩 시점에 변환을 끼워 넣을 수 있어 소스 코드 수정 없이 횡단 관심사를 주입한다.
+
+## 정리
+
+- `.class` 파일은 Constant Pool을 중심으로 모든 심볼릭 참조를 인덱스 체인으로 연결한다. 버전 번호가 JVM 호환성의 유일한 진실이다.
+- 스택 기반 설계는 플랫폼 독립성을 얻는 대가로 `iload`/`istore`의 명령어 수 증가를 선택했다. JIT가 이를 레지스터 기반 기계어로 변환한다.
+- 다섯 가지 invoke 명령어는 다형성 비용을 컴파일 타임에 명시적으로 분류한다. Monomorphic Call Site가 성능의 핵심이다.
+- `invokedynamic`은 구현을 런타임에 위임하는 빈 슬롯이다. 람다, String 연산, Switch 표현식이 이 위에 얹혀 JVM 업그레이드와 함께 자동으로 최적화된다.
+
+JVM 바이트코드의 모든 결정은 하나의 질문으로 수렴한다 — "이 비용을 컴파일 타임에 치를 것인가, 런타임에 치를 것인가?" 그 답이 지금 우리가 쓰는 JVM의 형태다.

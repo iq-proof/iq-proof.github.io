@@ -1,0 +1,116 @@
+---
+title: "JVM은 객체를 어떻게 들여다보는가"
+description: "Object Header의 Mark Word 구조부터 Compressed Oops, String Pool, Unsafe API, Reflection Inflation, Java Agent의 바이트코드 변환, JNI 경계 비용까지, JVM이 객체를 다루는 저수준 메커니즘을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jvm, object-header, reflection, java-agent, jni]
+difficulty: intermediate
+series:
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 코드를 작성할 때 객체는 그냥 `new`로 만들어지는 것처럼 보인다. 하지만 JVM 안에서 모든 객체는 8바이트의 Mark Word를 머리에 달고 태어나고, 포인터는 32비트로 압축되며, 문자열은 풀에서 재사용되고, 반사 호출은 15번째부터 코드가 새로 생성된다. 이 메커니즘들은 서로 무관해 보이지만, 하나의 질문으로 묶인다 — **JVM은 객체에 대해 무엇을 알고 있어야 하며, 그 정보를 어디에 얼마나 작게 담는가?**
+
+## 64비트 안에 담긴 객체의 현재 상태
+
+JVM의 모든 객체는 헤더로 시작한다. 64비트 JVM 기준으로 Mark Word 8바이트, Class Pointer 4바이트(Compressed Oops 활성화 시), 배열이면 Length 4바이트가 추가된다. 가장 흥미로운 부분은 Mark Word다.
+
+```
+Unlocked 상태:
+┌──────────┬──────┬───┬──┐
+│ hash:25  │age:4 │ 0 │01│
+└──────────┴──────┴───┴──┘
+
+Biased Lock 상태:
+┌──────────┬────────┬─────┬──┬──┐
+│thread:54 │epoch:2 │age:4│ 1│01│
+└──────────┴────────┴─────┴──┴──┘
+
+Lightweight Lock:
+┌─────────────────────────┬──┐
+│    lock record ptr:62   │00│
+└─────────────────────────┴──┘
+
+Heavyweight Lock:
+┌─────────────────────────┬──┐
+│   monitor ptr:62        │10│
+└─────────────────────────┴──┘
+```
+
+마지막 2비트가 Lock 상태(`01` / `00` / `10` / `11`)를 결정하고, 나머지 62비트의 의미가 상태에 따라 완전히 달라진다. `identityHashCode()`는 Unlocked 상태의 25비트에 지연 저장되고, GC age는 4비트(최대 15)에 담긴다. 한 번 hashCode가 기록된 객체에 Biased Lock을 걸 수 없는 이유도 여기에 있다 — hash 필드와 thread 필드가 같은 공간을 두고 충돌한다.
+
+작은 객체일수록 이 헤더의 비중이 커진다. `int x, y` 두 필드만 가진 `Point` 객체의 실제 크기는 24바이트인데, 그 중 12바이트가 헤더다. **오버헤드 비율 50%.**
+
+## 32GB가 마법의 숫자인 이유
+
+64비트 JVM에서 포인터를 8바이트 그대로 쓰면 메모리 사용량이 32비트 JVM 대비 30~50% 늘어난다. Compressed Oops는 이를 막는 트릭이다.
+
+핵심 관찰: Java 객체는 8바이트 정렬을 강제하므로, 모든 힙 주소의 하위 3비트는 항상 0이다. 이 3비트를 버리고 29비트만 저장하면 32비트로 $2^{32} \times 8 = 32\text{GB}$까지 표현할 수 있다.
+
+```
+압축:   64bit 주소 >> 3  →  32bit 저장
+해제:   32bit 저장  << 3  →  64bit 주소 복원
+```
+
+힙이 4GB 미만이면 Base를 0으로 두는 Zero-Based 모드, 4~32GB면 힙 시작 주소를 Base로 더하는 Heap-Based 모드가 동작한다. 32GB를 넘는 순간 Compressed Oops가 꺼지고 Class Pointer가 4바이트에서 8바이트로 늘어난다. 이것이 30GB 힙이 40GB 힙보다 실제 메모리를 적게 쓰는 역설의 원인이다.
+
+<Callout type="note" title="트레이드오프">
+Compressed Oops를 쓰면 Object Header가 16바이트에서 12바이트로 줄고 전체 힙 사용량이 20~30% 감소한다. 대신 힙이 32GB를 넘는 순간 이 이득이 모두 사라지고 포인터 비용이 두 배로 뛴다. 쿠버네티스 파드에 `memory: 40Gi`를 설정하는 대신 `memory: 30Gi`로 제한하면 JVM이 더 적은 메모리로 더 많은 객체를 다룰 수 있다.
+</Callout>
+
+## 문자열 풀과 Reflection Inflation — 같은 철학
+
+String Pool과 Reflection의 Inflation 메커니즘은 겉보기에 다르지만 같은 원칙으로 작동한다: **비용이 큰 자원의 생성을 미루고, 필요해진 시점에만 만든다.**
+
+String Pool은 리터럴 문자열을 HashTable(기본 버킷 수 60,013)에 캐싱한다. Java 7부터 풀이 PermGen에서 Heap으로 이동하면서 `intern()`이 문자열을 복사하는 대신 참조만 추가하게 됐다. 제한된 집합의 문자열(`enum` 이름, 고정 상태 코드 등)에는 유효하지만, UUID나 로그 메시지에 `intern()`을 남발하면 풀이 무한 증가해 메모리 누수로 이어진다.
+
+Reflection의 `Method.invoke()`는 처음 14번까지 JNI 기반의 `NativeMethodAccessorImpl`로 처리한다. 15번째 호출에서 ASM으로 바이트코드를 동적 생성해 `GeneratedMethodAccessor`로 교체한다.
+
+```
+0~14회:   NativeMethodAccessorImpl  →  ~500ns (JNI 경계)
+15회~:    GeneratedMethodAccessor   →  ~50ns  (직접 바이트코드)
+```
+
+`setAccessible(true)`는 접근 권한 체크를 생략해 20% 정도 개선한다. 더 나아가 `MethodHandle`을 쓰면 JIT가 인라인 최적화를 적용할 수 있어 5~10배까지 빠르다.
+
+## Unsafe, Java Agent, JNI — JVM 담장 밖으로
+
+이 세 메커니즘은 JVM의 안전망을 우회하는 방법들이다. 목적은 다르지만 공통점이 있다 — 경계를 넘는 비용이 반드시 존재하며, 그 비용을 줄이는 설계가 핵심이다.
+
+`sun.misc.Unsafe`는 GC 밖의 Off-Heap 메모리를 직접 할당하고, 객체 필드를 오프셋으로 접근하며, CPU의 `CMPXCHG` 명령을 직접 호출하는 CAS를 제공한다. `AtomicInteger`와 `ConcurrentHashMap`의 Lock-Free 구현이 여기에 의존한다. Java 9부터 `VarHandle`이 같은 성능을 안전한 API로 제공하므로 애플리케이션 코드에서 Unsafe를 직접 쓸 이유는 거의 없다.
+
+Java Agent(`-javaagent`)는 클래스 로딩 시점에 `ClassFileTransformer`를 통해 바이트코드를 가로채 변형한다. New Relic, DataDog 같은 APM 도구가 코드 수정 없이 모든 메서드 호출 시간을 측정하는 원리다. ByteBuddy의 `@Advice` 모델은 이 변환을 선언적으로 표현해 준다. 계측 대상을 최소화하고 샘플링을 적용하면 오버헤드를 5~15% 수준으로 유지할 수 있다.
+
+JNI는 Java와 C/C++ 사이의 경계다. 문제는 이 경계를 넘는 비용이 생각보다 크다는 것이다 — Java 메서드 호출이 ~1ns인 데 반해 JNI 호출은 ~20~50ns, 20~50배 차이가 난다. 스택 전환, Safepoint 체크, 타입 변환이 그 이유다.
+
+```java
+// ❌ 루프 안에서 JNI 100만 번 호출
+for (int i = 0; i < 1_000_000; i++) {
+    nativeProcess(data[i]);
+}
+
+// ✅ 배열 전체를 한 번에 넘기기
+nativeProcessBatch(data);
+```
+
+JNI를 써야 한다면 Batch 처리로 경계 통과 횟수를 줄이는 것이 첫 번째 최적화다.
+
+<Aside label="공통 패턴">
+Mark Word의 상태별 레이아웃, Compressed Oops의 3비트 생략, String Pool의 지연 생성, Reflection의 15회 Inflation — 모두 같은 설계 원칙으로 돌아온다. **필요한 정보를 가능한 한 작은 공간에, 실제로 필요한 순간에만 생성한다.** JVM의 저수준 메커니즘을 이해하면 "왜 이 코드가 느린가"에 대한 답이 훨씬 구체적으로 보인다.
+</Aside>
+
+## 정리
+
+- Object Header의 Mark Word는 64비트 안에서 Lock 상태, GC age, hashCode를 상태에 따라 다른 레이아웃으로 표현한다. 작은 객체일수록 헤더 오버헤드 비율이 높다.
+- Compressed Oops는 8바이트 정렬의 하위 3비트를 버려 32비트로 32GB를 표현한다. 힙이 32GB를 넘는 순간 이 이득이 사라진다.
+- Reflection은 15회 임계값에서 NativeMethodAccessor에서 GeneratedMethodAccessor로 교체된다. MethodHandle을 쓰면 JIT 인라인까지 가능하다.
+- Java Agent는 바이트코드를 클래스 로딩 시점에 변환해 코드 수정 없이 전역 계측을 구현한다. JNI는 경계 통과 비용이 크므로 Batch 처리로 호출 횟수를 최소화해야 한다.
+
+다음 글에서는 JVM의 GC가 이 Object Header의 GC age 필드를 어떻게 읽어 객체의 세대를 결정하는지, 그리고 G1GC와 ZGC가 이 판단을 어떻게 다르게 구현하는지 추적한다.

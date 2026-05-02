@@ -1,0 +1,102 @@
+---
+title: "JVM은 바이트코드를 어떻게 실행하는가"
+description: "Interpreter의 즉시 실행부터 JIT 계층화 컴파일, OSR, Deoptimization, Intrinsics까지 — HotSpot이 성능을 끌어올리는 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [jvm, jit, hotspot, bytecode, tiered-compilation]
+difficulty: intermediate
+series:
+  slug: jvm-deep-dive
+  title: Jvm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`java MyApp`을 실행하는 순간, JVM은 바이트코드를 즉시 CPU에서 돌릴 수 없다는 사실을 안다. 그러나 사용자는 기다리지 않는다. HotSpot은 이 모순을 어떻게 해결하는가?
+
+## 출발점: Interpreter가 먼저 뛴다
+
+JVM이 켜지면 모든 코드는 **Template Interpreter**로 시작한다. 이 Interpreter는 흔히 상상하는 "한 줄씩 파싱" 방식이 아니다. JVM 시작 시 각 바이트코드 opcode마다 대응하는 기계어 템플릿을 미리 생성해두고, 실행 시에는 opcode를 읽어 Dispatch Table에서 주소를 조회한 뒤 직접 점프한다.
+
+```
+opcode = *pc;
+addr   = dispatchTable[opcode];  // O(1) 조회
+goto addr;                        // 직접 점프, switch-case 없음
+```
+
+Switch-case보다 2~3배 빠른 이유는 조건 분기가 없기 때문이다. CPU는 `dispatchTable[opcode]`라는 예측 가능한 패턴만 따라간다. 그럼에도 Interpreter는 명령어당 약 50ns — JIT 대비 25배 느리다. 이것이 출발선일 뿐인 이유다.
+
+## 계층 컴파일: C1이 먼저, C2가 마무리한다
+
+HotSpot은 메서드 호출 횟수(Invocation Counter)와 루프 반복 횟수(Backedge Counter)를 추적한다. 임계값을 넘으면 백그라운드 컴파일러 스레드가 해당 메서드를 큐에 넣고 컴파일한다.
+
+컴파일은 한 번에 끝나지 않는다. **Tiered Compilation**은 5단계로 나뉜다.
+
+```
+Level 0: Interpreter (50ns/명령어)
+Level 1: C1 Simple — 빠른 컴파일, 기본 최적화
+Level 2: C1 Limited Profiling
+Level 3: C1 Full Profiling — C2를 위한 데이터 수집
+Level 4: C2 Full Optimization (2ns/명령어)
+```
+
+일반 경로는 `0 → 3 → 4`다. C1(Level 3)이 프로파일링 데이터를 쌓는 동안 사용자는 이미 5~10배 빨라진 응답을 받는다. C2(Level 4)가 완료되면 최대 25배 향상이 이루어진다. Tiered를 끄고 C2만 쓰면 Level 3의 중간 가속 없이 Interpreter가 훨씬 오래 돈다 — 대부분의 경우 Tiered ON이 유리하다.
+
+<Callout type="note" title="트레이드오프">
+메모리 제약 환경에서는 `-XX:TieredStopAtLevel=1`로 C2를 비활성화할 수 있다. C1만 사용하면 컴파일러 메모리를 아끼고 빠른 Warm-up을 유지하지만, 최종 성능은 C2 대비 약 50% 수준에 머문다. 배치 작업이나 512MB 이하 컨테이너에 적합하다.
+</Callout>
+
+## OSR: 실행 중인 루프를 바꿔치기한다
+
+문제가 하나 있다. 메서드가 딱 한 번만 호출되는데 내부 루프가 100만 번 돈다면? Invocation Counter는 1에 머물러 JIT가 트리거되지 않는다.
+
+**On-Stack Replacement(OSR)**는 이 문제를 해결한다. Backedge Counter가 루프 반복마다 올라가다가 임계값(기본 약 14,000)을 넘으면, 백그라운드에서 루프 본문만 JIT 컴파일하고 실행 중인 Stack Frame 자체를 JIT 버전으로 교체한다. `i=14,000`이던 지역 변수 값까지 그대로 복사해 루프 도중부터 JIT 코드가 이어받는다.
+
+`-XX:+PrintCompilation` 출력에서 `%` 표시가 보이면 OSR이 발생한 것이다.
+
+```
+120  1  %  3  OSRDemo::longLoop @ 15 (60 bytes)
+           ↑ OSR, @ 15 = backedge 바이트코드 위치
+```
+
+## 최적화의 뿌리: Inlining과 Escape Analysis
+
+C2가 하는 최적화 중 가장 중요한 것은 **Inlining**이다. 메서드 호출을 본문으로 대체하면, 호출 오버헤드가 사라질 뿐 아니라 Constant Folding 같은 후속 최적화가 연쇄적으로 일어난다.
+
+```java
+int result = sum(10, 20);  // Inlining →
+int result = 10 + 20;      // Constant Folding →
+int result = 30;           // 기계어: mov eax, 30
+```
+
+**Escape Analysis**는 객체가 메서드 밖으로 탈출하지 않으면 Heap 할당 자체를 제거한다(Scalar Replacement). `new Point(1, 2)`가 `int x = 1; int y = 2;`로 분해되면 GC 압박도 사라진다. Loop Unrolling과 SIMD Vectorization은 루프를 펼치고 한 명령어로 여러 데이터를 동시에 처리한다.
+
+## Deoptimization: 가정이 틀렸을 때
+
+C2는 프로파일링 데이터를 믿고 **Speculative Optimization**을 한다. "지금까지 `shape`는 항상 `Circle`이었다 → Virtual Call을 제거하고 `Circle.area()`를 직접 인라인하자." 이 가정은 `Square`가 등장하는 순간 무너진다.
+
+그 순간 **Deoptimization**이 발생한다. JIT Frame을 Interpreter Frame으로 복구하고, 기존 JIT 코드는 "made not entrant"(새 진입 금지)로 표시된다. 실행 중인 스레드는 완료까지 허용되고, 이후 재컴파일이 `Circle + Square` 모두를 고려해 다시 최적화한다.
+
+다형성이 넓을수록 이 사이클이 자주 일어난다. Monomorphic(1개 타입)은 최적화가 유지되고, Megamorphic(4개 이상)은 JIT가 최적화를 포기하고 Virtual Call을 남겨둔다.
+
+## Intrinsics: CPU 명령어로 바꿔버린다
+
+일부 메서드는 JIT 최적화의 한계를 넘는다. `Math.sqrt()`를 아무리 잘 컴파일해도 CPU의 `sqrtsd` 명령어 한 줄보다 빠를 수 없다. **JVM Intrinsics**는 특정 메서드를 바이트코드 단계에서 인식해 CPU 명령어로 직접 대체한다.
+
+`System.arraycopy`는 `rep movsq`로, `String.equals`는 AVX2 SIMD 비교로, `Integer.bitCount`는 `popcnt`로 대체된다. 효과는 5~20배 성능 향상이다. Intrinsics는 JIT 컴파일 시에만 작동하므로 `-Xint` 모드에서는 일반 Java 구현이 호출된다.
+
+<Aside label="설계 철학">
+HotSpot의 모든 장치 — Interpreter, Tiered Compilation, OSR, Deoptimization, Intrinsics — 는 같은 원칙을 공유한다. **지금 알고 있는 것만큼만 최적화하고, 틀리면 되돌아온다.** 컴파일타임에 모든 것을 확정하는 AOT와 달리, HotSpot은 런타임 관찰을 믿는다. 그래서 처음엔 느리고, 점점 빨라진다.
+</Aside>
+
+## 정리
+
+- JVM은 Interpreter로 즉시 실행을 시작하고, Tiered Compilation으로 점진적으로 최적화한다.
+- 긴 루프는 OSR이 도중에 JIT 버전으로 교체한다 — Invocation Counter가 낮아도 문제없다.
+- Inlining은 모든 고급 최적화의 게이트웨이다. 메서드를 작게 유지하면 JIT가 더 많이 볼 수 있다.
+- Deoptimization은 버그가 아니라 설계다. 타입을 단순하게 유지할수록 Speculative Optimization이 오래 살아남는다.
+- `Math.sqrt`, `System.arraycopy` 같은 표준 API는 직접 구현보다 항상 빠르다 — Intrinsics가 있기 때문이다.
