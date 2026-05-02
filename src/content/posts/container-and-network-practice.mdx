@@ -1,0 +1,154 @@
+---
+title: "컨테이너 네트워크는 어떻게 작동하는가"
+description: "Docker veth 페어와 iptables NAT부터 K8s kube-proxy의 ClusterIP 구현, 운영 중 RST·포트 고갈 패턴, RTT 기반 성능 측정까지 컨테이너 네트워킹의 전 계층을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, kubernetes, networking, iptables, tcp]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+컨테이너는 격리된 프로세스다. 그런데 격리된 프로세스끼리, 그리고 외부 세계와 어떻게 통신하는가? 단순히 "Docker가 해준다"는 설명으로는 `ping이 안 간다`는 상황에서 아무것도 할 수 없다. 컨테이너 네트워킹의 각 계층은 무엇이고, 그것이 무너질 때 어디서 무너지는가?
+
+## 격리의 기반 — Linux 네트워크 네임스페이스
+
+컨테이너 네트워크 격리의 실체는 **Linux 네트워크 네임스페이스**다. 각 네임스페이스는 독립된 네트워크 스택(인터페이스, 라우팅 테이블, iptables 규칙, 소켓)을 갖는다. 컨테이너가 "localhost"라고 말하면, 그것은 컨테이너 자신의 네임스페이스 내 루프백 인터페이스를 가리킨다 — 호스트나 다른 컨테이너의 localhost와 완전히 다르다.
+
+Docker는 컨테이너를 생성할 때 다음 순서로 네트워크를 구성한다.
+
+```
+1. 새 네트워크 네임스페이스 생성
+2. veth 페어 생성 (vethXXX ↔ vethYYY)
+3. vethXXX → docker0 브리지에 연결
+4. vethYYY → 새 네임스페이스로 이동, eth0으로 rename
+5. eth0에 IP 할당 (172.17.0.x)
+6. 기본 라우트 설정 (172.17.0.1이 게이트웨이)
+```
+
+veth(Virtual Ethernet) 페어는 파이프처럼 작동한다. 한쪽에 들어온 패킷이 다른 쪽으로 나온다. 컨테이너 1에서 컨테이너 2로 패킷을 보내면 경로는 다음과 같다.
+
+```
+컨테이너1 eth0 → veth0a1b2c → docker0(bridge) → veth0d3e4f → 컨테이너2 eth0
+```
+
+호스트에서 `ip link show type veth`를 실행하면 실행 중인 컨테이너 수만큼 veth 인터페이스가 보인다. `@if7` 같은 표기는 상대편 인터페이스 번호로, 컨테이너 내부의 eth0와 매핑된다.
+
+## 외부 통신 — iptables가 하는 일
+
+컨테이너가 인터넷에 나가거나 외부에서 컨테이너로 들어오는 경로는 모두 **iptables**가 담당한다.
+
+컨테이너(172.17.0.2)가 외부로 패킷을 보낼 때, iptables POSTROUTING 체인의 MASQUERADE 규칙이 출발지 IP를 호스트의 eth0 IP로 변환한다. 외부에서 보면 컨테이너가 아닌 호스트가 요청한 것처럼 보인다. conntrack이 연결을 추적하므로 응답 패킷은 자동으로 역변환되어 컨테이너에 전달된다.
+
+포트 매핑(`-p 8080:3000`)은 DNAT로 구현된다.
+
+```bash
+# iptables DNAT 규칙 확인
+sudo iptables -t nat -L DOCKER -n -v
+# DNAT tcp -- anywhere anywhere tcp dpt:8080 to:172.17.0.2:3000
+```
+
+외부에서 호스트:8080으로 들어온 패킷의 목적지가 컨테이너IP:3000으로 변환된다.
+
+<Callout type="note" title="host 네트워크 모드의 트레이드오프">
+`docker run --network host`는 컨테이너가 독립된 네트워크 네임스페이스를 갖지 않는다. 호스트의 모든 인터페이스를 공유하므로 NAT 오버헤드가 없고 성능이 최대치에 가깝다. 대신 포트 충돌 위험, 네트워크 격리 없음, 동일 컨테이너 복수 실행 불가라는 제약이 따른다. 네트워크 모니터링 도구나 성능 극한이 필요한 프록시에서만 선택적으로 쓴다.
+</Callout>
+
+멀티 호스트 통신이 필요한 경우(Docker Swarm, Kubernetes)에는 VXLAN 기반 overlay 네트워크가 추가된다. L2 프레임을 UDP 패킷(포트 4789)으로 캡슐화해 물리 네트워크 위에 가상 L2 네트워크를 만든다. 컨테이너 입장에서는 같은 네트워크에 있는 것처럼 통신하지만, 실제 패킷은 호스트 간 물리 링크를 UDP로 터널링된다. VXLAN 헤더 50바이트 오버헤드와 MTU 고려(1500 → 1450)가 필요하다.
+
+## Kubernetes — NAT 없는 플랫 네트워크
+
+Kubernetes의 네트워킹 모델은 Docker bridge와 근본적으로 다르다. K8s의 요구사항은 단순하지만 강력하다: **모든 Pod는 NAT 없이 다른 모든 Pod와 통신 가능해야 한다**.
+
+Docker에서는 컨테이너 IP가 172.17.x.x이고 NAT를 통해 호스트 IP로 변환되어 외부와 통신한다. K8s에서는 Pod IP(10.244.x.x)가 그대로 다른 노드의 Pod와 통신한다. 이 플랫 네트워크를 CNI(Container Network Interface) 플러그인이 구현한다.
+
+Service의 ClusterIP는 어떤 인터페이스에도 바인딩되지 않는 **가상 IP**다. kube-proxy가 이 VIP를 실제 Pod IP로 변환한다.
+
+```
+Service: my-svc (ClusterIP: 10.96.100.1:80)
+Endpoints: [10.244.1.5:8080, 10.244.2.7:8080]
+
+kube-proxy iptables 규칙:
+  KUBE-SERVICES → KUBE-SVC-XXXX (50% → Pod1, 50% → Pod2)
+  KUBE-SEP-AAAA: DNAT → 10.244.1.5:8080
+  KUBE-SEP-BBBB: DNAT → 10.244.2.7:8080
+```
+
+Service 수가 늘어나면 iptables 규칙도 선형으로 늘어난다. 1,000개 Service면 수만 개의 규칙이 생기고, 새 연결마다 O(N) 탐색이 일어난다. IPVS 모드는 해시 테이블 기반 O(1) 조회로 이 문제를 해결한다. Cilium은 eBPF로 kube-proxy 자체를 대체해 커널 레벨에서 처리한다.
+
+<Aside label="CNI 선택">
+CNI는 나중에 교체하기 어렵다 — 처음 선택이 중요하다. 단순함이 필요하면 Flannel, 프로덕션 표준은 Calico(BGP + NetworkPolicy), 고성능과 관찰 가능성이 필요하면 Cilium(eBPF). Flannel은 NetworkPolicy를 지원하지 않는다.
+</Aside>
+
+## 운영에서 만나는 실패 패턴
+
+### RST와 keepalive 불일치
+
+`Connection reset by peer`의 가장 흔한 원인은 keepalive 불일치다.
+
+```
+서버 nginx keepalive_timeout: 30초
+클라이언트 HTTP 연결 풀 keepalive: 60초
+
+t=0:  연결 수립
+t=30: 서버가 30초 idle → FIN 전송 → 연결 종료
+t=35: 클라이언트가 기존 연결 재사용 → GET 요청
+t=35: 서버 OS: 이미 닫힌 연결 → RST 응답
+      "Connection reset by peer"
+```
+
+해결 원칙은 간단하다: **클라이언트 keepalive < 서버 keepalive_timeout**. AWS ALB의 기본 idle timeout이 60초라면, 애플리케이션 HTTP 클라이언트의 keepalive를 55초 이하로 설정한다. 방화벽이 idle 연결의 상태 테이블 항목을 지운 후 해당 연결의 패킷에 RST를 전송하는 패턴도 동일한 구조다.
+
+### Ephemeral Port 고갈
+
+짧은 HTTP 연결을 반복하면 TIME_WAIT 소켓이 쌓인다. TIME_WAIT는 비정상이 아니라 TCP 정상 종료 후 2MSL(약 60초)간 유지되는 상태다. 문제는 수가 포트 범위를 초과할 때 발생한다.
+
+```
+초당 1,000 연결 × TIME_WAIT 60초 = 동시 60,000 소켓
+기본 ephemeral 포트 범위: 32768~60999 = 28,232개
+60,000 > 28,232 → 포트 고갈 → Connection refused
+```
+
+`ss -s`로 즉시 확인하고, 단기 조치로 포트 범위 확대와 `tcp_tw_reuse=1`을 적용한다. 근본 해결은 Connection Pool로 연결을 재사용해 TIME_WAIT 자체를 줄이는 것이다.
+
+<Callout type="warning" title="오류 유형 구분">
+- **Connection Refused**: 포트에 프로세스 없음 → 즉시 실패
+- **Connection Timeout**: SYN에 응답 없음 → N초 대기 후 실패 (서버 다운, 방화벽 DROP)
+- **Read Timeout**: 연결됐지만 응답 지연 → N초 대기 후 실패 (서버 처리 중)
+- **Connection Reset**: RST 수신 → 즉시 실패 (keepalive 불일치, 방화벽 세션 만료)
+
+원인이 다르면 해결책도 다르다. 혼동하지 마라.
+</Callout>
+
+## 성능 측정 — RTT부터 패킷까지
+
+네트워크 성능 문제를 진단할 때 "느리다"는 말은 출발점이 아니라 질문이다. 어느 계층에서 느린가?
+
+`curl -w`는 HTTP 지연을 계층별로 분해한다.
+
+```bash
+curl -w "
+DNS:    %{time_namelookup}s
+TCP:    %{time_connect}s
+TLS:    %{time_appconnect}s
+TTFB:   %{time_starttransfer}s
+Total:  %{time_total}s
+" -o /dev/null -s https://api.example.com
+```
+
+`time_connect - time_namelookup ≈ 1.5 RTT`. 이 값이 예상 RTT와 같으면 TCP는 정상이다. `time_starttransfer - time_appconnect`가 크면 서버 처리가 병목이다.
+
+`ss --info`는 개별 소켓의 TCP 혼잡 상태를 보여준다. `cwnd:10 rtt:2.5/1.25`에서 cwnd(혼잡 윈도우)가 작으면 혼잡 제어가 처리량을 억제하고 있다는 신호다. RTT 150ms, 기본 소켓 버퍼 65KB라면 단일 TCP 연결의 이론 최대 처리량은 65,535 / 0.15 ≈ 3.5Mbps에 불과하다. 해외 서버와 단일 연결로 빠른 전송이 안 된다면 네트워크 버그가 아니라 물리 법칙이다.
+
+## 정리
+
+- 컨테이너 격리는 Linux 네트워크 네임스페이스가 담당한다. "localhost"는 컨테이너마다 다르다.
+- Docker bridge 네트워크는 veth 페어 + docker0 브리지 + iptables NAT의 조합이다. 포트 매핑은 DNAT, 외부 통신은 MASQUERADE다.
+- K8s는 NAT 없는 플랫 네트워크를 요구한다. Service ClusterIP는 가상 IP이고 kube-proxy(ipt

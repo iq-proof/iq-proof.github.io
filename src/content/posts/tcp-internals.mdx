@@ -1,0 +1,91 @@
+---
+title: "TCP가 선택한 것들 — 연결, 신뢰성, 흐름, 혼잡, 그리고 UDP"
+description: "3-Way Handshake가 3번인 이유부터 CLOSE_WAIT가 서버를 죽이는 메커니즘까지, TCP 설계 철학의 일관된 패턴을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [tcp, udp, network, socket, congestion-control]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+TCP는 선택의 집합이다. 3-Way Handshake, 재전송 타이머, Sliding Window, AIMD — 이것들은 제각각 존재하는 기능이 아니라 하나의 철학에서 나온 귀결이다. 그 철학은 단순하다: **"네트워크는 신뢰할 수 없으므로, 신뢰성은 양 끝단이 협력해서 만든다."** 이 시리즈 7개 챕터가 다루는 모든 메커니즘은 그 명제의 다른 표현이다. 왜 하필 3번인가?
+
+## 연결 수립 — 왜 3번인가
+
+2-Way Handshake로는 서버가 클라이언트의 수신 능력을 확인할 수 없다. SYN-ACK를 보냈지만 클라이언트가 받았는지 알 방법이 없고, 오래된 SYN 패킷이 뒤늦게 도착해 가짜 연결을 수립할 수 있다. 3번째 ACK는 이 두 문제를 동시에 해결한다.
+
+핵심은 ISN(Initial Sequence Number) 교환이다. 클라이언트의 ISN을 서버가 확인하고, 서버의 ISN을 클라이언트가 확인하는 데 최소 3번의 메시지가 필요하다. 이 ISN은 암호학적 난수로 선택한다 — 예측 가능한 ISN은 TCP Session Hijacking의 입구다.
+
+```
+Client                    Server
+  │  SYN (ISN=x)            │
+  │ ──────────────────────► │
+  │  SYN-ACK (ISN=y, ack=x+1) │
+  │ ◄────────────────────── │
+  │  ACK (ack=y+1)           │
+  │ ──────────────────────► │  ESTABLISHED
+```
+
+Handshake 비용은 **1.5 RTT**다. 서울-미국(RTT≈150ms)이면 225ms, HTTPS면 TLS까지 합쳐 375ms. API 응답이 10ms라도 연결 수립에 375ms를 쓴다. 커넥션 풀이 필요한 이유는 바로 여기다 — Handshake를 최초 1회로 줄이면 그 비용이 사라진다.
+
+## 신뢰성 — Sequence Number가 하는 일
+
+TCP가 신뢰성을 제공하는 원리는 단순하다. 모든 바이트에 번호를 붙이고, 수신자는 "다음에 받기를 기대하는 번호"를 ACK로 돌려준다. 이 체계 하나가 손실, 중복, 순서 뒤바뀜을 모두 처리한다.
+
+패킷이 손실되면 수신자는 같은 ACK 번호를 반복한다(Duplicate ACK). 3번 반복되면 송신자는 타임아웃을 기다리지 않고 즉시 재전송한다 — 이것이 **Fast Retransmit**이다. RTO(Retransmission Timeout)는 고정값이 아니라 측정된 RTT의 함수로 동적 계산되며, 재전송 때마다 지수적으로 증가해 네트워크 추가 혼잡을 막는다.
+
+SACK(Selective ACK)는 "어떤 범위를 받았는지"를 구체적으로 알린다. `seq=1,2,3,5,6`을 받았다면 `ACK=4, SACK={5-6}`을 보내 4만 재전송하게 한다. Cumulative ACK만으로는 4 이후 패킷을 모두 재전송해야 할 수 있다.
+
+<Callout type="note" title="재전송 모니터링">
+`ss -ti 'dst target-ip'`에서 `retrans:3/150`을 보면 현재 3개 재전송 대기, 누적 150회 발생이다. `cwnd:1`과 함께 등장하면 RTO 타임아웃 후 혼잡 창이 완전 리셋된 것 — 패킷 손실이 반복되고 있다는 신호다.
+</Callout>
+
+## 흐름과 혼잡 — 두 개의 창
+
+TCP는 전송 속도를 두 개의 창으로 제어한다. `rwnd`(수신자 창)는 수신 버퍼의 여유 공간을 ACK에 실어 보낸다 — 수신자 버퍼를 보호한다. `cwnd`(혼잡 창)는 송신자가 자체적으로 추정해 관리한다 — 네트워크를 보호한다. **실제 전송량 = min(rwnd, cwnd)**.
+
+Slow Start는 `cwnd=10`에서 시작해 매 RTT마다 두 배씩 늘린다. ssthresh에 도달하면 RTT마다 1씩 늘리는 선형 증가(Congestion Avoidance)로 전환한다. 패킷 손실이 Duplicate ACK 3회로 감지되면 `cwnd`를 절반으로 줄이고 Fast Recovery로 빠르게 재개한다. RTO 타임아웃이면 `cwnd=1`로 완전 리셋 후 Slow Start 재시작 — 회복에 수십 RTT가 걸린다.
+
+AIMD(Additive Increase, Multiplicative Decrease)의 수학적 함의는 공정성이다. 두 연결이 같은 링크를 쓰면 각자 +1씩 늘다가 혼잡 시 각자 절반으로 줄이는 과정을 반복하면서 점점 같은 대역폭으로 수렴한다. BBR은 이 패러다임을 벗어나 대역폭과 RTT를 직접 측정해 전송률을 결정한다 — 손실을 혼잡의 신호로 보지 않기 때문에 무선 환경이나 고지연 링크에서 CUBIC보다 유리하다.
+
+## TCP vs UDP — 신뢰성을 얼마나 살 것인가
+
+UDP 헤더는 8바이트다. Source Port, Dest Port, Length, Checksum. TCP의 20~60바이트와 비교하면 Sequence Number도, ACK도, Window도, Flags도 없다. "연결"이라는 개념 자체가 없다.
+
+DNS가 UDP를 쓰는 이유는 단순하다. 28바이트짜리 쿼리에 TCP Handshake(1.5 RTT)를 붙이는 것은 낭비다. 대신 트랜잭션 ID로 응답을 검증하고, 타임아웃 후 재시도해 신뢰성을 애플리케이션 레벨에서 구현한다. 게임이 UDP를 쓰는 이유는 다르다 — 100ms 지연된 위치 정보보다 손실이 낫다. TCP의 재전송 대기가 오히려 더 나쁜 경험을 만든다.
+
+QUIC은 이 선택의 정점이다. UDP 위에서 스트림별 독립 재전송을 구현해 TCP의 Head-of-Line Blocking을 없앴다. TLS 1.3을 내장해 1 RTT로 연결과 암호화를 동시에 완료한다. Connection ID로 IP가 바뀌어도 연결을 유지한다. "UDP라서 신뢰성이 없다"는 말은 틀렸다 — 신뢰성을 필요한 만큼만, 더 정교하게 구현했다.
+
+<Aside label="선택의 비용">
+TCP를 쓰면 OS가 신뢰성을 처리한다. UDP를 쓰면 그 책임이 애플리케이션으로 넘어온다. 어느 것이 낫다는 절대 기준은 없다. "얼마만큼의 신뢰성이 필요한가"와 "그 비용을 어디서 지불할 것인가"의 트레이드오프만 있다.
+</Aside>
+
+## 소켓 상태 — CLOSE_WAIT가 서버를 죽이는 방법
+
+TCP 소켓은 11개 상태를 거친다. 장애 현장에서 가장 먼저 실행해야 할 명령어는 하나다:
+
+```bash
+ss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn
+```
+
+`CLOSE_WAIT`가 수백 개 이상 보이면 코드 버그다. 상대방이 FIN을 보내 OS가 ACK를 자동으로 돌려줬는데, 애플리케이션이 `close()`를 호출하지 않은 상태다. FIN을 보내지 않으므로 소켓이 영원히 열려있고, 파일 디스크립터를 계속 점유한다. `ulimit -n` 기본값(1024)이 고갈되면 `accept()`가 실패하고, 로그 파일도 열 수 없고, DB 연결도 불가능해진다 — 서버가 응답을 멈춘다.
+
+원인은 항상 같다: 예외 발생 경로에서 `close()`가 누락됐다. `RestTemplate`을 매 요청마다 `new`로 생성하거나, `CloseableHttpResponse`를 `try-with-resources` 없이 쓰거나, Nginx `keepalive_timeout`이 Tomcat보다 길어서 Nginx가 먼저 FIN을 보내거나. `TIME_WAIT`는 정상이다 — Active Close 측의 안전 대기이고 60~120초 후 사라진다. `CLOSE_WAIT`가 문제다.
+
+## 정리
+
+- 3-Way Handshake는 "양방향 ISN 동기화 + 상대 수신 능력 확인"에 필요한 최소 교환 횟수다.
+- Sequence Number 하나가 손실·중복·순서 뒤바뀜을 모두 처리한다. Fast Retransmit과 SACK는 그 위의 최적화다.
+- 실제 전송량은 `min(rwnd, cwnd)` — 수신자 버퍼와 네트워크 용량 중 더 작은 쪽이 병목이다.
+- UDP는 신뢰성이 없는 게 아니라, 신뢰성 구현의 책임을 애플리케이션으로 넘긴 것이다.
+- `CLOSE_WAIT` 누적은 네트워크 문제가 아니라 항상 코드 버그다. `try-with-resources`로 모든 `Closeable`을 감싸라.
+
+다음 글에서는 이 TCP 위에서 HTTP가 어떻게 동작하는지, 그리고 HTTP/1.1의 Keep-Alive가 Handshake 비용을 어떻게 줄이면서 어떤 새로운 문제를 만들어내는지 추적한다.

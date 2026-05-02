@@ -1,0 +1,113 @@
+---
+title: "HTTP는 어떻게 진화했는가 — 1.1의 한계부터 QUIC까지"
+description: "HOL Blocking이라는 단 하나의 적을 쫓아가다 보면, HTTP/1.1의 Keep-Alive, HTTP/2의 멀티플렉싱, HTTP/3의 QUIC이 하나의 연속된 이야기가 된다."
+pubDate: 2026-05-02
+category: dev
+tags: [http, quic, websocket, network, web-performance]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+HTTP는 단순한 텍스트 프로토콜로 시작했다. 그런데 지금 우리가 쓰는 HTTP/3는 UDP 위에서 동작하고, WebSocket은 HTTP를 버리고 직접 TCP를 쓴다. 왜 이렇게까지 바뀌었을까? 모든 변화의 배후에는 **HOL Blocking(Head-of-Line Blocking)** 이라는 하나의 적이 있다.
+
+## Keep-Alive — 연결을 아끼는 첫 번째 전략
+
+HTTP/1.0은 요청마다 TCP 연결을 새로 맺었다. 리소스 10개를 불러오면 Handshake가 10번. RTT가 50ms인 환경이라면 순수 연결 비용만 750ms다.
+
+HTTP/1.1은 **Keep-Alive**를 기본으로 도입했다. 하나의 TCP 연결을 여러 요청에 재사용한다. 같은 조건에서 연결 비용이 75ms로 줄어든다. 메커니즘은 단순하다. 클라이언트가 `Connection: keep-alive`를 보내면 서버는 `Keep-Alive: timeout=60, max=1000`으로 응답한다. 이후 60초 동안, 최대 1000번의 요청을 같은 TCP 연결에서 처리한다.
+
+그러나 Keep-Alive는 연결 비용만 줄였을 뿐, 연결 안에서 요청은 여전히 **직렬**로 처리된다. 응답 A가 오기 전까지 요청 B는 전송조차 할 수 없다. 이것이 HTTP/1.1 수준의 HOL Blocking이다.
+
+브라우저의 우회책은 **도메인당 병렬 연결 6개**다. 하지만 6개의 연결은 각자 독립적으로 HOL에 걸릴 뿐이고, 6배의 Handshake 비용이 든다.
+
+## HTTP/2 — 스트림으로 HOL을 깨다
+
+HTTP/2는 바이너리 프레임과 **멀티플렉싱**으로 HTTP 레벨 HOL을 해결했다. 핵심 아이디어는 단일 TCP 연결 위에 여러 **Stream**을 동시에 흘리는 것이다. 각 프레임에 Stream ID가 붙어 있으므로, 응답 A의 DATA 프레임과 응답 B의 DATA 프레임이 뒤섞여 전송되어도 클라이언트가 재조합할 수 있다.
+
+```
+Stream 1: [HEADERS][DATA-1][DATA-2]
+Stream 3: [HEADERS][DATA-1]
+실제 전송: HEADERS(1) → HEADERS(3) → DATA(1-1) → DATA(3-1) → DATA(1-2)
+```
+
+HPACK 헤더 압축도 함께 도입됐다. `User-Agent`, `Cookie` 같이 매 요청마다 반복되는 헤더를 동적 테이블에 올려두고 인덱스 번호(1~2 bytes)로 대체한다. 평균 1,400 bytes이던 헤더가 200 bytes로 줄어든다.
+
+<Callout type="note" title="트레이드오프 — TCP HOL의 잔존">
+HTTP/2 멀티플렉싱은 HTTP 레벨 HOL을 없앴지만, TCP 레벨 HOL은 남아 있다. 단일 TCP 연결에서 패킷 하나가 손실되면, 그 패킷이 재전송될 때까지 모든 스트림이 블로킹된다. 패킷 손실률 1% 환경에서는 HTTP/1.1의 6개 병렬 연결이 오히려 더 나을 수도 있다.
+</Callout>
+
+## HTTP/3 — UDP로 TCP를 버리다
+
+TCP HOL의 근본 원인은 TCP가 바이트 스트림을 순서대로 보장하기 때문이다. 스트림 3의 패킷이 손실되면 스트림 1도 기다려야 한다. TCP는 스트림 경계를 모른다.
+
+HTTP/3는 **QUIC** 위에서 동작한다. QUIC은 UDP를 기반으로 하되, 신뢰성과 흐름 제어를 사용자 공간에서 직접 구현한다. 핵심 차이는 **스트림별 독립 재전송**이다.
+
+```
+QUIC 패킷 3 손실 (Stream 3, Stream 5의 데이터 포함):
+  → Stream 3, Stream 5의 해당 오프셋만 재전송
+  → Stream 1의 패킷 4는 이미 도착 → 정상 처리
+```
+
+TCP에서는 불가능했던 일이다. QUIC은 각 스트림의 Offset을 독립적으로 추적하므로 다른 스트림이 영향을 받지 않는다.
+
+연결 수립도 빠르다. TCP + TLS 1.3이 2.5 RTT인 데 비해, QUIC은 UDP와 TLS를 통합해 **1 RTT**에 완료한다. 재연결 시 Session Ticket을 사용하면 0 RTT로 데이터를 먼저 보낼 수도 있다. 단, 0-RTT는 Replay Attack 위험이 있어 GET 같은 멱등 요청에만 사용해야 한다.
+
+**Connection Migration**도 QUIC이 가진 고유한 능력이다. Wi-Fi에서 LTE로 전환되면 IP가 바뀌어 TCP 연결은 끊긴다. QUIC은 IP/Port 대신 **Connection ID**로 연결을 식별하므로, IP가 바뀌어도 연결이 유지된다.
+
+<Aside label="실무 판단 기준">
+모바일 트래픽 비율이 높거나 패킷 손실이 잦은 환경이라면 HTTP/3의 효과가 크다. 안정적인 LAN 환경이라면 QUIC의 사용자 공간 처리 오버헤드(CPU 약 1.5~2배)가 이점을 상쇄할 수 있다. Cloudflare 측정에서는 HTTP/3 도입 후 TTFB 12% 감소, 고손실 환경에서 50% 이상 개선이 보고됐다.
+</Aside>
+
+## 캐싱 — 요청 자체를 없애는 전략
+
+프로토콜을 아무리 최적화해도, 요청 자체가 없으면 지연도 없다. HTTP 캐싱은 `Cache-Control` 헤더 하나로 제어된다.
+
+`no-cache`와 `no-store`는 자주 혼동된다. `no-cache`는 캐시를 저장하되 사용 전 서버에 반드시 유효성을 확인한다. `no-store`는 저장 자체를 금지한다. 개인 정보가 포함된 API에는 `no-store`가 필요하다.
+
+정적 파일에는 `public, max-age=31536000, immutable`을 쓰되, 파일명에 컨텐츠 해시를 포함(`main.abc123.js`)시켜야 한다. 배포 시 파일명이 바뀌면 새 URL = 새 캐시 항목이 되어 무효화가 자동으로 일어난다.
+
+CDN과 브라우저의 캐시 기간을 분리하려면 `s-maxage`를 사용한다. `max-age=60, s-maxage=300`은 브라우저에서 60초, CDN에서 5분을 의미한다.
+
+## WebSocket — HTTP를 벗어나 양방향으로
+
+캐싱과 멀티플렉싱이 해결하지 못하는 요구사항이 있다. **서버가 클라이언트에게 먼저 데이터를 보내야 하는 상황**이다. HTTP는 클라이언트의 요청이 있어야만 서버가 응답할 수 있다.
+
+WebSocket은 HTTP로 시작해서 TCP를 넘겨받는 방식으로 이 제약을 해결한다.
+
+```
+GET /ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+← HTTP/1.1 101 Switching Protocols
+  Upgrade: websocket
+  Sec-WebSocket-Accept: s3pPLMBiTxaQ9k...
+```
+
+101 이후 그 TCP 연결은 WebSocket 프레임 전용이 된다. 프레임 헤더는 2~10 bytes로 HTTP의 수백 bytes에 비해 압도적으로 가볍다.
+
+단방향 서버→클라이언트 스트리밍이 필요하다면 WebSocket보다 **SSE(Server-Sent Events)**가 더 적합하다. SSE는 일반 HTTP 연결(Chunked Transfer)을 유지하며 서버가 이벤트를 흘려보낸다. HTTP 포트를 그대로 쓰므로 방화벽에 친화적이고, 브라우저가 자동 재연결을 처리한다.
+
+| 방식 | 방향 | 오버헤드 | 적합 사례 |
+|---|---|---|---|
+| Long Polling | 양방향 | 높음(헤더 반복) | 레거시, 단순 구현 |
+| SSE | 서버→클라이언트 | 낮음 | 알림, 피드, 실시간 로그 |
+| WebSocket | 완전 양방향 | 최저 | 채팅, 게임, 실시간 협업 |
+
+## 정리
+
+- HTTP의 모든 버전 전환은 HOL Blocking 하나를 쫓아간 여정이다. Keep-Alive는 연결 비용을 줄였고, HTTP/2 멀티플렉싱은 HTTP 레벨 HOL을 없앴고, QUIC은 TCP 레벨 HOL까지 제거했다.
+- `Cache-Control` 설계는 프로토콜 최적화보다 선행한다. 정적 파일은 해시 포함 파일명 + `immutable`, 동적 API는 레이어별로 `max-age`와 `s-maxage`를 분리한다.
+- WebSocket은 HTTP를 버리는 것이 아니라 HTTP Upgrade로 TCP를 넘겨받는다. 단방향이면 SSE, 양방향이면 WebSocket이 기본 판단 기준이다.
+- HTTP/3 도입은 환경에 따라 효과가 다르다. 모바일·고손실 환경에서는 큰 차이가 나지만, 안정적인 서버 간 통신에서는 QUIC의 CPU 오버헤드가 부담이 될 수 있다.
+
+다음 글에서는 이 모든 HTTP 통신의 아래에서 동작하는 TLS의 핸드쉐이크 구조와 인증서 체인을 추적한다.

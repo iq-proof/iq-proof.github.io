@@ -1,0 +1,102 @@
+---
+title: "DNS는 어떻게 IP를 찾는가"
+description: "브라우저 주소창에서 시작한 도메인 조회가 Root NS, TLD NS, Authoritative NS를 거쳐 IP로 바뀌는 전 과정을 추적한다. TTL 캐시 전략부터 DNSSEC, JVM DNS 캐시 함정까지."
+pubDate: 2026-05-02
+category: dev
+tags: [dns, network, ttl, dnssec, coredns]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`api.example.com`을 입력하면 IP 주소가 나온다. 단 몇 밀리초 안에. 이 과정에는 Root NS, TLD NS, Authoritative NS가 순서대로 개입하고, 그 결과가 여러 계층의 캐시에 저장된다. 이 구조를 모르면, 배포 후 일부 서버만 새 IP를 받는 이유를 영원히 파악할 수 없다.
+
+## 조회는 세 단계 위임으로 이루어진다
+
+DNS 이름 공간은 트리 구조다. 루트(`.`)에서 `.com`, `.net` 같은 TLD로 내려오고, 그 아래에 `example.com` 같은 개별 도메인이 있다. 각 계층은 서로 다른 Name Server가 관리한다.
+
+브라우저 캐시와 OS 캐시, `/etc/hosts`를 모두 통과한 뒤에도 IP를 모르면 Recursive Resolver가 작동한다. 이 Resolver가 사용자를 대신해 Iterative 조회를 수행한다.
+
+```
+앱 → Recursive Resolver
+         │
+         ├→ Root NS (.) : "com 담당은 a.gtld-servers.net"
+         ├→ TLD NS (.com) : "example.com 담당은 ns1.example.com"
+         └→ Authoritative NS : "api.example.com → 203.0.113.10, TTL=300"
+```
+
+Root NS는 13개 클러스터지만, Anycast로 전 세계 수천 대 물리 서버가 같은 IP를 공유한다. 실제로 Root NS에 도달하는 쿼리는 전체의 1% 미만이다. 나머지는 Resolver 캐시에서 처리된다.
+
+## TTL이 배포를 결정한다
+
+Authoritative NS가 응답에 포함하는 TTL은 "이 결과를 이 시간만큼 캐시해도 된다"는 허가다. Recursive Resolver는 그 시간 동안 같은 결과를 돌려준다.
+
+DNS 레코드를 변경하면 전파는 즉각적이지 않다. Authoritative NS는 즉시 바뀌지만, 이미 캐시를 채운 전 세계 Resolver는 TTL이 만료될 때까지 이전 값을 쓴다.
+
+```bash
+# 현재 TTL 확인 (두 번째 컬럼이 남은 TTL)
+dig api.example.com | grep "IN A"
+# api.example.com.  295  IN  A  203.0.113.10
+
+sleep 10
+dig api.example.com | grep "IN A"
+# api.example.com.  285  IN  A  203.0.113.10
+```
+
+마이그레이션 24시간 전에 TTL을 300초로 낮추지 않으면, TTL=86400 상태에서 IP를 바꾼 순간 롤백이 24시간 동안 불가능해진다. "48시간 전파"라는 말은 TTL=86400짜리 레코드를 두 번 변경하던 시절의 유물이다.
+
+<Callout type="warning" title="JVM DNS 캐시 — 보이지 않는 계층">
+OS DNS 캐시가 만료돼도 JVM은 자체 캐시를 별도로 유지한다. 보안 매니저가 활성화된 JVM의 기본값은 `networkaddress.cache.ttl=-1`, 즉 영구 캐시다. DNS TTL이 60초여도 JVM은 재시작 전까지 이전 IP를 쓴다.
+
+```java
+// 애플리케이션 시작 시점에 설정
+java.security.Security.setProperty("networkaddress.cache.ttl", "30");
+java.security.Security.setProperty("networkaddress.cache.negative.ttl", "10");
+```
+</Callout>
+
+## 레코드 타입이 용도를 결정한다
+
+A 레코드는 호스트명을 IPv4로 매핑한다. CNAME은 별칭을 정식 이름으로 연결한다. 이 두 가지만으로는 충분하지 않다.
+
+Zone Apex(`example.com` 자체)에는 CNAME을 쓸 수 없다. SOA와 NS 레코드가 반드시 있어야 하는 위치인데, CNAME은 "다른 이름으로 대체"를 의미하므로 SOA/NS가 사라지는 구조가 된다. AWS에서는 Route53 Alias 레코드가 이 제약을 우회한다.
+
+이메일은 MX 레코드로 동작하는데, 여기에 IP를 직접 쓰면 RFC 위반이다. MX 값은 반드시 A 레코드를 가진 호스트명이어야 한다. 이메일이 스팸으로 분류되는 주요 원인인 SPF/DKIM/DMARC는 모두 TXT 레코드로 설정하며, SPF는 DNS 조회를 10번 이상 유발하면 PermError로 실패한다.
+
+## 보안: 서명과 암호화는 다른 문제다
+
+DNS Cache Poisoning은 Resolver의 캐시에 가짜 IP를 삽입하는 공격이다. UDP 16비트 트랜잭션 ID만으로 진위를 구분해야 했던 구조가 취약점이었다.
+
+DNSSEC은 Authoritative NS가 응답에 디지털 서명(RRSIG)을 추가하고, Resolver가 이를 검증하는 방식으로 위조를 차단한다. Root → TLD → Authoritative NS로 이어지는 신뢰 체인이 핵심이다. `dig +dnssec` 결과에서 `AD` 플래그가 있으면 검증 성공이다.
+
+그러나 DNSSEC은 응답 무결성을 보장할 뿐, 쿼리 자체를 숨기지 않는다. UDP 포트 53은 평문이므로 ISP가 어느 도메인을 조회하는지 볼 수 있다. DNS over HTTPS(DoH)는 포트 443으로 쿼리를 HTTPS 안에 숨긴다. DNS over TLS(DoT)는 포트 853에서 TLS로 암호화한다.
+
+<Callout type="note" title="트레이드오프">
+DoH는 방화벽 통과가 쉽지만, 기업 환경에서는 DNS 기반 보안 필터링을 우회하는 문제가 생긴다. DoT는 포트 853이 방화벽에서 식별 가능하다. 기업 환경에서는 관리형 DoH 서버를 내부에 두고 모든 트래픽을 그쪽으로 강제하는 방식이 현실적이다.
+
+DNS 라운드로빈은 Resolver 단위로 분산되므로 사용자 수 기반 균등 분산이 아니다. 서울 Resolver가 10.0.0.1을 캐시하면, 그 Resolver를 쓰는 사용자 전체가 10.0.0.1로 간다. 정확한 가중치 분산은 L4/L7 로드밸런서가 담당해야 한다.
+</Callout>
+
+## K8s와 JVM에서의 실전 함정
+
+K8s 내부에서 `my-service`를 조회하면 Pod의 `/etc/resolv.conf`에 있는 `ndots:5` 설정이 작동한다. 점이 5개 미만인 이름은 search 도메인을 차례로 붙여 시도한다. `my-service` → `my-service.default.svc.cluster.local` 순서로. CoreDNS가 이 요청을 받아 Service의 ClusterIP를 반환하고, kube-proxy가 실제 Pod로 부하 분산한다.
+
+CoreDNS가 다운되면 새 DNS 조회가 모두 실패한다. 최소 2개 이상의 레플리카와 PodAntiAffinity로 노드 분산, Node Local DNS Cache 도입이 표준 대응이다.
+
+블루-그린 배포에서 DNS를 활용할 때 CNAME TTL=60, A 레코드 TTL=3600 조합이 균형점이다. CNAME만 바꾸면 60초 내에 전환되고, IP는 Resolver 캐시에 오래 유지되어 DNS 비용을 낮출 수 있다.
+
+## 정리
+
+- DNS 조회는 Root → TLD → Authoritative NS 순서로 위임되며, Recursive Resolver가 이 과정을 대행하고 결과를 TTL 동안 캐시한다.
+- 마이그레이션 전에 TTL을 낮추지 않으면 전파 시간 동안 롤백이 불가능하다. JVM의 영구 DNS 캐시는 별도로 제어해야 한다.
+- DNSSEC은 응답 위조를 막고, DoH/DoT는 쿼리 내용을 숨긴다. 두 문제는 다른 레이어에 있다.
+- DNS 라운드로빈은 Resolver 단위 분산이므로 정밀한 부하 분산에는 L4/L7 로드밸런서가 필요하다.
+
+다음 글에서는 L4와 L7 로드밸런서가 어떻게 다르게 동작하는지, 그리고 Nginx가 어느 레이어에서 어떤 결정을 내리는지 추적한다.

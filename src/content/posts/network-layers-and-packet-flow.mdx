@@ -1,0 +1,85 @@
+---
+title: "네트워크는 왜 계층으로 나뉘는가"
+description: "OSI 7계층부터 NAT 동작 원리까지, 계층 모델이 만들어내는 독립성과 그 대가를 패킷의 시선으로 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [network, tcp-ip, osi, nat, arp]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+HTTP 요청 하나가 브라우저를 떠나 서버에 도달하기까지, 그 패킷은 최소 네 개의 계층을 내려갔다가 다시 올라온다. 각 계층은 헤더를 붙이고, 다음 계층에 책임을 넘긴다. 이 구조가 없다면 HTTP 개발자가 이더넷 프레임 포맷까지 직접 다뤄야 한다. 계층 모델은 어디서 왔고, 그 설계는 어떤 대가를 치르는가?
+
+## 계층의 출발점: 관심사 분리
+
+계층 모델의 핵심 약속은 단순하다. "나는 내 계층의 일만 한다." HTTP는 TCP 소켓에 데이터를 쓰기만 하면 된다. TCP는 IP 패킷으로 전달하기만 하면 된다. IP는 이더넷 프레임에 담기만 하면 된다. 이더넷을 Wi-Fi로 교체해도 HTTP 코드는 한 줄도 바뀌지 않는다. HTTP를 HTTP/2로 바꿔도 TCP 코드는 건드리지 않아도 된다.
+
+OSI 7계층은 이 원칙의 참조 모델이다. 실제 인터넷은 TCP/IP 4계층으로 구현된다. OSI의 Application·Presentation·Session(7·6·5)은 TCP/IP의 Application 하나로 합쳐지고, Data Link·Physical(2·1)은 Network Access로 묶인다. TLS가 Presentation(6계층)에 해당하지만 TCP 위에서 동작한다는 사실이 보여주듯, 경계는 언제나 깔끔하지 않다. OSI는 개념 모델이고, 현실은 TCP/IP다.
+
+## 캡슐화: 헤더가 쌓이는 과정
+
+Spring MVC가 HTTP 응답을 보내는 순간부터 시작한다. TCP는 그 데이터 앞에 20바이트 헤더를 붙인다. SrcPort, DstPort, Sequence Number가 여기 들어간다. IP는 다시 20바이트를 앞에 붙인다. SrcIP, DstIP, TTL, Protocol 필드가 담긴다. 마지막으로 이더넷이 14바이트 헤더와 4바이트 FCS를 추가한다.
+
+```
+[Ethernet Header 14B][IP Header 20B][TCP Header 20B][HTTP Data][FCS 4B]
+```
+
+실제 데이터 1바이트를 보내도 최소 54바이트의 헤더가 붙는다. 이것이 Nagle 알고리즘이 작은 패킷을 모아서 보내는 이유다.
+
+수신 측은 반대로 올라간다. 이더넷은 DstMAC이 자신의 것인지 확인하고 FCS로 오류를 검사한 뒤 IP에 넘긴다. IP는 DstIP를 확인하고 Protocol 필드를 보고 TCP에 넘긴다. TCP는 DstPort로 어느 프로세스에 전달할지 결정하고, 순서를 재조합해 소켓 버퍼에 쌓는다. Spring은 그 버퍼에서 HTTP 메시지를 꺼낸다.
+
+## 중간 노드가 처리하는 계층
+
+패킷이 거치는 장비는 각자 필요한 계층까지만 열어본다.
+
+L2 스위치는 이더넷 프레임의 DstMAC만 본다. MAC 주소 테이블로 포트를 결정하고 IP 헤더는 건드리지 않는다. L3 라우터는 IP 헤더의 DstIP를 열어 라우팅 테이블에서 Next Hop을 찾는다. Longest Prefix Match 원칙에 따라 가장 구체적인 경로(/숫자가 큰 경로)를 선택한다. L4 로드밸런서는 TCP 헤더의 DstPort까지 보고 트래픽을 분산한다. L7 로드밸런서(Nginx 등)는 HTTP 페이로드의 URL, 헤더, 쿠키까지 열어 라우팅 결정을 내린다.
+
+<Callout type="note" title="L 번호가 의미하는 것">
+"L4 로드밸런서"는 OSI 4계층(Transport)까지 처리하는 장비를 뜻한다. 계층이 높을수록 더 정교한 라우팅이 가능하지만 처리 비용이 올라간다. SSL 종료나 WebSocket은 반드시 L7이 필요하다.
+</Callout>
+
+계층 모델을 알면 장애 진단도 단계적으로 격리할 수 있다. `ping`이 성공하면 L3는 살아있다. `telnet host port`가 연결되면 L4까지 정상이다. `curl -v`에서 HTTP 오류가 나오면 L7 문제다. 세 명령으로 원인을 계층에 고정한다.
+
+## ARP와 NAT: 계층 경계를 넘나드는 메커니즘
+
+IP 주소가 있어도 같은 서브넷 안에서의 전달은 MAC 주소가 필요하다. 스위치는 IP를 모르고 MAC만 본다. ARP(Address Resolution Protocol)는 이 간극을 채운다.
+
+서버A가 서버B(192.168.1.20)의 MAC을 모를 때, ARP Request를 브로드캐스트(`FF:FF:FF:FF:FF:FF`)로 쏜다. "192.168.1.20을 가진 분, MAC 알려주세요." 서버B만 ARP Reply를 유니캐스트로 돌려보낸다. 이 매핑은 ARP 캐시에 저장되고, 다음 통신부터는 브로드캐스트 없이 바로 전달된다.
+
+NAT는 사설 IP와 공인 IP 사이의 변환 문제를 푼다. 192.168.x.x는 인터넷에서 라우팅되지 않는다. SNAT(Source NAT)는 내부 IP:Port를 공인 IP:Port로 변환하고, 이 매핑을 NAT 테이블에 기록한다. 응답 패킷이 오면 역변환해서 내부 호스트로 되돌린다. `docker run -p 8080:80`은 DNAT 규칙 하나다. iptables의 PREROUTING 체인에서 호스트의 8080으로 오는 TCP를 컨테이너의 172.17.0.x:80으로 전달한다.
+
+```bash
+# Docker가 만드는 NAT 규칙 확인
+sudo iptables -t nat -L DOCKER -n -v
+```
+
+Connection Tracking(Conntrack)은 NAT가 작동하는 핵심 엔진이다. 각 연결의 상태(NEW → ESTABLISHED → TIME_WAIT)를 추적하고, 응답 패킷을 ESTABLISHED로 인식해 자동으로 역변환을 적용한다. 방화벽에서 나가는 트래픽을 허용하면 응답은 별도 규칙 없이 들어온다.
+
+## 트레이드오프
+
+<Callout type="note" title="계층 모델의 비용">
+계층마다 헤더가 붙는다. Ethernet 14B + IP 20B + TCP 20B = 54바이트. 1바이트를 보내도 54배의 메타데이터가 따라붙는다. NAT는 공인 IP를 절약하지만 End-to-End 연결을 파괴한다. P2P 애플리케이션이 STUN/TURN 같은 우회 기술이 필요한 이유다. Conntrack 테이블이 고갈되면 새 연결이 불가능해진다.
+</Callout>
+
+QUIC(HTTP/3)은 이 경직성에 대한 응답이다. Transport 계층과 암호화(TLS)를 UDP 위에서 통합해 계층 경계를 의도적으로 허문다. 핸드쉐이크 왕복 횟수를 줄이고, L4 장비의 헤드라인 분리 없이 혼잡 제어를 애플리케이션 레이어로 가져온다. 계층 모델은 원칙이지 법칙이 아니다.
+
+<Aside label="진단 명령어 계층 매핑">
+`ping` → L3(IP 도달), `telnet host port` → L4(TCP 포트), `curl -v` → L7(HTTP), `tcpdump` → L2~L4(패킷 레벨), `ss -tanp` → 소켓 상태, `ip neigh show` → ARP 캐시, `iptables -t nat -L` → NAT 규칙
+</Aside>
+
+## 정리
+
+- 계층 모델의 핵심은 관심사 분리다. 각 계층이 헤더를 붙이고 위/아래에 책임을 넘긴다.
+- 장비는 자신이 처리하는 계층까지만 패킷을 열어본다. L2 스위치는 MAC, L3 라우터는 IP, L7 로드밸런서는 HTTP까지.
+- ARP는 같은 서브넷 안에서 IP를 MAC으로 변환한다. NAT는 사설 IP와 공인 IP 사이에서 포트로 다중 호스트를 구분한다.
+- 계층 분리의 대가는 헤더 오버헤드, NAT의 End-to-End 파괴, Conntrack 테이블 고갈이다. QUIC은 이 경계를 의도적으로 허물어 성능을 얻는다.
+
+다음 글에서는 이 계층 위에서 동작하는 TCP 3-Way Handshake의 내부를 추적한다. 연결 수립에 왕복이 세 번 필요한 이유, 그리고 TIME_WAIT가 왜 피할 수 없는지.

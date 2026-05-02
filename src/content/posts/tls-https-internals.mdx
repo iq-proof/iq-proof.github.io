@@ -1,0 +1,85 @@
+---
+title: "HTTPS는 어떻게 안전한가 — TLS의 설계 철학"
+description: "대칭키와 비대칭키의 조합부터 인증서 체인 검증, mTLS 기반 Zero Trust까지, TLS가 신뢰를 구축하는 방식을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [tls, https, cryptography, pki, mtls]
+difficulty: intermediate
+series:
+  slug: network-deep-dive
+  title: Network Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+HTTPS는 "HTTP에 자물쇠를 달았다"는 말로 설명하기 쉽다. 하지만 그 자물쇠가 어떻게 만들어지고, 왜 그 구조여야 하는지는 전혀 다른 이야기다. TLS는 대칭키, 비대칭키, 해시, 인증서, 신뢰 체인이라는 서로 다른 도구를 정밀하게 조합한다. 왜 하나의 암호화 방식으로 끝내지 않고, 이 모든 것을 함께 쓰는가?
+
+## 암호화의 분업 — 빠름과 안전함을 동시에
+
+TLS의 핵심 통찰은 하나다. **대칭키는 빠르고, 비대칭키는 안전하게 키를 나눌 수 있다.** 둘을 합치면 둘 다 얻는다.
+
+AES-256-GCM은 AES-NI 하드웨어 가속으로 단일 코어에서 수 GB/s를 처리한다. 반면 RSA-2048 서명은 초당 약 2,000회 수준이다. 대용량 데이터를 비대칭키로 직접 암호화하면 성능이 무너진다. 그래서 TLS는 비대칭키(ECDHE)로 세션 키를 안전하게 교환하고, 실제 데이터 암호화는 그 세션 키를 쓴 대칭키(AES-GCM)로 처리한다.
+
+비대칭키가 해결하는 문제는 구체적이다. "처음 만난 상대와 어떻게 안전한 공통 키를 만드는가?" — Diffie-Hellman 키 교환이 이 질문에 답한다. 공개된 채널에서 공개값만 교환해도, 각자의 비밀값과 조합하면 제3자가 계산할 수 없는 공통 비밀이 만들어진다. TLS 1.3은 여기에 ECDHE(타원 곡선 DH)를 쓴다. RSA-2048과 같은 보안 수준을 256비트 키로 달성하고, 세션마다 임시 키 쌍을 생성해 폐기한다.
+
+<Aside label="Forward Secrecy">
+임시 키 쌍은 핸드쉐이크가 끝나면 삭제된다. 서버 개인키가 나중에 유출되더라도 과거 세션은 복호화할 수 없다. TLS 1.3은 이 특성(Forward Secrecy)을 필수로 만들었다. TLS 1.2의 RSA 키 교환은 이를 보장하지 않았다.
+</Aside>
+
+## 핸드쉐이크 — 1 RTT로 신뢰를 구축하는 법
+
+TLS 1.2 핸드쉐이크는 2 RTT가 필요했다. 클라이언트가 서버의 공개키를 받은 후에야 키 교환 메시지를 보낼 수 있었기 때문이다. TLS 1.3은 이 순서를 뒤집었다.
+
+ClientHello에 `key_share` 확장을 추가해 ECDHE 공개키를 미리 보낸다. 서버는 첫 응답에서 자신의 ECDHE 공개키를 포함한 ServerHello를 보내고, 그 직후부터 암호화를 시작한다. Certificate, CertificateVerify, Finished — 이 모두가 암호화된 채로 첫 번째 왕복 안에 담긴다. 클라이언트는 서버 응답을 받는 즉시 Application Data를 보낼 수 있다.
+
+```
+Client → ServerHello 수신 (1 RTT): ECDHE 완료, 키 파생
+Server → Finished 검증 후: 연결 확립
+```
+
+TLS 1.3이 제거한 것도 설계의 일부다. RSA 키 교환, RC4, 3DES, CBC 모드, 재협상 — 약한 알고리즘과 복잡한 기능을 전부 걷어냈다. 남은 다섯 개의 Cipher Suite는 모두 안전하고, 별도 설정 없이 자동으로 선택된다.
+
+## 인증서 — 누가 공개키를 보증하는가
+
+암호화만으로는 충분하지 않다. "지금 통신하는 상대가 정말 api.example.com인가?"를 검증해야 한다. 공격자가 자신의 공개키를 api.example.com의 것이라 주장하면 암호화는 오히려 공격자와의 채널을 보호한다.
+
+X.509 인증서는 이 문제를 CA(Certificate Authority) 서명으로 해결한다. Root CA는 OS와 브라우저에 사전 내장된 약 150개의 신뢰 앵커다. Root CA가 Intermediate CA에 서명하고, Intermediate CA가 서버 인증서에 서명한다. 클라이언트는 이 체인을 역방향으로 검증한다.
+
+<Callout type="note" title="인증서 체인 설정 실수">
+서버 인증서만 설정하고 Intermediate CA 인증서를 포함하지 않으면 일부 클라이언트에서 체인 검증이 실패한다. Chrome은 Root CA 캐시로 자동 해결하지만, curl과 구형 Android는 실패한다. Nginx의 `ssl_certificate`에는 `fullchain.pem` — End-Entity + Intermediate CA 순서로 연결된 파일을 사용해야 한다.
+</Callout>
+
+인증서 유효성 검사에는 만료 확인, SAN(Subject Alternative Name) 도메인 일치, 폐기 확인이 포함된다. OCSP Stapling은 폐기 확인 비용을 없애는 최적화다. 서버가 미리 OCSP 응답을 캐시해 핸드쉐이크에 포함시키면, 클라이언트는 OCSP 서버에 별도 연결할 필요가 없다.
+
+## 성능 — 재연결 비용을 줄이는 구조
+
+RTT가 150ms인 해외 사용자에게 TLS 1.2 핸드쉐이크는 300ms다. OCSP 조회가 추가되면 450ms까지 늘어난다. 이 비용을 줄이는 도구가 세션 재개(Session Resumption)와 OCSP Stapling이다.
+
+Session Ticket은 서버 상태 없이 세션을 재개하는 방식이다. 서버가 세션 정보를 `ticket_key`로 암호화해 클라이언트에게 주고, 재연결 시 클라이언트가 Ticket을 제출한다. 서버는 복호화해 세션을 복원한다. 어느 서버 인스턴스로 라우팅되어도 재개할 수 있어 수평 확장에 친화적이다. 단, 모든 서버가 같은 `ticket_key`를 공유해야 하고 주기적으로 교체해야 한다 — 키가 유출되면 Forward Secrecy가 깨진다.
+
+TLS 1.3의 0-RTT Early Data는 재연결 시 첫 번째 패킷에 Application Data를 실어 보낸다. 그러나 이 데이터는 재전송 공격(Replay Attack)에 취약하다. `POST /payment` 같은 비멱등 요청에 사용하면 중복 처리가 발생할 수 있다. 서버에서 `425 Too Early`로 거부하거나, 금융 서비스에서는 0-RTT를 완전히 비활성화하는 것이 맞다.
+
+## mTLS — 서버도 클라이언트를 증명 요구한다
+
+일반 TLS는 단방향이다. 클라이언트가 서버를 검증하지만, 서버는 "누가 접속했는지" 알지 못한다. 마이크로서비스 환경에서 서비스 간 인증이 필요할 때, mTLS(Mutual TLS)가 이 공백을 채운다.
+
+mTLS 핸드쉐이크에는 세 단계가 추가된다. 서버가 `CertificateRequest`를 보내고, 클라이언트가 자신의 인증서를 전송하고, `CertificateVerify`로 개인키 소유를 서명해 증명한다. 인증서를 복사해 제출해도 개인키 없이는 서명을 만들 수 없으므로 위조가 차단된다.
+
+Zero Trust 원칙 — "내부 네트워크라도 신뢰하지 않는다" — 의 기술적 구현체가 mTLS다. Kubernetes Istio는 Envoy 사이드카가 앱 대신 mTLS를 처리한다. 앱 코드를 수정하지 않고도, `PeerAuthentication`으로 네임스페이스 전체에 mTLS를 강제할 수 있다. SPIFFE ID(`spiffe://cluster.local/ns/default/sa/order-service`)가 인증서의 SAN에 포함되어 서비스 신원을 표준화하고, `AuthorizationPolicy`로 어느 서비스가 어디에 접근할 수 있는지 암호학적으로 제어한다.
+
+<Callout type="note" title="트레이드오프">
+mTLS는 인증서 관리 복잡도를 높인다. 서비스 수 × 인증서 = 관리 대상이 늘어난다. Istio는 24시간마다 인증서를 자동 교체해 이 부담을 없애지만, 자체 구축 환경에서는 cert-manager 같은 자동화 도구가 필수다. 외부 파트너 통합에는 OAuth 2.0 Client Credentials가 더 현실적인 경우가 많다 — 모든 클라이언트가 클라이언트 인증서를 지원하지는 않는다.
+</Callout>
+
+## 정리
+
+- TLS는 단일 암호화 방식이 아니다. 비대칭키로 키를 교환하고, 대칭키로 데이터를 암호화하고, 해시로 무결성을 검증하고, 인증서로 신원을 확인한다. 각각의 약점을 나머지가 보완한다.
+- TLS 1.3은 2 RTT를 1 RTT로 줄이고, 취약 알고리즘을 제거하고, Forward Secrecy를 필수화했다. 새 서비스라면 TLS 1.2 폴백을 유지하되 TLS 1.3을 우선해야 한다.
+- 인증서 체인에 Intermediate CA를 포함하고, OCSP Stapling을 활성화하고, 만료 전 자동 갱신을 설정하는 것이 운영의 최소 기준이다.
+- mTLS는 Zero Trust의 구현이다. 내부 서비스 간 통신에 클라이언트 신원 증명이 필요할 때, 서비스 메시가 이를 코드 없이 처리한다.
+
+다음 글에서는 이 TLS 연결이 시작되기 전에 수행되는 DNS 조회 — 도메인 이름이 IP 주소로 바뀌는 과정의 내부 동작을 추적한다.
