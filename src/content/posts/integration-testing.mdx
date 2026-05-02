@@ -1,0 +1,123 @@
+---
+title: "단위 테스트가 통과해도 시스템이 망가지는 이유"
+description: "경계(boundary)에서 발생하는 통합 실패의 근본 원인부터 Testcontainers, 슬라이스 테스트, 트랜잭션 함정, Contract Testing까지 — 각 레이어가 연결되는 지점을 테스트하는 방법을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, testing, testcontainers, integration-test, contract-testing]
+difficulty: intermediate
+series:
+  slug: unit-testing
+  title: Unit Testing
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`OrderService.place()`의 단위 테스트가 통과한다. `JpaOrderRepository.save()`의 단위 테스트가 통과한다. `OrderController`의 단위 테스트가 통과한다. 그리고 `POST /orders`는 500을 반환한다. 왜 각 부품이 작동하는데 조립하면 실패하는가?
+
+## 경계가 문제다
+
+단위 테스트는 경계 **안쪽**만 검증한다. JPA Entity에 `@Column(nullable = false)`가 있는데 Service가 null을 전달하는 상황, Controller의 DTO 필드명이 `userId`인데 클라이언트 JSON 키는 `user_id`인 상황, `findByUserIdAndStatus` 쿼리가 잘못된 SQL을 생성하는 상황 — 이 문제들은 모두 경계 자체에 있다. Mock은 경계를 통과한다고 가정하기 때문에 이 가정이 틀렸을 때 침묵한다.
+
+통합 테스트가 검증해야 하는 경계는 네 곳이다. 애플리케이션과 데이터베이스 사이(JPA 쿼리, 제약조건, 트랜잭션), 애플리케이션과 외부 HTTP API 사이, 레이어 간(Spring 빈 연결, 직렬화), 서비스 간(MSA 계약).
+
+<Callout type="note" title="트레이드오프">
+통합 테스트는 단위 테스트보다 느리다. 이를 완화하는 방법은 세 가지다. `@DataJpaTest`, `@WebMvcTest` 같은 슬라이스 테스트로 `@SpringBootTest`를 대체해 로딩 범위를 최소화한다. 단위 테스트는 매 커밋, 통합 테스트는 PR/배포 시로 Gradle 태스크를 분리한다. Testcontainers 컨테이너를 테스트 스위트 전체에서 재사용해 기동 비용을 분산한다.
+</Callout>
+
+## H2는 MySQL이 아니다
+
+H2 인메모리 DB는 빠르고 설정이 간단하다. 하지만 프로덕션이 MySQL이라면 H2와의 차이가 런타임 오류로 나타난다. `DATE_FORMAT()` 같은 MySQL 전용 함수는 H2에서 존재하지 않는다. `JSON_EXTRACT()` 같은 JSON 함수도 마찬가지다. 격리 수준 차이 때문에 동시성 버그는 H2에서 재현되지 않는다. `H2 MySQL MODE`는 일부 호환성을 제공하지만 완전한 호환이 아니다. "테스트는 통과하는데 prod에서 터진다"는 패턴이 여전히 남는다.
+
+Testcontainers는 실제 Docker 컨테이너를 JUnit 생명주기와 연동한다. 테스트가 시작될 때 컨테이너를 기동하고, 끝나면 자동으로 제거한다.
+
+```java
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = NONE)  // H2 자동 대체 비활성화
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0")
+        .withDatabaseName("testdb")
+        .withUsername("test")
+        .withPassword("test");
+
+    @DynamicPropertySource
+    static void overrideProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", mysql::getJdbcUrl);
+        registry.add("spring.datasource.username", mysql::getUsername);
+        registry.add("spring.datasource.password", mysql::getPassword);
+    }
+
+    @Test
+    void JSON_컬럼이_올바르게_저장된다() {
+        Map<String, String> metadata = Map.of("source", "mobile");
+        Order saved = orderRepository.save(anOrder().withMetadata(metadata).build());
+        assertThat(saved.metadata()).containsEntry("source", "mobile");
+    }
+}
+```
+
+컨테이너 기동 비용이 부담이라면 `static` 필드로 선언해 클래스 내 공유하거나, `withReuse(true)`와 `~/.testcontainers.properties`에 `testcontainers.reuse.enable=true`를 추가해 JVM 재시작 후에도 컨테이너를 재사용한다. Spring Boot 3.1+에서는 `@ServiceConnection`으로 `@DynamicPropertySource` 없이 자동 연결된다.
+
+## 필요한 레이어만 로딩하라
+
+`@SpringBootTest`는 200개 빈과 모든 인프라를 로딩한다. 컨텍스트 기동에 8초가 걸린다면 테스트 50개에 400초가 쓰인다(캐싱 없을 때). 같은 테스트를 `@WebMvcTest`로 전환하면 기동 시간이 0.5초로 줄어든다.
+
+슬라이스 어노테이션은 검증 대상에 따라 나눈다. Controller 레이어의 요청 파싱, 응답 직렬화, Security 인가 검증은 `@WebMvcTest`로. Repository 레이어의 JPA 쿼리, DB 제약조건, Auditing은 `@DataJpaTest`로. Controller → Service → Repository 전체 흐름, 트랜잭션 전파, 이벤트 리스너는 `@SpringBootTest`로.
+
+```java
+// Controller: @WebMvcTest + @MockBean
+@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+    @MockBean OrderService orderService;
+    @Autowired MockMvc mockMvc;
+
+    @Test
+    @WithMockUser(roles = "USER")
+    void 필수_필드_누락_시_400_반환() throws Exception {
+        mockMvc.perform(post("/orders")
+                .contentType(APPLICATION_JSON)
+                .content("{}"))
+            .andExpect(status().isBadRequest());
+    }
+}
+```
+
+컨텍스트 캐싱을 극대화하려면 `@MockBean` 조합을 테스트 클래스마다 다르게 하지 않는다. 공통 `@MockBean` 설정을 부모 클래스로 추출하면 여러 테스트 클래스가 하나의 컨텍스트를 공유한다.
+
+## @Transactional 테스트는 거짓말을 한다
+
+테스트에 `@Transactional`을 붙이면 각 테스트가 자동으로 롤백된다. 편리하지만 세 가지 함정이 있다.
+
+첫째, 트랜잭션 전파가 숨겨진다. `orderService.place()`의 `@Transactional`은 기본 전파 수준이 `REQUIRED`이므로 테스트 트랜잭션에 참여한다. `REQUIRES_NEW`로 선언된 메서드도 흡수된다. 실제로는 새 트랜잭션이 시작되지 않으므로 커밋/롤백 동작을 검증하지 못한다.
+
+둘째, LazyLoading 예외가 감춰진다. 테스트 전체가 하나의 트랜잭션이라 `FetchType.LAZY` 컬렉션에 접근해도 세션이 열려 있어 성공한다. 프로덕션에서는 트랜잭션이 분리되어 `LazyInitializationException`이 발생하는데 테스트가 이를 잡지 못한다.
+
+셋째, `@TransactionalEventListener(phase = AFTER_COMMIT)`가 동작하지 않는다. 테스트 트랜잭션이 롤백되므로 `AFTER_COMMIT` 이벤트는 발행되지 않는다. 이메일 발송 리스너를 검증하는 테스트가 항상 실패하는 이유가 여기 있다.
+
+실제 커밋을 검증해야 할 때는 테스트에서 `@Transactional`을 제거하고 `@BeforeEach`에서 `deleteAll()`로 직접 정리한다. 판단 기준은 하나다 — "이 테스트가 커밋 후 동작에 의존하는가?" YES라면 `@Transactional`을 제거한다.
+
+## 각 서비스의 테스트가 모두 통과해도 함께 실패한다
+
+MSA에서 재고 서비스 개발자가 응답 필드를 `available`에서 `isAvailable`로 바꾼다. 재고 서비스의 테스트가 통과한다. 주문 서비스의 테스트도 통과한다. 두 서비스를 배포하면 주문 서비스가 `available` 필드를 읽지 못해 장애가 발생한다.
+
+Contract Testing은 이 문제를 배포 전에 잡는다. Consumer(주문 서비스)가 기대하는 요청/응답 명세를 계약 파일로 정의하고, Provider(재고 서비스)가 배포 전에 이 계약을 만족하는지 검증한다. 두 서비스를 실제로 띄울 필요 없이 각자의 테스트 스위트에서 실행된다.
+
+Pact는 Consumer 주도 방식이다. Consumer가 계약 파일을 생성하고 Pact Broker에 업로드한다. Provider는 Broker에서 계약 파일을 읽어 `@State`로 사전 데이터를 구성한 뒤 검증한다. Provider가 계약을 만족하지 못하면 CI 파이프라인이 배포를 차단한다.
+
+<Aside label="Spring Cloud Contract vs Pact">
+Spring Cloud Contract는 Provider가 계약을 주도하며 Spring 생태계에 밀착해 있다. Pact는 Consumer가 주도하며 Java, JavaScript, Python, Go 등 다언어를 지원한다. 서비스가 같은 언어와 팀이라면 Spring Cloud Contract, 다른 언어 서비스 간 계약이 필요하다면 Pact가 더 적합하다.
+</Aside>
+
+## 정리
+
+- 단위 테스트는 경계 안쪽만 검증한다. JPA 쿼리, DB 제약조건, 직렬화, Spring 빈 연결 같은 경계 문제는 통합 테스트가 잡는다.
+- H2로는 MySQL 전용 기능을 검증할 수 없다. Testcontainers로 프로덕션 DB와 동일한 환경에서 테스트한다.
+- `@SpringBootTest` 대신 `@WebMvcTest`, `@DataJpaTest`로 레이어를 분리하면 테스트가 빠르고 실패 원인이 명확해진다.
+- `@Transactional` 테스트는 트랜잭션 전파, Lazy 로딩, 이벤트 리스너 동작을 감춘다. 커밋 후 동작에 의존하는 테스트에서는 제거한다.
+- MSA에서 각 서비스의 테스트가 모두 통과해도 계약이 어긋나면 통합이 실패한다. Pact나 Spring Cloud Contract로 배포 전에 계약을 검증한다.

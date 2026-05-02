@@ -1,0 +1,169 @@
+---
+title: "테스트 코드가 프로덕션을 오염시키는 일곱 가지 방법"
+description: "if (isTest) 분기부터 Assertion Roulette까지, 테스트 안티패턴의 근본 원인과 설계 교정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [unit-testing, test-design, java, dependency-injection, flaky-test]
+difficulty: intermediate
+series:
+  slug: unit-testing
+  title: Unit Testing
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+프로덕션 코드에 `if (isTestEnvironment())` 한 줄이 들어간 순간, 테스트는 코드를 검증하는 것이 아니라 코드가 테스트를 속이기 시작한다. 이 문제는 단발성 실수가 아니다. `Thread.sleep(2000)`, `static` 공유 상태, 과잉 `verify()`, 애매한 실패 메시지까지 — 이 안티패턴들은 모두 같은 뿌리에서 자란다. 왜 테스트가 자신이 보호해야 할 코드를 오히려 왜곡하는가?
+
+## 프로덕션 코드에 테스트 로직이 끼어드는 이유
+
+`if (isTest)` 분기, 테스트 전용 생성자, `setXxx()` setter — 이 패턴들은 외관이 다르지만 공통 원인을 가진다. 프로덕션 코드가 의존성을 내부에서 `new`로 직접 생성하면, 테스트에서 그 의존성을 교체할 방법이 없다. 교체 수단이 없으니 뒷문을 만든다.
+
+```java
+// ❌ 의존성을 직접 생성 → 뒷문이 생긴다
+public class PaymentService {
+    public PaymentResult pay(Order order, Card card) {
+        if (isTestEnvironment()) {          // 뒷문
+            return PaymentResult.success("test-id");
+        }
+        return new TossPaymentGateway().charge(order.totalPrice(), card);
+    }
+}
+
+// ✅ 생성자 주입 → 뒷문이 불필요해진다
+public class PaymentService {
+    private final PaymentGateway paymentGateway;
+
+    public PaymentService(PaymentGateway paymentGateway) {
+        this.paymentGateway = paymentGateway;
+    }
+
+    public PaymentResult pay(Order order, Card card) {
+        return paymentGateway.charge(order.totalPrice(), card);
+    }
+}
+```
+
+생성자 주입 하나로 `isTest` 분기, 테스트 전용 생성자, `@VisibleForTesting` 남용이 전부 사라진다. 테스트는 `StubPaymentGateway`를 주입하고, 프로덕션은 `TossPaymentGateway`를 주입한다. 프로덕션 코드는 테스트의 존재를 알 필요가 없다.
+
+## 비동기 대기의 딜레마
+
+```java
+// ❌ 2초면 충분하다고 가정한다
+Thread.sleep(2000);
+verify(emailSender).send(any(), any());
+```
+
+이 코드는 두 방향으로 실패한다. CI 서버가 바쁘면 2초 안에 완료되지 않아 간헐적으로 실패하고, 실제로 100ms에 완료되어도 항상 2초를 기다린다. "적당한" sleep 값은 존재하지 않는다 — 환경마다 다르기 때문이다.
+
+Awaitility는 조건이 충족되는 즉시 통과하고, timeout 초과 시 명확한 메시지로 실패한다.
+
+```java
+// ✅ 조건 기반 대기
+await()
+    .alias("이메일 발송 대기")
+    .atMost(5, SECONDS)
+    .pollInterval(100, MILLISECONDS)
+    .untilAsserted(() ->
+        verify(emailSender).send(eq("user@example.com"), contains("주문"))
+    );
+```
+
+더 근본적인 해결책은 비동기 코드를 동기적으로 테스트할 수 있게 설계하는 것이다. `@KafkaListener` 핸들러의 비즈니스 로직을 별도 클래스(`OrderPlacedHandler`)로 분리하면, 핸들러 자체는 동기 단위 테스트로 즉시 검증할 수 있다. Kafka 연동은 `@EmbeddedKafka` 통합 테스트에서 최소한으로 다룬다.
+
+## Flaky 테스트의 네 가지 원인
+
+간헐적으로 실패하는 테스트는 항상 실패하는 테스트보다 나쁘다. 팀이 "다시 실행하면 통과하겠지"라는 습관을 갖게 되면, 실제 버그로 인한 실패도 같은 방식으로 무시된다.
+
+<Callout type="warning" title="Flaky 테스트의 악순환">
+간헐적 실패 → CI 재실행 → 실패 무시 습관 → 실제 버그도 재실행으로 처리 → 테스트 결과에 대한 신뢰 상실. 하나의 Flaky 테스트가 스위트 전체의 신뢰를 갉아먹는다.
+</Callout>
+
+원인과 해결책은 명확하게 대응된다.
+
+- **시간 의존성** — `LocalDate.now()`가 자정 경계에서 달라진다. `java.time.Clock`을 주입해 시간을 고정한다.
+- **테스트 간 공유 상태** — `static` 필드나 Spring Singleton Bean이 오염된다. `@BeforeEach`에서 초기화하거나 테스트마다 독립 인스턴스를 만든다.
+- **비동기 타이밍** — `Thread.sleep()` 대신 Awaitility를 사용한다.
+- **외부 시스템 의존성** — 실제 HTTP 호출 대신 WireMock으로 대체한다.
+
+`@TestMethodOrder(MethodOrderer.Random.class)`로 무작위 순서 실행을 설정하면 순서 의존성을 빠르게 발견할 수 있다.
+
+## 구현을 감시하는 테스트
+
+```java
+// ❌ 동작은 같은데 리팩터링 후 깨진다
+verify(discountPolicy).calculate(vipUser);
+verify(priceCalculator).apply(20_000, 10);
+assertThat(order.totalPrice()).isEqualTo(18_000);
+```
+
+`discountPolicy`를 다른 방식으로 구현해도 결과가 18,000원이면 올바르다. 하지만 `verify()`가 실패한다. 테스트가 동작이 아니라 구현을 감시하고 있기 때문이다.
+
+판단 기준은 단순하다. 반환값이나 상태로 검증할 수 있으면 `verify()`는 불필요하다. `verify()`가 적절한 경우는 이메일 발송, 이벤트 발행, 외부 API 호출처럼 **반환값이 없는 부수효과**를 검증할 때뿐이다.
+
+Fake Repository를 사용하면 `verify(repo.save())`조차 불필요해진다.
+
+```java
+// ✅ Fake로 상태를 검증한다
+InMemoryOrderRepository fakeRepo = new InMemoryOrderRepository();
+OrderService service = new OrderService(fakeRepo, discountPolicy, emailSender);
+
+Order placed = service.place(aCommand().build());
+
+assertThat(fakeRepo.findById(placed.id())).isPresent();
+assertThat(placed.totalPrice()).isEqualTo(18_000);
+```
+
+`save()`가 호출됐는지와 올바른 데이터가 저장됐는지를 동시에 검증한다. `verify()`보다 강력하다.
+
+## 숨겨진 의존성과 단언의 불명확함
+
+테스트 A가 만든 데이터를 테스트 B가 사용하면, 전체 스위트에서는 통과하지만 단독 실행 시 실패한다. 각 테스트는 자신의 전제 조건을 스스로 만들어야 한다. `@BeforeEach`에서 DB를 초기화하고, 각 테스트가 필요한 데이터를 직접 생성한다.
+
+테스트 코드 중복도 같은 맥락이다. 50개 테스트에 동일한 객체 생성 코드가 복사되면, 생성자가 바뀔 때 50개를 수정해야 한다. Test Data Builder로 기본값을 제공하고, 각 테스트는 관심 있는 필드만 오버라이드한다.
+
+```java
+// 이 테스트가 무엇에 관심 있는지 즉시 읽힌다
+User vipUser = aUser().withGrade(VIP).build();
+Order order = anOrder().withTotalPrice(20_000).build();
+```
+
+실패 메시지도 마찬가지다. `expected: 18000 but was: 20000`만으로는 어떤 주문의, 어떤 조건의 금액인지 알 수 없다. `as()`로 컨텍스트를 추가하고, 여러 필드를 동시에 검증할 때는 `SoftAssertions`를 사용한다.
+
+```java
+assertSoftly(softly -> {
+    softly.assertThat(order.totalPrice())
+        .as("VIP 10%% 할인 후 금액").isEqualTo(18_000);
+    softly.assertThat(order.status())
+        .as("초기 상태").isEqualTo(PENDING);
+    softly.assertThat(order.createdAt())
+        .as("생성 시각").isNotNull();
+});
+```
+
+한 번의 실행으로 모든 실패를 파악한다.
+
+## 트레이드오프
+
+<Callout type="note" title="테스트 격리 비용">
+`@BeforeEach`에서 `deleteAll()`을 호출하면 약간의 오버헤드가 생긴다. 하지만 Flaky 테스트를 디버깅하는 비용, 팀이 테스트 결과를 신뢰하지 않게 되는 비용과 비교하면 감수할 가치가 있다. `@Transactional` 롤백을 쓸 수 있는 경우라면 오버헤드도 거의 없다.
+</Callout>
+
+`SoftAssertions`도 항상 쓰는 것이 아니다. `assertThat(user).isNotNull()` 이 실패하면 `user.name()` 접근이 NPE를 던진다 — 앞 단언이 뒷 단언의 전제 조건일 때는 순차 실행이 맞다. 여러 독립 필드를 동시에 검증할 때 `SoftAssertions`를 선택적으로 사용한다.
+
+<Aside label="설계 원칙">
+테스트 안티패턴의 공통 원인은 테스트가 구현 세부사항에 결합되거나, 전제 조건이 코드 밖에 숨겨져 있는 것이다. 좋은 테스트는 "무엇이 되어야 하는가"만 말하고, 어떻게 만들어지는가는 프로덕션 코드에 위임한다.
+</Aside>
+
+## 정리
+
+- 프로덕션 코드에 테스트 로직이 끼어드는 유일한 원인은 의존성을 내부에서 생성하기 때문이다. 생성자 주입으로 해결한다.
+- `Thread.sleep()`은 환경마다 다른 "적당한" 값이 없다. Awaitility로 조건 기반 대기를 사용하거나, 비즈니스 로직을 동기 테스트 가능하게 분리한다.
+- `verify()`는 반환값으로 검증할 수 없는 부수효과에만 사용한다. Fake Repository는 `verify()`보다 더 강력한 검증이다.
+- 각 테스트는 독립적으로 실행 가능해야 한다. 전제 조건을 스스로 만들고, 만든 상태를 스스로 정리한다.
+- 실패 메시지는 원인을 즉시 드러내야 한다. `as()`로 컨텍스트를 추가하고, 여러 필드 검증에는 `SoftAssertions`를 사용한다.
+
+다음 글에서는 테스트 피라미드의 각 계층이 어떤 역할을 담당해야 하는지, 그리고 통합 테스트와 단위 테스트의 경계를 어떻게 그어야 하는지 추적한다.

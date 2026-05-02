@@ -1,0 +1,107 @@
+---
+title: "좋은 단위 테스트란 무엇인가"
+description: "단위의 정의부터 FIRST 원칙까지, 테스트가 팀의 짐이 아닌 자산이 되기 위한 설계 결정들을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [unit-testing, tdd, test-pyramid, first-principles]
+difficulty: intermediate
+series:
+  slug: unit-testing
+  title: Unit Testing
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"단위 테스트를 작성하고 있다"고 말하는 두 팀이 완전히 다른 테스트를 만들고 있는 경우가 있다. 한 팀은 클래스 하나를 Mock으로 격리하고, 다른 팀은 동작 전체의 결과를 검증한다. 어느 쪽이 옳은가? 그리고 그 선택이 팀의 테스트 전략 전체를 어떻게 바꾸는가?
+
+## 단위란 무엇인가
+
+런던파(London School)는 "단위 = 클래스"라고 정의한다. 모든 협력자를 Mock으로 교체해 하나의 클래스만 격리해서 검증한다. 실패하면 정확히 어떤 클래스가 문제인지 알 수 있다는 것이 장점이다.
+
+고전파(Classical School)는 "단위 = 동작(behavior)"이라고 정의한다. 외부 시스템(DB, 네트워크)만 교체하고 협력자는 실제 구현을 쓴다. 결과가 같으면 내부 구조가 바뀌어도 테스트가 통과한다.
+
+```java
+// 런던파: 협력자를 모두 Mock으로
+@Mock DiscountPolicy discountPolicy;
+@Mock OrderRepository orderRepository;
+verify(discountPolicy).calculate(user); // 구현 세부사항 검증
+
+// 고전파: 협력자는 실제 구현, 외부 시스템만 Fake로
+private final DiscountPolicy discountPolicy = new RateDiscountPolicy(10);
+private final OrderRepository orderRepository = new InMemoryOrderRepository();
+assertThat(savedOrder.totalPrice()).isEqualTo(18_000); // 동작의 결과 검증
+```
+
+<Callout type="note" title="트레이드오프">
+런던파는 리팩터링에 취약하다. 내부 호출 경로가 바뀌면 기능은 동일한데 테스트가 깨진다. 고전파는 실패 시 원인 파악이 상대적으로 어렵다. 실무 기본값은 고전파다 — "호출했는가"가 아닌 "결과가 맞는가"를 검증하라.
+</Callout>
+
+## 피라미드의 경제학
+
+테스트 피라미드는 버그의 종류에 따라 적합한 레이어를 분리하는 전략이다. 비즈니스 로직 오류는 단위 테스트가, 연동 오류는 통합 테스트가, 전체 흐름 오류는 E2E가 잡는다.
+
+```
+          ▲
+        /E2E\          5~10%   핵심 happy path
+       /─────\
+      /  INT  \        20~30%  DB·API 경계 검증
+     /─────────\
+    /   UNIT    \      60~70%  비즈니스 로직, 경계값
+   /─────────────\
+```
+
+역삼각형이 되면 팀에 세 가지 일이 생긴다. CI가 30분을 넘기 시작한다. 이유 없이 실패하는 Flaky Test가 쌓인다. 팀이 빨간 CI를 무시하기 시작한다. E2E 테스트 하나가 11초라면, 100개는 18분이다.
+
+경계값 검증과 예외 케이스는 단위 테스트로 내린다. E2E에는 핵심 사용자 시나리오 happy path만 남긴다.
+
+## 테스트를 읽을 수 있게 만드는 두 가지 규칙
+
+**AAA 구조**: Arrange(준비) — Act(실행) — Assert(검증)을 시각적으로 분리한다. Act는 거의 항상 한 줄이다. 두 줄 이상이면 두 동작을 한 테스트에서 검증하고 있다는 신호다. Assert가 없는 테스트는 예외가 발생하지 않는다는 것 외에 아무것도 검증하지 않는다.
+
+**이름은 문서다**: CI가 빨간불일 때 팀원이 처음 보는 것은 테스트 이름이다. 핵심 공식은 `[상황] + [동작/결과]`다.
+
+```java
+// ❌ 아무 정보 없음
+@Test void testPlace() { ... }
+@Test void place_callsDiscountPolicyAndSavesToRepo() { ... } // 구현 세부사항
+
+// ✅ 상황 + 결과
+@Test void VIP_회원_주문_시_10퍼센트_할인이_적용된다() { ... }
+@Test void 재고가_0이면_주문_생성이_실패한다() { ... }
+```
+
+테스트 이름만 보고 원인을 추정할 수 없다면 이름을 수정하라.
+
+## 커버리지가 말하지 못하는 것
+
+커버리지 100%인데 버그가 있을 수 있다. 커버리지는 "이 코드가 실행됐다"는 것만 말한다. 결과가 올바른지, 경계값이 검증됐는지, null과 예외가 처리됐는지는 말하지 않는다.
+
+팀에서 커버리지 목표를 숫자로 강제하면 게터/세터 테스트와 항상 통과하는 단언이 양산된다. 더 의미 있는 기준은 핵심 비즈니스 로직 패키지에만 Branch Coverage 90% 이상을 적용하는 것이다. 커버리지는 "부재의 지표"로 써야 한다 — 낮은 커버리지 영역에서 "여기에 테스트가 없다"를 발견하는 용도다.
+
+## FIRST — 테스트가 팀의 짐이 되는 원인
+
+"CI가 가끔 빨개", "테스트 순서 바꾸면 실패해", "아무도 안 믿는 초록불" — 이 말들은 각각 FIRST 원칙 중 하나가 깨졌을 때 나오는 신호다.
+
+- **Fast**: 단위 테스트 전체가 10초 이내여야 한다. DB, 네트워크, `Thread.sleep()`이 느리게 만드는 세 원인이다.
+- **Isolated**: 공유 상태가 있으면 테스트 순서에 따라 결과가 달라진다. `@BeforeEach`에서 매 테스트마다 상태를 새로 만들어라.
+- **Repeatable**: `LocalDate.now()`, `Math.random()`, 특정 OS 경로는 Flaky Test의 원인이다. 시간은 `Clock` 주입으로, 랜덤은 시드 고정으로 대체한다.
+- **Self-validating**: 결과는 Green/Red만 존재해야 한다. `System.out.println`은 테스트가 아니라 디버깅 코드다. `isNotNull()`처럼 항상 통과하는 단언은 아무것도 검증하지 않는다.
+- **Timely**: "나중에 테스트 추가"는 대부분 영원히 안 쓴다. 구현 직전 또는 직후에 작성해야 테스트가 설계에 영향을 미칠 수 있다.
+
+<Aside label="설계 철학">
+단위 테스트의 모든 결정 — 단위의 정의, 레이어 분리, 이름 작성, 커버리지 목표, FIRST 원칙 — 은 하나의 질문으로 수렴한다. "이 테스트가 버그를 발견하는 데 실제로 기여하는가?" 기여하지 않는 테스트는 유지보수 비용만 남긴다.
+</Aside>
+
+## 정리
+
+- 단위는 클래스가 아닌 동작이다. 기본값은 고전파 — 결과를 검증하라.
+- 피라미드 비율을 지켜라. E2E는 5~10%, 경계값은 단위 테스트로 내린다.
+- AAA 구조와 동작 중심 이름은 테스트를 문서로 만든다.
+- 커버리지는 부재 탐지 도구다. 단언의 품질이 숫자보다 중요하다.
+- FIRST 중 하나라도 깨지면 팀이 테스트를 신뢰하지 않게 된다.
+
+다음 글에서는 Arrange 단계의 중복을 줄이는 Test Data Builder 패턴과, Fake와 Mock을 선택하는 구체적인 기준을 다룬다.

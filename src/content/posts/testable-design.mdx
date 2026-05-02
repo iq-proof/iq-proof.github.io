@@ -1,0 +1,131 @@
+---
+title: "테스트하기 어렵다는 느낌은 설계 냄새다"
+description: "의존성 주입부터 Hexagonal Architecture까지, 테스트 가능한 설계의 공통 원칙과 각 패턴이 어떻게 같은 철학을 다른 방식으로 표현하는지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [unit-testing, dependency-injection, clean-architecture, design-patterns]
+difficulty: intermediate
+series:
+  slug: unit-testing
+  title: Unit Testing
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"테스트 코드를 작성하려고 하면 이상하게 복잡해진다." 이 느낌이 익숙하다면, 문제는 테스트가 아니라 설계에 있다. 테스트하기 어렵다는 감각은 설계가 특정 방향으로 잘못 굳어가고 있다는 신호다. 그렇다면 테스트하기 쉬운 설계란 어떤 구조를 공유하는가?
+
+## 모든 문제의 뿌리: 교체할 수 없는 의존성
+
+테스트가 어려워지는 근본 원인은 하나다 — **의존성을 교체할 수 없는 상태**. `new`로 의존성을 직접 생성하거나, `static` 메서드를 호출하거나, 거대한 인터페이스를 통째로 주입받을 때 발생한다.
+
+```java
+// ❌ 세 가지 패턴 모두 같은 문제를 만든다
+public class OrderService {
+    public Order place(Cart cart, User user) {
+        InventoryClient client = new HttpInventoryClient();  // new — 교체 불가
+        int discount = DiscountCalculator.calculate(user);   // static — 교체 불가
+        // UserRepository 12개 메서드 중 하나만 필요하지만 전부 알아야 함
+    }
+}
+```
+
+생성자 주입은 이 문제를 가장 직접적으로 해결한다. 의존성을 외부에서 받으면, 테스트에서 그 의존성을 원하는 것으로 교체할 수 있다. 그리고 생성자 파라미터가 7개를 넘는 순간 "이 클래스가 너무 많은 책임을 갖고 있다"는 신호를 코드가 직접 보내기 시작한다. 필드 주입이라면 `@Autowired`를 하나 더 추가하면 그만이라 이 신호를 놓친다.
+
+`static` 의존성도 같은 원칙으로 해결한다. `DateUtils.today()` 같은 정적 메서드는 `Clock`으로, `DiscountCalculator.calculate()` 같은 계산 로직은 `DiscountPolicy` 인터페이스로 교체한다. 순수 함수 형태의 `static`(같은 입력에 항상 같은 출력, 부수효과 없음)은 교체할 필요가 없으므로 그대로 둔다.
+
+<Callout type="note" title="트레이드오프">
+생성자 주입은 테스트 코드에서 의존성을 더 많이 설정해야 한다. 하지만 이것은 의존성 수가 많다는 신호이지 생성자 주입의 문제가 아니다. `@InjectMocks`나 `@SpringBootTest`로 감추면 문제가 보이지 않을 뿐이다.
+</Callout>
+
+## 인터페이스를 역할 단위로 쪼개면 Stub이 단순해진다
+
+12개 메서드를 가진 `UserRepository`를 Stub으로 만들려면, 실제로 한 개만 필요한데도 나머지 11개를 처리해야 한다. `findById()` 하나만 필요한 `OrderService`가 `UserRepository` 전체를 알아야 할 이유가 없다.
+
+ISP(Interface Segregation Principle)는 테스트 관점에서 "Stub이 알아야 할 것을 최소화하라"는 원칙이 된다. `UserFinder`라는 단일 메서드 인터페이스를 분리하면 테스트가 달라진다.
+
+```java
+// ❌ Before: mock(UserRepository.class) + 11개 메서드 무시
+// ✅ After: 람다 한 줄로 완성
+UserFinder stubFinder = id -> Optional.of(vipUser);
+OrderService service = new OrderService(stubFinder, ...);
+```
+
+`@FunctionalInterface`로 선언된 단일 메서드 인터페이스는 람다로 즉시 Stub이 된다. Mockito 없이도 완전한 테스트 더블이 만들어지는 것이다.
+
+분리 기준은 단순하다. "이 메서드들이 항상 함께 쓰이는가?" — 함께 쓰이면 같은 인터페이스, 독립적으로 쓰이면 분리를 고려한다.
+
+## 테스트할 수 없는 경계는 얇게 만든다
+
+HTTP 컨트롤러, Kafka 리스너, 배치 Job — 이 경계들은 프레임워크와 강하게 결합되어 있어 단위 테스트보다 통합 테스트가 적합하다. 통합 테스트는 느리다.
+
+Humble Object 패턴의 아이디어는 간단하다. **테스트하기 어려운 경계를 최대한 얇게 만들고, 비즈니스 로직은 안쪽으로 밀어넣는다.**
+
+```java
+// ❌ 두꺼운 컨트롤러: VIP 할인 로직이 HTTP 스택 안에 묶여 있다
+@PostMapping
+public ResponseEntity<OrderResponse> place(@RequestBody OrderRequest request) {
+    if (user.grade() == Grade.VIP) { /* 할인 계산 */ }
+    if (request.totalPrice() < 1_000) { /* 최소 금액 검증 */ }
+    ...
+}
+
+// ✅ 얇은 컨트롤러: 변환과 위임만 담당
+@PostMapping
+public ResponseEntity<OrderResponse> place(@RequestBody OrderRequest request) {
+    try {
+        OrderResult result = orderService.place(request.userId(), request.totalPrice());
+        return ResponseEntity.ok(OrderResponse.of(result.order()));
+    } catch (MinimumAmountException e) {
+        return ResponseEntity.badRequest().body(OrderResponse.error(e.getMessage()));
+    }
+}
+```
+
+컨트롤러 메서드가 5줄 이상이라면 비즈니스 로직이 섞인 것을 의심하라. Kafka 리스너나 배치 Step에 `if-else`가 있다면 같은 신호다.
+
+## 순수 함수는 준비물 없이 테스트된다
+
+부수효과(외부 상태 접근, 변경)를 분리하면 비즈니스 결정 로직을 순수 함수로 만들 수 있다. 순수 함수 테스트에는 Mock이 없고, `@BeforeEach`가 없고, 경계값을 한 줄에 추가할 수 있다.
+
+"Functional Core, Imperative Shell" 패턴은 이 원칙을 아키텍처 수준으로 끌어올린다.
+
+```
+  Imperative Shell: Service, Repository, Controller
+                    I/O, 부수효과 처리
+                         ↓ 호출
+  Functional Core:  Domain Object, Policy, Calculator
+                    순수 함수, 모든 비즈니스 결정
+```
+
+도메인 객체가 `Repository`에 의존하거나, 계산과 저장이 한 메서드에 섞여 있다면 Core가 오염된 것이다. 도메인 객체는 상태 변경 시 새 객체를 반환하고, 계산 로직은 파라미터만으로 결과를 낸다. 서비스는 I/O를 수행하고 순수 함수를 호출한 뒤 그 결과를 저장한다.
+
+## 테스트 경계는 아키텍처 경계와 일치해야 한다
+
+앞선 패턴들이 자연스럽게 수렴하는 지점이 Hexagonal Architecture(Ports and Adapters)다. Application Core는 인터페이스(Port)에만 의존하고, 구체적인 기술은 Adapter에만 존재한다.
+
+```
+Controller (Driving Adapter)
+    → PlaceOrderUseCase (Inbound Port)
+        → OrderService (Core) → OrderRepository (Outbound Port)
+                                    → JpaOrderRepository (Driven Adapter)
+```
+
+이 구조에서 테스트 경계가 명확해진다. Core는 Mock/Fake로 빠르게 단위 테스트하고, Adapter는 소수의 통합 테스트로 기술 연동을 검증한다. Port가 Mock의 경계가 된다.
+
+<Aside label="설계 철학">
+DI, ISP, Humble Object, Pure Functions, Hexagonal Architecture — 다섯 가지 패턴은 각각 다른 문제를 해결하지만 같은 원칙을 반복한다. *교체 가능한 의존성, 명확한 경계, 순수한 로직 분리*. 테스트하기 어렵다는 느낌이 드는 순간, 이 중 어떤 원칙이 위반되고 있는지를 묻는 것으로 시작하면 된다.
+</Aside>
+
+## 정리
+
+- `new`와 `static`은 교체 가능성을 없앤다. 생성자 주입과 인터페이스 추상화가 기본 해법이다.
+- 인터페이스가 클수록 Stub이 복잡해진다. 역할 단위로 쪼개면 람다 한 줄로 Stub이 완성된다.
+- 비즈니스 로직이 경계(Controller, Listener)에 있으면 통합 테스트 없이 검증할 수 없다. Humble Object로 안쪽으로 밀어라.
+- 순수 함수는 Mock 없이 테스트된다. 계산과 부수효과를 분리하면 Core가 순수해진다.
+- Hexagonal Architecture는 이 원칙들의 귀결이다. 테스트 경계가 곧 아키텍처 경계가 된다.
+
+다음 글에서는 이 설계 위에서 Test Double을 어떻게 선택하는지 — Mock, Stub, Fake, Spy의 차이와 각각을 언제 쓰는지 추적한다.
