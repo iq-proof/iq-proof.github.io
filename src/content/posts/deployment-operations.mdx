@@ -1,0 +1,111 @@
+---
+title: "Kubernetes 배포는 왜 이렇게 설계됐는가"
+description: "롤링 업데이트 알고리즘부터 Probe 삼각편대, RBAC 최소 권한, 설정 갱신 방식, 모니터링 파이프라인까지 — Kubernetes 운영 설계의 일관된 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kubernetes, rolling-update, rbac, prometheus, zero-downtime]
+difficulty: intermediate
+series:
+  slug: kubernetes-deep-dive
+  title: Kubernetes Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kubernetes는 복잡하다. Deployment, ReplicaSet, Probe, Hook, ServiceMonitor — 각각을 따로 공부하면 설정 조각의 나열처럼 보인다. 그런데 이 조각들을 이어보면 하나의 공통 패턴이 드러난다. Kubernetes의 모든 설계는 **"시스템은 항상 틀릴 수 있다"는 전제 위에서, 그 틀림을 사람 없이 감지하고 복구한다**는 철학을 따른다. 이 철학이 각 컴포넌트에서 어떻게 구현됐는가?
+
+## 롤링 업데이트 — 교착 없는 교체
+
+Deployment 롤링 업데이트의 핵심은 두 개의 숫자다. `maxSurge`는 동시에 추가할 수 있는 파드 수 상한이고, `maxUnavailable`은 동시에 불가용 상태를 허용할 파드 수다. 이 두 값이 모두 0이면 교착 상태가 된다. 기존 파드를 줄여야 새 파드를 늘릴 수 있는데, 둘 다 0이면 아무것도 진행되지 않는다.
+
+알고리즘은 단순하다. `maxSurge=1, maxUnavailable=0` 기준으로:
+
+```
+초기: RS-v1[A, B, C], RS-v2[]
+
+Step 1: RS-v2에 새 파드 추가 → [A,B,C] + [D(Pending)]
+Step 2: D가 Readiness Probe 통과 → Ready=4, surge=1
+Step 3: RS-v1에서 파드 하나 제거 → [B,C] + [D]
+        surge=0 → 다시 새 파드 추가 가능
+
+반복 후: RS-v1[], RS-v2[D,E,F]
+```
+
+여기서 핵심은 **새 파드가 Readiness Probe를 통과해야** 기존 파드가 제거된다는 점이다. Probe를 구현하지 않으면 컨테이너가 시작되는 순간 Ready로 처리되어, 아직 초기화 중인 파드로 트래픽이 들어간다.
+
+롤백은 새 이미지를 빌드하거나 pull하지 않는다. `kubectl rollout undo`는 etcd에 보존된 이전 ReplicaSet을 다시 스케일업한다. 노드에 이미지가 캐시되어 있으므로 일반 배포와 같은 속도로 복구된다.
+
+## 무중단 배포 — 세 요소의 순서
+
+"Readiness Probe와 preStop sleep을 설정했는데도 배포 중 502가 뜬다." 이 문제의 원인은 대부분 순서에 있다.
+
+파드 종료 시 Kubernetes는 `DeletionTimestamp`를 설정하는 동시에 Endpoints 제거와 preStop Hook 실행을 시작한다. 문제는 iptables 규칙 전파에 1~3초가 걸린다는 점이다. preStop sleep이 충분하지 않으면, iptables 업데이트가 완료되기 전에 SIGTERM이 전달되고, 그 사이에 들어온 요청이 이미 종료 중인 파드로 향한다.
+
+올바른 타임라인은 다음과 같다.
+
+```
+t=0:   DeletionTimestamp 설정
+       Endpoints 제거 요청 시작
+       preStop Hook 시작 (sleep 10)
+
+t=0~10: iptables 전파 완료 (3~5초면 충분)
+         새 요청이 이 파드로 더 이상 들어오지 않음
+
+t=10:  SIGTERM 전달
+       in-flight 요청만 처리 중
+
+t=10~60: graceful shutdown
+          terminationGracePeriodSeconds 내 완료 필수
+```
+
+<Callout type="warning" title="terminationGracePeriodSeconds는 preStop부터 카운트된다">
+preStop에서 sleep 50초를 사용하면 SIGTERM 후 남은 시간은 10초뿐이다. `preStop 시간 + 앱 종료 시간 < terminationGracePeriodSeconds`를 반드시 확인해야 한다.
+</Callout>
+
+Probe 세 종류도 각각 역할이 다르다. Startup Probe는 느린 앱의 초기화 시간을 보호한다(JVM 앱이 15초 뜨는 동안 Liveness가 kill하지 않도록). Readiness Probe는 트래픽 수신 여부를 제어한다. Liveness Probe는 데드락이나 무한루프 상태의 파드를 재시작한다. Readiness만 있고 Liveness가 없으면 좀비 파드가 살아있고, Liveness만 있고 Readiness가 없으면 초기화 중인 파드에 트래픽이 쏟아진다.
+
+## RBAC — 범위를 최소화한 위임
+
+파드 내부에서 API Server에 접근할 때, Kubernetes는 ServiceAccount가 마운트한 JWT 토큰으로 인증한다. 파드는 `/var/run/secrets/kubernetes.io/serviceaccount/token`을 Bearer Token으로 사용해 API Server를 호출하고, API Server는 RBAC으로 허용/거부를 판단한다.
+
+RBAC의 핵심 구분은 두 가지다. Role은 네임스페이스 범위, ClusterRole은 클러스터 전체 범위. Binding은 "누구에게 어느 범위에서" 부여하는가를 결정한다. ClusterRole을 RoleBinding으로 바인딩하면, ClusterRole의 권한을 해당 네임스페이스로 제한할 수 있다. 이를 통해 ClusterRole을 권한 템플릿으로 재사용하면서도 범위는 네임스페이스 단위로 제한한다.
+
+실무에서 가장 흔한 실수는 `default` ServiceAccount에 ClusterRoleBinding을 붙이는 것이다. `serviceAccountName`을 지정하지 않으면 모든 파드가 `default` SA를 사용하므로, 클러스터 전체 파드가 해당 권한을 갖게 된다.
+
+<Callout type="note" title="트레이드오프">
+최소 권한을 정확히 파악하려면 초기 분석 시간이 든다. 대신 `audit` 로그를 활용하면 실제 API 호출 기록을 기반으로 필요한 권한 목록을 파악할 수 있다. `kubectl auth can-i --list --as=system:serviceaccount:<ns>:<sa>`로 부여된 권한을 프로덕션 전환 전 검토하는 것이 필수다.
+</Callout>
+
+## 설정 분리 — 갱신 방식의 차이
+
+ConfigMap을 수정했는데 파드에 반영이 안 된다. `envFrom`으로 주입한 ConfigMap은 파드 시작 시 환경변수로 복사되고, 이후 원본이 바뀌어도 프로세스 환경변수는 바뀌지 않는다. OS 레벨 제약이다. 반면 볼륨 마운트 방식은 kubelet이 1분 주기로 변경을 감지해 symlink를 원자적으로 교체한다. 파드 재시작 없이 1~2분 내 파일이 갱신된다.
+
+Secret의 Base64 인코딩은 암호화가 아니다. 키 없이 누구나 디코딩할 수 있다. etcd 기본 설정에서 Secret은 평문(Base64 형태)으로 저장된다. `EncryptionConfiguration`을 설정해야 etcd 저장 시 실제 암호화가 적용된다.
+
+GitOps 환경에서의 Secret 관리는 두 가지 전략이 주로 쓰인다. Sealed Secret은 공개키로 암호화한 YAML을 git에 저장하고, 클러스터의 Controller가 개인키로 복호화해 Secret을 생성한다. External Secrets Operator는 AWS Secrets Manager나 Vault 같은 외부 시스템에서 값을 조회해 k8s Secret을 자동 생성한다. git에는 "어디서 가져올지"만 저장되고 실제 값은 없다.
+
+## 모니터링 — 파이프라인을 이해해야 끊김을 찾는다
+
+"새 서비스를 추가했는데 Prometheus에 메트릭이 안 보인다." Prometheus Operator를 쓴다면 ServiceMonitor 리소스를 생성해야 하고, ServiceMonitor의 `selector`가 Service 레이블과 매칭해야 하며, ServiceMonitor가 Prometheus CR의 `serviceMonitorSelector`와 매칭해야 한다. 세 레이블이 모두 맞아야 스크랩이 시작된다.
+
+`kubectl top pod`의 메트릭 경로도 연쇄적이다. 파드의 CPU/메모리 사용량은 kubelet Summary API → Metrics Server(15초 주기, 최신 값만 보관) → `metrics.k8s.io` API를 거쳐 HPA Controller에 도달한다. HPA는 이 값을 기반으로 `desiredReplicas`를 계산해 Deployment를 스케일한다.
+
+로그 파이프라인은 파드 stdout → 노드 로그 파일(`/var/log/pods/`) → Promtail(DaemonSet) → Loki로 흐른다. Loki는 레이블만 인덱싱하고 본문은 인덱싱하지 않아 저장 비용이 낮다. 빠른 장애 감지는 Prometheus 메트릭 기반 Alert으로, 원인 분석은 Loki LogQL로 하는 것이 일반적인 전략이다.
+
+<Aside label="일관된 철학">
+롤링 업데이트의 Readiness 확인, Probe의 상태 감지, RBAC의 최소 권한, Prometheus의 Up/Down 메트릭 — 모두 같은 원칙이다. "시스템 상태를 명시적으로 선언하고, 그 상태에서 벗어나면 자동으로 감지해 복구한다." Kubernetes를 쓰는 것은 이 루프를 구성하는 일이다.
+</Aside>
+
+## 정리
+
+- 롤링 업데이트는 새 파드의 Readiness 통과 후 기존 파드를 제거한다. `maxSurge=0, maxUnavailable=0`은 교착 상태다.
+- 무중단 배포는 Readiness Probe + preStop sleep + terminationGracePeriodSeconds 세 값의 순서와 합산이 맞아야 한다.
+- RBAC은 `default` ServiceAccount에 ClusterRoleBinding을 붙이는 순간 최소 권한 원칙이 무너진다.
+- ConfigMap 환경변수는 재시작 없이 갱신되지 않는다. 동적 갱신이 필요하면 볼륨 마운트를 써야 한다.
+- 모니터링 파이프라인은 레이블 매칭 세 단계(Service → ServiceMonitor → Prometheus CR)가 모두 맞아야 스크랩이 시작된다.
+
+다음 글에서는 Operator 패턴 — CRD와 Controller가 어떻게 이 루프를 커스텀 리소스로 확장하는지 추적한다.

@@ -1,13 +1,13 @@
 ---
-title: "Docker 네트워크는 어떻게 패킷을 옮기는가"
-description: "veth pair와 bridge 생성부터 iptables NAT, Overlay VXLAN, 네트워크 보안 정책까지 — Docker 컨테이너 네트워킹의 전체 흐름을 추적한다."
+title: "쿠버네티스 네트워킹은 어떻게 동작하는가"
+description: "IP-per-Pod 모델의 보장 원리부터 CNI, kube-proxy iptables 체인, Ingress, CoreDNS, Network Policy까지 — 클러스터 네트워크를 관통하는 단일 설계 철학을 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [docker, networking, iptables, overlay, cni]
+tags: [kubernetes, networking, cni, iptables, coredns]
 difficulty: intermediate
 series:
-  slug: docker-deep-dive
-  title: Docker Deep Dive
+  slug: kubernetes-deep-dive
+  title: Kubernetes Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,114 +16,115 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-Docker는 컨테이너가 서로 통신하게 만든다. 그런데 그 "통신"이 어떻게 이뤄지는지 제대로 아는 사람은 많지 않다. 컨테이너 하나가 외부 인터넷에 패킷을 보낼 때, 그 패킷은 정확히 어떤 경로를 거치는가?
+쿠버네티스는 "모든 파드는 고유한 IP를 가지며, NAT 없이 직접 통신한다"는 단 하나의 규칙을 네트워크 전체에 강제한다. pause 컨테이너, veth pair, iptables DNAT, CoreDNS, Network Policy — 이 다섯 가지는 그 규칙의 각기 다른 구현층이다. 왜 이 단순한 규칙 하나가 이토록 복잡한 스택을 요구하는가?
 
-## 모든 것의 출발점: veth pair와 bridge
+## IP-per-Pod의 출발점: pause 컨테이너
 
-Linux는 컨테이너마다 독립된 **Network Namespace**를 부여한다. 각 네임스페이스는 자체 인터페이스, IP, 라우팅 테이블을 갖는다. 문제는 격리된 네임스페이스끼리 어떻게 연결하느냐다.
-
-답은 **veth pair**다. 가상 네트워크 케이블 양쪽 끝으로, 한쪽은 컨테이너 네임스페이스 안에(`eth0`), 다른 쪽은 호스트에 남는다. 한쪽으로 들어간 패킷은 반드시 다른 쪽으로 나온다.
-
-여러 컨테이너를 연결하려면 **bridge**가 필요하다. Docker는 `docker0`라는 가상 스위치를 생성하고, 모든 컨테이너의 veth 호스트 쪽 끝을 여기에 붙인다. Layer 2 MAC 주소 기반으로 패킷을 전달하는 가상 스위치다.
-
-```
-Container A (eth0, 172.17.0.2)
-    │ veth-a
-    ├───────────────┐
-    │               ▼
-    │          docker0 (172.17.0.1)
-    │               │
-    └───────────────┤
-    │ veth-b         │
-Container B (eth0, 172.17.0.3)
-```
-
-컨테이너 간 통신은 이 구조 안에서 완결된다. NAT도 없고, 외부도 거치지 않는다.
-
-## iptables가 패킷을 인터넷으로 내보내는 방법
-
-컨테이너가 외부(예: `8.8.8.8`)에 패킷을 보내면 경로가 달라진다.
-
-```
-Container (172.17.0.2) → docker0 → FORWARD 체인 → POSTROUTING → eth0 → Internet
-```
-
-`POSTROUTING` 체인에는 Docker가 자동으로 추가한 `MASQUERADE` 규칙이 있다.
+파드가 생성될 때 가장 먼저 시작하는 것은 애플리케이션 컨테이너가 아니라 `pause` 컨테이너다. 이 컨테이너가 새로운 Linux Network namespace를 만들고, `pause(2)` 시스템콜로 무한 대기하며 namespace를 소유한다. 메인 컨테이너들은 이 namespace에 join한다.
 
 ```bash
-# iptables NAT 테이블 확인
-sudo iptables -t nat -L POSTROUTING -n -v
-# MASQUERADE  all  --  172.17.0.0/16  0.0.0.0/0
+# pause가 보유한 namespace 확인
+ls -la /proc/$PAUSE_PID/ns/net
+# net:[4026531992]
+
+# 앱 컨테이너가 같은 namespace를 공유하는지 확인
+ls -la /proc/$APP_PID/ns/net
+# net:[4026531992]  ← inode 번호 동일 = 같은 namespace
 ```
 
-`MASQUERADE`는 패킷의 출발지 IP를 호스트 `eth0` IP로 바꾼다. 인터넷에서 보면 이 패킷이 컨테이너에서 온 것인지 알 수 없다. 응답 패킷은 `conntrack`이 추적해서 원래 컨테이너로 되돌린다.
+결과적으로 파드 내 컨테이너들은 같은 IP와 포트 공간을 공유한다. 메인 컨테이너가 재시작되어도 pause가 namespace를 유지하므로 IP는 바뀌지 않는다. 반대로 컨테이너들이 같은 포트를 동시에 열 수 없다 — 사이드카가 8080을 쓰고 있으면 앱도 8080을 쓸 수 없다.
 
-포트 포워딩(`-p 8080:80`)은 반대 방향이다. `PREROUTING` 체인에 `DNAT` 규칙이 추가되고, 외부에서 들어온 `:8080` 패킷의 목적지를 `172.17.x.x:80`으로 변환한다.
+파드와 노드 사이의 연결은 veth pair가 담당한다. 한쪽 끝은 파드의 `eth0`, 다른 쪽 끝은 노드의 `cni0` 브리지에 꽂힌다. 같은 노드 내 파드 간 통신은 이 브리지를 통해 NAT 없이 이루어진다.
+
+## CNI: 누가 veth를 만드는가
+
+veth pair를 만들고 IP를 할당하고 라우팅을 설정하는 것은 CNI(Container Network Interface) 플러그인의 책임이다. kubelet은 파드를 생성할 때 `/etc/cni/net.d/`의 설정 파일을 읽고 `/opt/cni/bin/`의 플러그인 바이너리를 실행한다.
+
+노드 간 파드 통신은 CNI 구현 방식에 따라 갈린다.
+
+**Flannel(VXLAN)**: 각 노드에 `flannel.1`이라는 VTEP 인터페이스를 만들고, 다른 노드로 가는 패킷을 UDP/8472로 캡슐화한다. 50바이트 오버헤드가 발생하므로 파드 MTU를 1450으로 낮춰야 한다. Network Policy를 지원하지 않는다.
+
+**Calico(BGP)**: BIRD BGP 데몬으로 각 노드가 자신의 파드 CIDR을 광고한다. 캡슐화 없이 직접 L3 라우팅하므로 오버헤드가 없다. Felix 에이전트가 iptables 또는 eBPF로 Network Policy를 구현한다.
+
+```bash
+# Flannel: VXLAN FDB 테이블 확인
+bridge fdb show dev flannel.1
+# aa:bb:cc:dd:ee:02 dev flannel.1 dst 192.168.1.11 self permanent
+#                                  ↑ 원격 노드의 물리 IP
+
+# Calico: 노드 라우팅 테이블
+ip route show | grep 10.244
+# 10.244.2.0/24 via 192.168.1.11 dev eth0  ← 직접 라우팅, 캡슐화 없음
+```
 
 <Callout type="note" title="트레이드오프">
-Bridge + NAT 방식은 설정이 단순하고 이식성이 높지만, NAT 오버헤드가 있다. 이를 피하려면 **Host 네트워크 모드**(NAT 없음, 성능 +20%)나 **Macvlan**(컨테이너가 물리 네트워크 IP 직접 보유)을 쓸 수 있다. 대신 Host 모드는 포트 충돌과 격리 부재라는 비용이 따른다.
+VXLAN은 물리 네트워크 설정 변경 없이 동작해 설정이 단순하다. BGP는 오버헤드가 없어 성능이 높지만 클라우드 환경에서 VPC BGP peering 설정이 필요할 수 있다. CNI는 클러스터 운영 중 교체가 매우 어렵다 — 초기 설계 시 Network Policy 필요 여부와 성능 요구사항을 함께 결정해야 한다.
 </Callout>
 
-## 멀티 호스트: VXLAN이 네트워크를 확장하는 방식
+## kube-proxy: ClusterIP는 허구다
 
-단일 호스트에서는 bridge로 충분하다. 하지만 컨테이너가 여러 물리 서버에 흩어지면 Layer 2 브로드캐스트 도메인을 어떻게 연결하는가?
+`kubectl get svc`에서 보이는 ClusterIP(`10.96.43.125`)는 어떤 실제 네트워크 인터페이스에도 바인딩되어 있지 않다. 그런데 이 IP로 보낸 패킷이 실제 파드에 도착한다. 어떻게?
 
-Docker Swarm의 **Overlay 네트워크**는 **VXLAN**(Virtual Extensible LAN)으로 이 문제를 푼다. 컨테이너 간 패킷을 UDP 4789 포트 안에 캡슐화해서 물리 네트워크 위로 터널링한다.
+kube-proxy가 모든 노드에서 iptables PREROUTING 체인을 관리하기 때문이다. 패킷이 라우팅 테이블을 보기 전에 iptables가 목적지 IP를 실제 파드 IP로 DNAT한다.
 
 ```
-[Inner: Container IP Header] [Data]
-        ↓ VXLAN 캡슐화
-[Outer: Host IP Header] [UDP:4789] [VXLAN VNI] [Inner Ethernet] [Inner IP] [Data]
+PREROUTING → KUBE-SERVICES
+  -d 10.96.43.125/32 -p tcp --dport 80 → KUBE-SVC-XXXXXXXX
+
+KUBE-SVC-XXXXXXXX (확률 기반 로드밸런싱)
+  --probability 0.5 → KUBE-SEP-AAAAAAAA  (50% pod-a)
+                    → KUBE-SEP-BBBBBBBB  (50% pod-b)
+
+KUBE-SEP-AAAAAAAA
+  DNAT --to-destination 10.244.1.5:8080
 ```
 
-Host 2의 커널은 UDP 패킷을 받아 VXLAN 헤더를 제거하고, 내부 패킷을 목적 컨테이너에 전달한다. 컨테이너 입장에서는 같은 호스트에 있는 것과 다름없다.
+파드가 Readiness Probe에 실패하면 Endpoint Controller가 Endpoints 오브젝트에서 해당 파드 IP를 제거하고, kube-proxy가 이를 Watch해 KUBE-SEP 체인을 삭제한다. Service 트래픽이 실패한 파드로 가지 않는 원리가 이것이다.
 
-캡슐화 오버헤드는 약 50바이트, 성능 저하는 5~10% 수준이다. 민감한 데이터라면 `--opt encrypted` 옵션으로 IPSec을 추가할 수 있다.
+Service 수가 수천 개를 넘으면 iptables의 선형 체인 순회(O(n))가 병목이 된다. IPVS 모드(`--proxy-mode=ipvs`)는 커널의 해시 테이블로 O(1) 라우팅을 제공하고, Cilium은 iptables 자체를 eBPF로 대체한다.
 
-## DNS가 IP를 대신하는 이유
+## Ingress와 CoreDNS: L7과 이름 해석
 
-사용자 정의 네트워크를 생성하면 Docker는 컨테이너마다 `127.0.0.11:53`에 내장 DNS 서버를 연결한다. 컨테이너 이름이 자동으로 등록된다.
+LoadBalancer 타입 Service를 Service마다 만들면 클라우드 LB 비용이 Service 수에 비례해 발생한다. Ingress는 단일 LB 뒤에 Nginx 하나를 두고, 도메인/경로 기반으로 여러 Service에 라우팅한다.
+
+Ingress Controller는 Ingress 오브젝트를 Watch해 `nginx.conf`를 자동 생성한다. TLS는 Ingress Controller에서 종료하고 백엔드에는 평문 HTTP로 전달한다. 중요한 점은 Nginx가 kube-proxy의 iptables를 우회하고 Endpoints를 직접 Watch해 파드 IP에 직접 프록시한다는 것이다 — Nginx 자체 upstream 로드밸런싱(세션 유지, 가중치 등)이 가능한 이유다.
+
+파드 내에서 `my-service`라고만 써도 ClusterIP가 해석되는 것은 CoreDNS와 `/etc/resolv.conf`의 협업 덕분이다.
 
 ```bash
-docker exec app1 nslookup db
-# Server:   127.0.0.11
-# Name:     db
-# Address:  172.18.0.3
+cat /etc/resolv.conf
+# nameserver 10.96.0.10      ← CoreDNS Service IP
+# search default.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
 ```
 
-같은 별칭(`--network-alias`)을 공유하는 컨테이너가 여러 개면 DNS는 모든 IP를 반환한다 — 단순한 라운드 로빈 로드 밸런싱이 된다. IP를 하드코딩하지 않아도 되고, 컨테이너가 교체되면 DNS 레코드만 갱신된다.
+`ndots:5`는 점이 5개 미만인 이름에 search domain을 붙여 먼저 시도하라는 설정이다. `my-service`를 조회하면 `my-service.default.svc.cluster.local`을 먼저 시도해 ClusterIP를 찾는다. 그런데 외부 도메인(`api.external-company.com`, 점 2개)을 조회하면 search domain 3개를 먼저 시도한 후 NXDOMAIN이 나온 다음에야 실제 외부 쿼리를 보낸다 — DNS 쿼리 4배 증가, CoreDNS CPU 급증의 원인이다. 파드 스펙에 `dnsConfig.options.ndots: "1"`을 설정하거나 외부 도메인 뒤에 점(`.`)을 붙여 FQDN임을 명시하면 해결된다.
 
-기본 `bridge` 네트워크(`docker0`)에는 이 DNS가 없다. 이름 기반 통신이 필요하면 반드시 사용자 정의 네트워크를 써야 한다.
+## Network Policy: 평평한 네트워크에 방화벽을
 
-## 보안: 기본값은 "모두 연결"이다
+Network Policy가 없으면 클러스터 내 모든 파드는 서로 자유롭게 통신한다. DB 파드에 어느 파드에서든 직접 5432 포트로 접근할 수 있다.
 
-Docker 네트워크의 기본 상태는 같은 네트워크 안의 컨테이너가 서로 자유롭게 통신할 수 있다는 것이다. Kubernetes에서 Calico나 Cilium 같은 CNI 플러그인을 쓰더라도, 명시적인 `NetworkPolicy`가 없으면 마찬가지다.
+권장 패턴은 Default Deny 후 필요한 것만 허용이다.
 
 ```yaml
-# 기본 거부 — 이것부터 시작해야 한다
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: deny-all
+# 1단계: 네임스페이스 전체 차단
 spec:
-  podSelector: {}
-  policyTypes:
-  - Ingress
-  - Egress
+  podSelector: {}   # 모든 파드
+  policyTypes: [Ingress, Egress]
+  # 규칙 없음 = 전부 차단
 ```
 
-이후 필요한 경로만 열어준다. `frontend → api-gateway → backend → database` 경로에서 `frontend → database` 직접 연결은 차단된다.
+이후 필요한 통신만 명시적으로 열어준다. 이때 반드시 DNS egress(UDP 53)를 허용해야 한다 — 이것을 빠뜨리면 hostname 기반 통신이 전부 실패한다.
 
-<Aside label="설계 철학">
-Docker 네트워킹의 모든 레이어 — veth, bridge, iptables, VXLAN, DNS — 는 각자 하나의 문제를 푼다. 격리, 연결, 라우팅, 확장, 디스커버리. 이 레이어들이 어떻게 쌓이는지 알면, 네트워크 문제의 80%는 `ip addr`, `iptables -L`, `tcpdump` 세 명령으로 진단할 수 있다.
-</Aside>
+`podSelector`와 `namespaceSelector`가 같은 `from` 항목 안에 있으면 AND 조건, 배열의 별도 항목이면 OR 조건이다. 이 차이가 의도치 않은 허용으로 이어지는 흔한 실수다.
+
+Flannel은 Network Policy를 구현하지 않는다. Calico는 iptables 또는 eBPF로 L3/L4 정책을 구현하고, Cilium은 eBPF 전용으로 HTTP path 레벨의 L7 정책까지 지원한다.
 
 ## 정리
 
-- 컨테이너 네트워크는 **veth pair + bridge**로 시작한다. 같은 bridge 안의 컨테이너는 Layer 2로 직접 통신한다.
-- 외부 통신은 **iptables MASQUERADE**가 담당한다. 포트 포워딩은 `DNAT`, 컨테이너→인터넷은 `SNAT`이다.
-- 멀티 호스트는 **VXLAN Overlay**로 해결한다. 물리 네트워크 위에 가상 Layer 2를 구성한다.
-- **내장 DNS**(127.0.0.11)는 IP 대신 이름으로 서비스를 찾게 해준다. 기본 bridge에는 없다.
-- 보안의 출발점은 **기본 거부**다. 열려 있는 것을 닫는 것보다 닫혀 있는 것을 여는 것이 안전하다.
+- 쿠버네티스 네트워킹의 모든 계층은 "NAT 없는 IP-per-Pod 통신" 하나를 보장하기 위해 존재한다.
+- pause가 namespace를 소유하고, CNI가 veth를 만들고, kube-proxy의 iptables가 ClusterIP를 파드 IP로 변환하고, CoreDNS가 이름을 해석하고, Network Policy가 트래픽을 필터링한다.
+- 문제 진단의 순서는 계층 순서와 같다: namespace 공유 확인 → veth/bridge 확인 → iptables 규칙 확인 → Endpoints 확인 → DNS 조회 확인 → Network Policy 확인.
+- `ndots:5`는 클러스터 내부 이름 해석을 편리하게 만들지만, 외부 도메인 조회 시 불필요한 DNS 쿼리를 4배 발생시킨다.
 
-다음 글에서는 Docker 볼륨의 내부 구조와 `overlay2` 스토리지 드라이버가 레이어를 어떻게 관리하는지 추적한다.
+다음 글에서는 이 네트워크 위에서 파드가 재시작되어도 상태를 유지하는 방법 — Volume과 PersistentVolume의 내부 동작을 추적한다.

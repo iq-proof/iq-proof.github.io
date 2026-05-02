@@ -1,0 +1,109 @@
+---
+title: "쿠버네티스는 어떻게 스스로를 운영하는가"
+description: "Operator 패턴부터 Admission Webhook, Service Mesh, etcd, 멀티 클러스터까지 — 쿠버네티스 확장 철학의 공통 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kubernetes, operator, admission-webhook, service-mesh, etcd]
+difficulty: intermediate
+series:
+  slug: kubernetes-deep-dive
+  title: Kubernetes Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+쿠버네티스는 컨테이너 오케스트레이터다. 그런데 이 시스템이 PostgreSQL 장애 복구를 자동화하고, 배포 요청을 중간에 가로채 보안 정책을 적용하고, 서비스 간 mTLS를 코드 수정 없이 주입하는 것도 모두 쿠버네티스 위에서 일어난다. 어떻게 하나의 플랫폼이 이렇게 다양한 운영 지식을 담을 수 있는가? 그리고 이 모든 확장의 근저에는 어떤 하나의 원리가 흐르는가?
+
+## 선언과 조정 — Reconciliation의 철학
+
+쿠버네티스의 모든 확장은 하나의 패턴으로 수렴한다. "원하는 상태를 선언하면, 시스템이 실제 상태를 그쪽으로 맞춘다." Operator 패턴이 그 가장 직접적인 표현이다.
+
+CRD(Custom Resource Definition)는 API 스키마만 정의한다. `PostgresCluster`라는 리소스를 만들어도 아무 일도 일어나지 않는다. 실제로 동작하게 하려면 Custom Controller가 필요하다. Controller는 끊임없이 Reconcile 함수를 실행한다 — CR의 spec(원하는 상태)과 실제 StatefulSet 상태를 비교하고, 차이가 있으면 해소한다.
+
+```go
+func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req Request) (Result, error) {
+    cluster := &PostgresCluster{}
+    r.Get(ctx, req.NamespacedName, cluster)
+
+    sts := &StatefulSet{}
+    err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts)
+
+    if errors.IsNotFound(err) {
+        return r.createStatefulSet(ctx, cluster)
+    }
+
+    if *sts.Spec.Replicas != int32(cluster.Spec.Replicas) {
+        sts.Spec.Replicas = &cluster.Spec.Replicas
+        r.Update(ctx, sts)
+    }
+
+    return Result{RequeueAfter: 30 * time.Second}, nil
+}
+```
+
+이 설계의 핵심은 **멱등성**이다. 이벤트가 유실되어도, Controller가 재시작되어도, 항상 상태에서 복구할 수 있다. 이벤트 기반이 아닌 상태 기반이기 때문이다.
+
+## 파이프라인 — Webhook이 요청을 가로채는 지점
+
+`kubectl apply`가 실행되면 API Server는 단순히 저장하지 않는다. 인증 → 인가 → Mutating Webhook → 스키마 검증 → Validating Webhook → etcd 저장의 순서를 밟는다.
+
+Mutating Webhook은 리소스를 수정한다. Istio가 Envoy Sidecar를 자동 주입하는 것이 이 단계다. 파드 생성 요청이 `istiod`의 `/inject` 엔드포인트로 전달되고, istiod는 JSON Patch로 `istio-proxy` 컨테이너와 `istio-init` Init Container를 스펙에 추가한다. 애플리케이션 코드는 아무것도 모른다.
+
+Validating Webhook은 통과 여부만 결정한다. OPA/Gatekeeper가 "모든 Deployment에 resource request 필수"라는 정책을 강제할 때, `allowed: false`와 이유 메시지를 반환한다.
+
+<Callout type="warning" title="failurePolicy의 트레이드오프">
+`failurePolicy: Fail`은 Webhook 서버 장애 시 모든 리소스 생성을 차단한다. 보안 정책 강제에 필수지만 Webhook 서버가 단일 장애 지점이 된다. `Ignore`는 가용성을 지키지만 정책이 우회될 수 있다. 중요 보안 Webhook은 `Fail` + replicas≥2 + PDB 조합이 권장된다.
+</Callout>
+
+## 트래픽 — iptables가 만드는 투명한 프록시
+
+Istio Sidecar가 주입된 후, 파드 안의 트래픽 흐름은 완전히 바뀐다. `istio-init` Init Container가 `iptables` 규칙을 설치하기 때문이다.
+
+```
+# 모든 인바운드 트래픽 → Envoy 15006
+iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-port 15006
+
+# 모든 아웃바운드 트래픽 → Envoy 15001
+iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-port 15001
+
+# Envoy 자신(UID 1337)은 제외 — 무한루프 방지
+iptables -t nat -A OUTPUT -m owner --uid-owner 1337 -j RETURN
+```
+
+애플리케이션은 `localhost:8080`에 응답할 뿐이다. 실제로는 Envoy가 앞에서 mTLS를 처리하고 메트릭을 수집하고 분산 트레이싱 헤더를 달아준다. Istiod는 xDS 프로토콜로 클러스터 내 모든 Envoy에 서비스 디스커버리 정보를 배포한다 — 어떤 서비스가 어디 있는지, 트래픽을 어떻게 분산할지.
+
+VirtualService로 카나리 배포를 구현하는 것도 같은 레이어다. `weight: 80 / weight: 20` 설정 하나로 트래픽의 20%를 새 버전으로 보낼 수 있다. Deployment의 레플리카 수를 조작할 필요가 없다.
+
+## 진실의 원천 — etcd와 fsync
+
+이 모든 상태는 etcd에 저장된다. etcd는 쿠버네티스의 유일한 데이터 저장소다. API Server가 느리고, Controller Manager가 늦게 반응하고, `kubectl`이 타임아웃 난다면 — 대부분 etcd의 디스크 I/O가 원인이다.
+
+etcd는 쓰기마다 WAL(Write-Ahead Log)에 fsync를 호출한다. Raft 합의 알고리즘상 Quorum의 ACK를 받아야 커밋이 완료된다. 각 멤버의 fsync 지연이 곧 전체 쓰기 레이턴시다.
+
+<Aside label="핵심 메트릭">
+`etcd_disk_wal_fsync_duration_seconds{quantile="0.99"}` p99가 10ms를 넘으면 Control Plane 전체가 느려진다. HDD는 5~10ms, SATA SSD는 1~3ms, NVMe는 0.05~0.5ms다. etcd 노드에는 NVMe SSD가 사실상 필수다.
+</Aside>
+
+멤버 교체 순서도 중요하다. 죽은 멤버를 먼저 제거하면 Quorum이 깨질 수 있다. 반드시 새 멤버를 먼저 추가하고(`etcdctl member add`), 시작한 뒤, 죽은 멤버를 제거해야 한다. Quorum을 잃으면 etcd는 Read-Only가 되고 클러스터 전체가 멈춘다.
+
+## 경계를 넘어 — 멀티 클러스터의 조건
+
+단일 클러스터의 한계는 리전 장애다. 멀티 클러스터는 이를 해결하지만, 설계의 전제조건이 하나 있다: **파드 CIDR이 겹치면 안 된다.** 같은 VPC라도 두 클러스터가 `10.244.0.0/16`을 공유하면 라우팅이 불가능하다.
+
+Submariner는 클러스터 간 IPsec 터널을 수립하고 각 노드에 라우팅 규칙을 설치한다. `ServiceExport`/`ServiceImport` CRD로 서비스를 클러스터 간에 노출한다. Cilium Cluster Mesh는 eBPF로 같은 일을 더 낮은 오버헤드로 처리한다.
+
+그러나 멀티 클러스터가 항상 답은 아니다. "2개 클러스터 = 2배 운영 부담"이 아니다. CIDR 관리, 인증서 동기화, 네트워크 연결 설정까지 더하면 실제 부담은 3~4배에 달한다. 단일 클러스터의 Multi-AZ 노드 그룹으로 충분한지 먼저 검토해야 한다.
+
+## 정리
+
+- 쿠버네티스의 모든 확장은 **선언 → Reconciliation** 패턴을 따른다. 이벤트 기반이 아닌 상태 기반이기에 멱등성이 보장된다.
+- Admission Webhook은 API 파이프라인의 두 지점에서 개입한다. Mutating이 먼저(수정), Validating이 나중(검증).
+- Service Mesh는 iptables로 트래픽을 가로채고 xDS로 설정을 배포한다. 애플리케이션은 아무것도 모른다.
+- etcd WAL fsync 지연이 Control Plane 전체 성능을 결정한다. 멤버 교체는 추가 먼저, 제거 나중.
+- 멀티 클러스터는 리전 장애 대응의 답이지만, 단순 고가용성은 단일 클러스터 Multi-AZ로 충분하다.
+
+각 챕터가 서로 다른 레이어를 다루지만, 결국 같은 질문으로 돌아온다 — 시스템이 스스로를 관찰하고, 스스로 수렴하려면 어떤 구조가 필요한가.
