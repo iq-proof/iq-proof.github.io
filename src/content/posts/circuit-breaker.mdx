@@ -1,0 +1,102 @@
+---
+title: "Circuit Breaker는 어떻게 연쇄 장애를 막는가"
+description: "Cascading Failure의 발생 원리부터 Resilience4j의 상태 머신, 슬라이딩 윈도우, Slow Call 탐지, Fallback 체이닝, Bulkhead·Rate Limiter 조합까지, 분산 시스템 방어 메커니즘을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-cloud, circuit-breaker, resilience4j, msa, bulkhead]
+difficulty: intermediate
+series:
+  slug: spring-cloud-deep-dive
+  title: Spring Cloud Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MSA에서 하나의 서비스가 느려지면 그것을 호출하는 모든 서비스가 스레드를 소모하며 기다린다. 타임아웃을 짧게 줄이면 정상 응답까지 차단되고, 길게 두면 스레드 풀이 고갈된다. 이 딜레마를 해결하는 것이 Circuit Breaker 패턴인데, 단순히 "실패 시 차단"이라고 알고 있는 것과 실제 구현 사이에는 얼마나 큰 간격이 있는가?
+
+## 연쇄 장애가 만들어지는 방식
+
+Service C의 DB가 죽으면 Service B는 C의 응답을 기다리며 스레드를 점유한다. 요청이 계속 들어오면 B의 스레드 풀 200개가 전부 C를 향해 30초 타임아웃을 세고 있는 상태가 된다. 큐도 꽉 찬다. B가 503을 반환하기 시작하면 A도 같은 방식으로 무너진다.
+
+```
+Client → Service A → Service B → Service C (DB 장애)
+
+  ① C: 응답 지연
+  ② B: 스레드 풀 200개 전부 C 대기 → 큐 포화 → 503
+  ③ A: B 응답 대기 → 스레드 고갈 → 503
+  ④ 결과: DB 하나의 장애가 전체 체인을 파괴
+```
+
+핵심은 "장애 서비스를 계속 호출하는 것"이 장애를 증폭시킨다는 점이다. Circuit Breaker는 이 호출 자체를 차단한다.
+
+## 상태 머신 — 세 가지 상태가 필요한 이유
+
+단순 On/Off 구조라면 복구 시점을 알 수 없어 운영자가 수동으로 개입해야 한다. 자동으로 CLOSED로 돌리면 아직 불안정한 서비스에 트래픽이 몰려 다시 쓰러진다. Resilience4j는 HALF_OPEN 상태를 두어 이 문제를 해결한다.
+
+```
+CLOSED → (실패율 초과) → OPEN → (대기 시간 경과) → HALF_OPEN
+HALF_OPEN → (제한 요청 성공) → CLOSED
+HALF_OPEN → (실패 발생)     → OPEN
+```
+
+내부적으로 `CircuitBreakerStateMachine`은 `AtomicReference<CircuitBreakerState>`로 현재 상태를 관리하고, `compareAndSet(CAS)`으로 동시 상태 전이 시 race condition을 막는다. 상태 전이는 항상 원자적이다. OPEN 상태의 `tryAcquirePermission()`은 `waitDurationInOpenState`가 경과했는지 나노초 단위로 확인한 뒤 HALF_OPEN으로 전이하며, HALF_OPEN은 `AtomicInteger`로 허용 요청 수를 카운트한다.
+
+## 실패율 계산 — Ring Buffer와 시간 버킷
+
+Circuit Breaker가 OPEN으로 전환하는 판단 기준은 실패율이다. Resilience4j는 두 가지 슬라이딩 윈도우를 제공한다.
+
+**COUNT_BASED**는 원형 배열(Ring Buffer)을 사용한다. 크기 N의 배열에서 새 결과가 들어오면 가장 오래된 항목을 덮어쓴다. `TotalAggregation`이 집계값을 항상 최신으로 유지하므로 실패율 조회는 O(1)이다.
+
+**TIME_BASED**는 초(epoch second) 단위 버킷 배열을 사용한다. 요청 시점에 만료된 버킷을 제거하고 집계를 갱신한다. 시간대별로 요청 빈도가 크게 다른 서비스에 적합하지만, 공백 후 `minimumNumberOfCalls`를 다시 채워야 한다.
+
+호출 결과는 네 가지로 분류된다: `SUCCESS`, `ERROR`, `SLOW_SUCCESS`, `SLOW_ERROR`. 실패율은 `(ERROR + SLOW_ERROR) / 전체`로 계산된다.
+
+<Callout type="note" title="minimumNumberOfCalls의 역할">
+이 값 미만의 호출에서는 실패율을 계산해도 임계값과 비교하지 않는다. 배포 직후 첫 번째 네트워크 이상이 100% 실패율로 이어져 즉시 OPEN되는 상황을 막는다. 5 이상으로 설정하는 것이 일반적이다.
+</Callout>
+
+## Slow Call — 성공해도 시스템을 무너뜨리는 응답
+
+실패율만 보면 놓치는 상황이 있다. 결제 서비스가 HTTP 200을 반환하지만 응답 시간이 10초라면, 실패율은 0%이면서 스레드 100개가 10초씩 묶인다. `slowCallDurationThreshold`를 초과하는 응답은 `SLOW_SUCCESS`나 `SLOW_ERROR`로 기록되고, `slowCallRate >= slowCallRateThreshold` 조건을 만족하면 실패율과 독립적으로 OPEN을 트리거한다.
+
+`TimeLimiter`는 Slow Call 탐지와 역할이 다르다. `slowCallDurationThreshold`는 결과를 분류하는 기준이고, `TimeLimiter.timeoutDuration`이 실제로 호출을 중단시킨다. 권장 관계는 `timeoutDuration >= slowCallDurationThreshold`다. `timeoutDuration`이 더 짧으면 모든 "느린 호출"이 타임아웃 예외로 처리되어 Slow Call 탐지가 무의미해진다.
+
+## Fallback과 Bulkhead — 장애 격리의 두 축
+
+Circuit Breaker가 OPEN 상태에서 `CallNotPermittedException`을 던질 때, Fallback이 없으면 클라이언트는 500 오류를 받는다. Fallback 메서드의 시그니처 규칙은 엄격하다: 원본 파라미터 전부 + `Throwable` 서브타입(마지막), 반환 타입 동일. `FallbackMethod.create()`가 런타임에 리플렉션으로 매칭하며, 더 구체적인 예외 타입(`CallNotPermittedException`)이 더 넓은 타입(`Exception`)보다 우선 선택된다.
+
+Bulkhead는 Circuit Breaker와 다른 차원의 격리를 제공한다. Circuit Breaker가 "장애 감지 후 차단(사후)"이라면, Bulkhead는 "동시 호출 수 사전 제한(사전)"이다. Semaphore Bulkhead는 `java.util.concurrent.Semaphore`로 슬롯을 관리하며 별도 스레드가 없어 오버헤드가 낮다. ThreadPool Bulkhead는 전용 `ExecutorService`를 생성하고 `CompletableFuture<T>` 반환을 요구한다.
+
+<Aside label="데코레이터 실행 순서">
+어노테이션 방식에서 Resilience4j가 자동으로 부여하는 Order는 다음과 같다.
+
+바깥→안쪽: **Retry → CircuitBreaker → Bulkhead → RateLimiter → 실제 호출**
+
+Bulkhead가 Circuit Breaker보다 바깥에 위치하는 이유는, 동시 실행 수 제한이 장애 감지보다 앞서야 스레드 풀 고갈 자체를 막을 수 있기 때문이다.
+</Aside>
+
+Rate Limiter는 단위 시간당 요청 수를 제한한다. `AtomicRateLimiter`는 스케줄러 없이 요청 시점에 경과 시간을 계산해 토큰을 lazy하게 갱신한다. RPS = `limitForPeriod / limitRefreshPeriod(초)`로 계산되며, 분산 환경에서는 인스턴스 수로 나눠 설정하거나 Redis 기반 공유 Rate Limiter를 사용해야 한다.
+
+<Callout type="warning" title="트레이드오프">
+| | Circuit Breaker | Bulkhead | Rate Limiter |
+|---|---|---|---|
+| **보호 대상** | 장애 전파 | 스레드 고갈 | 처리량 한도 |
+| **동작 시점** | 실패 누적 후 | 즉시(동시 수) | 즉시(속도) |
+| **비용** | 슬라이딩 윈도우 메모리 | Semaphore/스레드 풀 | CAS 경쟁(Atomic) |
+
+세 패턴은 서로 대체재가 아니라 보완재다. 실무에서는 외부 HTTP 호출에 CB + Semaphore Bulkhead, 외부 API 한도가 있는 경우 Rate Limiter를 추가한다.
+</Callout>
+
+## 정리
+
+- Cascading Failure의 근원은 "장애 서비스를 계속 호출하는 것"이며, Circuit Breaker는 OPEN 상태로 이 호출 자체를 즉시 차단한다.
+- 슬라이딩 윈도우(Ring Buffer 또는 시간 버킷)가 실패율을 O(1)로 유지하고, Slow Call 탐지가 "성공하지만 느린" 장애를 추가로 감지한다.
+- Fallback은 CB OPEN 시 서비스 품질을 유지하는 유일한 수단이며, 시그니처 규칙과 예외 타입 분기가 정확해야 한다.
+- Bulkhead는 사전에 동시 실행 수를 격실로 분리해 한 외부 서비스의 지연이 다른 기능으로 번지지 않도록 막는다.
+- Rate Limiter는 시간 기반으로 요청 속도를 제한해 외부 API 한도 초과와 내부 과부하를 모두 방어한다.
+
+다음 글에서는 분산 트레이싱으로 이 방어 레이어들 사이에서 요청이 어떻게 흐르는지, Sleuth와 Zipkin이 trace·span을 어떻게 전파하는지 추적한다.

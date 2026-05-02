@@ -1,0 +1,123 @@
+---
+title: "Spring Cloud LoadBalancer는 어떻게 서비스 이름을 IP:Port로 바꾸는가"
+description: "Ribbon 종료 선언부터 Custom LoadBalancer 구현까지, Spring Cloud LoadBalancer의 내부 호출 체인과 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-cloud, load-balancer, ribbon, eureka, reactive]
+difficulty: intermediate
+series:
+  slug: spring-cloud-deep-dive
+  title: Spring Cloud Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`restTemplate.getForObject("http://order-service/orders/1", Order.class)`. 이 한 줄 안에서 `order-service`라는 문자열이 실제 `10.0.1.5:8080`으로 바뀌기까지, Spring Cloud LoadBalancer는 인터셉터, 캐시 두 단계, 알고리즘, URI 재구성을 순서대로 통과한다. 이 체인이 어떻게 설계됐는지, 그리고 왜 Ribbon은 이 설계를 이어받지 못했는가?
+
+## Ribbon이 떠난 자리
+
+Ribbon은 2013년 Netflix가 만든 클라이언트 사이드 로드밸런서다. `ILoadBalancer`, `IRule`, `IPing`이라는 인터페이스 체계로 설계됐고, 모든 반환 타입이 동기(blocking)였다. 2020년 Spring Cloud 2020.0 릴리즈에서 기본값이 비활성화됐고, 2022.0 이후로는 완전히 제거됐다. 이유는 세 가지다.
+
+첫째, Netflix 자신이 내부적으로 gRPC + Envoy로 전환하면서 Ribbon 유지보수 인력이 없어졌다. 둘째, WebFlux 환경에서 Ribbon의 블로킹 인터페이스는 이벤트 루프 스레드를 블로킹할 위험이 있었다. 셋째, Spring이 추구하는 Reactive-first 방향과 구조적으로 맞지 않았다.
+
+Spring Cloud LoadBalancer는 이 공백을 채우기 위해 `ReactorServiceInstanceLoadBalancer`라는 인터페이스를 중심으로 설계됐다. `choose(Request)` 하나가 `Mono<Response<ServiceInstance>>`를 반환한다. 완전히 Reactive다.
+
+## 호출 체인: 인터셉터에서 URI 재구성까지
+
+`@LoadBalanced RestTemplate`에 요청이 들어오면 `LoadBalancerInterceptor.intercept()`가 가장 먼저 실행된다. 여기서 URI의 host 부분(`order-service`)을 서비스 이름으로 추출해 `BlockingLoadBalancerClient.execute()`에 넘긴다.
+
+```
+RestTemplate.getForObject("http://order-service/orders/1")
+  │
+  ▼ LoadBalancerInterceptor
+  host 추출: "order-service"
+  │
+  ▼ BlockingLoadBalancerClient.choose()
+  LoadBalancerClientFactory → order-service Child Context
+  → RoundRobinLoadBalancer.choose()
+  │
+  ▼ ServiceInstanceListSupplier 체인
+  CachingServiceInstanceListSupplier (TTL: 35s)
+    → EurekaServiceInstanceListSupplier
+       → [10.0.1.5:8080, 10.0.1.6:8080]
+  │
+  ▼ reconstructURI()
+  "http://10.0.1.5:8080/orders/1"
+```
+
+`BlockingLoadBalancerClient`는 RestTemplate 호환성을 위한 어댑터다. 내부에서 `Mono.from(loadBalancer.choose(...)).block()`을 호출해 Reactive 결과를 동기로 변환한다. 이 `block()`이 Netty 이벤트 루프 스레드에서 호출되면 데드락이 발생한다. WebFlux 환경에서는 `@LoadBalanced WebClient`와 `ReactorLoadBalancerExchangeFilterFunction`을 써야 한다.
+
+<Callout type="warning" title="block() 호출 위치">
+`BlockingLoadBalancerClient`의 `choose()` 내부에는 `Mono.block()`이 있다. Servlet 컨테이너(Tomcat) 스레드에서는 안전하지만, Netty 이벤트 루프 스레드에서 호출하면 스레드가 블로킹되어 전체 이벤트 루프가 멈춘다. WebFlux Controller에서 `@LoadBalanced RestTemplate`을 사용할 때는 반드시 `subscribeOn(Schedulers.boundedElastic())`으로 격리해야 한다.
+</Callout>
+
+## 캐시 두 단계와 갱신 지연
+
+인스턴스 목록은 두 단계의 캐시를 거친다. `CachingServiceInstanceListSupplier`가 LoadBalancer 수준 캐시(기본 TTL 35초)를 담당하고, 그 아래 `EurekaServiceInstanceListSupplier`는 Eureka 클라이언트의 로컬 캐시(30초 갱신 주기)에서 읽는다.
+
+인스턴스가 다운됐을 때 최악의 경우 지연 시간은 다음과 같다.
+
+```
+인스턴스 다운 → Eureka 만료(90s) → Eureka 클라이언트 fetch(30s)
+→ LB 캐시 TTL 만료(35s) = 최대 155초
+```
+
+이 지연 때문에 Retry가 필수다. 인스턴스 목록에서 죽은 인스턴스가 제거되기 전까지, 해당 인스턴스로의 요청 실패를 다른 인스턴스로 즉시 재시도하는 것이 실용적인 방어 전략이다.
+
+## 알고리즘과 트레이드오프
+
+기본 알고리즘은 `RoundRobinLoadBalancer`다. `AtomicInteger.incrementAndGet()`으로 카운터를 원자적으로 증가시키고, `pos & Integer.MAX_VALUE`로 음수와 오버플로우를 방어한다. `Math.abs(Integer.MIN_VALUE)`가 여전히 음수를 반환하는 Java의 함정을 피하기 위한 선택이다.
+
+`RandomLoadBalancer`는 `ThreadLocalRandom.current().nextInt(size)`로 스레드별 독립 난수를 사용해 경합 없이 분산한다.
+
+Spring Cloud LoadBalancer가 기본으로 제공하는 알고리즘은 이 두 가지뿐이다. Ribbon의 `WeightedResponseTimeRule`에 해당하는 것은 직접 구현해야 한다.
+
+<Callout type="note" title="트레이드오프">
+Ribbon은 `WeightedResponseTime`, `ZoneAvoidance` 등 다양한 알고리즘을 내장했다. Spring Cloud LoadBalancer는 알고리즘 다양성보다 Reactive 통합과 확장성을 택했다. `ReactorServiceInstanceLoadBalancer` 인터페이스 하나만 구현하면 커스텀 알고리즘을 서비스별로 격리해 등록할 수 있다.
+</Callout>
+
+## Custom LoadBalancer: 카나리와 서비스별 격리
+
+`ReactorServiceInstanceLoadBalancer`를 구현하면 헤더, 메타데이터, 쿠키 등 요청 컨텍스트를 알고리즘 결정에 활용할 수 있다. 카나리 배포가 대표적인 예다.
+
+```java
+public class CanaryLoadBalancer implements ReactorServiceInstanceLoadBalancer {
+
+    @Override
+    public Mono<Response<ServiceInstance>> choose(Request request) {
+        return supplier.get(request).next()
+            .map(instances -> {
+                boolean isCanary = isCanaryRequest(request);
+                List<ServiceInstance> targets = instances.stream()
+                    .filter(i -> isCanary
+                        ? "true".equals(i.getMetadata().get("canary"))
+                        : !"true".equals(i.getMetadata().get("canary")))
+                    .collect(Collectors.toList());
+                if (targets.isEmpty()) targets = instances; // 폴백
+                int pos = Math.abs(position.incrementAndGet()) % targets.size();
+                return new DefaultResponse(targets.get(pos));
+            });
+    }
+}
+```
+
+이 구현을 특정 서비스에만 적용하려면 `@LoadBalancerClient(name = "order-service", configuration = CanaryLoadBalancerConfig.class)`를 사용한다. 설정 클래스에 `@Configuration`을 붙이면 컴포넌트 스캔에서 전역으로 등록되어 모든 서비스에 적용되는 버그가 생긴다. `@Configuration` 없는 일반 클래스로 선언하고 컴포넌트 스캔 범위 밖에 위치시켜야 한다.
+
+`LoadBalancerClientFactory`는 서비스마다 별도의 Child ApplicationContext를 생성해 LoadBalancer Bean을 격리한다. `ObjectProvider<ServiceInstanceListSupplier>`로 Lazy하게 주입받는 이유가 여기에 있다. Child Context 초기화 순서 문제로 직접 주입하면 순환 의존성 오류가 발생할 수 있다.
+
+<Aside label="Retry와 Circuit Breaker 순서">
+Retry는 Circuit Breaker 바깥에 위치해야 한다. Retry → Circuit Breaker → 업스트림 순서로 재시도 N회 모두 실패할 때 Circuit Breaker 실패 카운트가 1 증가한다. 반대 순서면 각 재시도가 별도 실패로 카운트되어 Circuit Breaker가 너무 빨리 열린다.
+</Aside>
+
+## 정리
+
+- `LoadBalancerInterceptor`가 서비스 이름을 추출하고, `BlockingLoadBalancerClient`가 Reactive 체인을 Blocking으로 감싼 뒤, `reconstructURI()`가 최종 URI를 조립한다.
+- 인스턴스 목록은 캐시 두 단계(LB 캐시 35s + Eureka 캐시 30s)를 거치며, 인스턴스 다운 후 최대 155초 지연이 생길 수 있다. Retry가 이 간격을 메운다.
+- `RoundRobinLoadBalancer`는 `AtomicInteger & Integer.MAX_VALUE`로 스레드 안전과 오버플로우 방어를 동시에 처리한다.
+- 커스텀 알고리즘은 `ReactorServiceInstanceLoadBalancer`를 구현하고 `@LoadBalancerClient`로 서비스별 격리해 등록한다. 설정 클래스에 `@Configuration`을 붙이지 않는 것이 핵심이다.
+
+다음 글에서는 Circuit Breaker 패턴이 이 LoadBalancer 체인 위에서 어떻게 동작하는지, 그리고 Resilience4j가 상태 전이를 어떻게 관리하는지 추적한다.

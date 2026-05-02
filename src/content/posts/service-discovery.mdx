@@ -1,0 +1,103 @@
+---
+title: "Eureka는 왜 AP를 선택했는가"
+description: "DNS의 한계부터 Self-Preservation까지, Spring Cloud Eureka의 서비스 디스커버리 설계 결정을 내부 구조와 함께 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-cloud, eureka, service-discovery, load-balancing]
+difficulty: intermediate
+series:
+  slug: spring-cloud-deep-dive
+  title: Spring Cloud Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MSA 환경에서 서비스 인스턴스는 Pod 재시작마다 IP가 바뀌고, Auto Scaling으로 수가 늘었다 줄었다 한다. nginx.conf에 IP를 하드코딩하던 방식은 여기서 무너진다. Spring Cloud Eureka는 이 문제를 "동적 레지스트리 + AP 모델"로 해결하는데, 그 설계 결정의 대가는 무엇인가?
+
+## DNS가 MSA에서 실패하는 이유
+
+가장 단순한 대안은 DNS다. `order-service.internal → 10.0.1.5`처럼 A 레코드를 관리하면 되지 않을까. 세 가지 이유로 이는 작동하지 않는다.
+
+첫째, **TTL 캐시**. Pod가 재시작되어 IP가 바뀌어도 클라이언트는 DNS를 60~300초간 캐시한다. TTL을 1초로 낮추면 DNS 서버가 과부하를 받는다. 둘째, **Health 무관 라우팅**. DNS Round Robin은 인스턴스가 죽었는지 살았는지 모른 채 분배한다. 셋째, **메타데이터 없음**. 어느 인스턴스가 v2인지, 어느 AZ에 있는지 DNS는 표현할 방법이 없다. 카나리 배포와 Zone-Aware 라우팅은 처음부터 불가능하다.
+
+Service Registry 패턴은 이 세 문제를 한 번에 해결한다. 서비스가 시작할 때 자신의 `IP:Port + 메타데이터`를 레지스트리에 등록(Registration)하고, 호출자는 레지스트리에서 실시간 목록을 조회(Discovery)한다.
+
+## Eureka의 내부 구조 — ConcurrentHashMap과 Lease
+
+Eureka Server의 레지스트리는 단순 Map이 아니다. `AbstractInstanceRegistry`는 이중 `ConcurrentHashMap`으로 동시성을 다룬다.
+
+```
+ConcurrentHashMap<String,              // appName ("SERVICE-A")
+  Map<String,                          // instanceId ("10.0.1.5:service-a:8080")
+    Lease<InstanceInfo>>>              // 만료 시간을 감싼 래퍼
+```
+
+`Lease<T>`는 만료 추적의 핵심이다. `renew()`가 호출될 때 `lastUpdateTimestamp = System.currentTimeMillis() + duration`으로 설정하는데, `duration`을 더하는 것이 의도적이다. 분산 환경의 시계 오차(clock skew)와 일시적 네트워크 지연을 허용하기 위해 실질적으로 `2 × duration` 시간이 지나야 만료가 된다.
+
+클라이언트는 30초마다 `PUT /eureka/apps/{appName}/{instanceId}`로 Heartbeat를 보낸다. 서버가 응답하지 않으면 클라이언트는 `404`를 받고 즉시 `register()`를 재호출해 자동으로 복구한다. Heartbeat 스케줄러는 일반 `scheduleAtFixedRate()`가 아닌 `TimedSupervisorTask`로 감싸져 있어서, 예외로 태스크가 종료되더라도 지수 백오프 후 재시작한다 — Heartbeat가 영구적으로 멈추는 상황을 막기 위한 장치다.
+
+조회 성능은 `ResponseCache`의 두 레벨 캐시가 담당한다. 레지스트리 변경 시 `readWriteCacheMap`(Guava, 30s TTL)을 무효화하고, `readOnlyCacheMap`은 30초마다 동기화된다. 클라이언트 fetch 주기(30초)까지 더하면 인스턴스 변경이 반영되기까지 **최대 60초**가 걸린다.
+
+## CAP 정리와 Eureka의 선택
+
+Eureka는 CP(ZooKeeper, Consul)가 아닌 **AP**를 선택했다. 네트워크 분단 시 CP 시스템은 일관성을 위해 일부 노드가 응답을 중단한다. MSA에서 이는 "Registry에 접근 불가 → 서비스 간 호출 전체 실패"를 의미한다.
+
+Netflix의 판단은 달랐다. "이미 알고 있는 오래된 주소 정보로 호출을 시도하는 것이, 아예 호출하지 못하는 것보다 낫다." 네트워크 분단 중에도 각 Eureka 노드는 캐시된 레지스트리로 응답을 계속하고, 분단이 해소되면 Peer Replication으로 동기화된다.
+
+<Callout type="note" title="트레이드오프">
+AP 선택의 대가는 명확하다. 비정상 종료된 인스턴스는 `lease-expiration`(기본 90초)이 지나야 레지스트리에서 제거된다. 클라이언트 캐시 주기(30초)까지 더하면 죽은 인스턴스로 요청이 라우팅될 수 있는 시간은 최대 **120초**다. 이 기간을 견디기 위해 Retry와 Circuit Breaker가 필수 조합이 된다. "Eureka는 Retry와 Circuit Breaker 없이는 반쪽짜리다."
+</Callout>
+
+## 메타데이터로 라우팅을 제어하는 방법
+
+Eureka가 DNS와 결정적으로 다른 점은 `InstanceInfo.metadataMap`이다. 자유 형식 key-value로 인스턴스에 라우팅 힌트를 심을 수 있다.
+
+```yaml
+eureka:
+  instance:
+    prefer-ip-address: true   # 컨테이너 환경 필수
+    instance-id: ${spring.cloud.client.ip-address}:${spring.application.name}:${server.port}
+    metadata-map:
+      version: "v2.1.0"
+      zone: "ap-northeast-2a"
+      canary: "true"
+```
+
+`@LoadBalanced RestTemplate`은 `LoadBalancerInterceptor`가 `http://service-inventory/path`에서 host를 추출해 `BlockingLoadBalancerClient.choose()`로 전달하고, 선택된 인스턴스의 `IP:Port`로 URI를 치환한다. `ServiceInstanceListSupplier` 체인의 `CachingServiceInstanceListSupplier`(기본 TTL 35초)가 Eureka 조회 빈도를 줄인다.
+
+카나리 배포 구현은 이 메타데이터를 읽는 커스텀 `ReactorServiceInstanceLoadBalancer`로 완성된다 — `canary=true` 인스턴스 풀과 일반 인스턴스 풀을 분리하고, 10% 확률로 카나리 풀을 선택한다. Zone-Aware 라우팅도 `zone` 메타데이터를 기준으로 같은 패턴을 따른다.
+
+## Self-Preservation — "불확실할 때는 삭제하지 않는다"
+
+AP의 설계를 완성하는 마지막 메커니즘이 Self-Preservation Mode다.
+
+네트워크 분단으로 50개 인스턴스가 동시에 Heartbeat를 보내지 못한다고 가정하자. Self-Preservation 없이는 90초 후 50개 모두 eviction된다 — 인스턴스는 다 살아있는데 레지스트리만 비어버리는 재앙이다.
+
+Eureka는 분당 수신 Heartbeat 수가 기댓값의 85% 미만으로 떨어지면 eviction을 완전히 중단한다.
+
+```
+numberOfRenewsPerMinThreshold
+  = 등록 인스턴스 수 × (60 / 30초) × 0.85
+  = 50 × 2 × 0.85 = 85회/분
+
+실수신 40회 < 85 → Self-Preservation 발동 → eviction 중단
+```
+
+이 상태에서 `evict()`는 `isLeaseExpirationEnabled()`를 확인하고 `false`이면 즉시 리턴한다. 레지스트리는 보존되고, 네트워크가 복구되면 Heartbeat가 재개되어 임계값을 넘는 순간 Self-Preservation이 해제된다.
+
+<Aside label="개발 환경 주의">
+Self-Preservation은 개발 환경에서 오히려 독이 된다. 서비스를 자주 재시작하면 Heartbeat가 불규칙해져 Self-Preservation이 발동되고, 이미 종료된 서비스가 레지스트리에 남아 혼란을 준다. 개발 환경에서는 `enable-self-preservation: false`와 짧은 lease 시간(`renewal: 5s, expiration: 15s`)을 조합해 사용한다.
+</Aside>
+
+## 정리
+
+- Eureka는 DNS의 TTL·Health·메타데이터 한계를 Service Registry 패턴으로 해결한다.
+- AP 선택의 대가는 120초간의 불일치 허용 — Retry와 Circuit Breaker가 이 구간을 보완한다.
+- `metadataMap`은 카나리·Zone-Aware·버전 라우팅을 가능하게 하는 핵심 확장 포인트다.
+- Self-Preservation은 "네트워크 파티션 시 레지스트리를 보존"하는 AP 철학의 마지막 방어선이다.
+
+다음 글에서는 이 레지스트리 위에서 동작하는 API Gateway — Spring Cloud Gateway가 어떻게 라우팅 규칙을 적용하는지 추적한다.

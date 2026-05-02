@@ -1,0 +1,134 @@
+---
+title: "MSA의 데이터 문제는 어떻게 푸는가"
+description: "동기 호출의 결합에서 벗어나 EDA·Saga·API Composition·CQRS로 MSA 데이터 흐름을 설계하는 방법을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-cloud, msa, event-driven, saga, cqrs]
+difficulty: intermediate
+series:
+  slug: spring-cloud-deep-dive
+  title: Spring Cloud Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MSA는 서비스를 나눈다. 그런데 서비스를 나누면 데이터도 나뉜다. DB가 다르면 JOIN이 없고, 트랜잭션 경계가 다르면 ACID도 없다. 그렇다면 MSA에서 데이터 일관성과 조회 성능은 어떻게 보장하는가?
+
+## 동기 호출의 한계
+
+가장 직관적인 선택은 HTTP 호출이다. Order Service가 Payment Service를 직접 호출한다. 그런데 이 선택에는 세 가지 결합이 따라붙는다. **시간적 결합** — Payment가 다운되면 주문도 불가다. **공간적 결합** — Payment의 URL을 알아야 한다. **연쇄 장애** — Payment가 느려지면 Order도 느려진다.
+
+Spring Cloud Stream의 함수형 모델은 이 결합을 끊는다. `Consumer<T>`, `Supplier<T>`, `Function<T,R>` Bean을 선언하면 Spring Cloud Stream이 자동으로 Kafka 토픽과 연결한다. Order Service는 `OrderCreatedEvent`를 토픽에 던지고 끝이다. Payment, Inventory, Notification은 각자의 속도로 이벤트를 소비한다.
+
+```java
+// 채널 이름 규칙: {functionName}-in-{index}
+@Bean
+public Consumer<OrderCreatedEvent> paymentProcessor() {
+    return event -> paymentService.processPayment(
+        event.getOrderId(), event.getAmount());
+}
+```
+
+`Binder` 추상화 덕분에 Kafka와 RabbitMQ는 동일한 코드로 연결된다. `pom.xml`에서 binder 의존성만 교체하면 브로커가 바뀐다.
+
+<Callout type="note" title="트레이드오프: EDA vs 동기 HTTP">
+이벤트 기반은 결합도를 낮추고 가용성을 높인다. 대신 **최종 일관성**만 보장된다 — 즉각적 일관성은 포기해야 한다. 메시지 브로커 운영 비용과 비동기 흐름 디버깅 난이도도 증가한다.
+</Callout>
+
+## 분산 트랜잭션: Saga가 2PC를 대체하는 이유
+
+EDA로 서비스를 분리했지만 문제가 남는다. 주문 생성, 재고 차감, 결제 처리는 한 묶음이어야 한다. 하나가 실패하면 나머지를 취소해야 한다.
+
+2PC(Two-Phase Commit)는 이 문제를 모든 서비스를 잠근 채로 해결한다. Prepare 단계에서 모든 참여자를 대기시키고, Commit 단계에서 일괄 확정한다. 하나라도 응답 없으면 전체가 블로킹된다. 코디네이터가 다운되면 전체가 멈춘다. MSA의 고가용성 요구와 정면으로 충돌한다.
+
+Saga는 다른 접근을 취한다. **긴 트랜잭션을 로컬 트랜잭션들의 연쇄로 분해하고, 실패 시 보상 트랜잭션으로 역순 취소**한다.
+
+구현 방식은 두 가지다. **Choreography** — 서비스들이 이벤트를 보고 스스로 다음 단계를 실행한다. 중앙 조율자가 없어 서비스 독립성이 높지만, 전체 흐름이 이벤트에 분산되어 파악하기 어렵다. **Orchestration** — 중앙 Saga 클래스가 상태 머신으로 각 서비스에 명령을 전달한다. 흐름이 한 곳에 모여 디버깅이 쉽지만, Saga 자체가 복잡해진다.
+
+보상 트랜잭션은 롤백이 아니다. 이미 커밋된 로컬 트랜잭션을 새로운 트랜잭션으로 취소하는 것이다. 따라서 **멱등성**이 필수다. Kafka Consumer 재처리 시 같은 보상이 두 번 실행될 수 있기 때문이다.
+
+```java
+@Transactional
+public void releaseStock(String productId, int quantity, String sagaId) {
+    // sagaId + step type으로 중복 보상 방지
+    if (compensationRepo.findBySagaIdAndType(sagaId, "RELEASE_STOCK").isPresent()) {
+        return;
+    }
+    inventoryRepository.increaseStock(productId, quantity);
+    compensationRepo.save(new CompensationRecord(sagaId, "RELEASE_STOCK"));
+}
+```
+
+DB 저장과 이벤트 발행의 원자성은 **Outbox 패턴**으로 보장한다. 이벤트를 같은 트랜잭션 안에서 `outbox` 테이블에 저장하고, 별도 Publisher가 주기적으로 읽어 Kafka에 전송한다. DB 저장 성공 후 크래시가 발생해도 이벤트는 유실되지 않는다.
+
+## API Composition: DB JOIN 없이 응답 조합하기
+
+서비스가 나뉘면 JOIN도 사라진다. 주문 상세 응답에 사용자 이름, 결제 금액, 재고 상태가 필요하다면 클라이언트가 4개 API를 각각 호출해야 하는가?
+
+API Composition은 BFF 또는 API Gateway에서 여러 서비스를 **병렬 호출**하고 하나의 응답으로 합친다. WebFlux의 `Mono.zip()`이 핵심 도구다.
+
+```java
+public Mono<OrderDetailResponse> getOrderDetail(Long orderId) {
+    Mono<OrderDto> orderMono = orderWebClient.get()
+        .uri("/orders/{id}", orderId)
+        .retrieve().bodyToMono(OrderDto.class)
+        .timeout(Duration.ofSeconds(2));
+
+    Mono<PaymentDto> paymentMono = paymentWebClient.get()
+        .uri("/payments/order/{id}", orderId)
+        .retrieve().bodyToMono(PaymentDto.class)
+        .timeout(Duration.ofSeconds(2))
+        .onErrorReturn(PaymentDto.empty()); // 부분 실패 허용
+
+    return Mono.zip(orderMono, paymentMono)
+        .map(t -> OrderDetailResponse.builder()
+            .order(t.getT1()).payment(t.getT2()).build());
+}
+```
+
+`Mono.zip()`은 구독 시점에 모든 요청을 동시에 시작한다. 완료 시각은 가장 느린 Mono에 수렴한다. 순차 호출 대비 레이턴시를 2배 이상 줄인다.
+
+목록 조회에서는 N+1 문제를 주의해야 한다. 주문 N개를 가져온 뒤 각 주문마다 사용자 API를 호출하면 N+1번의 요청이 발생한다. `collectList()`로 주문 목록을 먼저 수집하고, userId 집합을 배치 조회 API에 한 번 전달하면 1번으로 줄어든다.
+
+## CQRS: 쓰기와 읽기를 다른 모델로
+
+단일 DB에서 쓰기와 읽기가 같은 모델을 공유하면 경합이 발생한다. 쓰기는 정규화된 스키마와 ACID를 원하고, 읽기는 비정규화된 집계와 속도를 원한다. 둘 다를 만족하는 타협은 둘 다를 망친다.
+
+CQRS는 이를 분리한다. **Command Side**는 정규화된 MySQL에 저장하고 도메인 이벤트를 발행한다. **Query Side**는 이벤트를 받아 Elasticsearch나 Redis에 비정규화된 읽기 전용 모델을 유지한다.
+
+```java
+// Event Handler: Command Model 변경 → Query Model 동기화
+@Bean
+public Consumer<OrderCreatedEvent> orderIndexer() {
+    return event -> {
+        UserDto user = userClient.getUser(event.getUserId());
+        OrderDocument doc = OrderDocument.builder()
+            .id(event.getOrderId())
+            .userName(user.getName())   // 역정규화
+            .totalAmount(event.getAmount())
+            .build();
+        esTemplate.save(doc);
+    };
+}
+```
+
+Query Model은 ms~초 단위의 지연을 허용한다(최종 일관성). 쓰기 직후 즉각 읽기가 필요한 케이스는 Command DB에서 직접 조회하고, 나머지는 Query Model을 사용한다.
+
+별도 Query DB 없이도 **Spring Data Projection**으로 부분적 CQRS를 구현할 수 있다. 인터페이스 Projection은 필요한 필드만 선택적으로 조회하고, DTO Projection은 생성자 매핑으로 더 빠르게 동작한다.
+
+<Aside label="도입 판단">
+CQRS는 읽기/쓰기 비율 불균형이 심하거나 복잡한 집계가 쓰기 성능을 저하시킬 때 도입을 검토한다. 단순 CRUD나 강한 일관성이 반드시 필요한 경우, 또는 팀이 최종 일관성 설계에 익숙하지 않은 경우에는 보류하는 것이 낫다.
+</Aside>
+
+## 정리
+
+- EDA는 서비스 간 시간적·공간적 결합을 끊는다. 대신 최종 일관성과 브로커 운영 복잡도를 받아들여야 한다.
+- Saga는 2PC의 블로킹 문제를 보상 트랜잭션으로 대체한다. Choreography는 단순 흐름에, Orchestration은 복잡한 분기에 적합하다. 멱등성과 Outbox 패턴은 필수다.
+- API Composition은 `Mono.zip()`으로 병렬 호출해 레이턴시를 낮추고, `onErrorReturn`으로 부분 실패를 허용한다.
+- CQRS는 쓰기 모델과 읽기 모델을 분리해 각각을 최적화한다. Query Model은 Source of Truth가 아니므로 언제든 재구성 가능해야 한다.
+
+네 패턴은 독립적이지 않다 — EDA 위에 Saga가 동작하고, CQRS의 Query Model은 EDA로 동기화되며, API Composition은 그 결과를 모아 응답한다.
