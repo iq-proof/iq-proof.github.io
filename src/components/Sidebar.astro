@@ -1,23 +1,33 @@
 ---
 /**
- * Sidebar — 좌측 트리 네비게이션 (collapsed / expanded 토글)
+ * Sidebar — fixed 좌측 트리 네비게이션 (4단계 계층)
  *
- * 두 상태:
- *   collapsed (default): 폭 56px, 토글 버튼만 보임. 본문이 넓게 사용 가능.
- *   expanded:            폭 300px, 카테고리 → 시리즈 → 글 트리 전체 노출.
+ * 구조:
+ *   Category (Dev | AI | Agent)
+ *     └─ Group (Dev: Backend Deep Dive 9그룹 / AI: 11 레이어)
+ *         └─ Series (레포 단위, repo.slug == post.series.slug)
+ *             └─ Post #1 (series.order 오름차순)
+ *
+ * Positioning:
+ *   - position: fixed; top: header-height; left: 0; bottom: 0;
+ *   - 스크롤·페이지 이동 무관 viewport에 항상 고정
+ *   - body padding-left로 main을 옆으로 밀어냄 (collapsed/expanded 동기화)
  *
  * 동작:
- *   - 사용자 토글 → localStorage('sidebar.expanded') 영속화
- *   - 페이지 진입 시 직전 선택 상태 복원 (default collapsed)
- *   - 현재 글의 카테고리/시리즈는 자동 펼침 + 글 항목 accent 강조
- *   - sticky 100vh 로 viewport 풀 높이 유지 (스크롤해도 끊기지 않음)
+ *   - collapsed (default 56px): 토글 아이콘만 보임
+ *   - expanded (300px): 트리 풀 노출
+ *   - localStorage('iq-sidebar-expanded') 영속화
+ *   - 현재 글 페이지: 해당 카테고리·그룹·시리즈 자동 펼침 + 글 항목 강조
  *
  * 자동 갱신:
- *   - getCollection() 으로 build 타임에 모든 mdx 자동 스캔
- *   - 새 글 추가 시 코드 변경 없이 다음 빌드에 자동 반영
+ *   - getCollection() build 타임 스캔 → 새 글 추가 시 자동 반영
+ *   - DEV_LAB_GROUPS / AI_LAB_LAYERS (consts.ts)에서 그룹·레포 메타 읽음
+ *   - 글 0개 시리즈는 표시 안 함, 글 0개 그룹도 자동 숨김
  */
 
 import { getCollection } from 'astro:content';
+import { DEV_LAB_GROUPS, AI_LAB_LAYERS } from '@/consts';
+import Icon from '@/components/Icon.astro';
 
 type Category = 'dev' | 'ai' | 'agent';
 
@@ -25,7 +35,9 @@ interface PostMeta {
   slug: string;
   title: string;
   pubDate: Date;
-  series?: { slug: string; title: string; order: number };
+  seriesSlug?: string;
+  seriesTitle?: string;
+  seriesOrder?: number;
 }
 
 const CATEGORY_LABEL: Record<Category, string> = {
@@ -34,58 +46,104 @@ const CATEGORY_LABEL: Record<Category, string> = {
   agent: 'Agent',
 };
 
+const CATEGORY_COLOR: Record<Category, string> = {
+  dev: '#22D3EE',
+  ai: '#A78BFA',
+  agent: '#F59E0B',
+};
+
 // 1. 모든 글 fetch (draft 제외)
 const allPosts = await getCollection('posts', ({ data }) => !data.draft);
 
-// 2. 현재 페이지의 slug 추출
+// 2. 현재 페이지 slug
 const pathMatch = Astro.url.pathname.match(/^\/posts\/([^/]+)\/?$/);
 const currentSlug = pathMatch?.[1];
 
-// 3. 카테고리별로 분리
-const byCategory: Record<Category, PostMeta[]> = { ai: [], dev: [], agent: [] };
+// 3. 카테고리별 + seriesSlug별 인덱스
+const postsBySeries = new Map<string, PostMeta[]>();
+const postsByCategory: Record<Category, PostMeta[]> = { ai: [], dev: [], agent: [] };
 for (const p of allPosts) {
-  byCategory[p.data.category].push({
+  const meta: PostMeta = {
     slug: p.id,
     title: p.data.title,
     pubDate: p.data.pubDate,
-    series: p.data.series,
-  });
-}
-
-// 4. 각 카테고리 안: 시리즈 묶음 + Other
-function groupByCategory(items: PostMeta[]) {
-  const seriesMap = new Map<string, { title: string; posts: PostMeta[] }>();
-  const others: PostMeta[] = [];
-  for (const item of items) {
-    if (item.series) {
-      const g = seriesMap.get(item.series.slug) ?? { title: item.series.title, posts: [] };
-      g.posts.push(item);
-      seriesMap.set(item.series.slug, g);
-    } else {
-      others.push(item);
-    }
+    seriesSlug: p.data.series?.slug,
+    seriesTitle: p.data.series?.title,
+    seriesOrder: p.data.series?.order,
+  };
+  postsByCategory[p.data.category].push(meta);
+  if (meta.seriesSlug) {
+    const list = postsBySeries.get(meta.seriesSlug) ?? [];
+    list.push(meta);
+    postsBySeries.set(meta.seriesSlug, list);
   }
-  const series = Array.from(seriesMap.entries())
-    .map(([slug, g]) => ({
-      slug,
-      title: g.title,
-      posts: g.posts.sort((a, b) => (a.series!.order - b.series!.order)),
-    }))
-    .sort((a, b) => a.title.localeCompare(b.title, 'en'));
-  others.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
-  return { series, others };
 }
 
-const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
-  const { series, others } = groupByCategory(byCategory[cat]);
-  const total = series.reduce((s, g) => s + g.posts.length, 0) + others.length;
-  const hasCurrent = !!currentSlug && byCategory[cat].some((p) => p.slug === currentSlug);
-  return { cat, series, others, total, hasCurrent };
-});
+// 각 series 안 글 정렬
+for (const list of postsBySeries.values()) {
+  list.sort((a, b) => (a.seriesOrder ?? 0) - (b.seriesOrder ?? 0));
+}
+
+// 4. Dev/AI 그룹 데이터 빌드 (consts 기반 + 글 0개 필터)
+type SeriesNode = {
+  slug: string;
+  title: string;
+  posts: PostMeta[];
+  hasCurrent: boolean;
+};
+type GroupNode = {
+  title: string;
+  slug: string;
+  icon: string;
+  color: string;
+  description: string;
+  series: SeriesNode[];
+  total: number;
+  hasCurrent: boolean;
+  layer?: string;
+};
+
+function buildGroup(group: { title: string; slug: string; icon: string; color: string; description: string; repos: { slug: string; title: string }[] }, layer?: string): GroupNode | null {
+  const series: SeriesNode[] = [];
+  for (const repo of group.repos) {
+    const posts = postsBySeries.get(repo.slug) ?? [];
+    if (posts.length === 0) continue; // 양산 안 된 레포 숨김
+    const hasCurrent = !!currentSlug && posts.some((p) => p.slug === currentSlug);
+    series.push({ slug: repo.slug, title: repo.title, posts, hasCurrent });
+  }
+  if (series.length === 0) return null;
+  const total = series.reduce((s, g) => s + g.posts.length, 0);
+  const hasCurrent = series.some((s) => s.hasCurrent);
+  return { ...group, series, total, hasCurrent, layer };
+}
+
+const devGroups: GroupNode[] = DEV_LAB_GROUPS
+  .map((g) => buildGroup(g))
+  .filter((g): g is GroupNode => g !== null);
+
+const aiGroups: GroupNode[] = AI_LAB_LAYERS
+  .map((l) => buildGroup(l, l.layer))
+  .filter((g): g is GroupNode => g !== null);
+
+// Agent 카테고리: 그룹/시리즈 없으니 단순 글 목록
+const agentPosts = postsByCategory.agent
+  .slice()
+  .sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
+
+const totals = {
+  dev: postsByCategory.dev.length,
+  ai: postsByCategory.ai.length,
+  agent: postsByCategory.agent.length,
+};
+
+const hasCurrentInCat: Record<Category, boolean> = {
+  dev: !!currentSlug && postsByCategory.dev.some((p) => p.slug === currentSlug),
+  ai: !!currentSlug && postsByCategory.ai.some((p) => p.slug === currentSlug),
+  agent: !!currentSlug && postsByCategory.agent.some((p) => p.slug === currentSlug),
+};
 ---
 
 <aside class="sidebar" id="iq-sidebar" data-state="collapsed" aria-label="Site navigation">
-  {/* Toggle button — collapsed 상태에선 메뉴 아이콘, expanded 상태에선 close 아이콘 */}
   <button
     type="button"
     class="sidebar-toggle"
@@ -94,13 +152,11 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     aria-expanded="false"
     aria-controls="iq-sidebar-content"
   >
-    {/* Menu icon (collapsed 상태) */}
     <svg class="icon-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <line x1="3" y1="6" x2="21" y2="6" />
       <line x1="3" y1="12" x2="21" y2="12" />
       <line x1="3" y1="18" x2="21" y2="18" />
     </svg>
-    {/* Close icon (expanded 상태) */}
     <svg class="icon-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <line x1="18" y1="6" x2="6" y2="18" />
       <line x1="6" y1="6" x2="18" y2="18" />
@@ -108,7 +164,6 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     <span class="toggle-label">목차</span>
   </button>
 
-  {/* 트리 본문 — collapsed 일 땐 visibility:hidden */}
   <div class="sidebar-content" id="iq-sidebar-content">
     <div class="sidebar-meta">
       <span class="sidebar-meta-label">전체 글</span>
@@ -116,80 +171,147 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     </div>
 
     <nav class="sidebar-tree">
-      {grouped.map(({ cat, series, others, total, hasCurrent }) => (
-        total === 0 ? null : (
-          <details class={`cat-group cat-${cat}`} open={hasCurrent}>
-            <summary class="cat-summary">
-              <span class="cat-bar" aria-hidden="true"></span>
-              <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
-                <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              <span class="cat-label">{CATEGORY_LABEL[cat]}</span>
-              <span class="cat-count">{total}</span>
-            </summary>
+      {/* ─────── Dev ─────── */}
+      {devGroups.length > 0 && (
+        <details class="cat-group cat-dev" open={hasCurrentInCat.dev} style={`--cat-color: ${CATEGORY_COLOR.dev};`}>
+          <summary class="cat-summary">
+            <span class="cat-bar" aria-hidden="true"></span>
+            <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
+              <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="cat-label">{CATEGORY_LABEL.dev}</span>
+            <span class="cat-count">{totals.dev}</span>
+          </summary>
 
-            <div class="cat-body">
-              {series.map((s) => {
-                const seriesActive = s.posts.some((p) => p.slug === currentSlug);
-                return (
-                  <details class="series-group" open={seriesActive}>
-                    <summary class="series-summary">
-                      <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
-                        <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                      <span class="series-title">{s.title}</span>
-                      <span class="series-count">{s.posts.length}</span>
-                    </summary>
-                    <ol class="post-list">
-                      {s.posts.map((p) => (
-                        <li>
-                          <a
-                            href={`/posts/${p.slug}/`}
-                            class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
-                          >
-                            <span class="post-order">{p.series!.order}</span>
-                            <span class="post-title">{p.title}</span>
-                          </a>
-                        </li>
-                      ))}
-                    </ol>
-                  </details>
-                );
-              })}
+          <div class="cat-body">
+            {devGroups.map((g) => (
+              <details class="group-block" open={g.hasCurrent} style={`--group-color: ${g.color};`}>
+                <summary class="group-summary">
+                  <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
+                    <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  <span class="group-icon" aria-hidden="true" style={`color: ${g.color};`}>
+                    <Icon name={g.icon as any} size={14} />
+                  </span>
+                  <span class="group-title">{g.title}</span>
+                  <span class="group-count">{g.series.length}</span>
+                </summary>
+                <div class="group-body">
+                  {g.series.map((s) => (
+                    <details class="series-group" open={s.hasCurrent}>
+                      <summary class="series-summary">
+                        <svg class="chevron chevron-xs" viewBox="0 0 12 12" aria-hidden="true">
+                          <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                        <span class="series-title">{s.title}</span>
+                        <span class="series-count">{s.posts.length}</span>
+                      </summary>
+                      <ol class="post-list">
+                        {s.posts.map((p) => (
+                          <li>
+                            <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                              <span class="post-order">{p.seriesOrder}</span>
+                              <span class="post-title">{p.title}</span>
+                            </a>
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </details>
+      )}
 
-              {others.length > 0 && (
-                <details class="series-group" open={others.some((p) => p.slug === currentSlug)}>
-                  <summary class="series-summary">
-                    <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
-                      <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                    <span class="series-title">Other</span>
-                    <span class="series-count">{others.length}</span>
-                  </summary>
-                  <ul class="post-list">
-                    {others.map((p) => (
-                      <li>
-                        <a
-                          href={`/posts/${p.slug}/`}
-                          class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
-                        >
-                          <span class="post-title">{p.title}</span>
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </details>
-              )}
-            </div>
-          </details>
-        )
-      ))}
+      {/* ─────── AI ─────── */}
+      {aiGroups.length > 0 && (
+        <details class="cat-group cat-ai" open={hasCurrentInCat.ai} style={`--cat-color: ${CATEGORY_COLOR.ai};`}>
+          <summary class="cat-summary">
+            <span class="cat-bar" aria-hidden="true"></span>
+            <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
+              <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="cat-label">{CATEGORY_LABEL.ai}</span>
+            <span class="cat-count">{totals.ai}</span>
+          </summary>
+
+          <div class="cat-body">
+            {aiGroups.map((g) => (
+              <details class="group-block" open={g.hasCurrent} style={`--group-color: ${g.color};`}>
+                <summary class="group-summary">
+                  <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
+                    <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  <span class="group-icon" aria-hidden="true" style={`color: ${g.color};`}>
+                    <Icon name={g.icon as any} size={14} />
+                  </span>
+                  <span class="group-title">
+                    {g.layer && <span class="group-layer">L{g.layer}</span>}
+                    {g.title}
+                  </span>
+                  <span class="group-count">{g.series.length}</span>
+                </summary>
+                <div class="group-body">
+                  {g.series.map((s) => (
+                    <details class="series-group" open={s.hasCurrent}>
+                      <summary class="series-summary">
+                        <svg class="chevron chevron-xs" viewBox="0 0 12 12" aria-hidden="true">
+                          <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                        <span class="series-title">{s.title}</span>
+                        <span class="series-count">{s.posts.length}</span>
+                      </summary>
+                      <ol class="post-list">
+                        {s.posts.map((p) => (
+                          <li>
+                            <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                              <span class="post-order">{p.seriesOrder}</span>
+                              <span class="post-title">{p.title}</span>
+                            </a>
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {/* ─────── Agent ─────── */}
+      {agentPosts.length > 0 && (
+        <details class="cat-group cat-agent" open={hasCurrentInCat.agent} style={`--cat-color: ${CATEGORY_COLOR.agent};`}>
+          <summary class="cat-summary">
+            <span class="cat-bar" aria-hidden="true"></span>
+            <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
+              <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="cat-label">{CATEGORY_LABEL.agent}</span>
+            <span class="cat-count">{totals.agent}</span>
+          </summary>
+
+          <div class="cat-body">
+            <ul class="post-list direct">
+              {agentPosts.map((p) => (
+                <li>
+                  <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                    <span class="post-title">{p.title}</span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </details>
+      )}
     </nav>
   </div>
 </aside>
 
 <script is:inline>
-  // localStorage 영속화 + 토글
   (function () {
     const STORAGE_KEY = 'iq-sidebar-expanded';
     const sidebar = document.getElementById('iq-sidebar');
@@ -197,12 +319,12 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
 
     const setState = (expanded) => {
       sidebar.dataset.state = expanded ? 'expanded' : 'collapsed';
+      document.body.dataset.sidebarExpanded = String(expanded);
       const btn = sidebar.querySelector('[data-sidebar-toggle]');
       if (btn) btn.setAttribute('aria-expanded', String(expanded));
       try { localStorage.setItem(STORAGE_KEY, String(expanded)); } catch {}
     };
 
-    // 초기 상태: localStorage > default(false)
     let initial = false;
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -210,7 +332,6 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     } catch {}
     setState(initial);
 
-    // 토글 이벤트
     sidebar.addEventListener('click', (e) => {
       const target = e.target;
       if (target instanceof Element && target.closest('[data-sidebar-toggle]')) {
@@ -220,12 +341,25 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
   })();
 </script>
 
+<style is:global>
+  /* body padding-left — fixed sidebar 옆으로 main/footer 밀기 */
+  @media (min-width: 1024px) {
+    body {
+      padding-left: 56px;
+      transition: padding-left 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    body[data-sidebar-expanded="true"] {
+      padding-left: 300px;
+    }
+  }
+</style>
+
 <style>
   /* ──────────────────────────────────────────────────────────
-     레이아웃 — sticky로 viewport 풀 높이 유지 (끊김 방지)
+     레이아웃 — fixed positioning (스크롤 무관)
      ────────────────────────────────────────────────────────── */
   .sidebar {
-    /* 모바일 숨김 — 햄버거는 별도 PR */
+    /* 모바일 숨김 */
     display: none;
   }
 
@@ -233,17 +367,16 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     .sidebar {
       display: flex;
       flex-direction: column;
-      position: sticky;
+      position: fixed;
       top: 0;
-      align-self: flex-start;
-      height: 100vh;
-      flex-shrink: 0;
+      left: 0;
+      bottom: 0; /* viewport 풀 높이 — footer 영향 X */
       width: 56px;
-      background: linear-gradient(180deg, var(--bg-base, #0a0e1a) 0%, var(--bg-surface, #111827) 100%);
-      border-right: 1px solid var(--border-subtle, #374151);
+      background: linear-gradient(180deg, #0a0e1a 0%, #0f1424 100%);
+      border-right: 1px solid var(--color-border-subtle, #374151);
       transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
       overflow: hidden;
-      z-index: 10;
+      z-index: 30;
     }
     .sidebar[data-state="expanded"] {
       width: 300px;
@@ -251,14 +384,14 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
   }
 
   /* ──────────────────────────────────────────────────────────
-     Toggle button — collapsed/expanded 양쪽 사용
+     Toggle button
      ────────────────────────────────────────────────────────── */
   .sidebar-toggle {
     appearance: none;
     background: transparent;
     border: none;
-    border-bottom: 1px solid var(--border-subtle, #374151);
-    color: var(--fg-secondary, #9ca3af);
+    border-bottom: 1px solid var(--color-border-subtle, #374151);
+    color: var(--color-text-secondary, #9ca3af);
     width: 100%;
     height: 56px;
     display: flex;
@@ -270,8 +403,8 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     flex-shrink: 0;
   }
   .sidebar-toggle:hover {
-    background: var(--bg-elevated, #1a1f2e);
-    color: var(--accent-dev, #00d9ff);
+    background: rgba(34, 211, 238, 0.06);
+    color: var(--color-accent-cyan, #22d3ee);
   }
   .sidebar-toggle svg {
     width: 22px;
@@ -279,7 +412,6 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     flex-shrink: 0;
   }
 
-  /* 메뉴/닫기 아이콘 토글 */
   .icon-menu { display: block; }
   .icon-close { display: none; }
   .sidebar[data-state="expanded"] .icon-menu { display: none; }
@@ -299,7 +431,7 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
   }
 
   /* ──────────────────────────────────────────────────────────
-     Content — collapsed일 땐 visibility hidden
+     Content
      ────────────────────────────────────────────────────────── */
   .sidebar-content {
     flex: 1;
@@ -318,38 +450,37 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
 
   .sidebar-content::-webkit-scrollbar { width: 6px; }
   .sidebar-content::-webkit-scrollbar-thumb {
-    background: var(--border-subtle, #374151);
+    background: var(--color-border-subtle, #374151);
     border-radius: 3px;
   }
   .sidebar-content::-webkit-scrollbar-thumb:hover {
-    background: var(--fg-muted, #6b7280);
+    background: var(--color-text-tertiary, #6b7280);
   }
 
-  /* Sidebar meta — 전체 글 카운트 (header) */
   .sidebar-meta {
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
     padding: 0.5rem 1.25rem 1rem;
-    border-bottom: 1px dashed var(--border-subtle, #374151);
+    border-bottom: 1px dashed var(--color-border-subtle, #374151);
     margin-bottom: 0.5rem;
   }
   .sidebar-meta-label {
     font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.1em;
-    color: var(--fg-muted, #6b7280);
+    color: var(--color-text-tertiary, #6b7280);
     font-weight: 600;
   }
   .sidebar-meta-count {
     font-size: 1.1rem;
-    color: var(--fg-primary, #f3f4f6);
+    color: var(--color-text-primary, #f3f4f6);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
 
   /* ──────────────────────────────────────────────────────────
-     Tree — Category → Series → Posts
+     Tree — Category > Group > Series > Posts
      ────────────────────────────────────────────────────────── */
   .sidebar-tree {
     padding: 0 0.5rem;
@@ -357,13 +488,24 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     line-height: 1.5;
   }
 
-  /* Category */
-  .cat-group {
-    margin-bottom: 0.35rem;
-    border-radius: 6px;
-    overflow: hidden;
+  /* Common chevron */
+  .chevron {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    color: var(--color-text-tertiary, #6b7280);
+    transition: transform 0.18s ease;
+  }
+  .chevron-sm { width: 9px; height: 9px; }
+  .chevron-xs { width: 8px; height: 8px; }
+  details[open] > summary > .chevron {
+    transform: rotate(90deg);
   }
 
+  /* ─── Level 1: Category ─── */
+  .cat-group {
+    margin-bottom: 0.5rem;
+  }
   .cat-summary {
     cursor: pointer;
     list-style: none;
@@ -372,82 +514,58 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     gap: 0.55rem;
     padding: 0.5rem 0.65rem;
     border-radius: 6px;
-    color: var(--fg-primary, #f3f4f6);
+    color: var(--color-text-primary, #f3f4f6);
     font-weight: 600;
     user-select: none;
-    position: relative;
     transition: background 0.12s;
   }
   .cat-summary::-webkit-details-marker { display: none; }
   .cat-summary:hover {
-    background: var(--bg-elevated, #1a1f2e);
+    background: rgba(255,255,255,0.04);
   }
 
-  /* 좌측 색깔 bar (vertical accent) */
   .cat-bar {
     width: 3px;
     height: 16px;
     border-radius: 2px;
+    background: var(--cat-color);
     flex-shrink: 0;
-    transition: height 0.15s;
+    transition: height 0.15s, box-shadow 0.15s;
   }
-  .cat-dev .cat-bar { background: var(--accent-dev, #00d9ff); }
-  .cat-ai  .cat-bar { background: var(--accent-ai, #a78bfa); }
-  .cat-agent .cat-bar { background: var(--accent-agent, #f59e0b); }
-
   .cat-summary:hover .cat-bar,
   .cat-group[open] > .cat-summary .cat-bar {
     height: 20px;
-    box-shadow: 0 0 8px currentColor;
-  }
-  .cat-dev:hover .cat-bar,
-  .cat-dev[open] > .cat-summary .cat-bar { color: var(--accent-dev, #00d9ff); }
-  .cat-ai:hover .cat-bar,
-  .cat-ai[open] > .cat-summary .cat-bar { color: var(--accent-ai, #a78bfa); }
-  .cat-agent:hover .cat-bar,
-  .cat-agent[open] > .cat-summary .cat-bar { color: var(--accent-agent, #f59e0b); }
-
-  .chevron {
-    width: 10px;
-    height: 10px;
-    flex-shrink: 0;
-    color: var(--fg-muted, #6b7280);
-    transition: transform 0.18s ease;
-  }
-  details[open] > summary > .chevron {
-    transform: rotate(90deg);
+    box-shadow: 0 0 8px var(--cat-color);
   }
 
   .cat-label {
     flex: 1;
     font-size: 0.92rem;
+    color: var(--cat-color);
   }
-  .cat-dev .cat-label   { color: var(--accent-dev, #00d9ff); }
-  .cat-ai  .cat-label   { color: var(--accent-ai, #a78bfa); }
-  .cat-agent .cat-label { color: var(--accent-agent, #f59e0b); }
-
   .cat-count {
     font-size: 0.7rem;
-    color: var(--fg-muted, #6b7280);
+    color: var(--color-text-tertiary, #6b7280);
     font-weight: 500;
-    background: var(--bg-elevated, #1a1f2e);
-    padding: 0.1rem 0.4rem;
+    background: rgba(255,255,255,0.05);
+    padding: 0.1rem 0.45rem;
     border-radius: 9px;
-    min-width: 1.5rem;
+    min-width: 1.6rem;
     text-align: center;
     font-variant-numeric: tabular-nums;
   }
 
   .cat-body {
-    margin: 0.15rem 0 0.5rem 1rem;
-    padding-left: 0.75rem;
-    border-left: 1px solid var(--border-subtle, #374151);
+    margin: 0.2rem 0 0.5rem 0.85rem;
+    padding-left: 0.6rem;
+    border-left: 1px solid var(--color-border-subtle, #374151);
   }
 
-  /* Series */
-  .series-group { margin: 0.05rem 0; }
-
-  .series-summary {
+  /* ─── Level 2: Group ─── */
+  .group-block {
+    margin: 0.1rem 0;
+  }
+  .group-summary {
     cursor: pointer;
     list-style: none;
     display: flex;
@@ -455,38 +573,100 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     gap: 0.4rem;
     padding: 0.32rem 0.5rem;
     border-radius: 4px;
-    color: var(--fg-secondary, #9ca3af);
+    color: var(--color-text-secondary, #9ca3af);
     font-weight: 500;
     user-select: none;
     font-size: 0.8rem;
     transition: background 0.12s, color 0.12s;
   }
+  .group-summary::-webkit-details-marker { display: none; }
+  .group-summary:hover {
+    background: rgba(255,255,255,0.04);
+    color: var(--color-text-primary, #f3f4f6);
+  }
+  .group-block[open] > .group-summary {
+    color: var(--group-color);
+  }
+
+  .group-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+
+  .group-title {
+    flex: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+  }
+  .group-layer {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.65rem;
+    color: var(--color-text-tertiary, #6b7280);
+    font-weight: 700;
+    background: rgba(255,255,255,0.05);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+
+  .group-count {
+    font-size: 0.65rem;
+    color: var(--color-text-tertiary, #6b7280);
+    font-variant-numeric: tabular-nums;
+    min-width: 1rem;
+    text-align: right;
+  }
+
+  .group-body {
+    margin: 0.15rem 0 0.3rem 1.1rem;
+    padding-left: 0.6rem;
+    border-left: 1px dashed var(--color-border-subtle, #374151);
+  }
+
+  /* ─── Level 3: Series ─── */
+  .series-group {
+    margin: 0.05rem 0;
+  }
+  .series-summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.28rem 0.4rem;
+    border-radius: 3px;
+    color: var(--color-text-secondary, #9ca3af);
+    font-size: 0.76rem;
+    user-select: none;
+    transition: background 0.12s, color 0.12s;
+  }
   .series-summary::-webkit-details-marker { display: none; }
   .series-summary:hover {
-    background: var(--bg-elevated, #1a1f2e);
-    color: var(--fg-primary, #f3f4f6);
+    background: rgba(255,255,255,0.03);
+    color: var(--color-text-primary, #f3f4f6);
   }
   .series-group[open] > .series-summary {
-    color: var(--fg-primary, #f3f4f6);
+    color: var(--color-text-primary, #f3f4f6);
   }
-
-  .chevron-sm {
-    width: 8px;
-    height: 8px;
-  }
-
   .series-title { flex: 1; }
   .series-count {
-    font-size: 0.65rem;
-    color: var(--fg-muted, #6b7280);
+    font-size: 0.62rem;
+    color: var(--color-text-tertiary, #6b7280);
     font-variant-numeric: tabular-nums;
   }
 
-  /* Post list */
+  /* ─── Level 4: Post ─── */
   .post-list {
     list-style: none;
-    padding: 0.1rem 0 0.4rem 1.1rem;
+    padding: 0.1rem 0 0.3rem 1rem;
     margin: 0;
+  }
+  .post-list.direct {
+    padding-left: 0.5rem;
   }
   .post-list li { margin: 0; padding: 0; }
 
@@ -494,29 +674,28 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
-    padding: 0.3rem 0.5rem 0.3rem 0.65rem;
-    border-radius: 4px;
-    color: var(--fg-secondary, #9ca3af);
-    font-size: 0.78rem;
+    padding: 0.27rem 0.5rem 0.27rem 0.55rem;
+    border-radius: 3px;
+    color: var(--color-text-secondary, #9ca3af);
+    font-size: 0.75rem;
     text-decoration: none;
-    line-height: 1.45;
+    line-height: 1.4;
     border-left: 2px solid transparent;
     transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
   .post-link:hover {
-    background: var(--bg-elevated, #1a1f2e);
-    color: var(--fg-primary, #f3f4f6);
+    background: rgba(255,255,255,0.04);
+    color: var(--color-text-primary, #f3f4f6);
   }
   .post-link.active {
-    background: var(--bg-elevated, #1a1f2e);
+    background: rgba(255,255,255,0.06);
     font-weight: 600;
+    color: var(--cat-color);
+    border-left-color: var(--cat-color);
   }
-  .cat-dev .post-link.active   { color: var(--accent-dev, #00d9ff); border-left-color: var(--accent-dev, #00d9ff); }
-  .cat-ai  .post-link.active   { color: var(--accent-ai, #a78bfa); border-left-color: var(--accent-ai, #a78bfa); }
-  .cat-agent .post-link.active { color: var(--accent-agent, #f59e0b); border-left-color: var(--accent-agent, #f59e0b); }
 
   .post-order {
-    color: var(--fg-muted, #6b7280);
+    color: var(--color-text-tertiary, #6b7280);
     font-variant-numeric: tabular-nums;
     font-size: 0.7rem;
     flex-shrink: 0;

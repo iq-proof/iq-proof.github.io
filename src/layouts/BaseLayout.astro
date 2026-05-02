@@ -89,26 +89,12 @@ const resolvedOgImage = new URL(ogImage, Astro.site).toString();
 <span class="ink-drop ink-drop-2" aria-hidden="true"></span>
 <span class="ink-drop ink-drop-3" aria-hidden="true"></span>
 
+<Sidebar />
 <Header />
-<div class="layout-shell">
-  <Sidebar />
-  <main class="flex-1 min-w-0">
-    <slot />
-  </main>
-</div>
+<main class="flex-1 min-w-0">
+  <slot />
+</main>
 <Footer />
-
-<style is:global>
-  .layout-shell {
-    display: flex;
-    flex: 1 1 auto;
-    width: 100%;
-    align-items: stretch;
-    /* main이 짧은 페이지(archive, 404 등)에서도 sidebar sticky 영역이
-       viewport 풀 높이로 유지되도록 min-height 보장 */
-    min-height: calc(100vh - 4rem);
-  }
-</style>
 <SearchModal />
 <GoatCounter />
 </body>
