@@ -1,0 +1,343 @@
+---
+/**
+ * Sidebar — left fixed tree navigation.
+ *
+ * Structure:
+ *   Category (dev | ai | agent)
+ *     └─ Series (series.slug 단위, series.title 표시)
+ *         └─ Post #1 (series.order 오름차순)
+ *         └─ Post #2
+ *     └─ Other (시리즈 없는 글들)
+ *
+ * Behavior:
+ *   - Build-time: getCollection() 으로 모든 mdx 자동 스캔 → 새 글 추가 시 코드 변경 없이 반영
+ *   - Current post 페이지: 해당 카테고리/시리즈 자동 펼침 + 글 항목 강조
+ *   - Desktop only (lg+); 모바일은 숨김 (별도 햄버거는 향후)
+ *   - <details> native 사용으로 JS 없이 펼침/접기 동작
+ */
+
+import { getCollection } from 'astro:content';
+
+type Category = 'dev' | 'ai' | 'agent';
+
+interface PostMeta {
+  slug: string;
+  title: string;
+  pubDate: Date;
+  series?: { slug: string; title: string; order: number };
+}
+
+const CATEGORY_LABEL: Record<Category, string> = {
+  ai: 'AI',
+  dev: 'Dev',
+  agent: 'Agent',
+};
+
+// 1. 모든 글 fetch (draft 제외)
+const allPosts = await getCollection('posts', ({ data }) => !data.draft);
+const posts: PostMeta[] = allPosts.map((p) => ({
+  slug: p.id,
+  title: p.data.title,
+  pubDate: p.data.pubDate,
+  series: p.data.series,
+}));
+
+// 2. 현재 페이지의 slug 추출 (post 페이지일 때만)
+const pathMatch = Astro.url.pathname.match(/^\/posts\/([^/]+)\/?$/);
+const currentSlug = pathMatch?.[1];
+
+// 3. 카테고리별로 분리
+const byCategory: Record<Category, PostMeta[]> = { ai: [], dev: [], agent: [] };
+for (const p of allPosts) {
+  byCategory[p.data.category].push({
+    slug: p.id,
+    title: p.data.title,
+    pubDate: p.data.pubDate,
+    series: p.data.series,
+  });
+}
+
+// 4. 각 카테고리 안: 시리즈 묶음 + Other
+function groupByCategory(items: PostMeta[]) {
+  const seriesMap = new Map<string, { title: string; posts: PostMeta[] }>();
+  const others: PostMeta[] = [];
+  for (const item of items) {
+    if (item.series) {
+      const g = seriesMap.get(item.series.slug) ?? { title: item.series.title, posts: [] };
+      g.posts.push(item);
+      seriesMap.set(item.series.slug, g);
+    } else {
+      others.push(item);
+    }
+  }
+  const series = Array.from(seriesMap.entries())
+    .map(([slug, g]) => ({
+      slug,
+      title: g.title,
+      posts: g.posts.sort((a, b) => (a.series!.order - b.series!.order)),
+    }))
+    .sort((a, b) => a.title.localeCompare(b.title, 'en'));
+  others.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
+  return { series, others };
+}
+
+const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
+  const { series, others } = groupByCategory(byCategory[cat]);
+  const total = series.reduce((s, g) => s + g.posts.length, 0) + others.length;
+  const hasCurrent = !!currentSlug && byCategory[cat].some((p) => p.slug === currentSlug);
+  return { cat, series, others, total, hasCurrent };
+});
+---
+
+<aside class="sidebar" aria-label="Site navigation">
+  <nav class="sidebar-inner">
+    <div class="sidebar-title">목차</div>
+
+    {grouped.map(({ cat, series, others, total, hasCurrent }) => (
+      total === 0 ? null : (
+        <details class={`cat-group cat-${cat}`} open={hasCurrent}>
+          <summary class="cat-summary">
+            <span class="cat-label">{CATEGORY_LABEL[cat]}</span>
+            <span class="cat-count">{total}</span>
+          </summary>
+
+          <div class="cat-body">
+            {series.map((s) => {
+              const seriesActive = s.posts.some((p) => p.slug === currentSlug);
+              return (
+                <details class="series-group" open={seriesActive}>
+                  <summary class="series-summary">
+                    <span class="series-title">{s.title}</span>
+                    <span class="series-count">{s.posts.length}</span>
+                  </summary>
+                  <ol class="post-list">
+                    {s.posts.map((p) => (
+                      <li>
+                        <a
+                          href={`/posts/${p.slug}/`}
+                          class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
+                        >
+                          <span class="post-order">{p.series!.order}.</span>
+                          <span class="post-title">{p.title}</span>
+                        </a>
+                      </li>
+                    ))}
+                  </ol>
+                </details>
+              );
+            })}
+
+            {others.length > 0 && (
+              <details class="series-group" open={others.some((p) => p.slug === currentSlug)}>
+                <summary class="series-summary">
+                  <span class="series-title">Other</span>
+                  <span class="series-count">{others.length}</span>
+                </summary>
+                <ul class="post-list">
+                  {others.map((p) => (
+                    <li>
+                      <a
+                        href={`/posts/${p.slug}/`}
+                        class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
+                      >
+                        <span class="post-title">{p.title}</span>
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        </details>
+      )
+    ))}
+  </nav>
+</aside>
+
+<style>
+  .sidebar {
+    /* 모바일에서는 숨김 */
+    display: none;
+  }
+
+  /* lg breakpoint (≥1024px) — 데스크톱 좌측 고정 */
+  @media (min-width: 1024px) {
+    .sidebar {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: flex-start;
+      width: 280px;
+      flex-shrink: 0;
+      max-height: 100vh;
+      overflow-y: auto;
+      border-right: 1px solid var(--border-subtle, #374151);
+      background: var(--bg-base, #0a0e1a);
+    }
+  }
+
+  .sidebar-inner {
+    padding: 1.25rem 1rem 2rem 1.25rem;
+    font-size: 0.875rem;
+    line-height: 1.55;
+  }
+
+  .sidebar-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted, #6b7280);
+    margin-bottom: 0.75rem;
+    font-weight: 600;
+  }
+
+  /* Category group */
+  .cat-group {
+    margin-bottom: 0.5rem;
+  }
+
+  .cat-summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.4rem 0.5rem;
+    border-radius: 4px;
+    color: var(--fg-primary, #f3f4f6);
+    font-weight: 600;
+    user-select: none;
+  }
+  .cat-summary::-webkit-details-marker { display: none; }
+  .cat-summary::before {
+    content: '▶';
+    font-size: 0.65rem;
+    margin-right: 0.5rem;
+    transition: transform 0.15s;
+    color: var(--fg-muted, #6b7280);
+  }
+  .cat-group[open] > .cat-summary::before {
+    transform: rotate(90deg);
+  }
+  .cat-summary:hover {
+    background: var(--bg-elevated, #1a1f2e);
+  }
+
+  .cat-label {
+    flex: 1;
+  }
+  /* 카테고리별 색깔 */
+  .cat-dev .cat-label { color: var(--accent-dev, #00d9ff); }
+  .cat-ai .cat-label { color: var(--accent-ai, #a78bfa); }
+  .cat-agent .cat-label { color: var(--accent-agent, #f0b232); }
+
+  .cat-count {
+    font-size: 0.7rem;
+    color: var(--fg-muted, #6b7280);
+    font-weight: 500;
+  }
+
+  .cat-body {
+    margin-left: 0.5rem;
+    padding-left: 0.5rem;
+    border-left: 1px solid var(--border-subtle, #374151);
+    margin-top: 0.2rem;
+  }
+
+  /* Series group */
+  .series-group {
+    margin: 0.15rem 0;
+  }
+  .series-summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.3rem 0.5rem;
+    border-radius: 4px;
+    color: var(--fg-secondary, #9ca3af);
+    font-weight: 500;
+    user-select: none;
+    font-size: 0.82rem;
+  }
+  .series-summary::-webkit-details-marker { display: none; }
+  .series-summary::before {
+    content: '▸';
+    font-size: 0.6rem;
+    margin-right: 0.4rem;
+    transition: transform 0.15s;
+    color: var(--fg-muted, #6b7280);
+  }
+  .series-group[open] > .series-summary::before {
+    transform: rotate(90deg);
+  }
+  .series-summary:hover {
+    background: var(--bg-elevated, #1a1f2e);
+    color: var(--fg-primary, #f3f4f6);
+  }
+
+  .series-title { flex: 1; }
+  .series-count {
+    font-size: 0.65rem;
+    color: var(--fg-muted, #6b7280);
+  }
+
+  /* Post list */
+  .post-list {
+    list-style: none;
+    padding: 0.1rem 0 0.4rem 1.2rem;
+    margin: 0;
+  }
+  .post-list li {
+    margin: 0;
+    padding: 0;
+  }
+
+  .post-link {
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 3px;
+    color: var(--fg-secondary, #9ca3af);
+    font-size: 0.78rem;
+    text-decoration: none;
+    line-height: 1.4;
+  }
+  .post-link:hover {
+    background: var(--bg-elevated, #1a1f2e);
+    color: var(--fg-primary, #f3f4f6);
+  }
+  .post-link.active {
+    background: var(--bg-elevated, #1a1f2e);
+    color: var(--accent-dev, #00d9ff);
+    font-weight: 600;
+  }
+  .cat-ai .post-link.active { color: var(--accent-ai, #a78bfa); }
+  .cat-agent .post-link.active { color: var(--accent-agent, #f0b232); }
+
+  .post-order {
+    color: var(--fg-muted, #6b7280);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.7rem;
+    flex-shrink: 0;
+  }
+  .post-link.active .post-order {
+    color: inherit;
+  }
+
+  .post-title {
+    flex: 1;
+  }
+
+  /* 사이드바 자체 스크롤바 (다크 테마) */
+  .sidebar::-webkit-scrollbar { width: 6px; }
+  .sidebar::-webkit-scrollbar-thumb {
+    background: var(--border-subtle, #374151);
+    border-radius: 3px;
+  }
+  .sidebar::-webkit-scrollbar-thumb:hover {
+    background: var(--fg-muted, #6b7280);
+  }
+</style>
