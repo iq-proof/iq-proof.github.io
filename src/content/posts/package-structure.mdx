@@ -1,0 +1,139 @@
+---
+title: "패키지 구조는 왜 팀의 아키텍처를 결정하는가"
+description: "레이어 기반 구조의 응집도 문제부터 Hexagonal 패키지 설계, Gradle 멀티 모듈로 의존성을 컴파일 시점에 강제하고 ArchUnit으로 자동 검증하는 전략까지."
+pubDate: 2026-05-02
+category: dev
+tags: [architecture, hexagonal, archunit, gradle, spring-boot]
+difficulty: intermediate
+series:
+  slug: architecture-patterns-deep-dive
+  title: Architecture Patterns Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"주문에 쿠폰 적용 기능을 추가하려면 어느 파일을 열어야 하는가?" 이 질문에 4개 패키지를 동시에 열어야 한다면, 패키지 구조가 팀의 작업 방식을 이미 규정하고 있다는 신호다. 코드가 어디에 있는가는 단순한 관습이 아니라 팀이 변경을 어떻게 감지하고 격리하는가의 문제다. 그 선택이 왜 중요하고, 어떻게 강제하는가?
+
+## 레이어 기반 구조의 숨은 비용
+
+Spring Boot의 기본 관행인 `controller/`, `service/`, `repository/` 3단 구조는 **기술(레이어)** 로 분류한다. 주문 기능을 추가하면 4개 패키지가 동시에 열린다. 신규 팀원이 "Order 기능이 어디서 시작해서 어디서 끝나는가"를 파악하려면 4개 패키지를 탐색해야 한다. MSA로 분리하려면 어느 파일이 Order 관련인지 수작업으로 선별해야 한다.
+
+이 구조의 근본 문제는 **Common Closure Principle** 위반이다 — 함께 변경되는 것들이 함께 있지 않다. 기술 경계와 변경 경계가 다르기 때문에 벌어지는 일이다.
+
+기능 기반 구조는 이 방향을 뒤집는다. `order/`, `payment/`, `user/` 로 묶으면 기능 추가가 1-2개 패키지 안에서 완결된다. 기존 `service/` 안에서 OrderService와 PaymentService가 뒤섞이던 상황이 사라진다. Feature가 5개 이상이거나, 팀원이 3명 이상이거나, MSA 전환 계획이 있다면 기능 기반이 이익을 주기 시작한다.
+
+컴포넌트 기반 구조는 한 걸음 더 나아간다. Simon Brown이 제안한 이 방식은 기능 패키지 내부를 `api/`(외부 공개)와 `internal/`(접근 금지)로 나눈다. 다른 컴포넌트는 `api/`만 접근할 수 있다. ArchUnit으로 이 경계를 강제하면, 실수로 내부 구현에 접근하는 상황을 컴파일 이후 단계에서 차단한다. 다만 학습 비용이 높아 10명 이상의 대규모 팀에서 효과가 두드러진다.
+
+## Hexagonal 패키지의 파일 위치 결정 트리
+
+기능 기반만으로는 패키지 내부가 각자 다른 방식으로 채워진다. 개발자 A는 `order/domain/OrderRepository.java`에 인터페이스를 두고, 개발자 B는 `order/port/out/OrderRepository.java`에 두는 식으로 혼재가 생긴다. 실무에서 가장 안정적으로 작동하는 구조는 **기능 기반 외피 + Hexagonal 내부** 조합이다.
+
+```
+{feature}/
+├── domain/
+│   ├── model/          ← 비즈니스 규칙 (Spring/JPA 없음)
+│   └── port/
+│       ├── in/         ← Driving Port (UseCase 인터페이스)
+│       └── out/        ← Driven Port (Repository, API 인터페이스)
+├── application/
+│   └── service/        ← @Service, UseCase 구현
+└── adapter/
+    ├── in/web/         ← @RestController, DTO, Mapper
+    └── out/
+        ├── persistence/← @Repository, JPA Entity, Mapper
+        └── {service}/  ← 외부 API Adapter
+```
+
+새 파일을 어디에 만들지 모를 때는 질문 트리가 대부분의 경우를 해결한다.
+
+- "비즈니스 규칙인가? 도메인 전문가가 말하는 규칙인가?" → `domain/model/`
+- "외부에서 내 기능을 어떻게 호출하는가의 계약인가?" → `domain/port/in/`
+- "내 기능이 외부(DB, API)를 어떻게 쓰는가의 계약인가?" → `domain/port/out/`
+- "비즈니스 흐름 조율, @Transactional이 필요한가?" → `application/service/`
+- "HTTP 요청/응답 처리인가?" → `adapter/in/web/`
+- "DB 접근 구현인가?" → `adapter/out/persistence/`
+- "외부 API 연동인가?" → `adapter/out/{서비스명}/`
+- "여러 Feature가 공유하는 개념인가?" → `shared/domain/`
+
+이 트리를 따르면 `PlaceOrderUseCase.java`(인터페이스)는 `domain/port/in/`에, 구현체 `PlaceOrderService.java`는 `application/service/`에, `JpaOrderRepository.java`는 `adapter/out/persistence/`에 각각 위치한다. 패키지 경로만 봐도 역할이 드러난다.
+
+## Gradle 멀티 모듈 — 규칙을 컴파일 시점에 강제
+
+ArchUnit은 테스트를 실행해야 위반을 감지한다. Gradle 멀티 모듈은 한 단계 앞에서 막는다 — 위반 코드를 작성하는 순간 빌드가 실패한다.
+
+```kotlin
+// domain/build.gradle.kts
+dependencies {
+    // 의도적으로 비어 있음 — JPA, Spring 의존성 없음
+}
+
+// application/build.gradle.kts
+dependencies {
+    implementation(project(":domain"))  // domain만 의존
+}
+
+// infrastructure/build.gradle.kts
+dependencies {
+    implementation(project(":domain"))
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+}
+```
+
+`domain` 모듈에서 `import jakarta.persistence.Entity`를 추가하는 순간 컴파일 에러가 발생한다. "package jakarta.persistence does not exist." `domain` 모듈에 JPA 의존성이 없기 때문이다. 개발자가 ArchUnit 테스트를 실행하지 않아도, CI가 돌기 전에, 편집기에서 즉시 알 수 있다.
+
+기능 기반 멀티 모듈 구성도 가능하다. `:order`, `:payment`, `:notification` 각각을 독립 모듈로 만들고, `:shared`만 공통 의존으로 두면 `order`가 `payment`를 직접 import하는 순간 컴파일 에러가 발생한다. 두 기능의 통신은 이벤트나 `shared`의 Port 인터페이스를 통해서만 가능해진다. 아키텍처 결정이 Gradle 설정으로 굳어지는 것이다.
+
+빌드 속도 부수효과도 있다. `presentation` 모듈만 변경했다면 `presentation`만 재컴파일된다. `domain` 변경은 모든 모듈을 다시 컴파일하므로 — domain이 가장 안정적이어야 하는 이유가 빌드 비용에도 있다.
+
+## ArchUnit — 나머지 규칙을 코드로
+
+멀티 모듈로 표현하기 어려운 세밀한 규칙은 ArchUnit이 담당한다. "@Entity 클래스는 반드시 `adapter/out/persistence/entity/`에 있어야 한다", "UseCase 인터페이스 이름을 가진 클래스는 `domain/port/`에 있어야 한다" 같은 규칙은 모듈 경계로 표현하기 어렵다.
+
+```java
+@AnalyzeClasses(packages = "com.example", importOptions = ImportOption.DoNotIncludeTests.class)
+public class HexagonalArchitectureTest {
+
+    @ArchTest
+    static final ArchRule domain_should_not_use_spring =
+        noClasses()
+            .that().resideInAPackage("..domain..")
+            .should().dependOnClassesThat()
+            .resideInAPackage("org.springframework..")
+            .because("ADR-002: domain 레이어는 Spring을 모른다.");
+
+    @ArchTest
+    static final ArchRule jpa_entities_in_adapter =
+        classes()
+            .that().areAnnotatedWith("jakarta.persistence.Entity")
+            .should().resideInAPackage("..adapter.out.persistence.entity..")
+            .because("@Entity 클래스는 adapter/out/persistence/entity/에만 위치한다.");
+}
+```
+
+`because()` 메서드가 단순한 부연 설명이 아닌 이유는, CI에서 이 문자열이 에러 메시지로 출력되기 때문이다. "ADR-002 참고"가 에러 메시지에 있으면 신규 팀원이 ArchUnit 위반을 처음 마주쳤을 때 왜 이 규칙이 있는지 즉시 찾을 수 있다. 에러 메시지가 코드 가이드가 된다.
+
+코드 리뷰어의 역할도 바뀐다. "이 코드가 아키텍처 규칙을 지키는가"는 CI가 담당하므로, 리뷰어는 "이 코드가 비즈니스 로직을 올바르게 구현하는가"에 집중할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+멀티 모듈의 비용은 초기 설정(1-3일)과 Gradle 학습 곡선이다. ArchUnit의 비용은 테스트 코드 작성 시간(초기 2-4시간)과 빌드 시간 증가(10-30초)다. 두 도구를 함께 쓰면 — 멀티 모듈은 컴파일 시점에, ArchUnit은 더 세밀한 위치 규칙을 — 코드 리뷰에서 아키텍처 논쟁이 줄어드는 이익이 비용을 초과한다. 단, 팀 3명 이하 + 소규모 프로젝트라면 단일 모듈 + ArchUnit으로 충분하다.
+</Callout>
+
+## 가이드라인이 살아있으려면
+
+규칙을 문서화해도, 6개월 후 아무도 읽지 않는 문서가 되는 이유는 일상 워크플로에 없기 때문이다. PR 템플릿에 "파일 위치 결정 트리 확인" 체크박스 한 줄을 추가하면, 문서는 매 PR마다 참조된다. 신규 팀원 온보딩 1주차에 Order 기능 전체 코드를 위치 결정 트리와 함께 탐색하는 과제를 넣으면, 가이드라인이 학습 경로가 된다.
+
+가이드라인 완화 기준도 명시적으로 관리해야 한다. Application 레이어에 `@Transactional`을 허용하는 것은 Spring 의존이지만, Decorator 패턴으로 완전 분리하는 비용이 이익보다 크다. 이런 절충은 ADR(Architecture Decision Record)에 이유와 함께 기록하고, ArchUnit 예외 코드에도 주석으로 남긴다. 예외가 3개 이상 쌓이면 규칙 자체를 재검토하는 신호로 삼는다.
+
+<Aside label="지속가능한 구조">
+Gradle 멀티 모듈이 컴파일 시점에 막고, ArchUnit이 CI에서 검증하고, PR 체크리스트가 인간의 판단을 보조한다. 세 가지가 함께 작동할 때 아키텍처는 팀 문화가 아닌 시스템이 된다. 시스템은 팀원이 바뀌어도 유지된다.
+</Aside>
+
+## 정리
+
+- 레이어 기반 구조는 기술로 분류하므로, Feature가 늘어날수록 변경 파급 범위가 여러 패키지에 퍼진다.
+- 기능 기반 + Hexagonal 구조는 파일 위치 결정을 질문 트리로 표준화하여 팀 일관성을 만든다.
+- Gradle 멀티 모듈은 의존성 위반을 컴파일 시점에 막는다 — ArchUnit보다 한 단계 앞

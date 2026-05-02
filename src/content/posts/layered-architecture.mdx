@@ -1,0 +1,147 @@
+---
+title: "레이어드 아키텍처는 왜 시간이 지날수록 무너지는가"
+description: "Controller-Service-Repository를 나눴는데도 Fat Service와 DTO 침투가 생기는 이유부터 DIP로 구조적 한계를 넘어서는 경로까지, 레이어드 아키텍처의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [layered-architecture, dip, fat-service, spring, ddd]
+difficulty: intermediate
+series:
+  slug: architecture-patterns-deep-dive
+  title: Architecture Patterns Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Boot 프로젝트를 시작하면 거의 모든 팀이 Controller-Service-Repository 구조를 선택한다. 레이어를 나눴으니 레이어드 아키텍처를 쓰는 것이라 생각하지만, 1년 후 코드베이스를 열면 1,000줄 짜리 Service 파일과 HTTP DTO가 Repository 파라미터로 내려가는 광경을 마주한다. 왜 규칙을 지켰는데도 무너지는가?
+
+## 레이어의 본질은 "폴더 분류"가 아니다
+
+레이어드 아키텍처의 핵심은 **변경 이유(Reason to Change)에 따른 분리**다. Presentation Layer는 API 스펙이 바뀔 때, Business Layer는 비즈니스 규칙이 바뀔 때, Infrastructure Layer는 DB나 외부 API가 바뀔 때 각각 독립적으로 수정되어야 한다.
+
+이 분리가 제대로 작동하려면 의존성 방향이 단방향이어야 한다.
+
+```
+Presentation → Application → Domain ← Infrastructure
+```
+
+여기서 핵심은 화살표 방향이다. Infrastructure가 Domain을 구현하고, Domain은 Infrastructure를 모른다. 이 방향이 깨지는 순간 레이어를 나눈 의미가 사라진다.
+
+## Strict Layer vs Relaxed Layer — 팀 합의가 없으면 규칙이 없다
+
+레이어드 아키텍처에서 가장 자주 생기는 갈등은 "단순 조회는 Controller에서 Repository 직접 써도 되나요?"다. 이것이 Relaxed Layer 허용 여부 논쟁이다.
+
+Strict Layer는 인접한 레이어만 호출할 수 있다. Controller → Repository 직접 호출은 금지다. 반면 Relaxed Layer는 조회(Query)에 한해 하위 레이어 직접 접근을 허용한다.
+
+문제는 "단순 조회"의 기준이 시간이 지나면서 흐릿해진다는 것이다.
+
+```
+Day 1:   OrderController → OrderRepository.findById()          (단순 조회, OK)
+Month 2: + UserRepository.findById()  (권한 체크 추가)
+Month 4: + CouponRepository.findByOrderId() + 쿠폰 계산 로직
+Month 6: Controller가 200줄, 비즈니스 로직이 박혀 있음
+```
+
+Relaxed를 선택하더라도 **ArchUnit으로 규칙을 코드에 강제**하지 않으면 규칙은 코드 리뷰의 기억력에 의존하게 된다.
+
+```java
+@Test
+void presentation_should_not_access_infrastructure_directly() {
+    noClasses()
+        .that().resideInAPackage("..controller..")
+        .should().dependOnClassesThat()
+        .resideInAPackage("..repository..")
+        .check(importedClasses);
+}
+```
+
+사람이 체크하는 것보다 CI에서 자동으로 막히는 것이 훨씬 효과적이다.
+
+## Fat Service와 Anemic Domain — 레이어드의 구조적 함정
+
+레이어드 아키텍처에는 구조적으로 Fat Service를 만드는 경향이 있다. 암묵적 규칙이 "Controller는 HTTP만, Repository는 DB만"이면, 그 외 모든 것은 Service의 몫이 된다. 비즈니스 규칙, 유스케이스 조율, 외부 API 호출, 이벤트 발행이 모두 Service에 쌓인다.
+
+<Callout type="warning" title="Fat Service의 신호">
+Service 생성자에 의존성이 5개 이상이거나, 단일 메서드가 50줄을 넘거나, 클래스 전체가 500줄을 넘기 시작하면 Fat Service가 된 것이다. 이때 Domain 객체(Order, User)는 getter/setter만 있는 Anemic Domain Model이 되어 있다.
+</Callout>
+
+Anemic Domain Model의 본질적 문제는 **비즈니스 규칙이 중복**된다는 것이다. "주문 금액은 1,000원 이상"이라는 규칙이 `OrderService.placeOrder()`에도 있고, `AdminService.forceOrder()`에도 있고, `BatchService.scheduledOrder()`에도 있다. 규칙이 바뀌면 세 곳을 모두 찾아야 한다.
+
+해결은 규칙을 Domain 객체로 이동하는 것이다.
+
+```java
+// ❌ Anemic: 규칙이 Service에
+public void placeOrder(PlaceOrderCommand cmd) {
+    BigDecimal total = /* 계산 */;
+    if (total.compareTo(BigDecimal.valueOf(1000)) < 0)
+        throw new MinOrderAmountException();
+}
+
+// ✅ Rich Domain: 규칙이 Order에
+public class Order {
+    public void place(DiscountPolicy policy) {
+        Money total = policy.apply(calculateRawTotal());
+        if (total.isLessThan(Money.of(1_000)))
+            throw new MinOrderAmountException(Money.of(1_000));
+        this.status = OrderStatus.PLACED;
+    }
+}
+```
+
+Service는 조율만 한다. `order.place(policy)` 한 줄이 전부다.
+
+## 아키텍처가 테스트 비용을 결정한다
+
+Service가 `OrderJpaRepository`에 직접 의존하면, 그 Service의 단위 테스트는 JPA와 DB 없이 불가능하다. 테스트 100개가 전부 `@SpringBootTest`라면 실행에 40분이 걸린다. 40분짜리 테스트는 아무도 Push 전에 실행하지 않는다.
+
+```
+레이어드 (전형적):  @SpringBootTest 80개 × 30초 = 40분
+개선된 구조:        순수 Java 70개 × 0.01초
+                   + @DataJpaTest 20개 × 8초
+                   + @SpringBootTest 5개 × 30초 = 약 5분
+```
+
+비즈니스 규칙이 Domain 객체에 있으면 `Order.place()` 테스트는 Spring 없이 0.01초에 끝난다. 이것이 아키텍처 결정이 테스트 속도에 미치는 직접적인 영향이다.
+
+## DIP — 구조적 한계를 넘는 현실적 경로
+
+레이어드 아키텍처의 구조적 한계는 **의존성이 여전히 DB 방향으로 흐른다**는 것이다. Application Layer가 Infrastructure를 의존하므로, JPA를 MongoDB로 교체하면 Service 코드도 수정해야 한다.
+
+DIP(Dependency Inversion Principle)는 이 방향을 역전시킨다. Repository 인터페이스를 Business Layer에 두고, Infrastructure가 그것을 구현하게 한다.
+
+```
+Before: OrderService → OrderJpaRepository (구체 클래스)
+After:  OrderService → OrderRepository (인터페이스, Business Layer)
+                            ↑ implements
+                       JpaOrderRepository (Infrastructure)
+```
+
+인터페이스가 **Business Layer에 위치**해야 한다는 점이 핵심이다. Infrastructure Layer에 두면 DIP가 적용되지 않는다.
+
+이 구조가 만들어지면 테스트용 InMemory 구현체를 주입할 수 있다.
+
+```java
+// 단위 테스트: Spring/JPA/DB 없음, ~0.01초
+InMemoryOrderRepository repo = new InMemoryOrderRepository();
+PlaceOrderService sut = new PlaceOrderService(repo, fakePaymentPort);
+
+OrderId id = sut.placeOrder(validCommand());
+assertThat(repo.findById(id)).isPresent();
+```
+
+<Aside label="Hexagonal과의 연결">
+DIP를 적용하면 `OrderRepository` 인터페이스는 Hexagonal Architecture의 Driven Port가 되고, `JpaOrderRepository`는 Driven Adapter가 된다. UseCase 인터페이스를 하나 더 추가하면 Hexagonal이 완성된다. DIP 적용은 Hexagonal로 가는 자연스러운 중간 단계다.
+</Aside>
+
+## 정리
+
+- 레이어드 아키텍처의 핵심은 "변경 이유에 따른 분리"다. Controller-Service-Repository 폴더 구조는 형태만 레이어드다.
+- Strict/Relaxed 중 무엇을 선택하든 ArchUnit으로 규칙을 코드에 강제하지 않으면 유명무실해진다.
+- Fat Service와 Anemic Domain Model은 규칙 위반이 아니라 레이어드의 구조적 경향에서 나온다. 비즈니스 로직을 Domain 객체로 이동하면 해소된다.
+- 아키텍처가 테스트 비용을 결정한다. Domain에 로직이 없으면 모든 테스트가 `@SpringBootTest`가 된다.
+- DIP로 Repository 인터페이스를 Business Layer로 올리는 것이 구조적 한계를 넘는 현실적 출발점이다.
+
+다음 글에서는 DIP를 완성 형태로 밀어붙인 Hexagonal Architecture의 핵심 아이디어와, 레이어드에서 Hexagonal로 점진적으로 전환하는 방법을 추적한다.

@@ -1,0 +1,184 @@
+---
+title: "Clean Architecture의 모든 결정은 하나의 규칙에서 나온다"
+description: "의존성 규칙이 4개 레이어와 테스트 가능성, 인프라 독립성을 어떻게 동시에 만들어내는지, Entities부터 Frameworks까지 구조를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [clean-architecture, dependency-rule, spring-boot, ddd, hexagonal]
+difficulty: intermediate
+series:
+  slug: architecture-patterns-deep-dive
+  title: Architecture Patterns Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Uncle Bob의 Clean Architecture는 Hexagonal, Onion, BCE 등 여러 아키텍처 패턴을 하나의 프레임으로 통합한다. 그 핵심은 놀랍도록 단순하다 — **소스 코드 의존성은 반드시 안쪽으로만 향해야 한다**. 이 규칙 하나가 테스트 가능성, 인프라 독립성, 유지보수성을 전부 만들어낸다. 그렇다면 왜 실무 프로젝트에서 이 규칙이 자꾸 깨지는가?
+
+## 4개 동심원과 의존성 규칙
+
+Clean Architecture는 책임에 따라 코드를 4개의 동심원으로 나눈다.
+
+```
+         ┌──────────────────────────────────────┐
+         │ Frameworks & Drivers (가장 바깥)       │
+         │  JPA, Kafka, Spring MVC, HTTP        │
+         │  ┌──────────────────────────────┐    │
+         │  │ Interface Adapters            │    │
+         │  │  Controller, Presenter,       │    │
+         │  │  Gateway(Repository 구현)     │    │
+         │  │  ┌──────────────────────┐    │    │
+         │  │  │ Use Cases             │    │    │
+         │  │  │  애플리케이션 비즈니스  │    │    │
+         │  │  │  규칙, UseCase Interactor│  │    │
+         │  │  │  ┌──────────────┐    │    │    │
+         │  │  │  │  Entities    │    │    │    │
+         │  │  │  │  기업 수준   │    │    │    │
+         │  │  │  │  비즈니스 규칙│   │    │    │
+         │  │  │  └──────────────┘    │    │    │
+         │  │  └──────────────────────┘    │    │
+         │  └──────────────────────────────┘    │
+         └──────────────────────────────────────┘
+```
+
+가장 안쪽의 **Entities**는 기업 핵심 비즈니스 규칙을 캡슐화한다. "주문 취소는 배송 시작 전에만 가능하다"처럼 어떤 기술 스택을 써도 변하지 않는 규칙이다. **Use Cases**는 이 애플리케이션 고유의 흐름을 정의한다. "웹 쇼핑몰 주문 생성 시 재고 확인 → 결제 → 저장 → 알림" 같은 시퀀스다. **Interface Adapters**는 두 세계를 연결하는 번역기다. HTTP Request를 UseCase Input으로, UseCase Output을 HTTP Response로 변환한다. **Frameworks & Drivers**는 JPA, Kafka, Spring Boot — 세부 사항(Details)을 격리한다.
+
+의존성 규칙은 명확하다. Entities는 아무것도 모른다. Use Cases는 Entities만 안다. Interface Adapters는 Use Cases와 Entities를 안다. Frameworks는 모든 것을 알 수 있다. 역방향은 절대 금지다.
+
+## 가장 흔한 위반 — 폴더를 나눴지만 의존성은 그대로
+
+```
+// ❌ 폴더는 나눴지만 의존성 규칙 위반
+entities/
+  Order.java  ← @Entity 있음 (Entities → Frameworks 의존)
+usecases/
+  PlaceOrderUseCase.java  ← KafkaTemplate 직접 사용 (Use Cases → Frameworks 의존)
+```
+
+`Order.java`에 `@Entity`가 붙는 순간, Entities 레이어가 JPA(Frameworks)를 알게 된다. `PlaceOrderUseCase`가 `KafkaTemplate`을 직접 사용하는 순간, Use Cases가 Kafka(Frameworks)를 알게 된다. 폴더 이름은 Clean Architecture지만 의존성 방향은 완전히 반대다.
+
+<Callout type="warning" title="Clean Architecture ≠ 4개 폴더">
+핵심은 폴더 이름이 아니라 import 문이다. `Order.java`의 import에 `jakarta.persistence`가 있는가? `PlaceOrderUseCase`의 import에 `KafkaTemplate`이 있는가? 있다면 의존성 규칙 위반이다.
+</Callout>
+
+## Entities — 아무것도 모르는 레이어
+
+올바른 Entities 레이어는 순수 Java로만 이루어진다.
+
+```java
+public class Order {
+    private final OrderId id;
+    private final List<OrderLine> lines;
+    private OrderStatus status;
+
+    // 정적 팩토리 → 유효성 검증 후 생성
+    public static Order create(UserId userId, List<OrderLine> lines) {
+        Objects.requireNonNull(userId, "userId 필수");
+        if (lines == null || lines.isEmpty())
+            throw new IllegalArgumentException("주문 항목 없음");
+        return new Order(OrderId.newId(), userId, lines, OrderStatus.DRAFT);
+    }
+
+    // 기업 수준 비즈니스 규칙
+    public void place() {
+        if (this.status != OrderStatus.DRAFT)
+            throw new IllegalStateException("DRAFT 상태만 주문 가능");
+        if (calculateTotal().isLessThan(Money.of(1_000)))
+            throw new MinOrderAmountException(Money.of(1_000));
+        this.status = OrderStatus.PLACED;
+    }
+}
+```
+
+`import`에 `org.springframework.*`도 `jakarta.persistence.*`도 없다. JPA 버전이 바뀌어도, Spring이 업그레이드되어도 이 파일은 변하지 않는다. Entities가 가장 드물게 변경되는 이유다 — Fan-in이 가장 높은 레이어이므로 가장 안정적이어야 한다.
+
+"JPA `@Entity`는 Entities 레이어에 있어야 하지 않나?"라는 혼동이 가장 많다. Clean Architecture의 Entity는 JPA의 `@Entity`가 아니다. JPA Entity는 별도의 `OrderJpaEntity`로 분리해 Frameworks 레이어에 격리한다.
+
+## Use Cases — 흐름을 조율하는 레이어
+
+Use Cases의 핵심 구조는 Input Boundary와 Output Boundary로 이루어진다.
+
+```java
+// Input Boundary: UseCase가 외부에 제공하는 계약
+public interface PlaceOrderInputBoundary {
+    void execute(PlaceOrderRequestModel request, PlaceOrderOutputBoundary output);
+}
+
+// Gateway 인터페이스는 Use Cases 레이어에 위치
+public interface OrderGateway {
+    void save(Order order);
+    Optional<Order> findById(OrderId id);
+}
+```
+
+Gateway 인터페이스가 **Use Cases 레이어**에 있다는 점이 핵심이다. 인터페이스가 Interface Adapters에 있으면 `PlaceOrderInteractor`(Use Cases) → `OrderGateway`(Interface Adapters) 의존이 생겨 의존성 규칙을 위반한다. Use Cases에 두면 `JpaOrderGateway`(Interface Adapters)가 `OrderGateway`(Use Cases)를 구현하는 방향이 되어 규칙을 준수한다.
+
+UseCase Interactor는 HTTP도, JPA도, Kafka도 모른다. Gateway 인터페이스만 안다.
+
+```java
+@Service
+@Transactional
+public class PlaceOrderInteractor implements PlaceOrderInputBoundary {
+
+    private final OrderGateway orderGateway;
+    private final PaymentGateway paymentGateway;
+
+    @Override
+    public void execute(PlaceOrderRequestModel request, PlaceOrderOutputBoundary output) {
+        Order order = Order.create(UserId.of(request.userId()), mapLines(request.items()));
+        order.place();  // Entities의 기업 수준 규칙 실행
+
+        PaymentResponseModel payment = paymentGateway.charge(
+            new PaymentRequestModel(order.getId().value(), order.calculateTotal().getValue())
+        );
+        order.confirmPayment(payment.transactionId());
+        orderGateway.save(order);
+
+        output.present(new PlaceOrderResponseModel(
+            order.getId().value(), order.calculateTotal().toString()
+        ));
+    }
+}
+```
+
+이 UseCase는 Spring 없이 InMemory Gateway만으로 단위 테스트할 수 있다. 테스트 하나가 0.001초 안에 실행된다.
+
+## 트레이드오프
+
+Clean Architecture는 이론적으로 완전한 분리를 지향하지만, 실무에서는 절충이 필요하다.
+
+<Callout type="note" title="트레이드오프">
+**완전 적용의 비용**: Presenter 패턴(UseCase가 직접 반환하지 않고 Output Boundary로 전달)은 Thread Safety 문제와 코드 흐름 복잡도를 높인다. Domain Entity와 JPA Entity를 분리하면 매핑 코드가 추가된다. 개념 수(Interactor, Gateway, Input/Output Boundary)가 많아 학습 비용이 높다.
+
+**현실적 절충**: 대부분의 팀은 Presenter 패턴을 생략하고 직접 반환을 택한다. `@Transactional`을 Use Cases에 허용해 Spring 의존을 받아들인다. `@Entity`를 Domain에 허용하되 비즈니스 메서드는 반드시 유지한다. 이 절충들이 쌓이면 결국 Hexagonal Architecture와 유사해진다.
+</Callout>
+
+팀 합의 없이 각자 다른 해석으로 코드를 작성하면, Clean Architecture 구조를 갖췄지만 일관성이 없는 코드베이스가 된다. ArchUnit으로 결정을 코드 레벨에서 강제하는 것이 필수다.
+
+```java
+@Test
+void entities_have_no_outward_dependencies() {
+    noClasses()
+        .that().resideInAPackage("..entity..")
+        .should().dependOnClassesThat()
+        .resideInAnyPackage("org.springframework..", "jakarta.persistence..")
+        .check(classes);
+}
+```
+
+<Aside label="설계 철학">
+Uncle Bob이 말하는 "프레임워크 독립적"의 현실적 의미는 "Spring을 Quarkus로 완전 교체할 수 있다"가 아니다. "KakaoPay를 TossPay로 바꿀 때 비즈니스 코드를 건드리지 않는다", "Spring Boot 2→3 마이그레이션이 Entities에 영향 없다"가 실제 이익이다. 그 이익은 즉각적이고 측정 가능하다.
+</Aside>
+
+## 정리
+
+- 의존성 규칙("안쪽만")이 Clean Architecture의 전부다. 4개 레이어, Presenter, Gateway는 이 규칙의 구체적 표현이다.
+- Entities = 순수 Java + 비즈니스 규칙. `@Entity`는 Frameworks 레이어에 격리한다.
+- Gateway 인터페이스는 Use Cases 레이어에 위치해야 의존성 방향이 안쪽을 향한다.
+- Presenter 패턴은 이론적으로 엄격하지만 대부분의 팀은 직접 반환으로 단순화한다.
+- 아키텍처 패턴 선택보다 팀 합의와 ArchUnit 강제가 더 중요하다.
+
+다음 글에서는 Clean Architecture와 Hexagonal Architecture를 코드 레벨에서 비교하고, 상황에 따라 어떤 패턴을 선택해야 하는지 추적한다.
