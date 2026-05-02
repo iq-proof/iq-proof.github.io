@@ -44,6 +44,7 @@ IQ Lab은 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**
 
 - **Dev** — 백엔드 시스템의 내부 구조, JVM/DB/네트워크 근본 원리, 아키텍처 의사결정
 - **AI** — 머신러닝의 수학적 기반, 논문 재현, 알고리즘 유도 과정
+- **Agent** — AI 자동화 인프라 회고, 양산 시스템 설계, 도구 사용 패턴
 
 모든 포스트는 난이도 태그(`beginner` / `intermediate` / `advanced`)를 가지며, 정리(Theorem)와 증명(Proof)을 1급 시민으로 취급합니다.
 
@@ -73,7 +74,7 @@ IQ Lab은 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**
 ### Discovery
 
 - 🔍 **Full-text search** — Pagefind로 정적 인덱싱, `⌘K` / `Ctrl+K` 단축키
-- 🏷️ **Categories** — `dev` / `ai` 2종
+- 🏷️ **Categories** — `dev` / `ai` / `agent` 3종
 - 🔖 **Tags** — 자유 태그, `/tags/[tag]` 개별 페이지
 - 📚 **Series** — 시리즈 포스트 그룹핑, `/series/[slug]` 집합 페이지
 - ⭐ **Featured posts** — 홈 화면 상단 강조
@@ -288,7 +289,7 @@ title: "Spring AOP 프록시 메커니즘"
 description: "CGLIB vs JDK Dynamic Proxy 선택 기준과 내부 동작"
 pubDate: 2026-04-18
 updatedDate: 2026-04-20        # optional
-category: dev                  # 'dev' | 'ai' (required)
+category: dev                  # 'dev' | 'ai' | 'agent' (required)
 tags: [spring, aop, jvm, proxy]
 difficulty: intermediate       # 'beginner' | 'intermediate' | 'advanced' (optional)
 series:                        # optional
@@ -572,12 +573,49 @@ git commit -m "chore: remove node_modules from tracking"
 
 Pagefind는 빌드 타임에 실행됩니다. Dev 서버에선 작동 안 합니다. `npm run build && npm run preview`로 확인.
 
+### 8. MDX 빌드 실패: `ReferenceError: <name> is not defined` 또는 `Could not parse expression with acorn`
+
+**증상**:
+```
+[@mdx-js/rollup] Could not parse expression with acorn
+file: src/content/posts/spel.mdx:41:6
+```
+또는
+```
+ReferenceError: cipher is not defined
+```
+
+**원인**: 본문/헤더의 literal `{...}` 가 JSX expression으로 해석됨. 자주 발생하는 패턴: `${env}`, `#{ref}`, `V{n+1}`, `{cipher}`.
+
+**해결**: 백틱으로 감싸 literal 처리. 예: `## {cipher} 접두사` → `` ## `{cipher}` 접두사 ``. iq-blogger 양산 시 이 패턴은 system prompt #14 룰로 차단됨 (수동 작성 시 주의).
+
+### 9. MDX 빌드 실패: `Unexpected end of file in attribute value` (출력 절단)
+
+**증상**: 마지막 `<Reference />`의 `url` / `venue` / `title` attribute가 잘림. 같은 파일에서 결정적으로 재발.
+
+**원인**: 양산 LLM의 `max_tokens`가 본문 + retry 누적에 부족해 마지막 줄이 절단됨.
+
+**해결**: iq-blogger의 `max_tokens` 16384로 상향됨 (이미 적용). 양산 후에도 실패하면 troubleshooting 가이드 참조해 마지막 attribute를 손으로 채움. 자주 등장하는 논문의 정확한 메타데이터는 `iq-blogger/docs`에 정리됨.
+
+### 10. GHA 빌드 OOM: `Reached heap limit Allocation failed - JavaScript heap out of memory`
+
+**증상**: 페이지 800+ 일 때 GHA runner가 4GB heap 한계 초과로 빌드 죽음. 로컬에선 멀쩡한 빌드가 GHA에서만 실패.
+
+**원인**: Node 기본 heap 4GB. Astro가 모든 mdx를 메모리에 로딩하면서 한계 도달.
+
+**해결**: `package.json` build script에 NODE_OPTIONS 박아 GHA/로컬 양쪽 적용:
+```json
+"build": "NODE_OPTIONS='--max-old-space-size=8192' astro build && pagefind --site dist"
+```
+이미 적용됨.
+
 ---
 
 ## Roadmap
 
 계획은 있지만 강제는 아닙니다.
 
+- [ ] **Sidebar tree navigation** — 카테고리(dev/ai/agent) → 시리즈/레포 → 글 목록(1, 2, 3...) 트리 펼침/접기. 글 수가 늘어 카테고리 → 시리즈 단위 탐색 필요
 - [ ] **i18n** — 영문 버전 (`/en` prefix)
 - [ ] **Dark/Light toggle** — 현재는 다크 고정
 - [ ] **Post reactions** — Giscus 외 별도 좋아요 카운터
@@ -591,6 +629,7 @@ Pagefind는 빌드 타임에 실행됩니다. Dev 서버에선 작동 안 합니
 
 ## Related
 
+- **iq-blogger** — 양산 자동화 도구 (이 사이트의 컨텐츠 입력원): https://github.com/iq-agent-lab/iq-blogger
 - **iq-dev-lab** — Backend deep-dive studies: https://github.com/iq-dev-lab
 - **iq-ai-lab** — AI / ML deep-dive studies: https://github.com/iq-ai-lab
 - **dev-book-lab** — 기술 서적 분석 저장소: https://github.com/dev-book-lab
