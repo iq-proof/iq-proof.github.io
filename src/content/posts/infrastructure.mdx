@@ -1,0 +1,84 @@
+---
+title: "트래픽 진입점 설계 — DNS부터 스토리지까지"
+description: "로드밸런서, CDN, 캐싱, 메시지 큐, DB 확장, 검색, 스토리지까지 — 대규모 시스템의 각 계층이 어떤 하나의 원칙 아래 연결되는지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [system-design, load-balancer, cdn, caching, database-scaling]
+difficulty: intermediate
+series:
+  slug: system-design-deep-dive
+  title: System Design Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+시스템 설계 면접에서 "글로벌 서비스를 설계하라"는 질문을 받으면 많은 사람들이 각 컴포넌트를 나열한다. 로드밸런서, CDN, 캐시, 메시지 큐, 샤딩… 그런데 이 컴포넌트들은 왜 항상 이 순서로 등장하는가? 그 각각이 서로 다른 문제를 풀고 있는 것처럼 보이지만, 사실 모두 **하나의 원칙**으로 수렴한다 — "병목은 항상 가장 느린 공유 자원에서 생긴다. 공유를 줄이거나, 사본을 만들거나, 비동기로 미루어라."
+
+## 진입점: DNS와 로드밸런서
+
+사용자의 첫 번째 요청은 DNS에서 시작된다. DNS는 도메인을 IP로 변환할 뿐이지만, GeoDNS를 사용하면 서울 사용자를 서울 서버로, 미국 사용자를 버지니아 서버로 라우팅한다. 서울↔버지니아 RTT는 약 180ms, 서울↔서울은 5ms다. 지역 분산만으로 응답시간이 36배 달라진다.
+
+그러나 DNS는 헬스체크를 하지 않는다. 서버가 죽어도 TTL이 남아 있는 동안 그 IP를 계속 반환한다. 실제 생사 판단과 트래픽 분산은 로드밸런서의 몫이다. L4 로드밸런서는 TCP/IP 수준에서 패킷을 보지 않고 분산하므로 속도는 빠르지만 URL 기반 라우팅이 불가능하다. L7 로드밸런서는 HTTP를 파싱해 `/api/*` → API 서버, `/ws/*` → WebSocket 서버로 나눌 수 있다. 마이크로서비스라면 L7이 거의 필수다.
+
+<Callout type="warning" title="로드밸런서 자체의 SPOF">
+이중화한 서버 앞에 로드밸런서 한 대가 있으면 그것이 새 단일 장애점이 된다. Active-Passive(Keepalived + Virtual IP)로 수 초 안에 페일오버하거나, AWS ALB처럼 이중화가 내장된 관리형 서비스를 선택해야 한다.
+</Callout>
+
+## 정적 자원의 병목: CDN
+
+오리진 서버까지 매번 요청을 보내는 것은 불필요한 지연이다. CDN은 전 세계 엣지 서버에 콘텐츠 사본을 두고 가장 가까운 곳에서 응답한다. 핵심은 `Cache-Control` 헤더 설계다.
+
+콘텐츠 해시가 포함된 파일명(`app.a3b2c1.js`)은 `max-age=31536000, immutable`로 설정해 1년간 캐시한다. 파일이 바뀌면 파일명이 바뀌므로 CDN Invalidation이 필요 없다. HTML은 `no-cache`로 설정해 항상 최신 파일명을 참조하게 한다. 개인화된 API 응답에는 `private, no-store` — CDN에 절대 캐싱되어선 안 된다.
+
+## 읽기 병목: 캐싱 계층
+
+DB 조회는 1~100ms, 메모리 캐시는 0.1ms 이하다. 캐시 히트율이 90%이면 DB 요청이 10분의 1로 줄어든다. 전략 선택이 중요하다.
+
+**Cache-Aside(Lazy Loading)**는 대부분의 서비스에 적합하다. 읽기 시 캐시 미스가 나면 DB에서 가져와 캐시에 저장하고, 쓰기 시에는 캐시를 무효화한다. 단, 인기 키의 TTL이 만료되는 순간 수천 개의 요청이 동시에 DB로 쏟아지는 **Cache Stampede**가 발생할 수 있다.
+
+```python
+# PER(Probabilistic Early Reexpiration): TTL 만료 전 확률적으로 미리 갱신
+remaining = redis.ttl("product:1001")
+if remaining < 30 and random() < 0.1:
+    data = db.query(1001)
+    redis.set("product:1001", data, ex=300)
+```
+
+여러 서버가 각자 로컬 캐시(Caffeine)를 가지면 속도는 빠르지만 일관성이 깨진다. Redis Pub/Sub으로 무효화 이벤트를 전파하면 모든 서버의 L1 캐시를 동시에 비울 수 있다.
+
+## 쓰기 병목: 메시지 큐와 비동기 처리
+
+결제 완료 후 이메일 발송, 재고 차감, 포인트 적립을 모두 동기로 처리하면 응답시간이 1,200ms가 넘는다. Kafka에 이벤트를 발행하면 사용자는 결제 로직(300ms)만 기다리고, 나머지는 백그라운드 Consumer가 처리한다.
+
+Kafka는 메시지를 디스크에 영속 저장하므로 트래픽이 몰려도 큐가 완충재 역할을 한다. Consumer가 초당 100건을 처리할 수 있는데 1,000건이 몰리면 900건은 큐에 쌓이고 결국 모두 처리된다 — 서비스가 죽지 않는다.
+
+<Callout type="note" title="트레이드오프: Kafka vs RabbitMQ">
+Kafka는 디스크 영속 저장, 멀티 Consumer Group, Offset 재처리가 강점이다. 초당 수백만 건의 이벤트 스트리밍에 적합하다. RabbitMQ는 지연시간이 수 ms 이하로 낮고 복잡한 라우팅 규칙이 필요할 때 유리하다. 이메일/알림 같은 단순 작업 큐에는 RabbitMQ, 여러 서비스가 같은 이벤트를 소비하는 구조에는 Kafka를 선택한다.
+</Callout>
+
+중복 처리 방지는 메시지 ID를 활용한 멱등성 설계로 해결하고, 처리에 계속 실패하는 메시지는 Dead Letter Queue(DLQ)로 이동시켜 무한 루프를 막는다.
+
+## 데이터 계층: DB 확장과 검색
+
+단일 DB 서버는 읽기 트래픽으로 먼저 병목이 된다. 읽기 복제본 → 캐싱 → 파티셔닝 → 샤딩 순으로 단계적으로 확장한다. 샤딩은 마지막 수단이다. 샤딩 키를 잘못 선택하면 특정 샤드에 트래픽이 집중되는 Hot Shard 문제가 생기고, Cross-Shard JOIN은 애플리케이션이 직접 병합해야 한다.
+
+검색은 DB가 잘 못하는 영역이다. `LIKE '%이어폰%'`은 B-Tree 인덱스를 사용할 수 없어 Full Table Scan이 발생한다. Elasticsearch의 역색인은 "이어폰"이라는 토큰이 어느 문서에 있는지를 해시맵처럼 O(1)에 찾는다. DB와 ES의 동기화는 CDC(Debezium)로 DB Binlog를 읽어 Kafka를 거쳐 ES에 반영하는 방식이 가장 안정적이다 — 애플리케이션 코드 변경 없이 자동으로 동기화된다.
+
+파일 저장은 절대 DB BLOB이나 서버 로컬 디스크에 하지 않는다. S3 + CloudFront가 표준이다. 대용량 파일은 Presigned URL로 App 서버를 우회해 S3에 직접 업로드하고, Multipart Upload로 청크 단위 재시도를 지원한다.
+
+<Aside label="계층화의 공통 원칙">
+DNS → CDN → 로드밸런서 → 캐시 → 메시지 큐 → DB 읽기 복제본 → 샤딩. 이 순서는 각 계층이 다음 계층의 부하를 흡수한다. 앞 계층에서 처리할수록 더 빠르고 더 싸다. 아키텍처 결정의 핵심은 "이 요청이 어느 계층에서 끝나게 할 것인가"다.
+</Aside>
+
+## 정리
+
+- DNS(GeoDNS)와 L7 로드밸런서가 트래픽 진입점을 결정한다. 로드밸런서 자체의 SPOF를 반드시 제거해야 한다.
+- CDN은 정적 자원의 병목을 엣지에서 흡수한다. `Cache-Control` 헤더 설계가 핵심이다.
+- 읽기 병목은 캐싱(Cache-Aside + PER)으로, 쓰기 병목은 메시지 큐(Kafka)와 비동기 처리로 분리한다.
+- DB는 읽기 복제본 → 캐싱 → 파티셔닝 → 샤딩 순으로 단계적으로 확장하고, 풀텍스트 검색은 Elasticsearch에 위임한다. 파일은 S3 + CDN이 표준이다.
+
+각 컴포넌트가 독립적으로 존재하는 것처럼 보이지만, 결국 모두 같은 질문에 답하고 있다 — "병목을 어느 계층에서 막을 것인가."
