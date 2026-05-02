@@ -1,0 +1,183 @@
+---
+title: "GitOps는 배포 도구가 아니라 감사 시스템이다"
+description: "Git 커밋이 신뢰할 수 있는 배포 감사 추적이 되기까지, GitOps 4원칙부터 멀티 클러스터 ApplicationSet, Secret 암호화 전략까지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [gitops, argocd, kubernetes, cicd, secret-management]
+difficulty: intermediate
+series:
+  slug: cicd-deep-dive
+  title: Cicd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+장애가 났다. "1시간 전엔 정상이었는데..." 슬랙에 그 말만 남아 있다. 누가 뭘 배포했는지, 어떤 설정이 바뀌었는지, 롤백할 기준점이 어디인지 — 아무것도 없다. GitOps가 해결하려는 문제는 바로 이것이다. 그런데 GitOps를 "ArgoCD 설치하기"로 이해하는 순간, 핵심을 놓친다. Git 커밋이 **신뢰할 수 있는 감사 추적**이 되려면 무엇이 필요한가?
+
+## GitOps 4원칙 — 철학부터
+
+GitOps는 네 가지 원칙으로 압축된다.
+
+**Declarative**: `kubectl run`이 아니라 YAML로 "원하는 상태"를 정의한다. 명령형은 무상태다 — 같은 명령을 두 번 실행하면 오류가 난다. 선언형은 멱등성을 보장한다. Kubernetes가 현재 상태를 원하는 상태로 자동 조정한다.
+
+**Versioned**: 모든 설정이 Git에 있다. `git blame`으로 누가 바꿨는지, `git diff`로 정확히 뭐가 달라졌는지, `git revert`로 어느 시점으로든 돌아갈 수 있다. 배포 Audit Log를 별도로 유지할 필요가 없다. Git 히스토리가 그 자체로 감사 로그다.
+
+**Automated**: CI 파이프라인이 코드 빌드 → 이미지 푸시 → Git 설정 파일 업데이트까지 자동화한다. 개발자는 코드만 커밋하면 된다.
+
+**Continuously Reconciled**: ArgoCD가 3분마다(또는 Webhook으로 즉시) Git 상태와 클러스터 상태를 비교한다. 누군가 `kubectl edit`으로 직접 수정해도 ArgoCD가 Git 상태로 자동 복원한다. Drift가 불가능한 구조다.
+
+<Callout type="note" title="Pull 모델의 보안 의미">
+전통적인 Push 모델에서는 CI 서버가 클러스터에 직접 접근권한을 가진다. CI 서버가 침해되면 전체 클러스터가 위험하다. GitOps의 Pull 모델에서는 ArgoCD가 클러스터 내부에서 Git을 폴링한다. CI 서버는 클러스터 크래덴셜을 전혀 가지지 않는다.
+</Callout>
+
+## ArgoCD 아키텍처 — Reconciliation Loop의 구조
+
+ArgoCD는 세 컴포넌트로 구성된다.
+
+**Repo Server**는 Git에서 YAML을 가져와 Kustomize 또는 Helm으로 렌더링한다. 렌더링은 클러스터 외부(Repo Server 내부)에서 일어난다. 실행 파일을 클러스터에 설치할 필요가 없고, 렌더링 실패가 클러스터에 영향을 주지 않는다.
+
+**Application Controller**는 Reconciliation Loop의 핵심이다. 3분마다(또는 Webhook 트리거 시) Repo Server에게 현재 Git 상태를 요청하고, Kubernetes API로 실제 클러스터 상태를 조회한 뒤, 둘을 3-way diff로 비교한다. 같으면 `Synced`, 다르면 `OutOfSync`. `selfHeal: true`면 자동으로 Git 상태로 복원한다.
+
+**API Server**는 CLI, UI, Webhook 요청을 처리하고 RBAC를 적용한다. GitHub의 Push 이벤트가 Webhook으로 API Server에 도달하면, 해당 Application의 Reconciliation이 즉시 트리거된다. 폴링 3분을 기다리지 않아도 된다.
+
+```bash
+# OutOfSync 상태의 상세 내용 확인
+$ argocd app diff myapp
+deployment.apps/app
+  spec.replicas: 3 vs 5
+  spec.template.spec.containers[0].image: myimage:v1.2.3 vs myimage:emergency
+```
+
+## Sync 전략 — 언제, 어떻게, 어떤 순서로
+
+Sync 전략은 환경별로 달라야 한다.
+
+Dev 환경은 빠른 피드백이 목적이다 — `automated: { prune: true, selfHeal: true }`. 프로덕션은 신중함이 목적이다 — `automated` 블록 자체를 제거하면 수동 Sync만 허용된다. 배포 전에 `argocd app diff`로 변경사항을 검토하고 명시적으로 `argocd app sync`를 실행한다.
+
+배포 순서가 중요할 때는 **Sync Wave**를 쓴다.
+
+```yaml
+# Wave -1: DB 마이그레이션 먼저
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook: PreSync
+
+---
+# Wave 0: 앱 배포
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+
+---
+# Wave 1: 스모크 테스트
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smoke-test
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+```
+
+마이그레이션이 완료되기 전에 앱이 뜨는 문제, 앱이 준비되기 전에 Ingress가 트래픽을 받는 문제 — Sync Wave가 이 순서를 강제한다.
+
+<Callout type="warning" title="Pruning과 Self-Heal의 트레이드오프">
+`prune: true`는 Git에서 삭제된 리소스를 클러스터에서도 자동 제거한다. 실수로 ConfigMap을 Git에서 지우면 앱이 크래시할 수 있다. `selfHeal: true`는 `kubectl edit`으로 한 긴급 수정을 3분 후 되돌린다. 편의와 안전 사이의 균형을 환경별로 의식적으로 선택해야 한다.
+</Callout>
+
+## Kustomize와 Helm — 환경별 설정의 DRY 원칙
+
+dev, staging, prod 세 환경의 Deployment가 replicas 값만 다르다면 파일을 세 개 복사할 이유가 없다.
+
+**Kustomize**는 Base + Overlay 구조로 이 문제를 푼다. `base/deployment.yaml`에 공통 설정을 두고, `overlays/prod/kustomization.yaml`에서 차이만 패치한다.
+
+```yaml
+# overlays/prod/kustomization.yaml
+bases:
+- ../../base
+
+replicas:
+- name: app
+  count: 5
+
+images:
+- name: myimage
+  newTag: v1.2.3
+```
+
+`kustomize build overlays/prod/`를 실행하면 최종 YAML이 생성된다. ArgoCD의 Repo Server가 이 렌더링을 자동으로 수행한다.
+
+**Helm**은 Go 템플릿으로 더 복잡한 로직을 처리한다. `values-prod.yaml`로 프로덕션 값만 오버라이드한다. ArgoCD Application에서 `helm.valueFiles`로 여러 values 파일을 순서대로 병합할 수 있다 — 뒤에 오는 파일이 높은 우선순위를 갖는다.
+
+## 멀티 클러스터 — ApplicationSet의 역할
+
+10개 클러스터에 20개 앱을 배포하면 200개 Application 리소스를 수동으로 관리해야 한다. **ApplicationSet**은 이 반복을 제거한다.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: myapp
+spec:
+  generators:
+  - list:
+      elements:
+      - cluster: dev
+        server: https://dev-k8s.example.com
+        path: config/dev
+      - cluster: prod-us
+        server: https://prod-us-k8s.example.com
+        path: config/prod
+      - cluster: prod-eu
+        server: https://prod-eu-k8s.example.com
+        path: config/prod
+  template:
+    metadata:
+      name: 'myapp-{{ cluster }}'
+    spec:
+      source:
+        repoURL: https://github.com/company/app-config
+        path: '{{ path }}'
+      destination:
+        server: '{{ server }}'
+        namespace: default
+```
+
+이 하나의 ApplicationSet이 세 개의 Application을 자동 생성한다. 새 클러스터를 추가하려면 `elements`에 한 줄만 추가하면 된다. **Git Generator**를 쓰면 `config/*` 디렉토리를 스캔해서 새 폴더가 생길 때마다 Application을 자동으로 만든다.
+
+## Secret 관리 — Git에 저장하면 안 되는 이유와 대안
+
+GitOps의 "모든 것을 Git에"라는 원칙과 Secret 보안은 충돌한다. 평문 Secret이 Git 히스토리에 한 번 들어가면 `git rm`으로 제거해도 이전 커밋에서 여전히 보인다. 완전 삭제는 사실상 불가능하다.
+
+세 가지 현실적인 대안이 있다.
+
+**Sealed Secrets**는 클러스터의 공개키로 Secret을 암호화해서 Git에 저장한다. 클러스터 내부의 Sealed Secrets 컨트롤러만 Private Key로 복호화할 수 있다. 설정이 단순하고 외부 서비스가 필요 없다.
+
+**External Secrets Operator**는 Git에 참조(`ExternalSecret` 리소스)만 저장하고, 실제 값은 AWS Secrets Manager나 Vault 같은 외부 저장소에서 실시간으로 동기화한다. Secret이 자주 로테이션되어도 Git 커밋이 생기지 않는다.
+
+**SOPS**는 파일의 특정 필드만 KMS/GPG로 암호화한다. 나머지 설정은 평문으로 유지되므로 Git diff로 변경사항을 검토할 수 있다.
+
+<Aside label="선택 기준">
+소규모 단일 클러스터라면 Sealed Secrets로 충분하다. 멀티 클러스터에서 Secret을 중앙 관리해야 하거나 Secret 로테이션이 잦다면 External Secrets Operator가 낫다. 팀에 KMS 접근이 이미 있고 Git 친화적인 워크플로우를 원한다면 SOPS를 고려한다.
+</Aside>
+
+## 정리
+
+- GitOps의 핵심 가치는 **Git 커밋 = 배포 감사 로그**다. 명령형 배포는 이 추적성을 제공하지 않는다.
+- ArgoCD의 Reconciliation Loop는 클러스터가 Git 상태에서 벗어나는 것을 자동으로 감지하고 복원한다.
+- Sync 전략(Manual/Automated, Self-Heal, Pruning)은 편의와 안전 사이의 균형점을 환경별로 명시적으로 선택하는 행위다.
+- ApplicationSet은 멀티 클러스터를 코드로 관리하게 해준다 — 새 클러스터 추가가 한 줄 편집으로 끝난다.
+- Secret은 반드시 암호화 후 Git에 저장하거나, Git에는 참조만 두고 외부 저장소와 동기화해야 한다.
+
+GitOps를 완전히 도입하면 "누가 언제 뭘 배포했나"라는 질문에 `git log`로 답할 수 있다. 그게 이 구조 전체의 목적이다.

@@ -1,0 +1,149 @@
+---
+title: "배포 전략의 진짜 선택 기준은 무엇인가"
+description: "Rolling Update부터 Canary, Blue-Green, Argo Rollouts까지 — 각 배포 전략이 어떤 트레이드오프를 가지며, 언제 무엇을 선택해야 하는지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kubernetes, deployment, cicd, canary, rolling-update]
+difficulty: intermediate
+series:
+  slug: cicd-deep-dive
+  title: Cicd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kubernetes에서 배포 전략을 고를 때 가장 흔한 실수는 "무중단"이라는 단어를 목표로 삼는 것이다. 무중단은 결과이지 전략이 아니다. 진짜 질문은 다르다 — **롤백 속도, 인프라 비용, DB 마이그레이션 호환성, 자동화 수준 중 무엇을 우선하는가?** 이 선택이 전략을 결정한다.
+
+## 공통 기반: 무엇이 무중단을 만드는가
+
+모든 배포 전략에 앞서 애플리케이션 자체가 세 가지 조건을 갖춰야 한다. Readiness Probe, `maxUnavailable: 0`, 그리고 Graceful Shutdown이다.
+
+Readiness Probe가 없으면 시작 중인 Pod에 즉시 트래픽이 전달된다. DB 마이그레이션 중이거나 캐시를 워밍업하는 시점에 503이 쏟아진다. `maxUnavailable: 0`은 배포 중 항상 최소 하나의 Ready Pod을 보장한다. 두 조건을 모두 설정해도 Pod 종료 순간 진행 중인 요청이 끊길 수 있다.
+
+여기서 `preStop` Hook이 필요하다.
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 15"]
+```
+
+Pod 종료 순서는 이렇다 — Endpoint Controller가 Pod IP를 Service에서 제거하고 (1-2초), `preStop`이 실행되고 (15초), 그 뒤 SIGTERM이 전달된다. `preStop`의 15초 동안 새 요청은 들어오지 않고 기존 요청만 처리된다. Spring Boot라면 `server.shutdown: graceful`로 SIGTERM 수신 후 진행 중인 요청을 완료할 수 있다.
+
+이 기반 없이는 어떤 배포 전략도 진정한 무중단을 보장할 수 없다.
+
+## Rolling Update — 가장 저렴한 선택
+
+Rolling Update는 Kubernetes의 기본 전략이다. `maxSurge`와 `maxUnavailable` 두 파라미터가 전부다.
+
+`maxUnavailable: 0`으로 설정하면 새 Pod이 Ready되기 전까지 구 Pod을 제거하지 않는다. 배포 중 항상 `replicas` 수의 Ready Pod이 유지된다. `maxSurge: 2`로 높이면 병렬 교체가 늘어 배포 시간이 단축된다.
+
+```
+replicas=5, maxSurge=2, maxUnavailable=0 기준:
+- 보수적 설정 (maxSurge=1): ~40초
+- 공격적 설정 (maxSurge=2): ~15초
+```
+
+<Callout type="warning" title="Rolling Update의 한계">
+롤백이 느리다. `kubectl rollout undo`는 이전 ReplicaSet을 재활성화하지만, Pod 교체 사이클을 다시 거치므로 15-40초가 걸린다. 배포 중 구 버전과 신 버전이 혼재하므로 두 버전이 동시에 DB에 접근한다. 스키마 변경이 있다면 양방향 호환성이 필수다.
+</Callout>
+
+`revisionHistoryLimit`을 설정하지 않으면 기본값 10이 적용된다. 이 값을 넘어서 삭제된 revision으로는 롤백할 수 없다. 일일 배포 5회 기준으로 `revisionHistoryLimit: 10`은 이틀치 이력이다.
+
+## Blue-Green — 롤백 속도를 사는 비용
+
+Blue-Green은 두 개의 동일한 환경을 유지하고 Service selector를 바꿔 트래픽을 전환한다.
+
+```bash
+# 트래픽을 Green으로 전환
+kubectl patch service myapp -p '{"spec":{"selector":{"slot":"green"}}}'
+
+# 문제 발생 시 즉시 롤백
+kubectl patch patch service myapp -p '{"spec":{"selector":{"slot":"blue"}}}'
+```
+
+Service selector 변경은 Endpoints 객체를 즉시 갱신한다. 새 연결이 밀리초 단위로 전환된다. Rolling Update의 40초 롤백과 비교하면 압도적인 차이다.
+
+<Callout type="note" title="트레이드오프">
+트래픽 전환 전까지 Blue와 Green이 동시에 실행된다. 인프라 비용이 2배다. AWS t3.medium 기준 3개 Pod이면 월 $150이 기본인데, Blue-Green 안정화 기간(보통 1시간) 동안 $150이 추가된다. 일일 배포 1회 기준 월 $187 추가 비용이다. DB 스키마 변경이 있으면 Blue와 Green이 서로 다른 스키마를 읽을 수 없으므로 호환성 계층이 필수다.
+</Callout>
+
+Blue-Green이 적합한 상황은 명확하다 — 긴급 hotfix 배포, 롤백 RTO가 1초 이하여야 하는 서비스, 충분한 인프라 예산이 있을 때다. 반대로 빈번한 배포 환경이나 DB 스키마 변경이 잦은 서비스에는 Rolling Update가 더 단순하다.
+
+## Canary — 위험을 분산하는 방법
+
+Canary는 Rolling Update와 Blue-Green의 중간이다. 소수 트래픽으로 먼저 검증하고 단계적으로 확대한다.
+
+Nginx Ingress의 `canary-weight` annotation이 핵심이다.
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "5"
+```
+
+이 설정은 전체 트래픽의 5%를 Canary Service로 라우팅한다. `5 → 20 → 50 → 100`으로 단계적으로 올린다. 각 단계에서 에러율이 임계값을 넘으면 `canary-weight: 0`으로 즉시 롤백한다.
+
+`canary-by-header`로 특정 사용자만 새 버전을 받게 할 수도 있다. 내부 팀이나 VIP 사용자를 먼저 테스트 대상으로 삼는 방식이다.
+
+비용은 낮다. Canary Pod은 5% 트래픽만 처리하므로 1개로 충분한 경우가 많다. 단점은 배포 시간이다 — 각 단계마다 모니터링 시간이 필요하므로 5-10분이 소요된다.
+
+## Argo Rollouts — 모니터링을 자동화로
+
+수동 Canary의 병목은 사람이다. 각 단계에서 메트릭을 확인하고 판단하는 사람이 없으면 야간 배포를 할 수 없다.
+
+Argo Rollouts는 이 판단을 Prometheus 쿼리로 대체한다.
+
+```yaml
+strategy:
+  canary:
+    steps:
+    - setWeight: 20
+    - analysis:
+        templates:
+        - name: error-rate
+```
+
+`AnalysisTemplate`은 Prometheus에서 에러율을 주기적으로 조회하고, 임계값을 초과하면 자동으로 이전 버전으로 롤백한다. `failureLimit`을 초과하는 순간 배포가 중단된다.
+
+<Aside label="자동화의 역설">
+자동 롤백의 위험은 오탐이다. 트래픽 스파이크나 외부 서비스 지연으로 에러율이 일시적으로 오르면 정상 배포도 롤백된다. `initialDelay`로 Pod 시작 직후의 불안정 구간을 건너뛰고, `count`와 `interval`로 충분한 샘플을 모아야 한다.
+</Aside>
+
+Argo Rollouts가 가치 있는 시나리오는 일일 배포 10회 이상이거나 야간·주말 배포가 필요한 팀이다. Prometheus 의존성과 AnalysisTemplate 설정 비용이 있으므로 배포 빈도가 낮으면 오버엔지니어링이 된다.
+
+## 전체 파이프라인 — 배포 전략을 감싸는 구조
+
+배포 전략은 파이프라인의 일부일 뿐이다. 코드 Push부터 프로덕션까지 흐름은 이렇다.
+
+```
+CI (GitHub Actions)
+  → 단위 테스트 → 빌드 → 보안 스캔 → 이미지 푸시
+  → Kubernetes manifests 업데이트 (image tag 변경)
+
+CD (ArgoCD)
+  → manifests repo 감지 → kubectl apply
+  → Rolling Update / Canary 실행
+
+배포 후 모니터링
+  → 에러율 체크 → 임계값 초과 시 자동 롤백
+  → GitHub Deployment API 상태 업데이트
+```
+
+CI와 CD의 경계는 Docker Registry다. CI는 검증된 이미지를 레지스트리에 올리는 데까지다. CD는 그 이미지를 클러스터에 적용하는 것이다. GitHub Deployment API는 배포 상태를 PR과 릴리스에 연결해 "이 코드가 언제 어디에 배포됐는가"를 추적한다.
+
+## 정리
+
+- **Rolling Update**: 가장 저렴하고 단순하다. 롤백이 느리고(15-40초) 배포 중 버전이 혼재한다. DB 스키마 호환성만 보장하면 대부분의 상황에서 충분하다.
+- **Blue-Green**: 롤백이 1초 미만이다. 인프라 비용 2배와 DB 마이그레이션 복잡도가 따라온다. 긴급 배포와 높은 가용성 요구 서비스에 적합하다.
+- **Canary**: 위험을 분산한다. 5%로 검증하고 단계적으로 확대한다. 배포 시간이 길고 모니터링 설계가 필요하다.
+- **Argo Rollouts**: 메트릭 기반 자동 판단이다. Prometheus와 AnalysisTemplate 설정 비용이 있다. 빈번한 배포와 야간 자동화가 필요한 팀에 적합하다.
+- **Zero-Downtime의 전제**: 어떤 전략을 쓰든 Readiness Probe, `maxUnavailable: 0`, `preStop` Hook, Graceful Shutdown이 없으면 배포 중 요청 손실이 발생한다.
+
+다음 글에서는 GitOps의 핵심 원칙과 ArgoCD가 클러스터 상태를 어떻게 단일 소스 오브 트루스로 관리하는지 추적한다.

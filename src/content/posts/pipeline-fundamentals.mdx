@@ -1,0 +1,119 @@
+---
+title: "CI/CD는 자동화 도구인가, 운영 철학인가"
+description: "수동 배포의 3대 구조적 실패부터 GitOps의 지속적 수렴 원칙까지, 코드가 프로덕션에 도달하는 전 과정을 신뢰 가능하게 만드는 설계를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [cicd, github-actions, gitops, pipeline, devops]
+difficulty: intermediate
+series:
+  slug: cicd-deep-dive
+  title: Cicd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+배포는 개발팀에게 가장 스트레스받는 순간이다. 금요일 오후 배포를 피하는 문화, 배포 당일 전 팀원이 대기하는 관행, 장애 시 원인을 찾는 데 수 시간이 걸리는 현실 — 이 모든 것은 수동 배포 프로세스가 본질적으로 불안정하다는 증거다. CI/CD는 이 불안정성을 구조적으로 제거하려는 시도다. 그런데 파이프라인을 도입해도 왜 어떤 팀은 여전히 배포를 두려워하는가?
+
+## 수동 배포의 3대 구조적 실패
+
+수동 배포가 반복적으로 실패하는 이유는 운이 나쁜 탓이 아니다. 구조적 필연이다.
+
+**첫째, 휴먼 에러.** 배포 체크리스트가 20단계라면 19번은 성공하고 1번은 실수한다. 6번 단계와 7번 단계 사이에 30초를 기다려야 한다는 사실이 문서에 없을 수 있고, 특정 환경에서만 필요한 8-1단계가 존재하는데 신규 팀원은 모른다. 사람은 반복 작업에서 실수를 피할 수 없다.
+
+**둘째, 환경 불일치.** "내 로컬에서는 됐는데"는 환경 불일치의 신호다. 개발자 로컬은 Java 21에 macOS이고, CI 서버는 Java 17에 Ubuntu이며, 스테이징은 환경변수 일부가 누락된 상태라면 특정 환경에서만 재현되는 버그는 필연적이다. Docker 컨테이너 이미지는 이 문제를 해결한다. 이미지 안에 Java 버전, 의존성, 설정이 모두 포함되어 어느 환경에서 실행해도 동일한 결과를 보장한다.
+
+**셋째, 롤백 불가능.** 수동 배포에서 롤백은 또 다른 수동 작업이다. 이전 버전의 파일이 어디 있는지, 어떤 설정이 필요한지 패닉 상태에서 기억해야 한다. CI/CD 파이프라인에서 롤백은 이전 이미지 태그로 배포하는 것이다. 이미지는 불변 아티팩트이기 때문에 이전 상태로 돌아가는 것이 확실하게 보장된다.
+
+## CI — "항상 배포 가능한 상태"를 강제하는 메커니즘
+
+CI의 핵심 전제는 코드베이스가 항상 배포 가능한 상태여야 한다는 것이다. 이를 가로막는 가장 흔한 장애물이 **머지 지옥(Merge Hell)**이다. 개발자 A와 B가 2주씩 독립적으로 기능 브랜치에서 작업한 뒤 main에 병합하면 충돌 100줄이 발생하고, 수동 해결 과정에서 버그가 유입된다. CI는 이를 매일 소규모 통합으로 쪼개 해결한다.
+
+Feature Flag는 이 원칙을 극단까지 밀고 나간 개념이다. 완성되지 않은 기능도 main에 통합하되, 플래그로 활성화를 제어한다.
+
+```java
+if (featureFlags.isEnabled("new-checkout-flow")) {
+    return newCheckoutService.process(order);
+} else {
+    return legacyCheckoutService.process(order);
+}
+```
+
+코드는 main에 있지만 비활성화 상태다. 통합 문제는 개발 중에 발견되고, 기능 출시는 배포와 분리된다.
+
+## 파이프라인 구성 요소 — 격리와 데이터 흐름
+
+GitHub Actions 파이프라인의 각 계층은 명확한 역할을 가진다. **Trigger**는 GitHub 이벤트와 파이프라인을 연결하는 시작점이다. **Job**은 독립된 Runner에서 실행되는 작업 단위로, `needs:`로 순서를 제어하지 않으면 기본적으로 병렬 실행된다. **Step**은 같은 Job 안에서 순차 실행되며 파일 시스템과 환경변수를 공유한다.
+
+여기서 자주 오해가 생긴다. Job은 서로 다른 Runner에서 실행되기 때문에 파일 시스템이 공유되지 않는다.
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./gradlew bootJar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs/*.jar
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+      - run: echo "배포 진행..."
+```
+
+**Artifact**가 Job 간 파일 공유의 유일한 공식 수단이다. 이 격리 덕분에 빌드 환경이 배포 환경을 오염시키지 않는다.
+
+## Fast Fail — 파이프라인 설계의 핵심 원칙
+
+버그를 늦게 발견할수록 수정 비용이 기하급수적으로 증가한다. CI 실패로 발견하면 개발 중 발견보다 5배, 프로덕션에서 발견하면 100배의 비용이 든다. 이것이 "테스트가 느리다"는 불평에도 파이프라인에 반드시 넣어야 하는 이유다.
+
+Fast Fail을 구현하는 원칙은 단순하다. **가장 빠른 검사를 먼저 배치**한다. 30초짜리 린트가 10분짜리 통합 테스트보다 먼저 실행되어야 한다. 그리고 의존성 없는 Job은 병렬로 실행한다.
+
+```
+레이어 1 (병렬): lint | unit-test | security-scan   → max(1분, 3분, 2분) = 3분
+레이어 2 (순차): integration-test                   → 10분
+레이어 3 (순차): build → deploy                     → 5분
+총 시간: 18분  (완전 직렬 23분 대비 23% 단축)
+```
+
+<Callout type="note" title="트레이드오프">
+Job 병렬화는 Runner 비용을 늘린다. 3개 Job을 병렬로 실행하면 3개 Runner가 동시에 과금된다. 시간은 줄지만 비용은 비슷하거나 약간 증가할 수 있다. 개발자 대기 시간 감소(생산성 향상)와 Runner 비용 증가를 비교해 결정한다. 또한 캐시를 잘못 구성하면 "캐시된 이전 결과로 테스트 통과"하는 상황이 생긴다. 의존성 캐시(Gradle, Maven)는 안전하지만, 테스트 결과 자체를 캐싱하는 것은 위험하다.
+</Callout>
+
+## GitOps — 파이프라인을 넘어선 운영 모델
+
+ArgoCD를 "YAML을 Git에 올리면 자동 배포되는 도구" 정도로 이해하면 절반만 맞다. GitOps는 시스템의 원하는 상태(Desired State)를 Git에 선언적으로 정의하고, 실제 시스템이 그 상태를 향해 지속적으로 수렴하도록 강제하는 **운영 모델**이다.
+
+OpenGitOps v1.0이 정의하는 4원칙은 다음과 같다.
+
+- **Declarative**: "이렇게 해라"(명령형)가 아닌 "이런 상태여야 한다"(선언형)로 정의
+- **Versioned**: Git의 모든 커밋은 불변이며 완전한 히스토리를 가진다
+- **Automated Pull**: ArgoCD가 Git을 감시해 변경을 자동으로 적용한다
+- **Continuously Reconciled**: Git 상태와 실제 상태를 지속적으로 비교해 차이가 생기면 자동 복원한다
+
+Pull 모델이 Push 모델보다 보안상 유리한 이유는 명확하다. Push 방식에서는 CI 서버가 Kubernetes 클러스터에 직접 접근해야 하므로 kubeconfig가 외부에 저장된다. Pull 방식에서는 ArgoCD가 클러스터 내부에서 실행되며 Git만 바라본다. CI 서버 침해가 클러스터 침해로 이어지지 않는다.
+
+Self-Heal이 활성화되면 `kubectl edit`으로 직접 수정해도 3분 내에 Git 상태로 자동 복원된다. Git 커밋 히스토리가 배포 Audit Log를 대체한다. `git log k8s/deployment.yaml`만으로 누가, 언제, 왜 배포했는지 PR 링크까지 추적할 수 있다.
+
+<Aside label="설계 철학">
+GitOps를 도입해도 팀원이 `kubectl edit`이나 Helm 수동 명령으로 직접 수정하는 관행이 사라지지 않는 경우가 많다. 도구는 GitOps지만 방식은 여전히 명령형인 이상한 상태다. 도구 도입보다 "모든 변경은 Git을 통해서만"이라는 원칙의 팀 합의가 먼저다.
+</Aside>
+
+## 정리
+
+- 수동 배포는 **휴먼 에러**, **환경 불일치**, **롤백 불가능**이라는 3대 구조적 문제를 가진다. CI/CD는 이 각각을 코드화된 절차, 불변 이미지, 이전 아티팩트 재배포로 해결한다.
+- 파이프라인 설계의 핵심은 **Fast Fail**이다. 빠른 검사를 앞에, 독립적인 Job은 병렬로 배치해 피드백 루프를 5분 이내로 유지한다.
+- GitOps는 자동화 도구가 아닌 운영 모델이다. Git이 시스템 상태의 Single Source of Truth이고, 시스템은 그 상태를 향해 지속적으로 수렴한다.
+- CD(Delivery)는 배포 준비 자동화, CD(Deployment)는 배포 자체 자동화다. 두 방식 모두 "항상 배포 가능한 상태"를 전제로 하며, 최종 트리거가 사람인지 자동인지만 다르다.
+
+다음 글에서는 GitHub Actions Workflow YAML의 내부 구조를 분해하고, 표현식 `${{ }}`가 언제 어디서 평가되는지, 그리고 인젝션 취약점이 어떻게 발생하는지 추적한다.
