@@ -1,19 +1,20 @@
 ---
 /**
- * Sidebar — left fixed tree navigation.
+ * Sidebar — 좌측 트리 네비게이션 (collapsed / expanded 토글)
  *
- * Structure:
- *   Category (dev | ai | agent)
- *     └─ Series (series.slug 단위, series.title 표시)
- *         └─ Post #1 (series.order 오름차순)
- *         └─ Post #2
- *     └─ Other (시리즈 없는 글들)
+ * 두 상태:
+ *   collapsed (default): 폭 56px, 토글 버튼만 보임. 본문이 넓게 사용 가능.
+ *   expanded:            폭 300px, 카테고리 → 시리즈 → 글 트리 전체 노출.
  *
- * Behavior:
- *   - Build-time: getCollection() 으로 모든 mdx 자동 스캔 → 새 글 추가 시 코드 변경 없이 반영
- *   - Current post 페이지: 해당 카테고리/시리즈 자동 펼침 + 글 항목 강조
- *   - Desktop only (lg+); 모바일은 숨김 (별도 햄버거는 향후)
- *   - <details> native 사용으로 JS 없이 펼침/접기 동작
+ * 동작:
+ *   - 사용자 토글 → localStorage('sidebar.expanded') 영속화
+ *   - 페이지 진입 시 직전 선택 상태 복원 (default collapsed)
+ *   - 현재 글의 카테고리/시리즈는 자동 펼침 + 글 항목 accent 강조
+ *   - sticky 100vh 로 viewport 풀 높이 유지 (스크롤해도 끊기지 않음)
+ *
+ * 자동 갱신:
+ *   - getCollection() 으로 build 타임에 모든 mdx 자동 스캔
+ *   - 새 글 추가 시 코드 변경 없이 다음 빌드에 자동 반영
  */
 
 import { getCollection } from 'astro:content';
@@ -35,14 +36,8 @@ const CATEGORY_LABEL: Record<Category, string> = {
 
 // 1. 모든 글 fetch (draft 제외)
 const allPosts = await getCollection('posts', ({ data }) => !data.draft);
-const posts: PostMeta[] = allPosts.map((p) => ({
-  slug: p.id,
-  title: p.data.title,
-  pubDate: p.data.pubDate,
-  series: p.data.series,
-}));
 
-// 2. 현재 페이지의 slug 추출 (post 페이지일 때만)
+// 2. 현재 페이지의 slug 추출
 const pathMatch = Astro.url.pathname.match(/^\/posts\/([^/]+)\/?$/);
 const currentSlug = pathMatch?.[1];
 
@@ -89,111 +84,284 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
 });
 ---
 
-<aside class="sidebar" aria-label="Site navigation">
-  <nav class="sidebar-inner">
-    <div class="sidebar-title">목차</div>
+<aside class="sidebar" id="iq-sidebar" data-state="collapsed" aria-label="Site navigation">
+  {/* Toggle button — collapsed 상태에선 메뉴 아이콘, expanded 상태에선 close 아이콘 */}
+  <button
+    type="button"
+    class="sidebar-toggle"
+    data-sidebar-toggle
+    aria-label="목차 열기/닫기"
+    aria-expanded="false"
+    aria-controls="iq-sidebar-content"
+  >
+    {/* Menu icon (collapsed 상태) */}
+    <svg class="icon-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+    {/* Close icon (expanded 상태) */}
+    <svg class="icon-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+    <span class="toggle-label">목차</span>
+  </button>
 
-    {grouped.map(({ cat, series, others, total, hasCurrent }) => (
-      total === 0 ? null : (
-        <details class={`cat-group cat-${cat}`} open={hasCurrent}>
-          <summary class="cat-summary">
-            <span class="cat-label">{CATEGORY_LABEL[cat]}</span>
-            <span class="cat-count">{total}</span>
-          </summary>
+  {/* 트리 본문 — collapsed 일 땐 visibility:hidden */}
+  <div class="sidebar-content" id="iq-sidebar-content">
+    <div class="sidebar-meta">
+      <span class="sidebar-meta-label">전체 글</span>
+      <span class="sidebar-meta-count">{allPosts.length}</span>
+    </div>
 
-          <div class="cat-body">
-            {series.map((s) => {
-              const seriesActive = s.posts.some((p) => p.slug === currentSlug);
-              return (
-                <details class="series-group" open={seriesActive}>
+    <nav class="sidebar-tree">
+      {grouped.map(({ cat, series, others, total, hasCurrent }) => (
+        total === 0 ? null : (
+          <details class={`cat-group cat-${cat}`} open={hasCurrent}>
+            <summary class="cat-summary">
+              <span class="cat-bar" aria-hidden="true"></span>
+              <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
+                <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <span class="cat-label">{CATEGORY_LABEL[cat]}</span>
+              <span class="cat-count">{total}</span>
+            </summary>
+
+            <div class="cat-body">
+              {series.map((s) => {
+                const seriesActive = s.posts.some((p) => p.slug === currentSlug);
+                return (
+                  <details class="series-group" open={seriesActive}>
+                    <summary class="series-summary">
+                      <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
+                        <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                      <span class="series-title">{s.title}</span>
+                      <span class="series-count">{s.posts.length}</span>
+                    </summary>
+                    <ol class="post-list">
+                      {s.posts.map((p) => (
+                        <li>
+                          <a
+                            href={`/posts/${p.slug}/`}
+                            class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
+                          >
+                            <span class="post-order">{p.series!.order}</span>
+                            <span class="post-title">{p.title}</span>
+                          </a>
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                );
+              })}
+
+              {others.length > 0 && (
+                <details class="series-group" open={others.some((p) => p.slug === currentSlug)}>
                   <summary class="series-summary">
-                    <span class="series-title">{s.title}</span>
-                    <span class="series-count">{s.posts.length}</span>
+                    <svg class="chevron chevron-sm" viewBox="0 0 12 12" aria-hidden="true">
+                      <polyline points="4,2 8,6 4,10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                    <span class="series-title">Other</span>
+                    <span class="series-count">{others.length}</span>
                   </summary>
-                  <ol class="post-list">
-                    {s.posts.map((p) => (
+                  <ul class="post-list">
+                    {others.map((p) => (
                       <li>
                         <a
                           href={`/posts/${p.slug}/`}
                           class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
                         >
-                          <span class="post-order">{p.series!.order}.</span>
                           <span class="post-title">{p.title}</span>
                         </a>
                       </li>
                     ))}
-                  </ol>
+                  </ul>
                 </details>
-              );
-            })}
-
-            {others.length > 0 && (
-              <details class="series-group" open={others.some((p) => p.slug === currentSlug)}>
-                <summary class="series-summary">
-                  <span class="series-title">Other</span>
-                  <span class="series-count">{others.length}</span>
-                </summary>
-                <ul class="post-list">
-                  {others.map((p) => (
-                    <li>
-                      <a
-                        href={`/posts/${p.slug}/`}
-                        class={p.slug === currentSlug ? 'post-link active' : 'post-link'}
-                      >
-                        <span class="post-title">{p.title}</span>
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            )}
-          </div>
-        </details>
-      )
-    ))}
-  </nav>
+              )}
+            </div>
+          </details>
+        )
+      ))}
+    </nav>
+  </div>
 </aside>
 
+<script is:inline>
+  // localStorage 영속화 + 토글
+  (function () {
+    const STORAGE_KEY = 'iq-sidebar-expanded';
+    const sidebar = document.getElementById('iq-sidebar');
+    if (!sidebar) return;
+
+    const setState = (expanded) => {
+      sidebar.dataset.state = expanded ? 'expanded' : 'collapsed';
+      const btn = sidebar.querySelector('[data-sidebar-toggle]');
+      if (btn) btn.setAttribute('aria-expanded', String(expanded));
+      try { localStorage.setItem(STORAGE_KEY, String(expanded)); } catch {}
+    };
+
+    // 초기 상태: localStorage > default(false)
+    let initial = false;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved === 'true') initial = true;
+    } catch {}
+    setState(initial);
+
+    // 토글 이벤트
+    sidebar.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target instanceof Element && target.closest('[data-sidebar-toggle]')) {
+        setState(sidebar.dataset.state !== 'expanded');
+      }
+    });
+  })();
+</script>
+
 <style>
+  /* ──────────────────────────────────────────────────────────
+     레이아웃 — sticky로 viewport 풀 높이 유지 (끊김 방지)
+     ────────────────────────────────────────────────────────── */
   .sidebar {
-    /* 모바일에서는 숨김 */
+    /* 모바일 숨김 — 햄버거는 별도 PR */
     display: none;
   }
 
-  /* lg breakpoint (≥1024px) — 데스크톱 좌측 고정 */
   @media (min-width: 1024px) {
     .sidebar {
-      display: block;
+      display: flex;
+      flex-direction: column;
       position: sticky;
       top: 0;
       align-self: flex-start;
-      width: 280px;
+      height: 100vh;
       flex-shrink: 0;
-      max-height: 100vh;
-      overflow-y: auto;
+      width: 56px;
+      background: linear-gradient(180deg, var(--bg-base, #0a0e1a) 0%, var(--bg-surface, #111827) 100%);
       border-right: 1px solid var(--border-subtle, #374151);
-      background: var(--bg-base, #0a0e1a);
+      transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow: hidden;
+      z-index: 10;
+    }
+    .sidebar[data-state="expanded"] {
+      width: 300px;
     }
   }
 
-  .sidebar-inner {
-    padding: 1.25rem 1rem 2rem 1.25rem;
-    font-size: 0.875rem;
-    line-height: 1.55;
+  /* ──────────────────────────────────────────────────────────
+     Toggle button — collapsed/expanded 양쪽 사용
+     ────────────────────────────────────────────────────────── */
+  .sidebar-toggle {
+    appearance: none;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--border-subtle, #374151);
+    color: var(--fg-secondary, #9ca3af);
+    width: 100%;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0 1rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+  .sidebar-toggle:hover {
+    background: var(--bg-elevated, #1a1f2e);
+    color: var(--accent-dev, #00d9ff);
+  }
+  .sidebar-toggle svg {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
   }
 
-  .sidebar-title {
-    font-size: 0.75rem;
+  /* 메뉴/닫기 아이콘 토글 */
+  .icon-menu { display: block; }
+  .icon-close { display: none; }
+  .sidebar[data-state="expanded"] .icon-menu { display: none; }
+  .sidebar[data-state="expanded"] .icon-close { display: block; }
+
+  .toggle-label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0;
+    transition: opacity 0.15s;
+    white-space: nowrap;
+  }
+  .sidebar[data-state="expanded"] .toggle-label {
+    opacity: 1;
+    transition-delay: 0.12s;
+  }
+
+  /* ──────────────────────────────────────────────────────────
+     Content — collapsed일 땐 visibility hidden
+     ────────────────────────────────────────────────────────── */
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.5rem 0 1.5rem 0;
+    opacity: 0;
+    transition: opacity 0.15s;
+    pointer-events: none;
+  }
+  .sidebar[data-state="expanded"] .sidebar-content {
+    opacity: 1;
+    transition-delay: 0.1s;
+    pointer-events: auto;
+  }
+
+  .sidebar-content::-webkit-scrollbar { width: 6px; }
+  .sidebar-content::-webkit-scrollbar-thumb {
+    background: var(--border-subtle, #374151);
+    border-radius: 3px;
+  }
+  .sidebar-content::-webkit-scrollbar-thumb:hover {
+    background: var(--fg-muted, #6b7280);
+  }
+
+  /* Sidebar meta — 전체 글 카운트 (header) */
+  .sidebar-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.5rem 1.25rem 1rem;
+    border-bottom: 1px dashed var(--border-subtle, #374151);
+    margin-bottom: 0.5rem;
+  }
+  .sidebar-meta-label {
+    font-size: 0.7rem;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.1em;
     color: var(--fg-muted, #6b7280);
-    margin-bottom: 0.75rem;
     font-weight: 600;
   }
+  .sidebar-meta-count {
+    font-size: 1.1rem;
+    color: var(--fg-primary, #f3f4f6);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
 
-  /* Category group */
+  /* ──────────────────────────────────────────────────────────
+     Tree — Category → Series → Posts
+     ────────────────────────────────────────────────────────── */
+  .sidebar-tree {
+    padding: 0 0.5rem;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+
+  /* Category */
   .cat-group {
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.35rem;
+    border-radius: 6px;
+    overflow: hidden;
   }
 
   .cat-summary {
@@ -201,109 +369,139 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
     list-style: none;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 0.4rem 0.5rem;
-    border-radius: 4px;
+    gap: 0.55rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 6px;
     color: var(--fg-primary, #f3f4f6);
     font-weight: 600;
     user-select: none;
+    position: relative;
+    transition: background 0.12s;
   }
   .cat-summary::-webkit-details-marker { display: none; }
-  .cat-summary::before {
-    content: '▶';
-    font-size: 0.65rem;
-    margin-right: 0.5rem;
-    transition: transform 0.15s;
-    color: var(--fg-muted, #6b7280);
-  }
-  .cat-group[open] > .cat-summary::before {
-    transform: rotate(90deg);
-  }
   .cat-summary:hover {
     background: var(--bg-elevated, #1a1f2e);
   }
 
+  /* 좌측 색깔 bar (vertical accent) */
+  .cat-bar {
+    width: 3px;
+    height: 16px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    transition: height 0.15s;
+  }
+  .cat-dev .cat-bar { background: var(--accent-dev, #00d9ff); }
+  .cat-ai  .cat-bar { background: var(--accent-ai, #a78bfa); }
+  .cat-agent .cat-bar { background: var(--accent-agent, #f59e0b); }
+
+  .cat-summary:hover .cat-bar,
+  .cat-group[open] > .cat-summary .cat-bar {
+    height: 20px;
+    box-shadow: 0 0 8px currentColor;
+  }
+  .cat-dev:hover .cat-bar,
+  .cat-dev[open] > .cat-summary .cat-bar { color: var(--accent-dev, #00d9ff); }
+  .cat-ai:hover .cat-bar,
+  .cat-ai[open] > .cat-summary .cat-bar { color: var(--accent-ai, #a78bfa); }
+  .cat-agent:hover .cat-bar,
+  .cat-agent[open] > .cat-summary .cat-bar { color: var(--accent-agent, #f59e0b); }
+
+  .chevron {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    color: var(--fg-muted, #6b7280);
+    transition: transform 0.18s ease;
+  }
+  details[open] > summary > .chevron {
+    transform: rotate(90deg);
+  }
+
   .cat-label {
     flex: 1;
+    font-size: 0.92rem;
   }
-  /* 카테고리별 색깔 */
-  .cat-dev .cat-label { color: var(--accent-dev, #00d9ff); }
-  .cat-ai .cat-label { color: var(--accent-ai, #a78bfa); }
-  .cat-agent .cat-label { color: var(--accent-agent, #f0b232); }
+  .cat-dev .cat-label   { color: var(--accent-dev, #00d9ff); }
+  .cat-ai  .cat-label   { color: var(--accent-ai, #a78bfa); }
+  .cat-agent .cat-label { color: var(--accent-agent, #f59e0b); }
 
   .cat-count {
     font-size: 0.7rem;
     color: var(--fg-muted, #6b7280);
     font-weight: 500;
+    background: var(--bg-elevated, #1a1f2e);
+    padding: 0.1rem 0.4rem;
+    border-radius: 9px;
+    min-width: 1.5rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .cat-body {
-    margin-left: 0.5rem;
-    padding-left: 0.5rem;
+    margin: 0.15rem 0 0.5rem 1rem;
+    padding-left: 0.75rem;
     border-left: 1px solid var(--border-subtle, #374151);
-    margin-top: 0.2rem;
   }
 
-  /* Series group */
-  .series-group {
-    margin: 0.15rem 0;
-  }
+  /* Series */
+  .series-group { margin: 0.05rem 0; }
+
   .series-summary {
     cursor: pointer;
     list-style: none;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 0.3rem 0.5rem;
+    gap: 0.4rem;
+    padding: 0.32rem 0.5rem;
     border-radius: 4px;
     color: var(--fg-secondary, #9ca3af);
     font-weight: 500;
     user-select: none;
-    font-size: 0.82rem;
+    font-size: 0.8rem;
+    transition: background 0.12s, color 0.12s;
   }
   .series-summary::-webkit-details-marker { display: none; }
-  .series-summary::before {
-    content: '▸';
-    font-size: 0.6rem;
-    margin-right: 0.4rem;
-    transition: transform 0.15s;
-    color: var(--fg-muted, #6b7280);
-  }
-  .series-group[open] > .series-summary::before {
-    transform: rotate(90deg);
-  }
   .series-summary:hover {
     background: var(--bg-elevated, #1a1f2e);
     color: var(--fg-primary, #f3f4f6);
+  }
+  .series-group[open] > .series-summary {
+    color: var(--fg-primary, #f3f4f6);
+  }
+
+  .chevron-sm {
+    width: 8px;
+    height: 8px;
   }
 
   .series-title { flex: 1; }
   .series-count {
     font-size: 0.65rem;
     color: var(--fg-muted, #6b7280);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Post list */
   .post-list {
     list-style: none;
-    padding: 0.1rem 0 0.4rem 1.2rem;
+    padding: 0.1rem 0 0.4rem 1.1rem;
     margin: 0;
   }
-  .post-list li {
-    margin: 0;
-    padding: 0;
-  }
+  .post-list li { margin: 0; padding: 0; }
 
   .post-link {
     display: flex;
     align-items: baseline;
-    gap: 0.35rem;
-    padding: 0.25rem 0.5rem;
-    border-radius: 3px;
+    gap: 0.5rem;
+    padding: 0.3rem 0.5rem 0.3rem 0.65rem;
+    border-radius: 4px;
     color: var(--fg-secondary, #9ca3af);
     font-size: 0.78rem;
     text-decoration: none;
-    line-height: 1.4;
+    line-height: 1.45;
+    border-left: 2px solid transparent;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
   .post-link:hover {
     background: var(--bg-elevated, #1a1f2e);
@@ -311,33 +509,21 @@ const grouped = (Object.keys(byCategory) as Category[]).map((cat) => {
   }
   .post-link.active {
     background: var(--bg-elevated, #1a1f2e);
-    color: var(--accent-dev, #00d9ff);
     font-weight: 600;
   }
-  .cat-ai .post-link.active { color: var(--accent-ai, #a78bfa); }
-  .cat-agent .post-link.active { color: var(--accent-agent, #f0b232); }
+  .cat-dev .post-link.active   { color: var(--accent-dev, #00d9ff); border-left-color: var(--accent-dev, #00d9ff); }
+  .cat-ai  .post-link.active   { color: var(--accent-ai, #a78bfa); border-left-color: var(--accent-ai, #a78bfa); }
+  .cat-agent .post-link.active { color: var(--accent-agent, #f59e0b); border-left-color: var(--accent-agent, #f59e0b); }
 
   .post-order {
     color: var(--fg-muted, #6b7280);
     font-variant-numeric: tabular-nums;
     font-size: 0.7rem;
     flex-shrink: 0;
+    min-width: 1.2rem;
+    text-align: right;
   }
-  .post-link.active .post-order {
-    color: inherit;
-  }
+  .post-link.active .post-order { color: inherit; opacity: 0.85; }
 
-  .post-title {
-    flex: 1;
-  }
-
-  /* 사이드바 자체 스크롤바 (다크 테마) */
-  .sidebar::-webkit-scrollbar { width: 6px; }
-  .sidebar::-webkit-scrollbar-thumb {
-    background: var(--border-subtle, #374151);
-    border-radius: 3px;
-  }
-  .sidebar::-webkit-scrollbar-thumb:hover {
-    background: var(--fg-muted, #6b7280);
-  }
+  .post-title { flex: 1; }
 </style>
