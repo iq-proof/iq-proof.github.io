@@ -1,0 +1,112 @@
+---
+title: "Spring Security 접근 제어는 어떻게 작동하는가"
+description: "URL 기반 필터부터 메서드 레벨 SpEL, 투표 기반 AccessDecisionManager, 도메인 객체 권한, 커스텀 AuthorizationManager까지 — 선언적 보안의 실행 경로를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-security, authorization, aop, spel, method-security]
+difficulty: intermediate
+series:
+  slug: spring-security-deep-dive
+  title: Spring Security Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Security의 접근 제어는 크게 두 층으로 나뉜다. URL 수준에서 요청을 거르는 **Filter 체인**과, 서비스 메서드 수준에서 어노테이션을 평가하는 **AOP Proxy**. 이 두 층이 협력하는 방식을 이해하지 못하면, `@PreAuthorize`가 왜 조용히 무시되는지, `KEYS *`처럼 블록킹하는 명령어와 같은 방식으로 `@Secured`가 실패하는 이유를 영원히 파악할 수 없다. 여섯 챕터를 가로지르는 공통 질문은 하나다 — 선언된 보안 정책은 런타임에서 정확히 어떤 경로로 평가되는가?
+
+## 두 층의 방어선
+
+URL 기반 접근 제어는 첫 번째 방어선이다. Spring Security 6.x에서 `authorizeHttpRequests()`를 설정하면 `AuthorizationFilter`(순서 3600)가 등록된다. 모든 요청은 이 필터를 통과하면서 `RequestMatcherDelegatingAuthorizationManager`에게 위임된다. 이 매니저는 등록 순서대로 `RequestMatcher`를 순회해 첫 번째 매칭 규칙의 `AuthorizationManager`를 선택한다.
+
+```java
+http.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/admin/public/**").permitAll() // 좁은 패턴 먼저
+    .requestMatchers("/admin/**").hasRole("ADMIN")   // 넓은 패턴 나중
+    .anyRequest().authenticated()
+);
+```
+
+순서가 바뀌면 `/admin/public/info` 요청은 두 번째 규칙에 도달하지 못한다. 첫 번째 방어선의 핵심 원칙이다 — 좁은 패턴이 먼저, 넓은 패턴이 나중, `anyRequest()`는 반드시 마지막.
+
+`AuthorizationFilter`가 거부를 결정하면 `AccessDeniedException`을 던진다. 바로 앞에서 대기하는 `ExceptionTranslationFilter`(순서 3500)가 이를 받아 익명 사용자면 로그인으로 리다이렉트, 인증된 사용자면 403을 응답한다.
+
+## AOP Proxy와 @PreAuthorize 실행 경로
+
+URL 필터를 통과한 요청은 Controller를 거쳐 Service에 도달한다. 여기서 두 번째 방어선이 작동한다. `@EnableMethodSecurity`를 선언하면 Spring은 `AnnotationAwareAspectJAutoProxyCreator`를 등록하고, `@PreAuthorize`가 붙은 Bean을 CGLIB Proxy로 감싼다. 다른 Bean이 이 Service를 주입받으면 실제 객체가 아닌 Proxy를 받는다.
+
+```
+외부 호출 → CGLIB Proxy
+  → AuthorizationManagerBeforeMethodInterceptor.invoke()
+  → PreAuthorizeAuthorizationManager.check()
+  → MethodSecurityExpressionHandler → SpEL 평가
+  → ACCESS_GRANTED → invocation.proceed() (실제 메서드)
+  → ACCESS_DENIED → AccessDeniedException
+```
+
+SpEL 평가에서 `#userId` 같은 파라미터 참조는 `MethodSecurityExpressionHandler`가 `MethodInvocation`의 파라미터 이름을 통해 바인딩한다. Spring Boot는 기본적으로 `-parameters` 컴파일 옵션을 활성화하므로 대부분 문제없지만, 직접 빌드 설정을 다루는 환경에서는 명시적 확인이 필요하다.
+
+<Callout type="warning" title="self-invocation — 침묵하는 보안 구멍">
+같은 Bean 내부에서 `this.securedMethod()`를 호출하면 Proxy를 우회한다. `@PreAuthorize` 검사가 실행되지 않고 메서드가 그대로 실행된다. 해결책은 세 가지다: 메서드를 별도 Bean으로 분리(권장), `@Lazy` self-injection, 또는 `@EnableMethodSecurity(mode = AdviceMode.ASPECTJ)` 위빙.
+</Callout>
+
+## 세 어노테이션의 처리 경로 차이
+
+`@PreAuthorize`, `@Secured`, `@RolesAllowed`는 겉보기엔 비슷하지만 처리 클래스가 다르고, 그 차이가 실무에서 버그로 나타난다.
+
+| 어노테이션 | 처리 클래스 | SpEL | ROLE_ 접두사 |
+|---|---|---|---|
+| `@PreAuthorize` | `PreAuthorizeAuthorizationManager` | ✓ | 자동 추가 |
+| `@Secured` | `SecuredAuthorizationManager` | ✗ | 수동 필요 |
+| `@RolesAllowed` | `Jsr250AuthorizationManager` | ✗ | 수동 필요 |
+
+`@Secured("ADMIN")`은 `getAuthorities()`에서 정확히 `"ADMIN"` 문자열을 찾는다. `@WithMockUser(roles = "ADMIN")`은 `"ROLE_ADMIN"`으로 권한을 부여하므로 항상 403이 된다. `@PreAuthorize("hasRole('ADMIN')")`은 내부적으로 `"ROLE_ADMIN"`을 검색하므로 이 문제가 없다.
+
+SpEL이 필요 없는 단순 역할 검사라도 `@PreAuthorize("hasRole('ADMIN')")`을 쓰는 것이 더 안전하다. `@Secured`는 접두사 처리가 직관적이지 않아 실수를 유발한다.
+
+## 투표에서 위임으로 — AccessDecisionManager의 진화
+
+Spring Security 5.x의 `AccessDecisionManager`는 Voter 기반 투표 방식이었다. 세 가지 전략이 있었다.
+
+- **AffirmativeBased**: 하나라도 `GRANTED`면 허용 (OR 조건, 기본값)
+- **ConsensusBased**: `GRANTED` 수 > `DENIED` 수면 허용 (다수결)
+- **UnanimousBased**: 하나라도 `DENIED`면 거부 (AND 조건)
+
+6.x의 `AuthorizationManager`는 이 복잡성을 `check()` 메서드 하나로 정리했다. 반환값이 `null`이면 판단 보류(다음 처리에 위임), `AuthorizationDecision(true)`면 허용, `AuthorizationDecision(false)`면 거부. 그리고 핵심 개선은 **지연 Authentication 로드**다 — `Supplier<Authentication>`을 받으므로 `permitAll()` 규칙에서는 `SecurityContextHolder`에 접근조차 하지 않는다. 정적 리소스 요청에서 HttpSession을 여는 비용이 사라진다.
+
+<Callout type="note" title="트레이드오프 — URL 기반 vs Method Security">
+URL 기반 접근 제어는 전체 보안 정책이 한 곳에 집중된다는 장점이 있다. 하지만 `order#42`가 현재 사용자의 것인지는 URL 패턴으로 표현할 수 없다. Method Security는 도메인 객체 수준의 세밀한 제어가 가능하지만, 정책이 여러 클래스에 분산된다. 권장 패턴은 URL 기반을 1차 방어선(인증 여부, 역할 수준), Method Security를 2차 방어선(소유권, 세밀한 조건)으로 사용하는 **Defense in Depth**다.
+</Callout>
+
+## 도메인 객체 권한 — PermissionEvaluator와 SpEL
+
+"kim은 `ROLE_USER`다"와 "kim은 order#42를 수정할 수 있다"는 다른 문제다. 후자를 처리하는 것이 `PermissionEvaluator`다.
+
+```java
+// @PostAuthorize: 메서드가 먼저 실행 → returnObject로 권한 검사 (추가 DB 조회 없음)
+@PostAuthorize("hasPermission(returnObject, 'read')")
+public Order getOrder(Long id) {
+    return orderRepository.findById(id).orElseThrow();
+}
+
+// @PreAuthorize: 실행 전 차단 → ID만 있으므로 PermissionEvaluator 내부에서 DB 조회
+@PreAuthorize("hasPermission(#orderId, 'Order', 'write')")
+public void updateOrder(Long orderId, OrderUpdateRequest request) { ... }
+```
+
+`@PostAuthorize`는 메서드가 **항상 먼저 실행**된다. DB 조회가 발생한 후 권한 검사가 실패하면 조회는 이미 일어난 것이다. 읽기 전용 메서드에는 `@PostAuthorize`가 코드가 간결하고 추가 DB 조회가 없어 효율적이다. 부작용이 있는 메서드(쓰기, 삭제)에는 `@PreAuthorize`가 안전하다.
+
+SpEL의 `@beanName.method()` 패턴은 복잡한 권한 로직을 Spring Bean으로 분리해 IDE 지원과 단위 테스트를 확보하는 방법이다. `PermissionEvaluator`는 여러 도메인 타입의 권한을 중앙에서 관리하고 ACL 시스템과 통합하기 좋다.
+
+## 정리
+
+- `AuthorizationFilter`와 AOP Proxy는 독립적인 두 층의 방어선이다. URL 규칙은 역할 수준, Method Security는 소유권 수준을 담당한다.
+- `@Secured`와 `@RolesAllowed`는 `ROLE_` 접두사를 자동으로 추가하지 않는다. 모호하면 `@PreAuthorize("hasRole(...)")`을 써라.
+- `this.method()` 호출은 Proxy를 우회한다. `@PreAuthorize`가 붙은 메서드를 같은 Bean 내부에서 호출하면 보안 검사가 실행되지 않는다.
+- `Supplier<Authentication>`을 활용한 지연 로드는 `permitAll()` 경로에서 불필요한 세션 접근을 막는다.
+- 복잡한 SpEL 표현식은 `@beanName.method()`나 `PermissionEvaluator`로 위임하라. SpEL 오류는 런타임에만 발견된다.
+
+다음 글에서는 세션 고정 공격(Session Fixation Attack)과 Spring Security가 인증 성공 후 세션을 어떻게 교체하는지 추적한다.

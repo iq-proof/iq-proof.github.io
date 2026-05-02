@@ -1,0 +1,133 @@
+---
+title: "JWT는 왜 서명만 하고 암호화하지 않는가"
+description: "위조 방지를 위한 HMAC 서명부터 RTR 기반 Refresh Token 탈취 감지까지, Spring Security JWT 인증 체계의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-security, jwt, authentication, refresh-token]
+difficulty: intermediate
+series:
+  slug: spring-security-deep-dive
+  title: Spring Security Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+JWT는 Base64URL로 인코딩된 JSON이다. 누구나 디코딩해서 내용을 읽을 수 있다. 그런데 Spring Security 인프라의 절반은 이 토큰을 신뢰하는 데 집중한다. 왜 암호화하지 않아도 되는가? 그리고 그 신뢰는 어디서 무너지는가?
+
+## 서명이 암호화를 대체하는 이유
+
+JWT의 세 파트는 각자 역할이 다르다. Header는 알고리즘을 선언하고, Payload는 클레임을 담고, Signature는 **변조 감지**를 담당한다.
+
+```
+HMAC_SHA256(
+  BASE64URL(Header) + "." + BASE64URL(Payload),
+  secretKey
+) → Signature
+```
+
+Payload를 변조하면 Signature가 불일치한다. secretKey를 모르면 유효한 Signature를 만들 수 없다. 기밀성이 아니라 **무결성**을 보장하는 구조다.
+
+이 설계가 의미하는 바는 명확하다. Payload에 담긴 정보는 누구나 읽을 수 있다. `userId`, `roles`는 노출돼도 무방하지만 비밀번호, SSN, 카드번호는 절대 들어가선 안 된다. 기밀 데이터가 토큰 안에 반드시 필요한 경우에만 JWE(JSON Web Encryption)로 넘어간다.
+
+<Callout type="warning" title="alg=none 취약점">
+`{"alg":"none"}` 헤더를 가진 토큰은 Signature가 없다. 취약한 라이브러리는 이를 수락해 보안이 완전히 우회된다. 최신 jjwt는 기본으로 거부하며 `UnsupportedJwtException`을 던진다. secretKey를 명시적으로 설정하면 라이브러리가 강제한다.
+</Callout>
+
+## 검증 순서가 보안을 결정한다
+
+jjwt의 `parseClaimsJws()`는 다음 순서로 동작한다.
+
+```
+1. 형식 검사 (3파트 여부)
+2. Signature 검증 ← 가장 먼저
+3. exp 검증
+4. nbf, iss, aud 검증
+```
+
+Signature를 `exp`보다 먼저 검증하는 이유가 있다. 공격자가 `exp`만 변조한 토큰을 만들었을 때, 클레임 값 자체를 신뢰하기 전에 서명이 깨졌는지 확인해야 한다.
+
+Signature 비교에는 `MessageDigest.isEqual()`을 사용한다. 일반 `Arrays.equals()`는 첫 불일치 바이트에서 즉시 반환하므로, 공격자가 응답 시간으로 몇 바이트가 일치하는지 추론할 수 있다(타이밍 공격). 상수 시간 비교는 항상 동일한 시간이 걸린다.
+
+## OncePerRequestFilter — 필터 체인의 적절한 위치
+
+JWT 인증은 Spring Security Filter Chain의 `UsernamePasswordAuthenticationFilter` 앞에 위치한다. 인가 서버가 `Bearer` 토큰을 처리하기 전에 `SecurityContext`에 `Authentication`을 설정해야 `AuthorizationFilter`가 올바르게 판단할 수 있다.
+
+`OncePerRequestFilter`를 상속하면 Forward/Include 요청에서 필터가 중복 실행되지 않는다. 내부적으로 request 속성에 `FILTERED` 플래그를 설정해 두 번째 실행을 건너뛴다.
+
+```java
+// 인증 성공 경로
+UsernamePasswordAuthenticationToken authentication =
+    UsernamePasswordAuthenticationToken.authenticated(
+        userDetails,
+        null,                        // credentials: JWT 환경에서 null
+        userDetails.getAuthorities() // 반드시 포함
+    );
+SecurityContext context = securityContextHolderStrategy.createEmptyContext();
+context.setAuthentication(authentication);
+securityContextHolderStrategy.setContext(context);
+
+// 인증 실패 경로 — chain은 반드시 계속
+} catch (JwtException e) {
+    securityContextHolderStrategy.clearContext();
+}
+chain.doFilter(request, response); // 인증 성공/실패 무관
+```
+
+`authenticated()` 팩토리 메서드와 `unauthenticated()`의 차이는 `authorities` 포함 여부다. `authorities`가 null이면 `isAuthenticated()`가 false가 되어 `AuthorizationFilter`에서 거부된다.
+
+`@Component`와 `addFilterBefore()`를 동시에 사용하면 Servlet FilterChain과 Spring Security FilterChain에 각각 한 번씩 등록되어 필터가 두 번 실행된다. `@Component`를 제거하거나 `FilterRegistrationBean.setEnabled(false)`로 Servlet 체인 등록을 비활성화해야 한다.
+
+## Access Token과 Refresh Token의 분리
+
+Access Token은 15분, Refresh Token은 7일. 이 비대칭이 설계의 핵심이다.
+
+짧은 Access Token은 탈취 피해 시간을 최소화한다. 긴 Refresh Token은 사용자가 매번 로그인하지 않아도 되게 한다. 두 토큰을 구분하지 않으면 Refresh Token이 직접 API 인증에 사용될 수 있다 — `tokenType` 클레임으로 강제해야 한다.
+
+```java
+.claim("tokenType", "ACCESS")   // Access Token
+.claim("tokenType", "REFRESH")  // Refresh Token
+// JwtAuthenticationFilter에서 ACCESS만 허용
+```
+
+Refresh Token은 HttpOnly Secure 쿠키로 전달한다. `localStorage`는 XSS로 JavaScript가 탈취할 수 있다. `SameSite=Strict`로 CSRF도 차단한다.
+
+## RTR — Refresh Token 탈취 감지
+
+RTR(Refresh Token Rotation)은 재발급마다 Refresh Token을 교체한다. 이전 토큰을 Redis에서 즉시 삭제하고 새 토큰의 jti를 저장한다.
+
+```
+정상 흐름: RT1 → 재발급 → RT2 (RT1 삭제)
+탈취 감지: 공격자가 RT1 재사용 → Redis에 RT1 없음 → 전체 세션 강제 종료
+```
+
+Redis 키 구조는 `refresh:token:{jti}` → `"userId:username"`, `refresh:user:{userId}` → `Set<jti>`다. 개별 토큰 유효성 확인과 사용자의 모든 세션 관리를 분리한다.
+
+<Callout type="note" title="트레이드오프">
+RTR에서 네트워크 오류가 발생하면 서버는 새 토큰을 발급했지만 클라이언트가 수신하지 못한 상태가 된다. 클라이언트가 이전 토큰으로 재시도하면 탈취 감지로 오판된다. Grace Period(30초간 이전 토큰 유효)를 두거나 재로그인을 요구하는 두 가지 선택이 있다. Refresh Token 교체 없이 단일 장기 토큰을 사용하면 네트워크 오류에 강인하지만 탈취 감지가 불가능하다.
+</Callout>
+
+## HS256 vs RS256 — 키 전략
+
+단일 서버에서는 HS256이 적합하다. 서명과 검증에 동일한 secretKey를 사용하므로 구현이 단순하고 빠르다. secretKey는 최소 256비트(32바이트)여야 한다 — `Keys.hmacShaKeyFor()`가 미달 시 `WeakKeyException`으로 강제한다.
+
+마이크로서비스에서는 RS256이 필요하다. privateKey는 인가 서버만 보유하고, 리소스 서버는 publicKey(공개)로 검증한다. secretKey를 서비스 간에 공유하지 않으므로 공격 표면이 줄어든다. JWKS 엔드포인트로 publicKey를 자동 배포할 수 있다.
+
+RSA 연산은 HS256보다 수십 배 느리다. 처리량이 중요하다면 EC256(타원곡선)이 더 짧은 키로 동등한 보안을 제공한다.
+
+<Aside label="설계 철학">
+JWT의 모든 설계 결정은 하나의 방향을 향한다 — Stateless. 서버가 세션을 유지하지 않아도 토큰 하나로 신원을 증명한다. 대신 사용자에게 명확한 책임을 요구한다: Payload에 민감 정보를 넣지 마라, secretKey를 코드에 하드코딩하지 마라, alg=none 토큰을 수락하지 마라. Stateless의 대가는 항상 사용자의 주의다.
+</Aside>
+
+## 정리
+
+- JWT는 암호화가 아닌 서명이다. Payload는 누구나 읽을 수 있으므로 민감 정보는 절대 담지 않는다.
+- 검증 순서는 `Signature → exp → iss/aud` 순서다. 클레임 값을 신뢰하기 전에 서명이 먼저다.
+- `OncePerRequestFilter`는 `UsernamePasswordAuthenticationFilter` 앞에 위치하며, 인증 실패 시에도 `chain.doFilter()`를 반드시 호출한다.
+- RTR은 재발급마다 Refresh Token을 교체해 탈취를 감지한다. 이전 토큰 재사용이 감지되면 해당 사용자의 모든 세션을 강제 종료한다.
+- HS256은 단일 서버, RS256은 마이크로서비스. secretKey는 최소 256비트, 환경 변수나 Secrets Manager에 저장한다.
+
+다음 글에서는 Spring Security의 `@PreAuthorize`, `@PostAuthorize`가 SpEL로 메서드 레벨 권한을 어떻게 평가하는지, 그리고 AOP 프록시와의 관계를 추적한다.

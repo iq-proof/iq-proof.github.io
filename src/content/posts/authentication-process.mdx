@@ -1,0 +1,136 @@
+---
+title: "Spring Security 인증 아키텍처 — 위임 계층이 설계된 이유"
+description: "AuthenticationManager부터 커스텀 AuthenticationProvider까지, Spring Security 인증 계층의 설계 철학과 각 컴포넌트가 담당하는 책임을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-security, authentication, provider-manager, filter-chain]
+difficulty: intermediate
+series:
+  slug: spring-security-deep-dive
+  title: Spring Security Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Security의 인증 코드를 처음 읽으면 `AuthenticationManager`, `ProviderManager`, `AuthenticationProvider`, `UserDetailsService`가 뒤엉켜 있어 어디서 무슨 일이 일어나는지 파악하기 어렵다. 왜 이렇게 많은 계층이 필요한가? 그리고 이 계층 구조가 `KEYS *` 하나로 서버를 멈추는 것과 같은 종류의 실수를 어떻게 방지하는가?
+
+## 왜 Filter가 직접 인증하면 안 되는가
+
+가장 단순한 설계는 각 `Filter`가 직접 자격증명을 검증하는 것이다. `UsernamePasswordAuthenticationFilter`가 DB를 직접 조회하고, `JwtAuthenticationFilter`가 서명을 직접 검증한다. 이 방식의 문제는 인증 로직이 필터마다 복제된다는 점이다. 새 인증 방식을 추가하려면 새 필터 전체를 다시 작성해야 하고, 비밀번호 검증 같은 공통 로직의 수정이 여러 곳에 퍼진다.
+
+Spring Security의 답은 관심사 분리다. **Filter는 요청에서 자격증명을 추출하고, `AuthenticationManager`에 위임한다.** 검증은 `AuthenticationProvider`가 담당한다. Filter는 인터페이스 하나(`AuthenticationManager.authenticate()`)만 알면 되므로 구현체를 교체해도 필터 코드는 바뀌지 않는다.
+
+## ProviderManager — supports()로 책임을 분배하는 전략
+
+`AuthenticationManager`의 표준 구현체인 `ProviderManager`는 등록된 `AuthenticationProvider` 목록을 순회하며 `supports()` 메서드로 처리 가능한 Provider를 선택한다.
+
+```java
+for (AuthenticationProvider provider : getProviders()) {
+    if (!provider.supports(toTest)) {
+        continue;
+    }
+    result = provider.authenticate(authentication);
+    if (result != null) {
+        copyDetails(authentication, result);
+        break;
+    }
+}
+
+// 모든 Provider가 실패하면 부모 AuthenticationManager에 위임
+if (result == null && this.parent != null) {
+    result = this.parent.authenticate(authentication);
+}
+```
+
+이 구조는 전략 패턴의 교과서적 적용이다. 폼 로그인은 `DaoAuthenticationProvider`가, SMS OTP는 커스텀 `SmsOtpAuthenticationProvider`가 처리한다. 각 Provider는 `supports()` 반환값으로 "내가 이 타입의 토큰을 처리한다"고 선언한다.
+
+부모-자식 위임 구조는 `SecurityFilterChain`별로 독립된 로컬 `ProviderManager`를 두면서도, 처리하지 못한 요청을 전역 `ProviderManager`로 넘길 수 있게 한다. API 체인의 로컬 `ProviderManager`가 JWT와 API Key만 알면 되는 이유다.
+
+```
+로컬 ProviderManager (API 체인)
+  providers: [JwtAuthenticationProvider, ApiKeyAuthenticationProvider]
+  → 처리 실패 시 → 전역 ProviderManager (부모)
+       providers: [DaoAuthenticationProvider]
+```
+
+<Callout type="note" title="ProviderNotFoundException의 원인">
+`"No AuthenticationProvider found for class X"` 예외는 항상 `supports()` 불일치가 원인이다. 커스텀 `SmsAuthenticationToken`을 만들었지만 `SmsAuthenticationProvider`를 등록하지 않은 전형적인 패턴이다. `ProviderManager`의 `getProviders()` 목록을 출력해 등록 여부를 먼저 확인하라.
+</Callout>
+
+## UserDetailsService와 4개 플래그의 순서
+
+`DaoAuthenticationProvider`는 사용자 로드를 `UserDetailsService`에게 위임한다. 인터페이스는 단 하나의 메서드다 — `loadUserByUsername(String username): UserDetails`. 계약은 단순하다: 사용자가 없으면 `null`이 아니라 `UsernameNotFoundException`을 던져야 한다. `null`을 반환하면 `DaoAuthenticationProvider`가 `InternalAuthenticationServiceException`으로 변환해 500 에러처럼 보이게 만든다.
+
+`UserDetails`의 4개 상태 플래그는 `AbstractUserDetailsAuthenticationProvider`에서 정해진 순서로 검사된다.
+
+```
+1. isAccountNonLocked()     → false: LockedException       (비밀번호 검증 전)
+2. isEnabled()              → false: DisabledException
+3. isAccountNonExpired()    → false: AccountExpiredException
+   ── 비밀번호 검증 ──
+4. isCredentialsNonExpired()→ false: CredentialsExpiredException
+```
+
+`isCredentialsNonExpired()`를 마지막에 검사하는 이유가 있다. 비밀번호가 맞다는 것을 확인한 뒤에야 "비밀번호 만료" 안내를 제공해야 한다. 자격증명 오류인지 만료인지를 구분하기 위해서다.
+
+## PasswordEncoder와 무중단 마이그레이션
+
+비밀번호는 **적응형 해시 함수**로 저장해야 한다. MD5나 SHA-256은 GPU로 초당 수십억 번 계산할 수 있어 브루트포스에 무방비다. BCrypt는 의도적으로 느리게 설계됐다 — `strength=12`에서 약 0.3초. 하드웨어가 빨라질수록 `strength`를 올려 대응한다.
+
+`DelegatingPasswordEncoder`는 `{id}encodedPassword` 형식으로 저장한다.
+
+```
+{bcrypt}$2a$12$eImiTXuWVxfM37uY4JANjQ...
+{argon2}$argon2id$v=19$m=65536...
+{noop}plaintext  ← 레거시 마이그레이션용
+```
+
+`matches()`는 접두사에서 ID를 추출해 해당 인코더에 위임한다. 기존 MD5 해시를 BCrypt로 마이그레이션할 때 서비스를 멈추지 않아도 되는 이유다 — `UserDetailsPasswordService`를 구현하면 로그인 성공 시 자동으로 새 인코더로 재해싱하고 DB를 업데이트한다.
+
+## UsernamePasswordAuthenticationFilter의 성공과 실패
+
+`AbstractAuthenticationProcessingFilter`는 로그인 처리의 공통 흐름을 담당한다.
+
+```
+POST /login
+  → requiresAuthentication() = true
+  → attemptAuthentication()  → AuthenticationManager.authenticate()
+  → 성공: successfulAuthentication()
+      SecurityContext.setAuthentication()
+      securityContextRepository.saveContext()  ← HttpSession에 저장
+      rememberMeServices.loginSuccess()
+      successHandler.onAuthenticationSuccess() ← 리다이렉트
+  → 실패: unsuccessfulAuthentication()
+      SecurityContext.clearContext()
+      failureHandler.onAuthenticationFailure()
+```
+
+`SavedRequestAwareAuthenticationSuccessHandler`가 로그인 전에 접근하려 했던 URL로 리다이렉트하는 원리는 `RequestCacheAwareFilter`가 세션에 저장해 둔 `SavedRequest`를 읽기 때문이다. 로그인 성공 후 `/dashboard`로 돌아가는 동작이 코드 없이 작동하는 이유다.
+
+<Aside label="세션 고정 방어">
+`sessionStrategy.onAuthentication()`은 로그인 성공 시 새 세션 ID를 발급한다. 기본 전략인 `ChangeSessionIdAuthenticationStrategy`는 세션 데이터를 유지하면서 ID만 교체한다(`request.changeSessionId()`). `SavedRequest`, 장바구니 같은 로그인 전 데이터를 잃지 않으면서 세션 고정 공격을 방어한다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**단일 전역 `AuthenticationManager`**: 구성이 단순하고 Provider 중복이 없다. 그러나 모든 인증 방식이 한 곳에 집중되어 체인별로 다른 전략을 적용하기 어렵다.
+
+**SecurityFilterChain별 로컬 `AuthenticationManager`**: API 체인은 JWT만, 웹 체인은 폼 로그인만 처리해 Provider 순회 비용이 줄고 관심사가 분리된다. 공통 Provider의 중복 등록이 생길 수 있지만 부모 AM 공유로 해결한다.
+
+**커스텀 `AuthenticationProvider`**: `AbstractUserDetailsAuthenticationProvider`를 상속하면 타이밍 공격 방어, 캐싱, 계정 상태 검사를 공짜로 얻는다. 단, `UsernamePasswordAuthenticationToken`에 종속된다. SMS OTP나 API Key처럼 패러다임이 다른 인증은 `AuthenticationProvider`를 직접 구현해야 완전한 제어권을 갖는다.
+</Callout>
+
+## 정리
+
+- Spring Security 인증의 핵심 설계 원칙은 **Filter = 추출, Provider = 검증**의 분리다.
+- `ProviderManager`는 `supports()`로 토큰 타입과 Provider를 매핑한다. `ProviderNotFoundException`은 항상 이 매핑 누락이 원인이다.
+- `UserDetails`의 4개 플래그는 순서가 정해져 있다. `isCredentialsNonExpired()`는 비밀번호 검증 성공 후에만 검사된다.
+- `DelegatingPasswordEncoder`의 `{id}` 접두사 방식은 서비스 중단 없이 해시 알고리즘을 마이그레이션하는 열쇠다.
+- Remember-Me는 `PersistentTokenBasedRememberMeServices`를 사용해야 탈취를 감지할 수 있다. 민감한 작업에는 `isFullyAuthenticated()`로 폼 로그인 여부를 추가로 확인하라.
+
+다음 글에서는 인증이 완료된 이후의 문제 — `@PreAuthorize`, `@Secured`, 메서드 수준 인가가 내부에서 어떻게 동작하는지 추적한다.

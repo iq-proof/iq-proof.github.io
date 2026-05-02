@@ -1,0 +1,126 @@
+---
+title: "Spring Security의 모든 방어선은 어디에 서 있는가"
+description: "CORS Preflight 차단부터 멀티 테넌트 데이터 격리까지, Spring Security가 필터 체인 위에서 구축하는 다층 방어 전략을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-security, cors, csp, multi-tenancy, filter-chain]
+difficulty: intermediate
+series:
+  slug: spring-security-deep-dive
+  title: Spring Security Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Security는 레이어드 아키텍처다. CORS 허용, 보안 헤더 주입, 로그인 실패 감지, 메서드 수준 접근 제어, 테넌트 데이터 격리 — 이 다섯 가지는 서로 다른 문제처럼 보이지만, 전부 **필터 체인 위의 서로 다른 위치에서 실행되는 같은 철학**의 표현이다. 이 방어선들은 왜 그 위치에 있는가?
+
+## 필터 체인 — 모든 결정이 일어나는 장소
+
+Spring Security의 모든 보안 메커니즘은 서블릿 필터 체인 위에 쌓인다. 요청은 왼쪽에서 오른쪽으로 필터를 통과하며, 각 필터는 자신의 책임만 진다.
+
+```
+CorsFilter → HeaderWriterFilter → SecurityContextFilter
+  → JwtAuthFilter → AuthorizationFilter → DispatcherServlet
+```
+
+위치가 곧 정책이다. `CorsFilter`가 앞에 있어야 Preflight OPTIONS 요청이 인증 필터에 도달하기 전에 처리된다. `@CrossOrigin`은 DispatcherServlet 이후, 즉 인증을 통과한 후에야 동작한다. 그래서 `@CrossOrigin`만 쓰면 브라우저의 Preflight가 `401`로 거부되고, 클라이언트는 "CORS 오류"로 받는다 — 서버는 정상 응답했지만 브라우저가 차단한 것이다.
+
+올바른 방법은 하나다.
+
+```java
+http.cors(cors -> cors.configurationSource(corsConfigurationSource()));
+```
+
+이 한 줄이 `CorsFilter`를 인증 필터 앞에 삽입한다. Preflight는 인증 없이 통과하고, 실제 요청만 인증을 거친다.
+
+<Callout type="warning" title="allowedOrigins(*) + allowCredentials(true) 조합 금지">
+브라우저 CORS 스펙이 명시적으로 금지한다. 와일드카드 출처에 쿠키를 허용하면 공격자 사이트도 인증 세션을 첨부할 수 있다. `allowedOriginPatterns("https://*.myapp.com")`으로 패턴을 제한하라.
+</Callout>
+
+## 응답 헤더 — 브라우저를 방어선으로 만드는 법
+
+`HeaderWriterFilter`는 모든 응답에 보안 헤더를 주입한다. Spring Security는 기본적으로 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Strict-Transport-Security`, `Cache-Control`을 자동으로 추가한다. 개발자가 직접 설정해야 하는 것은 `Content-Security-Policy`다.
+
+CSP의 핵심 원칙은 하나다 — **출처를 명시적으로 선언하라**.
+
+```java
+"default-src 'self'; "
++ "script-src 'self' https://cdn.trusted.com; "
++ "frame-ancestors 'none'; "
++ "form-action 'self'"
+```
+
+`'unsafe-inline'`이나 `'unsafe-eval'`은 CSP를 무력화한다. 인라인 스크립트가 필요하다면 `nonce` 방식으로 — 요청마다 `SecureRandom`으로 생성한 값을 스크립트 태그와 헤더에 동시에 심는다. 공격자는 이 값을 예측할 수 없다.
+
+HSTS는 순서가 있다. `max-age=300`으로 시작해 문제가 없으면 늘린다. `includeSubDomains`를 추가하기 전에 모든 서브도메인이 HTTPS를 지원하는지 확인하라. `preload`는 되돌리기가 거의 불가능하니 마지막에 결정한다.
+
+## 이벤트 — 인증 흐름을 관찰하는 채널
+
+인증이 실패하면 Spring Security는 예외 타입에 따라 이벤트를 발행한다. `BadCredentialsException` → `AuthenticationFailureBadCredentialsEvent`, `LockedException` → `AuthenticationFailureLockedEvent`. `DefaultAuthenticationEventPublisher`가 이 매핑을 관리한다.
+
+이 이벤트들을 `@EventListener`로 수신해 로그인 실패 횟수를 Redis에 기록하면 Brute Force를 방어할 수 있다.
+
+```java
+@EventListener
+@Async
+public void onBadCredentials(AuthenticationFailureBadCredentialsEvent event) {
+    String username = (String) event.getAuthentication().getPrincipal();
+    loginAttemptService.recordFailure(username, getIp(event));
+}
+```
+
+`@Async`가 중요하다. 이벤트 핸들러가 느리거나 예외를 던져도 인증 흐름에 영향을 주지 않는다. Redis가 다운돼도 로그인은 성공한다 — fail-open 정책이다. 보안과 가용성의 트레이드오프를 의식적으로 선택한 것이다.
+
+5번째 실패 시 `UserDetailsService`에서 `accountNonLocked=false`를 반환하면 Spring Security가 `LockedException`을 던진다. 잠금 해제는 Redis TTL이 만료되거나 관리자가 수동으로 처리한다.
+
+<Aside label="설계 철학">
+이벤트 기반 설계는 인증 로직과 보안 정책을 분리한다. 인증 필터는 "누가 맞는지" 판단하고, 이벤트 리스너는 "그 결과를 어떻게 기록하고 반응할지" 결정한다. 두 책임이 같은 클래스에 있으면 하나가 다른 하나를 망친다.
+</Aside>
+
+## 메서드 보안 — 필터를 통과한 후의 두 번째 문
+
+`@PreAuthorize`와 `@PostFilter`는 필터 체인 이후, 즉 컨트롤러와 서비스 레이어에서 동작한다. 역할 기반 단순 허가는 `hasRole()`로 충분하지만, "내 데이터만 볼 수 있다"는 비즈니스 규칙은 SpEL이 필요하다.
+
+`@PostFilter("filterObject.ownerId == authentication.principal.userId")`는 반환된 컬렉션에서 현재 사용자 소유가 아닌 요소를 제거한다. 단, 이 필터링은 **메모리에서** 일어난다. DB에서 수십만 건을 조회한 뒤 필터링하면 OOM이 온다. `@PostFilter`는 소량 데이터에만 쓰고, 대용량은 쿼리 레벨에서 `findByOwnerId(userId)`로 처리하라.
+
+복잡한 도메인 규칙은 커스텀 `SecurityExpressionRoot`로 캡슐화할 수 있다.
+
+```java
+@PreAuthorize("isPremiumUser() and hasFeatureAccess('export')")
+public ReportExport exportReport() { ... }
+```
+
+`isPremiumUser()`는 구독 서비스를 호출하는 Java 메서드다. SpEL이 이 메서드를 평가하고, `DefaultMethodSecurityExpressionHandler`가 커스텀 루트를 연결한다.
+
+## 멀티 테넌시 — 가장 깊은 격리 문제
+
+멀티 테넌트 시스템의 핵심 불변식은 하나다 — **테넌트 A는 테넌트 B의 데이터에 접근할 수 없다**. 이 불변식을 지키려면 방어선이 네 겹이어야 한다.
+
+```
+JWT tenantId 클레임 → TenantContextHolder 설정 (Filter)
+  → @tenantSecurity.isSameTenant() (Method Security)
+    → findByIdAndTenantId() (Repository)
+      → Hibernate @Filter (SQL 자동 조건)
+```
+
+각 레이어가 독립적으로 실패할 수 있다고 가정하고 설계한다. Hibernate `@Filter`는 마지막 방어선이다 — 위의 모든 레이어가 뚫려도 SQL 수준에서 `WHERE tenant_id = ?`가 붙는다.
+
+`TenantContextHolder`의 생명주기 관리가 핵심이다. `finally` 블록에서 반드시 `clear()`를 호출하지 않으면 스레드 풀이 오염된다. `@Async`에서는 `TaskDecorator`로 명시적으로 테넌트 컨텍스트를 전파하고, 작업 완료 후 정리한다.
+
+<Callout type="note" title="트레이드오프">
+단일 DB에 `tenantId` 컬럼으로 격리하는 방식은 운영이 단순하지만 필터 누락 시 데이터가 전부 노출된다. DB 인스턴스를 테넌트별로 분리하면 완전한 격리가 되지만 운영 비용이 테넌트 수에 비례해 증가한다. 대부분의 SaaS는 공유 DB + Hibernate Filter + Repository 레이어 검증의 조합으로 시작한다.
+</Callout>
+
+## 정리
+
+- **위치가 정책이다.** `CorsFilter`가 인증 필터 앞에 있어야 Preflight가 401로 거부되지 않는다.
+- **브라우저를 방어선으로 만들어라.** CSP, HSTS, X-Frame-Options는 서버가 아니라 브라우저가 공격을 막는 메커니즘이다.
+- **이벤트로 인증 흐름과 보안 정책을 분리하라.** `@Async` 리스너는 인증 속도에 영향 없이 감사 로그와 실패 제한을 구현한다.
+- **`@PostFilter`는 소량 전용이다.** 대용량 필터링은 항상 쿼리 레벨로 내려보내라.
+- **테넌트 격리는 레이어드로.** 어느 한 레이어가 뚫려도 다음 레이어가 막는다는 전제로 설계하라.
+
+Spring Security의 다층 방어는 "어디에 서는가"의 문제다. 각 메커니즘이 필터 체인의 올바른 위치에 있을 때 비로소 방어선이 완성된다.

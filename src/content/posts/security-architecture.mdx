@@ -1,0 +1,103 @@
+---
+title: "Spring Security의 요청 처리 구조는 어떻게 설계되어 있는가"
+description: "DelegatingFilterProxy의 브릿지 역할부터 SecurityContextHolder의 ThreadLocal 기반 인증 전파까지, Spring Security의 핵심 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-security, filter-chain, security-context, authentication]
+difficulty: intermediate
+series:
+  slug: spring-security-deep-dive
+  title: Spring Security Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Security는 수십 개의 Filter로 구성된 보안 체계를 Spring Bean으로 관리한다. 그런데 Servlet Container는 Spring의 세계를 모른다. 이 간극을 메우기 위해 Spring Security가 선택한 구조는 무엇이고, 그 결정이 어떤 설계 패턴으로 이어지는가?
+
+## 두 세계의 브릿지 — DelegatingFilterProxy
+
+Servlet Container(Tomcat)가 Filter를 초기화하는 시점에 Spring ApplicationContext는 아직 존재하지 않는다. 따라서 Servlet Container는 Spring Bean을 Filter로 직접 등록할 방법이 없다.
+
+`DelegatingFilterProxy`는 이 문제를 해결하기 위해 존재한다. 그 자체는 Servlet Container가 알아볼 수 있는 평범한 `Filter`다. 그러나 실제 요청 처리는 아무것도 하지 않는다. 단 하나의 역할만 한다 — ApplicationContext에서 `springSecurityFilterChain`이라는 이름의 Bean을 찾아 위임한다.
+
+```
+Servlet Container가 아는 세계        Spring이 아는 세계
+─────────────────────────────         ──────────────────────────
+DelegatingFilterProxy (일반 Filter)  FilterChainProxy (Spring Bean)
+     ↕                                       ↕
+Servlet Container에 등록됨           ApplicationContext에서 관리됨
+     ↕                                       ↕
+요청을 받으면 Spring Bean에게 위임 →  실제 Security Filter 실행
+```
+
+`DelegatingFilterProxy`는 지연 초기화를 사용한다. `initFilterBean()` 시점에 ApplicationContext가 없으면, 첫 번째 요청이 들어올 때 `springSecurityFilterChain` Bean을 조회해 `delegate` 필드에 캐싱한다. 이후 모든 요청은 이 `delegate`에 그대로 위임된다.
+
+## FilterChainProxy — 체인을 선택하는 관문
+
+`FilterChainProxy`가 `DelegatingFilterProxy`로부터 요청을 넘겨받으면, 가장 먼저 `HttpFirewall`로 악의적인 요청(디렉토리 트래버설, 비정상 URL 인코딩 등)을 차단한다. 그다음 등록된 `SecurityFilterChain` 목록을 `@Order` 순서대로 순회해 현재 요청에 매칭되는 첫 번째 체인을 선택한다.
+
+```java
+// 매칭된 체인의 Filter 목록만 반환
+private List<Filter> getFilters(HttpServletRequest request) {
+    for (SecurityFilterChain chain : this.filterChains) {
+        if (chain.matches(request)) {
+            return chain.getFilters(); // 첫 번째 매칭 체인만
+        }
+    }
+    return null;
+}
+```
+
+선택된 체인의 Filter 목록은 `VirtualFilterChain`으로 순차 실행된다. Security Filter들이 서로 `chain.doFilter()`로 연결될 때 Servlet Container의 실제 FilterChain을 건드리지 않기 위해서다. Security Filter를 모두 통과한 뒤에야 `originalChain.doFilter()`가 호출되어 DispatcherServlet으로 진입한다.
+
+<Callout type="warning" title="체인 선택의 함정">
+`SecurityFilterChain`에 `securityMatcher()`를 지정하지 않으면 모든 요청에 매칭된다. `@Order(1)`인 체인에 매처가 없으면 `@Order(2)` 이하의 체인은 영원히 실행되지 않는다. 범위가 좁은 체인일수록 낮은 `@Order` 값(높은 우선순위)을 가져야 한다.
+</Callout>
+
+## 15개 Filter의 실행 순서
+
+`FilterChainProxy` 안에서 실행되는 각 Filter의 순서는 `FilterOrderRegistration`이 결정한다. 각 Filter 클래스에 100 단위 정수를 부여하고, 활성화된 Feature에 따라 해당 Filter가 체인에 추가된다. 간격을 100씩 두는 이유는 커스텀 Filter를 기존 Filter 사이에 삽입할 수 있도록 하기 위해서다.
+
+순서에서 반드시 기억할 두 가지 관계가 있다.
+
+첫째, `CorsFilter`(900)는 인증 Filter보다 앞에 위치해야 한다. Preflight `OPTIONS` 요청이 인증 Filter에 도달해 `401`을 받는 상황을 막기 위해서다.
+
+둘째, `ExceptionTranslationFilter`(3400)는 `AuthorizationFilter`(3600) 바로 앞에 있어야 한다. `ExceptionTranslationFilter`는 뒤에 오는 Filter를 `try-catch`로 감싸서 실행한다. `AuthorizationFilter`가 던진 `AccessDeniedException`을 이 Filter가 받아 `403` 응답 또는 로그인 리다이렉트로 변환한다. 순서가 뒤바뀌면 예외가 처리되지 않고 Servlet Container까지 전파된다.
+
+`AnonymousAuthenticationFilter`(3100)는 SecurityContext가 비어 있을 때 `AnonymousAuthenticationToken`을 삽입한다. 이 Filter 덕분에 `AuthorizationFilter`는 항상 `null`이 아닌 `Authentication` 객체를 받아 안전하게 권한 검사를 수행할 수 있다.
+
+## SecurityContext와 ThreadLocal
+
+인증 정보를 모든 메서드 파라미터로 전달하면 비즈니스 로직이 Security에 강하게 결합된다. `SecurityContextHolder`는 `ThreadLocal` 기반 전역 저장소를 제공해 이 문제를 해결한다. 동일 스레드 내라면 어디서든 `SecurityContextHolder.getContext().getAuthentication()`으로 인증 정보를 꺼낼 수 있다.
+
+`SecurityContextHolderFilter`가 이 생명주기를 관리한다. 요청이 시작되면 `SecurityContextRepository`에서 `Supplier<SecurityContext>`를 로드해 ThreadLocal에 저장한다. 실제 `getContext()` 호출이 있을 때까지 세션 I/O는 발생하지 않는다(지연 로딩). 요청이 끝나면 `finally` 블록에서 `clearContext()`가 반드시 호출된다. 이 호출이 누락되면 스레드 풀에서 스레드가 재사용될 때 이전 요청의 `SecurityContext`가 그대로 남아 권한 상승 취약점이 생긴다.
+
+<Callout type="note" title="트레이드오프">
+ThreadLocal은 Thread-per-Request 모델에서 완벽히 작동하지만, `@Async`, `CompletableFuture`, ThreadPool 환경에서는 SecurityContext가 새 스레드로 전파되지 않는다. `DelegatingSecurityContextAsyncTaskExecutor`로 Executor를 래핑해야 한다. WebFlux(Reactor) 환경에서는 ThreadLocal 자체가 적합하지 않아 `ReactiveSecurityContextHolder`(Reactor Context 기반)를 사용한다.
+</Callout>
+
+## Authentication 객체와 ROLE_ 규칙
+
+`Authentication` 인터페이스는 모든 인증 방식의 결과를 하나로 추상화한다. `getPrincipal()`은 인증된 사용자(보통 `UserDetails` 구현체), `getCredentials()`는 인증 수단(비밀번호 등, 인증 후 `null`로 지워짐), `getAuthorities()`는 권한 목록을 반환한다.
+
+`UsernamePasswordAuthenticationToken`은 생성자 두 개로 인증 전·후 상태를 강제한다. 자격증명만 받는 생성자는 `isAuthenticated=false`, 권한 목록까지 받는 생성자는 `isAuthenticated=true`다. 외부에서 `setAuthenticated(true)`를 호출하면 `IllegalArgumentException`이 발생한다. 반드시 `AuthenticationManager`를 통해서만 인증 완료 상태의 토큰을 얻을 수 있다.
+
+권한 명명에서 가장 흔한 혼란은 `hasRole()`과 `hasAuthority()`의 차이다. `hasRole("ADMIN")`은 내부적으로 `"ROLE_ADMIN"`을 검색한다. `hasAuthority("ADMIN")`은 `"ADMIN"`을 그대로 검색한다. `@Secured("ROLE_ADMIN")`은 접두사를 자동으로 추가하지 않아 명시가 필요하지만, `@PreAuthorize("hasRole('ADMIN')")`은 자동 추가된다.
+
+<Aside label="설계 철학">
+`ROLE_` 접두사는 역할(Role)과 권한(Permission)을 같은 `getAuthorities()` 목록 안에서 구별하기 위해 도입됐다. `ROLE_ADMIN`은 역할의 묶음, `READ_USERS`는 세부 권한이다. `RoleHierarchy`를 설정하면 `ROLE_ADMIN > ROLE_MANAGER > ROLE_USER` 계층을 선언해 상위 역할이 하위 역할의 권한을 자동으로 포함하도록 만들 수 있다.
+</Aside>
+
+## 정리
+
+- `DelegatingFilterProxy`는 Servlet Container와 Spring의 생명주기 불일치를 해소하는 브릿지다. 요청을 직접 처리하지 않고 `FilterChainProxy`에 100% 위임한다.
+- `FilterChainProxy`는 `@Order`와 `securityMatcher()`로 요청에 맞는 `SecurityFilterChain` 하나를 선택해 `VirtualFilterChain`으로 실행한다.
+- Filter 순서에서 핵심은 두 가지다. `CorsFilter`는 인증 Filter 앞에, `ExceptionTranslationFilter`는 `AuthorizationFilter` 바로 앞에 위치해야 한다.
+- `SecurityContextHolder`의 ThreadLocal은 동일 스레드 내 인증 정보 전파를 담당한다. `clearContext()`는 반드시 `finally`에서 호출해야 스레드 재사용 시 컨텍스트 누수를 막는다.
+- `hasRole()`은 `ROLE_` 접두사를 자동 추가하고, `hasAuthority()`는 문자열을 그대로 비교한다. 팀 내 명명 규칙을 통일하지 않으면 항상 `403`이 나오는 원인 모를 버그로 이어진다.
+
+다음 글에서는 `AuthenticationManager`와 `ProviderManager`가 실제 인증 요청을 처리하는 내부 흐름을 추적한다.
