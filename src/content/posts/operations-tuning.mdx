@@ -1,0 +1,114 @@
+---
+title: "Elasticsearch 운영의 모든 결정은 하나의 균형에서 나온다"
+description: "샤드 크기 설계부터 ILM 생명주기, 힙 메모리 제한, 쓰기 최적화, 캐시 전략, 장애 복구까지 — Elasticsearch 운영의 핵심 트레이드오프를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [elasticsearch, shard, ilm, heap, performance]
+difficulty: intermediate
+series:
+  slug: elasticsearch-deep-dive
+  title: Elasticsearch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Elasticsearch를 운영하다 보면 이상한 패턴을 발견하게 된다. 힙을 크게 줄수록 검색이 빨라지고, 샤드를 많이 만들수록 클러스터가 느려지고, 내구성을 높일수록 쓰기 속도가 떨어진다. 이 역설들은 사실 하나의 균형 — **리소스를 어디에 얼마나 할당하느냐** — 의 다른 표현이다. 왜 ES의 모든 설계 결정은 이 균형에 수렴하는가?
+
+## 샤드 크기: 10~50GB 권장의 근거
+
+샤드당 10~50GB 가이드라인은 경험 법칙처럼 보이지만, 실제로는 두 가지 비용 곡선의 교차점이다.
+
+샤드가 너무 작으면 Lucene 인스턴스 오버헤드(JVM 객체, 세그먼트 메타데이터, 파일 핸들)가 데이터보다 커진다. 1TB 데이터를 1GB 샤드로 쪼개면 1,000개의 샤드가 생기고, Primary + Replica 합계 2,000개의 샤드 정보를 Master 노드가 항상 관리해야 한다. Coordinator 노드는 검색마다 1,000개 샤드에 요청을 뿌리고 결과를 병합한다.
+
+샤드가 너무 크면 리밸런싱 비용이 폭발한다. 200GB 샤드를 노드 간 이동하면 수십 분의 네트워크 전송이 필요하고, 그 동안 성능이 저하된다. 노드 장애 후 복구 시간도 샤드 크기에 비례해 늘어난다.
+
+```
+예상 1년 데이터 크기 / 목표 샤드 크기(30GB) = Primary 샤드 수
+```
+
+이 수식이 설계의 출발점이다. 시계열 데이터라면 ILM과 함께 롤오버를 사용해 각 인덱스가 목표 크기에 도달하면 새 인덱스를 자동으로 생성한다.
+
+## ILM: 데이터 온도를 관리하는 자동화
+
+로그·이벤트 데이터를 단일 인덱스에 무한정 쌓으면 6개월 후 샤드 크기가 100GB를 넘어서고, 오래된 데이터를 지우려면 `DELETE by query`라는 비싼 연산에 의존해야 한다. ILM은 이 문제를 인덱스 단위 생명주기로 해결한다.
+
+```
+Hot  → Warm     → Cold          → Delete
+쓰기  조회 최적화  장기 보관(저비용)  만료 삭제
+SSD  forcemerge  freeze/snapshot  자동 삭제
+```
+
+Hot 단계에서는 rollover가 핵심이다. `max_primary_shard_size: 40gb` 또는 `max_age: 7d` 조건을 만족하면 새 인덱스로 전환된다. Warm 단계에서는 `forcemerge`로 세그먼트를 하나로 압축하고, `shrink`로 샤드 수를 줄여 Master 노드 부담을 낮춘다. 쓰기가 없는 오래된 데이터는 샤드 5개를 유지할 이유가 없다.
+
+<Aside label="데이터 스트림">
+ES 7.9+에서는 데이터 스트림이 롤오버 + 별칭 + 타임스탬프 필드를 통합한 상위 추상화를 제공한다. 시계열 데이터라면 별칭을 직접 관리하는 대신 데이터 스트림을 권장한다.
+</Aside>
+
+## 힙 50% 제한: 역설의 원리
+
+"힙을 크게 주면 성능이 좋아진다"는 직관은 ES에서 틀렸다. 이유는 Lucene이 힙이 아니라 OS Page Cache에 의존하기 때문이다.
+
+Lucene 세그먼트 파일(`.tim`, `.doc`, `.dvd`)은 mmap으로 접근한다. Page Cache에 올라오면 ~100ns로 읽히고, miss 시 디스크에서 읽으면 ~100μs, 즉 1,000배 느리다. 32GB RAM 서버에서 힙을 24GB로 설정하면 Page Cache에 남는 공간이 6GB뿐이다. 힙을 16GB로 줄이면 Page Cache가 14GB로 늘어나고, 더 많은 세그먼트가 메모리에 상주해 검색이 빨라진다.
+
+두 번째 제약은 CompressedOOPs다. 힙이 32GB 미만이면 JVM이 오브젝트 포인터를 4바이트로 표현한다. 32GB 이상이면 8바이트로 늘어나 같은 힙에 더 적은 객체를 수용한다. 결과적으로 힙 32GB가 30GB보다 실제 수용량이 낮을 수 있다.
+
+```
+힙 = min(RAM × 50%, 30GB)
+-Xms = -Xmx  # 고정 힙 (동적 확장 없음)
+```
+
+## 쓰기 성능: 세 가지 비용의 조합
+
+대량 적재 시 쓰기 성능을 제한하는 요인은 세 가지다.
+
+**HTTP 왕복**: 단건 인덱싱으로 100만 건을 처리하면 100만 번의 HTTP 요청이 필요하다. Bulk API로 1,000건씩 묶으면 1,000회로 줄어든다. 배치 크기는 5~15MB가 경험적 최적값이다.
+
+**세그먼트 병합**: `refresh_interval: 1s` 기본값에서 초당 새 세그먼트가 생성된다. 대량 적재 중에는 `-1`로 비활성화하면 버퍼가 가득 찰 때만 큰 세그먼트가 생성되어 병합 부하가 없어진다.
+
+**fsync 비용**: `translog.durability: request` 기본값은 매 요청마다 디스크에 동기화한다. `async`로 변경하면 `sync_interval`마다 한 번만 fsync하지만, 노드 재시작 시 최대 `sync_interval` 동안의 데이터가 손실될 수 있다.
+
+<Callout type="note" title="초기 적재 설정 조합">
+`refresh_interval: -1`, `number_of_replicas: 0`, `translog.durability: async`를 조합하면 최대 쓰기 성능을 낸다. 적재 완료 후 `POST /_refresh`와 함께 모든 설정을 복원해야 한다.
+</Callout>
+
+## 캐시 계층과 검색 성능
+
+ES에는 두 개의 명시적 캐시와 하나의 암묵적 캐시가 있다.
+
+**Filter Cache**는 `bool.filter` 쿼리 결과를 세그먼트 레벨의 Roaring Bitset으로 저장한다. `now`를 포함한 범위 쿼리는 매 요청마다 다른 쿼리로 인식되어 캐시가 불가능하다. 애플리케이션에서 시간을 분 단위로 반올림해 고정값으로 전달하면 캐시를 재사용할 수 있다.
+
+**Request Cache**는 `size: 0` 집계 요청의 결과 전체를 노드에 저장한다. refresh마다 무효화되므로 `refresh_interval`이 길수록 캐시 효과가 크다. ILM warm 단계 인덱스처럼 읽기 전용 데이터에서 효과가 극대화된다.
+
+`preference=_local`을 설정하면 동일 요청이 항상 같은 노드의 샤드로 라우팅되어 두 캐시의 히트율이 높아진다. 대시보드 쿼리처럼 반복적인 집계에서 응답 시간 차이가 크게 난다.
+
+## 장애 대응: 진단 순서가 결과를 결정한다
+
+Yellow는 Primary가 살아있고 Replica만 미할당된 상태다. 서비스는 정상이지만 노드 하나가 더 죽으면 Red가 된다. Red는 Primary가 미할당되어 해당 샤드 데이터에 접근할 수 없는 상태다.
+
+진단은 반드시 이 순서를 따른다.
+
+```
+_cluster/health → _cat/shards?v&s=state → _cluster/allocation/explain
+```
+
+`_cluster/allocation/explain`은 왜 특정 샤드가 할당되지 못하는지 decider별로 설명한다. `disk_threshold`가 나오면 디스크 공간 확보가 선행이고, `same_shard`가 나오면 노드 증설 또는 replica 수 감소가 해결책이다.
+
+<Callout type="warning" title="절대 금지">
+원인 파악 전 `allocate_empty_primary`로 강제 할당하면 `accept_data_loss: true`를 명시적으로 선언한 것이다. 해당 샤드의 모든 데이터가 즉시, 영구적으로 손실된다. Yellow 상태에서 인덱스를 삭제하는 것도 동일한 결과다.
+</Callout>
+
+디스크 Flood Stage(95%)에 도달하면 해당 인덱스가 read-only로 잠긴다. 공간을 확보한 후 `index.blocks.read_only_allow_delete: null`로 잠금을 해제해야 쓰기가 재개된다.
+
+## 정리
+
+- 샤드 크기는 오버헤드와 리밸런싱 비용의 균형점에서 10~50GB를 권장한다.
+- 힙을 줄이면 Page Cache가 늘어나 검색이 빨라진다. `min(RAM × 50%, 30GB)`가 공식이다.
+- 쓰기 성능은 HTTP 왕복(Bulk API), 세그먼트 병합(refresh_interval), fsync(translog durability) 세 가지를 함께 조정해야 한다.
+- 캐시 효과는 `now` 대신 고정 시간값, `preference`로 같은 노드 라우팅, `refresh_interval` 연장으로 높인다.
+- 장애 대응은 진단 순서가 결과를 결정한다. 원인 파악 전 조치는 데이터 손실로 이어진다.
+
+ES의 모든 튜닝 파라미터는 결국 같은 질문을 던진다 — 지금 이 순간 가장 중요한 리소스는 무엇인가.

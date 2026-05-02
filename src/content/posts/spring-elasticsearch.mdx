@@ -1,0 +1,125 @@
+---
+title: "Spring + Elasticsearch, 어디서 무엇이 깨지는가"
+description: "매핑 어노테이션의 변환 원리부터 인덱싱 전략, 쿼리 선택, 무중단 재인덱싱까지 — Spring Data Elasticsearch 실전 운영의 핵심 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [elasticsearch, spring-data, indexing, data-sync, search]
+difficulty: intermediate
+series:
+  slug: elasticsearch-deep-dive
+  title: Elasticsearch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Data Elasticsearch를 "JPA처럼" 쓰다 보면 어느 순간 검색이 의도대로 되지 않거나, MySQL은 롤백됐는데 ES에는 데이터가 남아 있거나, 배포 후 인덱스가 엉뚱하게 생성된 것을 발견하게 된다. 왜 그런가? 그리고 각 설계 결정 지점에서 무엇을 선택해야 하는가?
+
+## 어노테이션이 매핑 JSON으로 변환되는 방식
+
+`@Document`와 `@Field`는 애플리케이션 시작 시 Spring Data ES가 엔티티 클래스를 스캔해 ES 매핑 JSON으로 변환한다. `@Field(type = FieldType.Text, analyzer = "nori_analyzer")`는 아래처럼 변환된다.
+
+```json
+{
+  "title": {
+    "type": "text",
+    "analyzer": "nori_analyzer",
+    "search_analyzer": "nori_analyzer"
+  }
+}
+```
+
+여기서 첫 번째 함정이 있다. `@Field`로 Analyzer 이름을 지정했다고 해서 그 Analyzer가 인덱스에 정의된 것이 아니다. `nori_analyzer`가 해당 인덱스 settings에 실제로 정의되어 있어야 한다. 없으면 인덱싱 시점에 오류가 난다.
+
+두 번째 함정은 `createIndex = true`다. 기본값을 그대로 두면 애플리케이션 시작 시 인덱스가 자동 생성된다. 이미 존재하면 덮어쓰지 않지만, 없으면 샤드 수·레플리카 등 기본 설정으로 만들어진다. 프로덕션에서 의도한 최적화 설정 없이 인덱스가 생성될 수 있다. **`createIndex = false`를 기본으로 설정하고, 인덱스 생성은 Terraform·Kibana·별도 스크립트로 외부에서 관리한다.**
+
+`@Field`로 표현할 수 없는 설정(커스텀 Analyzer 정의, `dynamic: strict`, `eager_global_ordinals` 등)이 필요하면 `@Mapping(mappingPath = "es-mappings/products-mapping.json")`으로 JSON 파일을 직접 주입한다.
+
+## 인덱싱: 단건·Bulk·비동기의 선택 기준
+
+단건 인덱싱 루프는 직관적이지만 치명적으로 느리다. 10만 건 × 20ms = 33분. Bulk 인덱싱은 1,000건을 하나의 HTTP 요청으로 묶어 처리하므로 100 요청 × 100ms ≈ 10초, 약 200배 빠르다. **대량 처리라면 항상 `bulkIndex()`를 사용한다.**
+
+비동기 단건 인덱싱에서는 트랜잭션 경계가 핵심이다. `@Transactional` 안에서 ES 인덱싱을 함께 실행하면 두 가지 문제가 생긴다. MySQL 롤백 시 ES는 취소가 불가능하고, ES 오류가 MySQL 트랜잭션 롤백을 유발한다. 올바른 패턴은 `@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)` + `@Async`다.
+
+```java
+@Async("esIndexingExecutor")
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void handleProductIndex(ProductIndexEvent event) {
+    // MySQL 커밋 완료 후에만 실행
+    // MySQL 롤백 시 이 메서드는 호출되지 않는다
+}
+```
+
+Bulk의 부분 실패도 반드시 처리해야 한다. `bulkIndex()`는 전체 예외를 던지지 않고 `List<IndexedObjectInformation>`을 반환한다. 인덱스별 결과를 순회해 실패한 문서 ID를 추출하고, 그 문서만 재시도한다.
+
+<Callout type="warning" title="Bulk 부분 실패 함정">
+`try-catch`로 전체 예외를 잡아 "전체 실패"로 처리하면 성공한 문서도 재인덱싱된다. `bulkIndex()` 반환값에서 실패 항목만 골라 재처리해야 한다.
+</Callout>
+
+## 쿼리 타입 선택: NativeQuery가 기본이어야 하는 이유
+
+Repository 메서드명으로 쿼리를 만드는 방식은 간결하지만 한계가 뚜렷하다. 복잡한 조건이 붙으면 메서드명이 비현실적으로 길어지고, BM25 스코어링·하이라이팅·집계는 표현 자체가 불가능하다.
+
+`NativeQuery`는 ES Query DSL을 Java 빌더로 그대로 표현한다. 타입 안전성과 자동 완성을 유지하면서 ES의 모든 기능을 쓸 수 있다. `CriteriaQuery`는 단순 필터링에, `StringQuery`는 Kibana에서 검증한 정적 JSON을 이식할 때 임시로 사용한다(파라미터 동적 바인딩이 없어 injection 위험이 있다).
+
+동적 쿼리에서 null 조건 처리는 단순하다. 조건이 null이면 `boolQuery`에 추가하지 않는다.
+
+```java
+if (StringUtils.hasText(request.category())) {
+    boolQuery.filter(f -> f.term(t -> t.field("category").value(request.category())));
+}
+```
+
+`SearchHits`에서 데이터를 꺼낼 때는 `hit.getContent()`(원본 문서), `hit.getScore()`(BM25 점수), `hit.getHighlightFields()`(하이라이트), `hit.getSortValues()`(search_after용 정렬값)를 각각 분리해서 추출한다.
+
+대용량 페이지네이션에서 `from + size` 방식은 깊어질수록 비용이 올라간다. 무한 스크롤이나 대량 export에는 `search_after`를 쓴다. 이때 정렬 기준에 반드시 `_id`를 마지막에 추가해야 한다. 점수·날짜처럼 동점이 발생하는 필드만 쓰면 페이지 경계에서 문서가 누락되거나 중복될 수 있다.
+
+## 데이터 동기화: 세 가지 패턴과 트레이드오프
+
+MySQL이 원본, ES가 검색 인덱스인 구조에서 정합성 문제는 피할 수 없다. 세 가지 패턴이 있다.
+
+**이중 쓰기**는 `@TransactionalEventListener(AFTER_COMMIT)` + 재처리 큐 조합이다. 구현이 단순하고 Kafka가 없어도 된다. 대신 ES 오류 재처리 로직을 직접 구현해야 하고, 여러 시스템에 동시에 전파하기 어렵다.
+
+**배치 동기화**는 스케줄러로 `updated_at` 기준 변경분만 주기적으로 동기화한다. 가장 단순하지만 분 단위 지연이 발생한다. 실시간 검색이 불필요한 경우에 적합하다.
+
+**CDC (Change Data Capture)**는 MySQL binlog를 Debezium이 읽어 Kafka로 전송하고, 컨슈머가 ES에 인덱싱한다. 실시간성과 안정성을 동시에 갖추고, 여러 시스템(알림·통계·검색)이 같은 이벤트를 소비할 수 있다. 대신 Kafka 운영과 Debezium 설정이라는 복잡도가 따라온다.
+
+<Callout type="note" title="트레이드오프">
+이중 쓰기는 소규모·빠른 개발에, 배치 동기화는 실시간이 불필요한 곳에, CDC는 대규모·여러 컨슈머가 필요한 곳에 적합하다. "검색은 약간 오래된 데이터를 허용하고, 상세 조회는 MySQL에서 직접 가져온다"는 설계로 대부분의 정합성 요구사항을 충족할 수 있다.
+</Callout>
+
+## 무중단 재인덱싱: 별칭이 핵심이다
+
+매핑 변경(필드 타입, Analyzer 교체)이나 대규모 데이터 수정이 필요할 때 기존 인덱스를 삭제하고 재생성하면 그 시간만큼 서비스가 중단된다. **인덱스를 직접 가리키지 말고 별칭(alias)을 통해 접근**하면 이 문제를 해결할 수 있다.
+
+절차는 네 단계다. 새 매핑을 적용한 `products-v2`를 생성한다. Reindex API로 데이터를 비동기 복사한다. 별칭을 원자적으로 전환한다(`products` 별칭을 v1에서 v2로). 충분히 검증한 뒤 v1을 삭제한다.
+
+```bash
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "products-v1", "alias": "products" } },
+    { "add":    { "index": "products-v2", "alias": "products" } }
+  ]
+}
+```
+
+애플리케이션은 `@Document(indexName = "products")`로 별칭만 바라보므로 코드 변경 없이 새 인덱스로 전환된다.
+
+<Aside label="설계 철학">
+ES의 text 필드는 기존 타입 변경이 불가능하다. 필드 타입을 바꾸려면 반드시 Reindex가 필요하다. 이 제약을 알고 처음부터 별칭 기반으로 설계하면, 매핑 변경이 배포 중단 없는 정기 작업이 된다.
+</Aside>
+
+## 정리
+
+- `@Field` 어노테이션은 Analyzer 이름을 지정하지만 정의하지 않는다. 설정은 `@Setting`이나 `@Mapping`으로 별도 주입한다.
+- `createIndex = false`가 프로덕션 기본값이다. 인덱스 생성은 인프라 코드로 관리한다.
+- 인덱싱은 `bulkIndex()` + 부분 실패 처리 + `@TransactionalEventListener(AFTER_COMMIT)` 패턴이 기본 조합이다.
+- 쿼리는 `NativeQuery`를 기본으로 쓴다. `CriteriaQuery`는 단순 필터에만 한정한다.
+- 동기화 방식은 규모와 실시간 요구사항에 따라 이중 쓰기·배치·CDC 중 선택한다.
+- 인덱스는 항상 별칭을 통해 접근하고, 재인덱싱은 새 인덱스 생성 → 데이터 복사 → 별칭 전환 순서로 무중단 처리한다.
+
+다음 글에서는 ES의 샤딩 전략과 검색 성능 튜닝 — 샤드 수 결정, refresh interval, 그리고 _source 필드 최적화를 다룬다.

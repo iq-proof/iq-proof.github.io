@@ -1,13 +1,13 @@
 ---
-title: "쿠버네티스는 왜 모든 것을 API Server를 통해서만 통신하는가"
-description: "Control Plane과 Data Plane의 역할 분리부터 Reconciliation Loop의 실체, etcd Raft 합의, kubelet Probe, 클러스터 부트스트랩까지 — 하나의 아키텍처 원칙이 모든 설계를 관통하는 방식을 추적한다."
+title: "Elasticsearch는 어떻게 분산 검색을 완성하는가"
+description: "Lucene 위에 쌓인 5계층 구조부터 Split-Brain 방지, 라우팅 수식, Scatter-Gather 읽기 경로까지 Elasticsearch의 설계 결정을 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [kubernetes, control-plane, etcd, reconciliation, kubelet]
+tags: [elasticsearch, distributed-systems, lucene, sharding, scatter-gather]
 difficulty: intermediate
 series:
-  slug: kubernetes-deep-dive
-  title: Kubernetes Deep Dive
+  slug: elasticsearch-deep-dive
+  title: Elasticsearch Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,87 +16,102 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-쿠버네티스의 모든 컴포넌트는 서로 직접 통신하지 않는다. Scheduler가 kubelet에게 직접 "이 파드를 실행해라"고 명령하지 않는다. Controller Manager가 etcd에 직접 쓰지 않는다. 모든 읽기와 쓰기는 API Server를 경유한다. 왜 이 원칙을 이렇게 철저하게 지키는가?
+Elasticsearch는 Lucene이 아니다. Lucene은 단일 머신 위에서 동작하는 검색 라이브러리고, Elasticsearch는 그 위에 분산 레이어를 얹은 시스템이다. 이 구분이 사소해 보이지만, 운영에서 마주치는 대부분의 문제는 "ES를 Lucene인 줄 알고 쓸 때" 발생한다. 클러스터, 노드, 인덱스, 샤드, 세그먼트 — 이 5계층이 각각 무엇을 책임지고, 문서 하나가 이 계층을 어떤 순서로 통과하는가?
 
-## API Server 중심 설계의 출발점
+## Lucene 위에 무엇을 얹었는가
 
-쿠버네티스 클러스터는 두 계층으로 나뉜다. Control Plane은 클러스터의 상태를 관리하는 두뇌다. API Server, etcd, Scheduler, Controller Manager가 여기에 속한다. Data Plane은 실제로 컨테이너를 실행하는 실행 환경이다. 각 노드의 kubelet, kube-proxy, Container Runtime이 여기에 속한다.
+Lucene이 제공하는 것은 역색인 구축, 세그먼트 관리, BM25 스코어링이다. 단일 프로세스 안에서만 동작하고, Java API로만 접근할 수 있다. 여기에 Elasticsearch가 추가한 것은 세 가지다.
 
-두 계층 사이, 그리고 Control Plane 내부 컴포넌트들 사이의 모든 통신은 API Server를 통해서만 이루어진다. etcd에 직접 접근하는 컴포넌트는 API Server 단 하나뿐이다.
+첫째, **분산 레이어**. 문서를 어느 샤드에 저장할지 결정하는 라우팅, Primary에서 Replica로의 복제, 모든 샤드에 병렬 요청을 보내고 결과를 병합하는 Scatter-Gather 검색.
 
-이 설계의 이유는 단순하다. **진단 가능성**이다. 클러스터에서 무슨 일이 일어나든 API Server 로그 하나로 전체 흐름을 추적할 수 있다. 파드가 Pending에서 멈추면 Scheduler 로그를 본다. Deployment를 수정해도 반영되지 않으면 Controller Manager를 확인한다. 컴포넌트가 API Server를 우회해 통신한다면 이 진단 지도가 무너진다.
+둘째, **접근성**. REST API와 HTTP/JSON으로 언어 무관하게 접근할 수 있다.
 
-## Watch — 폴링 없이 이벤트를 받는 방법
+셋째, **운영 도구**. 인덱스 생명주기 관리(ILM), 스냅샷, `_cat` API.
 
-API Server 중심 설계가 실용적일 수 있는 핵심 메커니즘이 Watch다. 컴포넌트들이 1초마다 "파드 목록 줘"라고 폴링한다면 API Server는 즉시 병목이 된다. 쿠버네티스는 다른 방식을 택했다.
+각 샤드는 완전한 Lucene 인스턴스다. 인덱스 하나는 여러 샤드로 쪼개지고, 각 샤드는 독립적으로 색인하고 검색한다. ES는 이 Lucene 인스턴스들 위에서 분산 조율을 담당한다.
+
+## 5계층 구조와 노드 역할 분리
+
+계층 구조는 클러스터 → 노드 → 인덱스 → 샤드 → 세그먼트로 이어진다.
+
+**클러스터**는 노드들의 집합이자 공유 클러스터 상태를 가진 단위다. 클러스터 상태에는 모든 노드 정보, 인덱스 메타데이터, 샤드 라우팅 테이블이 담긴다. **인덱스**는 MySQL의 테이블에 대응하지만, 내부적으로 샤드로 분산된다는 점에서 다르다. **샤드**는 Lucene 인스턴스 하나다. **세그먼트**는 샤드 내부의 불변 단위로, `refresh`(기본 1초)마다 새 세그먼트가 생성되어 검색이 가능해진다.
+
+노드 역할은 셋으로 나뉜다.
 
 ```
-폴링 방식:
-  컴포넌트 → "파드 목록 줘" → API Server  (변경 없어도 매번)
-
-Watch 방식:
-  컴포넌트 → "파드 변경 구독할게" → API Server
-  API Server → (파드 생성됨) → 이벤트 전송
-  API Server → (파드 삭제됨) → 이벤트 전송
+Master 노드:    클러스터 상태 관리, 샤드 배치 결정
+Data 노드:      샤드 저장, 검색·집계 처리
+Coordinating:   요청 라우팅, 결과 병합
 ```
 
-HTTP/2 스트리밍으로 구현된 이 Watch API는 `kubectl get pods -w`가 사용하는 바로 그것이다. `resourceVersion`을 기준으로 어느 시점 이후의 변경만 받을 수 있어, 컴포넌트가 재시작돼도 누락 없이 이벤트를 이어받는다.
+대규모에서 Master 전용 노드를 3대(홀수)로 분리하는 이유는 명확하다. Data 노드의 GC pause가 Master에 영향을 주지 않아야 하고, Quorum(과반수)을 보장해야 한다.
 
-`kubectl apply`를 실행하면 API Server는 인증 → 인가(RBAC) → Mutating Admission → Validating Admission → etcd 저장 파이프라인을 거친다. 저장이 완료되는 순간, 해당 리소스를 Watch하던 Controller Manager, Scheduler, kubelet이 순서대로 이벤트를 받아 각자의 역할을 수행한다.
+## Split-Brain 방지 — Raft 기반 합의
 
-## Reconciliation — "선언형"이 내부에서 의미하는 것
+클러스터 운영에서 가장 위험한 장애는 Split-Brain이다. 네트워크 파티션으로 두 노드 그룹이 각자 자신을 Master로 선출하면, 두 개의 독립 클러스터가 서로 다른 문서를 인덱싱한다. 네트워크가 복구된 후 어느 쪽이 진실인지 판단할 수 없다.
 
-Controller Manager 안에는 수십 개의 컨트롤러가 고루틴으로 실행된다. 각 컨트롤러는 동일한 패턴으로 동작한다.
+ES 7.x 이전의 Zen Discovery는 `minimum_master_nodes`를 운영자가 수동으로 관리해야 했다. 노드를 추가할 때마다 이 값을 업데이트하지 않으면 Split-Brain 위험이 남는다.
 
-```python
-while True:
-    desired = get_from_etcd()   # 원하는 상태
-    actual  = get_current()     # 실제 상태
-    if desired != actual:
-        reconcile(desired - actual)
-```
+ES 7.x부터 Raft 기반 합의로 전환하면서 이 문제가 수학적으로 해소됐다.
 
-ReplicaSet Controller가 파드 3개를 유지하는 것, Node Controller가 노드 장애를 감지해 파드를 다른 노드로 옮기는 것, Endpoint Controller가 Ready 파드 IP를 Service에 연결하는 것 — 전부 이 루프의 결과다.
-
-"선언형(Declarative)"이 내부에서 의미하는 것이 바로 이것이다. `kubectl delete pod my-app-xxx`를 실행해도 파드가 즉시 재생성되는 이유는 버그가 아니다. Deployment가 "파드 3개인 상태여야 한다"고 선언됐고, ReplicaSet Controller가 2개로 줄어든 것을 감지해 1개를 생성한다. 파드를 없애고 싶다면 파드가 아니라 Deployment를 수정해야 한다.
-
-<Callout type="note" title="트레이드오프">
-Reconciliation Loop는 이벤트 기반으로 동작하되, 주기적 재동기화(resync, 기본 10~30분)도 함께 수행한다. 이벤트만으로는 유실 가능성이 있기 때문이다. 재동기화는 안전망이다. 같은 Reconcile 함수가 여러 번 호출돼도 동일한 결과여야 하는 멱등성(Idempotency)이 이 구조를 안전하게 만든다.
+<Callout type="note" title="Raft의 핵심 보장">
+동일 term에서 최대 1개의 Master만 선출된다. 양쪽 파티션이 각각 과반수 투표를 얻으려면 공통 노드가 양쪽 모두에 투표해야 하는데, 한 노드는 한 term에서 한 번만 투표할 수 있다. 따라서 Split-Brain은 수학적으로 불가능하다.
 </Callout>
 
-## etcd — 단일 진실 공급원의 대가
+3노드 구성에서 Quorum은 2다. 1노드 장애 시 나머지 2노드가 Quorum을 충족해 새 Master를 선출하고 서비스를 이어간다. 짝수 구성(4노드)은 2:2 분리 시 어느 쪽도 Quorum을 충족하지 못해 클러스터 전체가 마비될 수 있어 피해야 한다.
 
-API Server가 읽고 쓰는 유일한 저장소인 etcd는 Raft 합의 알고리즘으로 분산 일관성을 보장한다. 모든 쓰기는 Leader를 통해 과반수(Quorum) 노드에 복제된 후 커밋된다.
+## 라우팅 수식 — Primary 샤드 수가 고정인 이유
 
-Quorum 공식은 단순하다: `Q = (N/2) + 1`. 3노드 클러스터는 Quorum 2로 1개 장애를 허용하고, 5노드 클러스터는 Quorum 3으로 2개 장애를 허용한다. 과반수가 없으면 etcd는 쓰기를 거부한다. 네트워크 파티션으로 클러스터가 3/2로 분리되면, 3노드 그룹만 쓰기가 가능하고 2노드 그룹은 쓰기를 거부한다. Split-Brain을 막는 방법이 바로 이것이다.
+문서가 어느 샤드에 저장될지는 다음 수식으로 결정된다.
 
-이 Raft 커밋 과정에는 반드시 `fsync`가 필요하다. 쓰기 지연 = 네트워크 RTT + 디스크 fsync 시간이다. "kubectl이 느리다"는 현상의 상당수가 etcd 디스크 성능 문제다. etcd에는 NVMe SSD가 필요하고, `etcd_disk_wal_fsync_duration_seconds` p99가 10ms 이하여야 한다.
-
-## kubelet과 Probe — 노드 에이전트의 책임
-
-kubelet은 API Server를 Watch해 자기 노드에 배정된 파드 스펙을 받아오고, CRI(Container Runtime Interface) gRPC로 containerd에 컨테이너 실행을 지시한다. 파드 스펙을 로컬에 캐시하기 때문에 API Server 연결이 끊겨도 기존 컨테이너는 계속 실행된다. **Control Plane이 죽어도 이미 실행 중인 파드는 계속 동작한다.** 이 설계 덕분에 Control Plane 유지보수 중에도 서비스가 중단되지 않는다.
-
-Probe는 이 에이전트가 컨테이너 상태를 지속적으로 검사하는 메커니즘이다. 세 종류의 역할은 명확히 구분된다.
-
-```yaml
-startupProbe:   # 기동 시간 보장 — Liveness를 차단
-  failureThreshold: 30   # 최대 300초 허용
-
-livenessProbe:  # 데드락/무응답 감지 → 재시작
-  failureThreshold: 3
-
-readinessProbe: # 트래픽 수신 준비 → 실패 시 Service 엔드포인트에서 제거
-  failureThreshold: 3
+```
+shard_num = hash(_id) % number_of_primary_shards
 ```
 
-Readiness Probe 실패는 재시작이 아니라 엔드포인트 제거다. kubelet이 `pod.status.conditions`를 업데이트하면, Endpoint Controller가 Endpoints 오브젝트를 갱신하고, kube-proxy가 iptables 규칙을 갱신한다. Service로 들어오는 트래픽에서 해당 파드가 제외된다. Probe 없이 배포하면 컨테이너가 시작되는 순간 트래픽이 들어온다. Spring Boot처럼 기동 시간이 긴 애플리케이션은 기동 중에 요청이 들어와 오류가 발생한다.
+`number_of_primary_shards`가 바뀌면 기존 모든 문서의 라우팅 결과가 달라진다. `hash("abc123") % 3 = 0`이던 문서가 `hash("abc123") % 5`에서는 다른 샤드를 가리킨다. 기존 문서를 찾을 수 없게 되므로, Primary 샤드 수는 인덱스 생성 시 영구 고정된다.
+
+반면 Replica 수는 운영 중 언제든 변경 가능하다. Primary가 쓰기 진입점과 복제 오케스트레이터 역할을 맡고, Replica는 읽기 분산과 장애 시 Primary 승격을 담당한다. Primary 장애 시에는 In-sync Replica Set(IRS)에 포함된 Replica만 승격 대상이 된다.
+
+샤드 수를 변경해야 할 때는 `_split`(배수로 증가), `_shrink`(약수로 감소) API가 있지만, 근본적인 재설계는 Reindex가 유일한 선택이다. 처음 설계가 운영 전체를 좌우하는 이유가 여기 있다.
+
+<Callout type="warning" title="트레이드오프">
+샤드가 너무 적으면 병렬 검색이 없고 용량 확장이 막힌다. 너무 많으면 Coordinating 노드의 병합 부하가 커지고 클러스터 상태가 비대해진다. Elastic의 공식 권장은 샤드 하나당 10~50GB, 노드당 샤드 수 20~25개 이하다.
+</Callout>
+
+## 쓰기와 읽기 — NRT의 "Near"와 Scatter-Gather
+
+**쓰기 경로**는 Coordinating → Primary(로컬 인덱싱 + Translog 기록) → Replica 병렬 복제 순서로 진행된다. 인덱싱된 문서는 즉시 검색되지 않는다. 인메모리 버퍼에 들어간 후 `refresh`(기본 1초)가 실행되어야 새 세그먼트가 생성되고 검색이 가능해진다. Near Real-Time의 "Near"는 이 1초 지연이다.
+
+Translog는 세그먼트가 디스크에 `fsync`되기 전 노드 재시작에 대비한다. 재시작 시 마지막 flush 이후의 Translog를 재생해 데이터를 복구한다.
+
+**읽기 경로**는 세 단계다.
+
+```
+Query Phase (Scatter):
+  모든 샤드에 병렬 쿼리 전송
+  각 샤드: 문서 ID + 점수만 반환 (_source 없음)
+
+Merge Phase:
+  Coordinating이 전역 정렬 후 상위 N개 문서 ID 선정
+
+Fetch Phase (Gather):
+  선정된 문서의 _source를 해당 샤드에서만 가져옴
+```
+
+Query Phase에서 `_source`를 가져오지 않는 이유는 명확하다. 3개 샤드에서 각 10개씩 30개를 모은 후 최종 10개를 고르는데, 30개 전체의 본문을 미리 가져오면 20개가 낭비다.
+
+`from + size` 페이지네이션이 깊어질수록 느려지는 이유도 여기 있다. `from=10000, size=10`이면 각 샤드는 상위 10,010개를 계산해서 보내야 한다. 3개 샤드라면 30,030개를 Coordinating이 병합해야 한다. `search_after`로 전환하면 마지막 결과의 sort 값을 커서로 사용해 항상 `O(page_size)` 비용으로 처리할 수 있다.
+
+<Aside label="설계 철학">
+ES의 모든 성능 문제는 결국 같은 질문으로 수렴한다 — "이 작업의 비용이 샤드 수에 비례하는가, 결과 크기에 비례하는가?" Query Phase 비용은 샤드 수에 비례하고, Fetch Phase 비용은 결과 크기에 비례한다. 이 구분을 이해하면 쿼리 최적화 방향이 보인다.
+</Aside>
 
 ## 정리
 
-- 모든 컴포넌트가 API Server를 경유하는 설계는 "진단 가능성"을 위한 선택이다. 아키텍처가 곧 진단 지도다.
-- Watch 메커니즘이 폴링 없이 이벤트를 전달하기 때문에 이 중앙화 방식이 실용적일 수 있다.
-- Reconciliation Loop가 "자가 치유"의 실체다. 선언형은 컨트롤러가 상태를 지속적으로 감시하고 유지한다는 의미다.
-- etcd의 Raft Quorum은 일관성을 위해 가용성을 희생하는 선택이다. 그리고 etcd의 fsync 지연이 Control Plane 전체 응답 속도를 결정한다.
-- Static Pod는 닭-달걀 순환 의존을 끊는 방법이다. kubelet이 파일을 직접 읽어 API Server 없이도 Control Plane을 부트스트랩한다.
+- Elasticsearch = Lucene(검색 코어) + 분산 레이어. 샤드 하나가 Lucene 인스턴스 하나다.
+- 5계층(클러스터 → 노드 → 인덱스 → 샤드 → 세그먼트)은 각각 명확한 책임을 가진다.
+- ES 7.x+의 Raft 기반 합의는 Split-Brain을 수학적으로 방지한다. Master-eligible 노드는 홀수(최소 3개)로 구성한다.
+- Primary 샤드 수는 라우팅 수식에 묶여 고정이다. 처음 설계가 운영 전체를 결정한다.
+- 읽기는 Scatter-Gather 2회 왕복으로 완성된다. 깊은 페이지네이션은 `search_after`로 대체한다.
 
-이 챕터의 다섯 컴포넌트 — API Server, etcd, Controller Manager, kubelet, kubeadm — 는 각각 다른 문제를 풀지만, 같은 원칙 위에 서 있다. **상태를 선언하면, 시스템이 그 상태로 수렴한다.** 다음 글에서는 파드 하나가 생성되는 전체 여정을 스텝별로 추적한다.
+다음 글에서는 각 샤드 내부의 Lucene 역색인이 B-Tree와 어떻게 다른지, 그리고 전문 검색이 왜 역색인 없이는 불가능한지 추적한다.

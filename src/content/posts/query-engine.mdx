@@ -1,0 +1,120 @@
+---
+title: "Elasticsearch는 왜 같은 조건도 다르게 처리하는가"
+description: "Query Context와 Filter Context의 내부 분기부터 BM25 수식, 분산 IDF 편차, HNSW 벡터 검색까지, Elasticsearch 검색 파이프라인의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [elasticsearch, query-dsl, bm25, hnsw, hybrid-search]
+difficulty: intermediate
+series:
+  slug: elasticsearch-deep-dive
+  title: Elasticsearch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Elasticsearch에서 같은 `term` 조건을 `must`에 넣느냐 `filter`에 넣느냐에 따라 내부 실행 경로가 완전히 달라진다. 한쪽은 BM25 점수를 계산하고, 다른 쪽은 비트 연산만 한다. 왜 이 차이가 존재하고, 이 구조가 BM25 스코어링·분산 IDF·벡터 검색까지 어떻게 이어지는가?
+
+## 두 개의 실행 경로
+
+Elasticsearch의 쿼리 실행은 "점수가 필요한가"를 기준으로 두 경로로 나뉜다.
+
+**Query Context**(`must`, `should`)는 "얼마나 관련 있는가"를 숫자로 표현해야 하므로 BM25 계산이 실행된다. CPU 집약적이고 결과가 매번 다를 수 있어 캐시되지 않는다.
+
+**Filter Context**(`filter`, `must_not`)는 "해당하는가/아닌가"의 이진 판단이다. 결과를 Roaring Bitset으로 변환해 세그먼트 레벨에서 캐시한다. 두 번째 요청부터는 비트 AND 연산만으로 필터링이 끝난다.
+
+```json
+{
+  "query": {
+    "bool": {
+      "must":   [{ "match": { "title": "keyboard" } }],
+      "filter": [
+        { "term":  { "category": "electronics" } },
+        { "term":  { "in_stock": true } },
+        { "range": { "price": { "lte": 200000 } } }
+      ]
+    }
+  }
+}
+```
+
+`category`, `in_stock`, `price`는 점수와 무관한 이진 조건이다. 이 세 조건을 `must`에 넣으면 매 요청마다 BM25가 불필요하게 실행된다. `filter`로 옮기면 첫 요청 이후에는 캐시된 비트셋을 재사용한다.
+
+<Callout type="note" title="트레이드오프">
+`filter`는 성능을 높이지만 점수 기여가 0이다. 모든 조건을 `filter`로 옮기면 정렬 기준이 사라져 검색 결과가 의미 없는 순서로 나열된다. 전문 검색(`match`, `multi_match`)은 반드시 `must`에 두어야 관련성 순위가 유지된다.
+</Callout>
+
+## BM25 — 포화 곡선과 필드 길이 정규화
+
+Query Context에서 점수를 만드는 수식이 BM25다.
+
+$$
+\text{score}(d, q) = \sum_{t \in q} \text{IDF}(t) \times \text{TF\_norm}(t, d)
+$$
+
+**IDF**(역문서 빈도)는 희귀한 단어에 높은 가중치를 부여한다. "the"처럼 모든 문서에 등장하는 단어는 IDF가 0에 수렴하고, "elasticsearch"처럼 일부 문서에만 있는 단어는 IDF가 높아진다.
+
+$$
+\text{IDF}(t) = \ln\!\left(1 + \frac{N - n(t) + 0.5}{n(t) + 0.5}\right)
+$$
+
+**TF\_norm**은 단어 빈도(tf)를 포화 곡선으로 처리한다. tf가 아무리 높아도 점수는 $k_1 + 1$(기본 2.2)에 수렴한다. 단어를 스팸처럼 반복해도 무한히 점수가 올라가지 않는다.
+
+$$
+\text{TF\_norm}(t,d) = \frac{tf \cdot (k_1 + 1)}{tf + k_1 \cdot \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}
+$$
+
+`b` 파라미터(기본 0.75)는 필드 길이 정규화 강도다. 짧은 제목에서 "keyboard"가 1번 나온 것과 긴 설명에서 1번 나온 것은 "밀도"가 다르다. `b`가 높을수록 긴 문서의 TF를 하향 조정한다. 상품 제목처럼 짧은 필드에는 `b`를 낮게(0.3), 본문처럼 긴 필드에는 높게(0.75) 설정하면 서비스 특성에 맞는 점수 체계를 구성할 수 있다.
+
+## 분산 IDF — 샤드 위치가 점수를 바꾼다
+
+BM25의 IDF는 샤드 내 문서 통계를 기반으로 계산된다. 3개 샤드로 나뉜 인덱스에서 "keyboard"가 Shard 0에는 2개, Shard 1에는 25개 문서에 등장한다면 두 샤드의 IDF는 각각 4.0과 1.38로, 거의 3배 차이가 난다. 같은 내용의 문서라도 어느 샤드에 배치되느냐에 따라 점수가 달라진다.
+
+`DFS_QUERY_THEN_FETCH`는 Phase 0을 추가해 모든 샤드의 통계를 먼저 수집하고 글로벌 IDF를 계산한다. 점수 일관성은 보장되지만 네트워크 왕복이 한 번 더 발생한다.
+
+현실적인 대응 전략은 세 가지다:
+
+- **개발/테스트**: 단일 샤드(`number_of_shards: 1`)로 운영. 로컬 IDF = 글로벌 IDF, 점수 일관성 완전 보장.
+- **소규모 프로덕션**: `DFS_QUERY_THEN_FETCH` 적용 검토. 성능 비용과 점수 정확도를 교환.
+- **대규모 프로덕션**: 기본값 유지. 샤드당 100만 문서 이상이면 로컬 IDF가 글로벌 IDF에 통계적으로 수렴한다.
+
+## 쿼리 실행 계획 — 절 순서가 성능을 결정한다
+
+Lucene은 bool 쿼리의 각 절에 예상 매칭 문서 수(Cost)를 추정하고, Cost가 낮은 절부터 평가한다. `category="electronics"`(500개)가 `in_stock=true`(8000개)보다 Cost가 낮으면 앞 절을 먼저 적용해 후보 집합을 빠르게 줄인다. 이후 절은 더 적은 문서에만 적용된다.
+
+`script` 쿼리처럼 Cost 예측이 불가능한 쿼리는 Lucene이 자동 최적화하지 못한다. 이런 쿼리는 `filter` 배열의 마지막에 수동으로 배치해야 앞선 term/range 조건이 후보를 줄인 이후에 실행된다.
+
+`_profile` API는 각 절의 실제 실행 시간을 `time_in_nanos`로 보여준다. `_explain` API는 특정 문서의 IDF, TF\_norm, 각 절 기여도를 분해해 보여준다. "왜 이 문서의 점수가 낮은가"라는 질문에는 `_explain`이, "왜 이 쿼리가 느린가"라는 질문에는 `_profile`이 답한다.
+
+## 벡터 검색 — HNSW와 하이브리드
+
+BM25 기반 검색은 "배터리 소모"로 검색했을 때 "배터리 설정"을 찾지 못한다. 단어가 다르기 때문이다. 벡터 검색은 의미론적 유사성으로 이 간극을 메운다.
+
+`dense_vector` 필드는 역색인과 반대 방향으로 저장된다. 역색인이 "단어 → 문서 목록"이라면, 벡터 인덱스는 "문서 → N차원 부동소수점 배열"이다. 100만 문서 × 768차원 = 약 3GB로, 메모리 확보가 필수다.
+
+HNSW(Hierarchical Navigable Small World)는 계층적 그래프 구조로 근사 최근접 이웃을 탐색한다. 완전 탐색이 $O(N \times \text{차원})$인 데 반해, HNSW는 $O(\log N)$으로 수천~수만 배 빠르다. 정확도는 95%+ 수준이다. `num_candidates`를 높이면 정확도가 올라가고 속도가 내려간다. `k`의 5~10배가 균형점이다.
+
+BM25와 kNN을 결합하는 Reciprocal Rank Fusion(RRF)은 두 방식의 점수 스케일 차이를 무시하고 순위만으로 결합한다.
+
+$$
+\text{score\_rrf}(d) = \sum_i \frac{1}{\text{rank}_i(d) + k}
+$$
+
+BM25 1위이면서 kNN 5위인 문서와, BM25 3위이면서 kNN 1위인 문서를 각각의 순위로 공정하게 결합한다. 정확한 키워드 매칭(BM25)과 의미론적 유사성(kNN) 모두를 활용하는 현재 권장 아키텍처다.
+
+<Aside label="설계 철학">
+Query/Filter Context 분리, BM25 포화 곡선, HNSW 근사 탐색 — 이 모든 결정의 공통 동기는 하나다. "완벽한 정확도 대신 충분히 좋은 결과를 예측 가능한 비용으로." Elasticsearch의 모든 파라미터(`k1`, `b`, `num_candidates`, `rank_constant`)는 이 트레이드오프를 사용자가 직접 조율할 수 있도록 노출된 손잡이들이다.
+</Aside>
+
+## 정리
+
+- `filter`는 Roaring Bitset 캐시로 이진 조건을 처리하고, `must`는 BM25로 관련성 점수를 계산한다. 이 분리가 Elasticsearch 성능 최적화의 출발점이다.
+- BM25의 TF 포화 곡선과 필드 길이 정규화(`b`)는 단순 단어 반복을 방지하고 "단어 밀도"를 점수에 반영한다.
+- 분산 IDF는 샤드 구성에 따라 같은 문서의 점수를 달라지게 만든다. 데이터가 적은 초기 단계와 A/B 테스트에서 특히 주의해야 한다.
+- `_explain`으로 점수 원인을 추적하고, `_profile`로 느린 절을 식별하면 쿼리 최적화가 추측이 아닌 근거 있는 결정이 된다.
+- BM25와 kNN의 하이브리드 검색(RRF)은 키워드 정확도와 의미론적 이해를 모두 확보하는 현재 권장 패턴이다.
+
+다음 글에서는 집계(Aggregation) 아키텍처로 이동해, Elasticsearch가 수억 개 문서에서 통계를 실시간으로 계산하는 내부 구조를 추적한다.

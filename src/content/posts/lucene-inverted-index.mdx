@@ -1,0 +1,98 @@
+---
+title: "Elasticsearch는 왜 역색인인가"
+description: "MySQL LIKE 검색의 Full Scan 한계부터 FST 압축, 불변 세그먼트, NRT, doc_values까지 — Elasticsearch 내부 설계 결정의 공통 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [elasticsearch, inverted-index, lucene, segment, doc-values]
+difficulty: intermediate
+series:
+  slug: elasticsearch-deep-dive
+  title: Elasticsearch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MySQL에 인덱스가 있는데 Elasticsearch를 따로 써야 하는 이유가 무엇인가? 단순히 "빠르다"는 답은 틀리지 않지만 불완전하다. B-Tree와 역색인은 서로 다른 질문에 최적화된 자료구조이고, Elasticsearch의 모든 내부 설계 — FST, 불변 세그먼트, NRT, doc_values — 는 하나의 선택에서 파생된다. "단어 → 문서 목록"이라는 뒤집힌 매핑을 고수하기로 한 선택이다.
+
+## 왜 B-Tree는 전문 검색에 실패하는가
+
+B-Tree 인덱스는 왼쪽 정렬 구조다. `WHERE title LIKE 'mech%'`는 범위 탐색으로 처리할 수 있지만, `WHERE title LIKE '%keyboard%'`는 불가능하다. "중간에 포함"이라는 조건은 B-Tree가 알 방법이 없어 전체 행을 스캔한다. 1,000만 건이면 1,000만 번 비교다.
+
+역색인의 발상은 방향을 뒤집는다. 문서를 저장할 때 미리 단어를 추출해 **단어 → 문서 ID 목록(Posting List)** 을 만들어둔다. "keyboard"를 검색하면 `[doc_1, doc_4]`가 즉시 반환된다. 전체 문서를 열어보지 않는다.
+
+```
+B-Tree (LIKE '%keyboard%'):  O(N) — 전체 스캔
+역색인 검색:                  O(단어 길이 + 결과 수)
+
+N = 10,000,000, 결과 = 100개
+B-Tree:  10,000,000번 비교
+역색인:  약 110번 연산
+```
+
+## Term Dictionary는 어떻게 메모리에 들어가는가
+
+단어 수천만 개를 HashMap으로 메모리에 올리면 GC 압박이 심하다. Lucene은 대신 **FST(Finite State Transducer)** 를 쓴다.
+
+FST는 Trie와 달리 접두사뿐 아니라 접미사도 공유한다. "car"·"cat"·"dog"·"dot"를 저장할 때 Trie는 9개 노드가 필요하지만 FST는 공통 접미사("t")를 공유해 7개로 줄인다. 단어 수천만 개 규모에서 이 차이는 수 GB 대 수십 MB로 벌어진다.
+
+탐색 비용은 `O(단어 길이)`다. "keyboard"(8자)를 찾으면 정확히 8번 상태 전이로 Posting List 위치를 얻는다. 전체 단어 수와 무관하다. FST는 직렬화해서 `.tim` 파일로 저장하고 `mmap`으로 접근하므로 JVM 힙 밖에 올라간다. GC 대상이 아니다.
+
+<Aside label="FST와 세그먼트 불변성">
+FST는 구축 후 수정이 불가능한 자료구조다. Term Dictionary를 바꾸려면 세그먼트 전체를 다시 만들어야 한다. Lucene 세그먼트가 불변(Immutable)으로 설계된 근본 이유 중 하나가 여기 있다.
+</Aside>
+
+## 불변 세그먼트가 만드는 결과
+
+세그먼트가 불변이면 DELETE와 UPDATE는 실제 데이터를 지우지 않는다. 삭제는 `.liv` 비트셋에 마킹만 하고, 수정은 "삭제 마킹 + 새 문서 삽입"으로 처리된다. 실제 제거는 세그먼트 병합(Merge) 시 발생한다.
+
+<Callout type="warning" title="트레이드오프">
+불변 세그먼트의 이득은 명확하다 — 락 없는 동시 읽기, OS Page Cache 최적화, GC 친화적 mmap 사용. 비용도 명확하다 — DELETE 후 디스크 공간이 즉시 줄지 않고, 잦은 UPDATE는 삭제 마킹 문서를 쌓아 Posting List 탐색 비용을 높인다. 삭제 마킹 비율이 30%를 넘으면 `_forcemerge?only_expunge_deletes=true`로 정리해야 한다.
+</Callout>
+
+TieredMergePolicy는 세그먼트를 크기로 계층화해 자동 병합한다. 정적 인덱스(더 이상 쓰기 없음)라면 `max_num_segments=1`로 단일 세그먼트로 합쳐 검색 성능을 최대화할 수 있다.
+
+## NRT — "Near"가 의미하는 1초
+
+인덱싱한 문서가 즉시 검색되지 않는다. Lucene은 문서를 인메모리 버퍼에 쌓고, **refresh**마다 새 세그먼트를 생성해 OS Page Cache에 올린다. 기본 `refresh_interval`은 1초다.
+
+```
+인덱싱 → 인메모리 버퍼 + translog  (검색 불가, 내구성 있음)
+refresh → OS Page Cache 세그먼트   (검색 가능, fsync 아직 없음)
+flush   → 디스크 fsync             (완전한 내구성)
+```
+
+세그먼트가 Page Cache에만 있어도 검색이 가능한 이유는 `mmap` 덕분이다. Lucene은 세그먼트 파일을 mmap으로 접근하므로 Page Cache 히트 시 디스크 I/O 없이 메모리 속도로 읽는다. 내구성은 translog가 보장한다 — 매 쓰기마다 translog에 기록하므로 flush 전에 노드가 재시작되어도 translog를 replay해 복구한다.
+
+refresh를 자주 할수록 작은 세그먼트가 많이 생겨 병합 부하가 커진다. 대량 적재 시에는 `refresh_interval: -1`로 비활성화하고 완료 후 수동 refresh하는 것이 표준 패턴이다.
+
+## 역색인이 못하는 것 — doc_values
+
+역색인은 "단어 → 문서 ID" 순방향 매핑이다. 정렬과 집계는 "문서 ID → 필드 값" 역방향 조회가 필요하다. 역색인으로는 직접 답할 수 없다.
+
+Elasticsearch는 이를 **doc_values**로 해결한다. 컬럼 지향 저장소로, `price` 컬럼 전체를 연속 메모리로 읽어 정렬하거나 집계하는 데 최적화됐다. `.dvd` 파일로 저장되고 mmap으로 접근 — 역시 힙 밖이다.
+
+반면 `text` 필드에 `fielddata: true`를 설정하면 역색인을 뒤집어 힙에 올린다. 100만 문서의 description 필드면 400MB~1GB가 힙에 박힌다. OOM의 가장 흔한 원인이다. 올바른 패턴은 `text` + `keyword` 멀티필드다.
+
+```json
+"title": {
+  "type": "text",
+  "fields": {
+    "keyword": { "type": "keyword" }
+  }
+}
+```
+
+`title`은 역색인으로 전문 검색, `title.keyword`는 doc_values로 집계·정렬. 힙을 RAM의 50% 이하로 제한하는 이유도 여기 있다 — 나머지 50%를 Page Cache로 남겨 doc_values, Posting List, FST가 캐시에 상주하도록 한다.
+
+## 정리
+
+- B-Tree는 "값 → 레코드" 순방향에 최적화됐다. 전문 검색은 방향이 다른 문제다.
+- 역색인, FST, 불변 세그먼트, NRT, doc_values는 별개 기능이 아니라 하나의 설계 철학의 연속이다 — 쓰기 시점에 모든 자료구조를 구성해두고, 읽기 시점에는 최소한의 연산만 한다.
+- `text` 필드 집계에는 `fielddata`가 아닌 `.keyword` 서브필드를 써라. OOM을 막는 가장 확실한 방법이다.
+- 세그먼트 병합은 자동 정책을 신뢰하되, 정적 인덱스에만 `_forcemerge`를 쓴다.
+
+다음 글에서는 검색어가 어떻게 토큰으로 분리되고 역색인에 저장되는지 — Analyzer 파이프라인의 내부를 추적한다.
