@@ -1,0 +1,125 @@
+---
+title: "Spring Batch Partitioning은 어떻게 1,000만 건을 나누는가"
+description: "Manager-Worker 분리 구조부터 Remote Partitioning의 메시지 큐 분산까지, Partitioning의 설계 철학과 성능 한계를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-batch, partitioning, parallel-processing, thread-pool]
+difficulty: intermediate
+series:
+  slug: spring-batch-deep-dive
+  title: Spring Batch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+대용량 배치를 단일 스레드로 처리하면 언제나 같은 문제에 부딪힌다 — 17분짜리 작업을 4분으로 줄이려면 어떻게 해야 하는가. Spring Batch의 Partitioning은 이 질문에 대한 구체적인 답이다. 그런데 단순히 스레드를 늘리는 것과 무엇이 다른가?
+
+## Partitioning의 출발점 — 동종 작업을 데이터로 나눈다
+
+Partitioning은 **같은 작업을 데이터 범위로 쪼개 병렬 실행**하는 전략이다. Split이 서로 다른 종류의 작업을 병렬화한다면, Partitioning은 동일한 Step을 여러 개 복제하되 각각이 다른 데이터 구간을 담당하게 만든다.
+
+구조는 Manager-Worker 패턴이다. `PartitionStep`(Manager)이 전체 오케스트레이션을 담당하고, Worker Step들이 실제 데이터를 처리한다. Manager는 세 가지 컴포넌트로 이 분배를 수행한다.
+
+```
+Manager Step (PartitionStep) 실행:
+    │
+    ▼ ① Partitioner.partition(gridSize=4)
+    │   → Map 생성: partition0~3, 각각 minId/maxId
+    │
+    ▼ ② StepExecutionSplitter.split()
+    │   → BATCH_STEP_EXECUTION 4개 행 생성
+    │
+    ▼ ③ TaskExecutorPartitionHandler.handle()
+    │
+    ├─ Thread 1 ──── workerStep:partition0 ─── id 1~250만 ────── COMPLETED ─┐
+    ├─ Thread 2 ──── workerStep:partition1 ─── id 250~500만 ──── COMPLETED ─┤
+    ├─ Thread 3 ──── workerStep:partition2 ─── id 500~750만 ──── COMPLETED ─┤
+    ├─ Thread 4 ──── workerStep:partition3 ─── id 750~1000만 ─── COMPLETED ─┤
+    │                                                                        │
+    ◀─────────────────── 모든 Worker 완료 대기 (Future.get()) ────────────────┘
+    │
+    ▼ ④ 결과 집계 → Manager Step COMPLETED
+```
+
+`Partitioner.partition(gridSize)`가 반환하는 것은 `Map<String, ExecutionContext>`다. 키("workerStep:partition0")가 Worker Step의 이름이 되고, 값(`{minId=1, maxId=2500000}`)이 해당 Worker가 처리할 데이터 범위가 된다. `StepExecutionSplitter`는 이 맵을 기반으로 Worker별 `StepExecution`을 데이터베이스에 저장하고, `TaskExecutorPartitionHandler`가 각 Worker를 스레드 풀에 제출한다.
+
+Worker Step은 `@StepScope` 빈으로 구성해야 한다. `@Value("#{stepExecutionContext['minId']}")`로 각 Worker의 실행 컨텍스트에서 범위를 읽어 오는데, `@StepScope` 없이는 이 Late Binding이 동작하지 않는다.
+
+## Partitioner 구현 — 균등 분할이 핵심이다
+
+Partitioner의 품질이 전체 성능을 결정한다. Worker 4개 중 하나가 400만 건을 처리하고 나머지가 각 200만 건을 처리한다면, 전체 처리 시간은 400만 건짜리 Worker에 종속된다.
+
+단순 ID 범위 분할(`(maxId - minId) / gridSize`)은 소프트 딜리트 등으로 ID 공백이 많을 때 심각한 불균형을 만든다. ID 범위가 균등해도 실제 데이터 건수가 3.5배 차이날 수 있다.
+
+더 정확한 방법은 `NTILE` 함수로 실제 건수 기반 균등 분할을 하는 것이다.
+
+```sql
+SELECT MAX(id) AS boundary_id
+FROM (
+    SELECT id,
+           NTILE(4) OVER (ORDER BY id) AS bucket
+    FROM orders
+    WHERE status = 'PENDING'
+) t
+GROUP BY bucket
+ORDER BY bucket
+```
+
+각 버킷의 경계 ID를 기준으로 파티션을 나누면 Worker별 실제 처리 건수가 균등해진다. 대신 전체 테이블 스캔 쿼리가 한 번 더 필요하다는 비용이 있다.
+
+파일 기반, 날짜 기반 분할도 같은 원칙이다 — Worker가 각자의 범위를 `stepExecutionContext`에서 읽고, Reader는 그 범위에 해당하는 데이터만 처리한다.
+
+<Callout type="warning" title="Reader 이름 충돌 주의">
+`@StepScope` Reader의 `.name()` 설정에 파티션 인덱스를 포함해야 한다. 모든 Worker가 동일한 이름을 쓰면 `ExecutionContext`의 재시작 위치 정보(`read.count`)가 덮어써진다. `.name("workerReader-" + partitionIndex)` 패턴을 쓴다.
+</Callout>
+
+## GridSize, 스레드 수, 커넥션 풀 — 세 숫자가 맞아야 한다
+
+`gridSize`는 Partitioner에게 전달되는 힌트다. 실제 Worker 수는 Partitioner가 반환하는 맵의 크기로 결정된다. 두 값이 다를 수 있다.
+
+스레드 풀 설정에서 가장 흔한 실수는 `queueCapacity=0`으로 설정한 상태에서 `corePoolSize < gridSize`로 구성하는 것이다. Worker 제출 순간 `TaskRejectedException`이 발생한다. 완전 병렬이 목표라면 `corePoolSize = maxPoolSize = gridSize`로 맞추고 `queueCapacity=0`을 쓴다. 제한된 병렬이 목표라면 `corePoolSize < gridSize`이고 `queueCapacity ≥ (gridSize - corePoolSize)`여야 한다.
+
+커넥션 풀은 다음 공식이 안전하다.
+
+```
+pool_size = 동시 실행 Worker 수 × Worker당 최대 커넥션 + 여유(5~10)
+일반적:    gridSize × 3 + 10
+```
+
+`JdbcCursorItemReader`는 Step 전체 기간 동안 커넥션을 하나 유지하므로 특히 주의한다. 커넥션 부족은 조용히 타임아웃으로 이어진다.
+
+성능은 선형으로 증가하지 않는다. 동일 환경(MySQL 8.0, No-Offset 페이징, Chunk 2000)에서 GridSize를 늘리면 DB I/O 포화 이후 수익이 급격히 체감된다. GridSize 8→16에서 30% 향상이지만 16→32에서는 2.5% 향상에 불과하다. 일반적으로 GridSize 8~16이 최적 구간이다.
+
+## Remote Partitioning — 단일 서버의 한계를 넘을 때
+
+단일 서버의 CPU·메모리·커넥션 풀이 포화되면 Local Partitioning의 gridSize를 늘려도 의미가 없다. Remote Partitioning은 Worker를 별도 프로세스, 별도 서버로 분리한다.
+
+구조는 메시지 큐를 매개로 한다. Manager가 `StepExecutionRequest`(jobExecutionId, stepExecutionId 포함)를 큐에 발행하면, Worker 프로세스들이 이를 수신해 자신의 Step을 실행하고, 완료 후 응답 메시지를 Manager에게 돌려보낸다.
+
+핵심 설계 결정은 **공유 JobRepository**다. Manager와 Worker가 같은 데이터베이스의 `BATCH_STEP_EXECUTION`을 공유하므로, Worker는 메시지에서 ID만 받아서 DB에서 자신의 `StepExecution`을 조회하고, 처리 후 상태를 같은 DB에 갱신한다. Manager는 마지막에 DB를 조회해 모든 Worker의 상태를 집계한다.
+
+<Callout type="note" title="트레이드오프">
+Remote Partitioning은 Worker 서버 추가로 처리 용량을 선형 확장할 수 있다. 대신 메시지 큐 인프라, 공유 DB(단일 장애점), `timeout` 설정 오류로 인한 거짓 실패, 여러 프로세스에 걸친 로그 추적이라는 운영 비용이 따라붙는다. `timeout`은 Worker 최대 처리 시간의 2~3배로 설정하지 않으면, 정상 실행 중인 Worker가 실패로 처리된다.
+</Callout>
+
+## 재시작 전략 — 실패 Worker만 다시 처리한다
+
+Partitioning의 재시작 메커니즘은 Worker 단위다. `StepExecutionSplitter`는 재시작 시 각 Worker의 마지막 `StepExecution` 상태를 확인한다. `COMPLETED`인 Worker는 건너뛰고, `FAILED`인 Worker만 새 `StepExecution`을 생성해 재실행한다.
+
+이 기반은 Worker별 `StepExecution`이 DB에 독립적으로 저장된다는 구조에서 온다. `BATCH_STEP_EXECUTION`의 `step_name`이 `"workerStep:partition1"`처럼 Worker마다 고유하므로, 각 Worker를 개별적으로 추적할 수 있다.
+
+`allowStartIfComplete=true`로 설정하면 `COMPLETED` Worker도 재실행한다. Writer가 `ON DUPLICATE KEY UPDATE` 같은 멱등 연산이라면 안전하다. 그렇지 않다면 기본값(`false`)을 유지해야 중복 처리를 피할 수 있다.
+
+Reader 최적화도 재시작과 연결된다. `JpaPagingItemReader`는 OFFSET 기반이라 250만 건 처리 시 마지막 페이지에서 `OFFSET 2,499,000`을 실행한다. `JdbcPagingItemReader`의 No-Offset 방식(`id > lastId`)은 이 문제를 피하면서 재시작 시에도 마지막 커밋 위치(`lastId`)를 `ExecutionContext`에서 정확히 복원한다.
+
+## 정리
+
+- Partitioning은 동종 작업을 데이터 범위로 분할한다. Partitioner가 반환하는 맵이 Worker 수와 범위를 모두 결정한다.
+- 균등 분할이 핵심이다. ID 범위가 아닌 실제 건수(`NTILE`) 기반 분할이 Worker간 처리 시간을 균등하게 만든다.
+- `gridSize`, 스레드 수, 커넥션 풀 세 값이 맞지 않으면 `TaskRejectedException` 또는 커넥션 타임아웃이 발생한다.
+- 성능은 GridSize 8~16 이후 수렴한다. DB I/O 대역폭이 진짜 병목이다.
+- 재시작은 Worker 단위다. 멱등 Writer와 No-Offset Reader를 조합하면 안전하고 효율적인 재처리가 가능하다.

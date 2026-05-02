@@ -1,0 +1,108 @@
+---
+title: "Spring Batch는 왜 Job·Step·Tasklet으로 나누는가"
+description: "단순 파일 이동부터 100만 건 정산까지, Spring Batch 3계층 실행 구조의 설계 근거와 JobRepository·JobParameters·자동 구성까지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-batch, job-repository, execution-context, tasklet, chunk]
+difficulty: intermediate
+series:
+  slug: spring-batch-deep-dive
+  title: Spring Batch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Batch는 배치 작업을 `Job`, `Step`, `Tasklet` 세 계층으로 나눈다. 파일 하나를 옮기는 단순 작업이나 100만 건 주문을 정산하는 복잡한 작업이나, 동일한 구조 위에 올라간다. 왜 이렇게 분리했을까? 그리고 이 분리가 실패 복구와 재시작을 어떻게 가능하게 만드는가?
+
+## 3계층이 존재하는 이유
+
+배치 작업은 복잡도 차이가 극적이다. 테이블 한 번 Truncate하는 작업과, CSV를 파싱해 DB에 적재하고 결과를 이메일로 발송하는 작업을 같은 추상화로 다루려면 구조가 필요하다.
+
+`Job`은 전체 작업을 정의하고 메타데이터를 관리한다. `Step`은 독립적으로 실행·실패·재시작 가능한 단위다. `Tasklet`은 Step이 실제로 수행하는 작업을 담는다. 이 분리의 핵심은 **Step이 독립적 복구 단위**라는 점이다.
+
+```
+SimpleJob.execute()
+    │
+    ├─ Step 1: downloadFileStep   → COMPLETED
+    ├─ Step 2: processOrdersStep  → FAILED (50만 건 처리 중)
+    └─ Step 3: sendReportStep     → 실행 안 됨
+```
+
+재시작하면 Step 1은 건너뛰고 Step 2의 50만 1건부터 재개한다. 이 동작이 가능한 건 각 Step의 상태가 DB에 영구 저장되기 때문이다.
+
+## Tasklet vs ChunkOrientedTasklet
+
+`Tasklet` 인터페이스는 단순하다. `execute()`를 호출하고 `RepeatStatus.FINISHED` 또는 `CONTINUABLE`을 반환한다. 단순 작업 — 파일 이동, 단일 쿼리, API 한 번 호출 — 은 이 인터페이스를 직접 구현한다.
+
+대용량 처리는 다르다. `chunk(1000)`으로 선언하면 Spring Batch는 내부적으로 `ChunkOrientedTasklet`을 생성한다. 이 Tasklet이 `CONTINUABLE`을 반환하는 동안 `ItemReader → ItemProcessor → ItemWriter` 사이클이 1000건 단위로 반복된다. `ItemReader.read()`가 `null`을 반환하면 비로소 `FINISHED`다.
+
+<Callout type="warning" title="단순 Tasklet로 대용량 처리하면 생기는 일">
+100만 건을 일반 Tasklet 하나에서 루프로 처리하면 세 가지 문제가 동시에 발생한다. 전체 데이터가 한 번에 힙에 올라와 OOM이 생기고, 단일 트랜잭션이라 1건 실패 시 전체가 롤백되며, 실패 지점을 알 수 없어 처음부터 재처리해야 한다.
+</Callout>
+
+## JobRepository — 상태를 DB에 기록하는 이유
+
+Spring Batch의 재시작이 가능한 근거는 `JobRepository`다. 6개 테이블이 실행 상태 전체를 기록한다.
+
+```
+BATCH_JOB_INSTANCE          → Job + JobParameters 조합의 고유 식별자
+BATCH_JOB_EXECUTION         → 실행 이력 (시작/종료, 상태)
+BATCH_JOB_EXECUTION_PARAMS  → 실행에 사용된 JobParameters
+BATCH_JOB_EXECUTION_CONTEXT → Job 수준 ExecutionContext
+BATCH_STEP_EXECUTION        → Step별 readCount, writeCount, commitCount
+BATCH_STEP_EXECUTION_CONTEXT→ Step 수준 ExecutionContext (재시작 포인트)
+```
+
+Chunk 커밋이 일어날 때마다 `BATCH_STEP_EXECUTION`의 카운트와 `BATCH_STEP_EXECUTION_CONTEXT`의 재시작 포인트가 갱신된다. 재시작 시 `ItemStream.open(executionContext)`에서 이 값을 읽어 중단 지점부터 재개한다.
+
+`JobInstance`와 `JobExecution`은 다른 개념이다. `JobInstance`는 `JobName + JobParameters` 조합의 논리적 단위다. `JobExecution`은 그 인스턴스에 대한 물리적 실행 시도다. 같은 날짜로 실행한 배치가 실패한 뒤 재시도하면 `JobInstance`는 하나지만 `JobExecution`은 두 개가 된다. `JobInstance`가 `COMPLETED`면 같은 파라미터로 재실행할 수 없다 — 이 제약이 중복 처리를 막는다.
+
+## JobParameters와 ExecutionContext
+
+두 가지는 목적이 다르다.
+
+`JobParameters`는 실행 입력값이다. 실행 전에 결정되고 실행 중 바뀌지 않는다. `targetDate=2024-01-01`처럼 `JobInstance`를 식별하는 데 쓰인다. `@StepScope`와 함께 SpEL로 Bean에 주입된다.
+
+`ExecutionContext`는 실행 중 생성된 상태다. Step 간 데이터 전달과 재시작 포인트 저장이 목적이다. Job-scope EC는 모든 Step이 공유하고, Step-scope EC는 해당 Step만 접근한다.
+
+```java
+// @StepScope 없이는 null이 된다
+@Bean
+@StepScope
+public ItemReader<Order> orderReader(
+        @Value("#{jobParameters['targetDate']}") String targetDate) {
+    // Spring Context 초기화 시점이 아닌 Step 실행 시점에 SpEL이 평가된다
+    return new JpaPagingItemReaderBuilder<Order>()
+        .queryString("SELECT o FROM Order o WHERE o.orderDate = :date")
+        .parameterValues(Map.of("date", LocalDate.parse(targetDate)))
+        .build();
+}
+```
+
+`@StepScope`는 CGLIB Proxy를 만들고 실제 Bean 생성을 Step 실행 시점까지 지연한다. 이 시점에 비로소 `JobParameters`가 존재한다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+3계층 분리와 DB 기반 JobRepository는 재시작·중복 방지·이력 관리를 제공하는 대신 비용이 따른다. 설정 코드가 많고(JobBuilder, StepBuilder, Reader/Processor/Writer 각각 Bean 등록), Chunk 커밋마다 DB UPDATE가 발생하며, 메타데이터 테이블이 계속 커져 주기적 정리가 필요하다. 운영 환경에서 `spring.batch.jdbc.initialize-schema=never`로 설정하고 Flyway나 Liquibase로 스키마를 관리하는 이유가 여기 있다.
+</Callout>
+
+Spring Boot 3.x에서는 `@EnableBatchProcessing`을 붙이지 않아야 한다. `BatchAutoConfiguration`이 자동으로 `JobRepository`, `JobLauncher`, `JobExplorer`, `JobRegistry`를 등록한다. `@EnableBatchProcessing`을 추가하면 이 자동 구성이 비활성화되어 `spring.batch.*` 설정이 무시된다.
+
+<Aside label="설계 철학">
+Spring Batch의 3계층은 "배치 작업을 얼마나 세밀하게 복구할 수 있는가"를 결정한다. Step이 없으면 Job 전체를 재실행해야 하고, Tasklet 구분이 없으면 대용량과 단순 작업에 같은 메커니즘을 강요해야 한다. 각 계층은 독립적인 실패 경계이자 재시작 경계다.
+</Aside>
+
+## 정리
+
+- `Job → Step → Tasklet` 3계층은 각각 독립적인 실패·재시작 경계다.
+- 단순 작업은 Tasklet, 대용량은 `ChunkOrientedTasklet` — Chunk 크기가 트랜잭션 경계이자 메모리 제어 단위다.
+- `JobRepository`의 6개 테이블이 Chunk 커밋마다 상태를 갱신해 재시작 포인트를 보존한다.
+- `JobParameters`는 불변 입력값(JobInstance 식별), `ExecutionContext`는 가변 실행 상태(재시작·Step 간 전달).
+- Spring Boot 3.x에서 `@EnableBatchProcessing`은 자동 구성을 깨뜨린다 — 붙이지 않는 것이 기본값이다.
+
+다음 글에서는 Chunk 처리의 내부 — `ItemReader`, `ItemProcessor`, `ItemWriter`가 어떻게 트랜잭션과 묶이는지, 그리고 Skip·Retry가 어느 시점에 개입하는지 추적한다.

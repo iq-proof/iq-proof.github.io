@@ -1,0 +1,102 @@
+---
+title: "Spring Batch의 Chunk는 왜 Read→Process→Write인가"
+description: "트랜잭션 경계와 Chunk 크기가 맞물리는 원리부터 Reader 선택·Writer 최적화·Custom ItemStream 구현까지, Spring Batch의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-batch, chunk-processing, item-reader, item-writer, jdbc-batch]
+difficulty: intermediate
+series:
+  slug: spring-batch-deep-dive
+  title: Spring Batch Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Batch의 Chunk 처리는 단순해 보인다 — Read 1000건, Process 1000건, Write 1000건, COMMIT. 그런데 이 반복 루프 안에는 트랜잭션 경계, 메모리 제어, 재시작 안전성, JDBC 배치 효율이 동시에 얽혀 있다. `KEYS *` 하나로 Redis 전체가 멈추듯, Chunk Size 하나로 배치 전체가 OOM에 빠지거나 200배 느려질 수 있다. 왜 이 설계가 필요했고, 어디서 균형을 찾는가?
+
+## Chunk 처리의 출발점 — 100만 건을 하나의 트랜잭션으로 처리하면 안 되는 이유
+
+100만 건을 단일 트랜잭션으로 처리하면 세 가지 문제가 동시에 터진다. 메모리에 전체 데이터를 올려야 하고(`-Xmx512m` 환경에서 1KB짜리 레코드 100만 건은 즉시 OOM), 999,999번째에서 실패하면 전체 롤백이며, 100만 건의 행 잠금이 COMMIT 전까지 유지돼 다른 트랜잭션을 차단한다.
+
+Chunk 처리는 이 세 문제를 하나의 구조로 해결한다. **Chunk 크기 = 트랜잭션 경계**다. 1000건씩 읽어 처리하고 COMMIT하면, 힙에는 항상 1000건만 존재하고, 실패 시 최대 1000건만 재처리하며, COMMIT마다 잠금이 해제된다.
+
+```
+[Chunk 1 — 트랜잭션 시작]
+  Read   001~1000 → Process → Write → UPDATE BATCH_STEP_EXECUTION_CONTEXT
+COMMIT ──── 재시작 안전 지점 ①
+
+[Chunk 2 — 트랜잭션 시작]
+  Read   1001~2000 → Process → Write → UPDATE BATCH_STEP_EXECUTION_CONTEXT
+COMMIT ──── 재시작 안전 지점 ②
+```
+
+`ChunkOrientedTasklet.execute()`는 Chunk 하나를 처리하고 `CONTINUABLE`을 반환한다. `TaskletStep`이 `do-while`로 이를 반복 호출하면서 전체 데이터를 처리한다. `ItemReader.read()`가 `null`을 반환하는 순간 루프가 종료된다.
+
+## null의 두 가지 의미 — 종료 신호와 필터링 신호
+
+Spring Batch에서 `null`은 맥락에 따라 뜻이 다르다.
+
+`ItemReader.read()` → `null`: 데이터 소진. `SimpleCompletionPolicy`가 즉시 루프를 끝내고 남은 건수를 마지막 Chunk로 Write한다.
+
+`ItemProcessor.process()` → `null`: 이 아이템을 Writer에 전달하지 말라는 필터링 신호. `filterCount++`가 기록되고 조용히 제외된다. 예외를 throw하는 것과 근본적으로 다르다.
+
+<Callout type="warning" title="null 반환 vs 예외 throw">
+`null` 반환은 비즈니스 규칙에 의한 정상적인 제외다 — `filterCount`에 기록되고 `ItemSkipListener`가 호출되지 않는다. 예외 throw는 처리 불가능한 오류 상황이다 — `skipCount`에 기록되고 리스너가 알림을 받는다. 예외를 `null`로 대체하면 오류가 조용히 묻힌다.
+</Callout>
+
+`CompositeItemProcessor`에서 중간 Processor가 `null`을 반환하면 이후 Processor는 모두 건너뛴다. 블랙리스트 필터 → 수수료 계산 → 환율 변환 체인에서 첫 단계가 `null`을 반환하면 불필요한 API 호출이 발생하지 않는다.
+
+## Reader 선택 — 커넥션 점유와 OFFSET 성능의 균형
+
+Reader 선택은 두 가지 축의 교환이다: **DB 커넥션 점유 시간** vs **OFFSET 성능**.
+
+`JdbcCursorItemReader`는 한 번의 쿼리로 DB 커서를 생성하고 Step 전체 동안 커넥션을 유지한다. OFFSET 스캔이 없으므로 100만 건 읽기에 약 30초가 걸린다. 대신 커넥션 풀을 점유하고 Thread-unsafe하다.
+
+`JpaPagingItemReader`는 페이지마다 쿼리를 재실행한다. 커넥션은 짧게 사용하고 Thread-safe하지만, OFFSET이 깊어질수록 느려진다. 페이지 1은 2ms, 페이지 500,000은 800ms — 같은 데이터의 같은 1000건을 읽는 데 400배 차이가 난다.
+
+MySQL에서 Cursor Reader를 제대로 쓰려면 반드시 `fetchSize(Integer.MIN_VALUE)`를 설정해야 한다. 이 값이 없으면 전체 ResultSet이 한 번에 메모리에 올라온다 — 커서처럼 보이지만 실제로는 전체 로드다.
+
+OFFSET 문제를 Paging 방식으로 해결하려면 No-Offset 패턴을 쓴다. `WHERE id > :lastId ORDER BY id LIMIT 1000` 형태로 이전 페이지의 마지막 ID를 조건으로 추가하면, OFFSET 스캔 없이 인덱스 range scan으로 처리된다. `JdbcPagingItemReader`의 `MySqlPagingQueryProvider`가 이를 자동으로 생성한다.
+
+## Writer 최적화 — List를 받는 이유
+
+`ItemWriter.write(List<T>)`가 단건 API가 아닌 이유는 명확하다. Chunk 전체를 한 번의 JDBC `batchUpdate()`로 전송하기 위해서다.
+
+```
+단건 INSERT × 1,000,000 → 약 16분
+배치 INSERT × 1,000    → 약 5초 (200배 차이)
+```
+
+MySQL에서 이 효과를 얻으려면 `rewriteBatchedStatements=true`가 JDBC URL에 있어야 한다. 없으면 `JdbcBatchItemWriter`가 내부적으로 `batchUpdate()`를 호출해도 단건 INSERT가 반복 실행된다.
+
+`JpaItemWriter`는 기본값으로 `merge()`를 사용한다 — ID가 있으면 UPDATE, 없으면 INSERT. 재처리 시 중복 INSERT 없이 안전하다. 단, `@GeneratedValue(strategy = IDENTITY)` 전략은 Hibernate가 배치를 비활성화한다. 대용량 배치에서 JPA를 사용한다면 SEQUENCE 전략이나 UUID로 교체해야 한다.
+
+<Callout type="note" title="트레이드오프 — Chunk Size">
+크게 설정하면 JDBC 배치 효율이 높아지고 커밋 횟수가 줄지만, 메모리 사용량이 늘고 실패 시 재처리 건수가 증가한다. 1000→5000 구간에서 성능이 수렴하고 그 이상은 GC 압력만 늘어난다. 100만 건 기준 실측에서 Chunk 1000은 45초, Chunk 10000은 오히려 42초→느림. 황금 구간은 **1000~5000**이다.
+</Callout>
+
+## Custom ItemStream — 재시작 가능한 컴포넌트의 핵심
+
+기본 제공 Reader/Writer가 없는 소스(Kafka, REST API, S3)를 다룰 때는 `ItemStreamReader`를 직접 구현해야 한다. 핵심은 세 메서드다.
+
+- `open(ExecutionContext)`: Step 시작 시 리소스를 열고, EC에 이전 위치가 있으면 복원한다.
+- `update(ExecutionContext)`: Chunk 커밋마다 현재 위치를 EC에 저장한다. 이 정보가 재시작 포인트가 된다.
+- `close()`: Step 종료 시 리소스를 정리한다.
+
+`update()`와 트랜잭션 커밋은 같은 트랜잭션 안에서 수행된다. DB COMMIT이 실패하면 EC 업데이트도 함께 롤백되므로 처리 데이터와 재시작 포인트가 불일치하는 상황은 발생하지 않는다.
+
+EC에는 최소한의 정보만 저장해야 한다. "어디까지 읽었는가"를 나타내는 페이지 번호, 마지막 ID, 오프셋만 충분하다. 처리된 모든 ID 목록을 저장하면 Chunk 커밋마다 수 MB의 직렬화 오버헤드가 발생한다.
+
+## 정리
+
+- Chunk 크기 = 트랜잭션 경계. 이 등식이 메모리·재시작·잠금 세 문제를 동시에 해결한다.
+- `null`은 맥락에 따라 종료 신호(Reader)이거나 필터링 신호(Processor)다. 예외와 혼용하지 마라.
+- Cursor는 빠르지만 커넥션을 점유하고 Thread-unsafe하다. Paging은 안전하지만 OFFSET이 깊어지면 느려진다 — No-Offset 패턴으로 우회한다.
+- MySQL에서 배치 성능의 핵심은 두 가지다: `rewriteBatchedStatements=true`와 `fetchSize=Integer.MIN_VALUE`.
+- Custom Reader는 `ItemStreamReader`를 구현하고 `update()`에서 최소한의 재시작 포인트를 저장해야 재시작 가능하다.
+
+다음 글에서는 Job Flow 제어 — Sequential Flow, Conditional Flow, Parallel Flow의 내부 동작과 각 전략의 트레이드오프를 추적한다.
