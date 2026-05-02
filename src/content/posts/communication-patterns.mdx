@@ -1,0 +1,103 @@
+---
+title: "MSA 통신 계층은 왜 이렇게 복잡한가"
+description: "동기/비동기 선택 기준부터 gRPC 바이너리 인코딩, Kafka Outbox 패턴, API Composition 병렬화, Service Mesh 사이드카, GraphQL Federation까지 — MSA 통신 설계의 공통 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [msa, grpc, kafka, service-mesh, graphql-federation]
+difficulty: intermediate
+series:
+  slug: msa-deep-dive
+  title: Msa Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MSA는 서비스를 분리해서 독립 배포와 확장을 얻는다. 그런데 분리하는 순간 반드시 따라오는 문제가 있다 — **서비스끼리 어떻게 대화할 것인가**. REST, gRPC, Kafka, Service Mesh, GraphQL Federation까지, 선택지가 너무 많고 각자의 트레이드오프가 다르다. 이 모든 기술이 사실 하나의 질문에 대한 다른 답이라면 어떨까?
+
+## 통신 방식 선택의 수학
+
+동기 호출을 5개 서비스에 걸쳐 체이닝하면 가용성이 어떻게 될까.
+
+```
+전체 가용성 = 0.999 ^ 5 ≈ 99.5%
+
+월 99.9% → 43분 다운타임
+월 99.5% → 3.6시간 다운타임 (3배 증가!)
+```
+
+이것이 "비동기 우선" 원칙이 강조되는 이유다. 그러나 모든 통신을 비동기로 할 수는 없다. 결제 승인, 실시간 재고 차감처럼 **즉시 응답이 비즈니스 요구사항인 경우**는 동기 호출이 불가피하다.
+
+MSA 통신 설계의 핵심 판단은 결국 이것이다 — **"이 호출이 Critical Path인가, Non-Critical Path인가"**. 결제·재고 차감은 동기, 알림·분석·배송 준비는 비동기. 이 구분이 흐려지면 아키텍처 전체가 흔들린다.
+
+<Callout type="note" title="트레이드오프">
+동기 호출은 즉시성과 ACID를 얻는 대신 Cascading Failure 위험을 산다. 비동기 이벤트는 격리와 확장성을 얻는 대신 Eventual Consistency와 복잡한 상태 관리 비용을 산다. 둘 다 "옳은" 선택이 아니라, 상황에 맞는 선택이 있을 뿐이다.
+</Callout>
+
+## gRPC — 바이너리가 주는 것
+
+내부 서비스 간 통신에서 JSON 기반 REST는 불필요한 오버헤드를 만든다. Protocol Buffers의 Varint 인코딩은 작은 숫자를 1바이트에 담고, 필드 번호 기반 매핑으로 파싱 비용을 없앤다.
+
+```
+JSON: {"id":123,"name":"상품명"} → 약 32 바이트
+Protobuf: 필드 번호 + 길이 + 값 → 약 13 바이트 (60% 감소)
+```
+
+HTTP/2 멀티플렉싱은 여기에 더해 10개의 동시 조회를 하나의 TCP 연결에서 처리한다. 순차 호출의 `10 × 100ms = 1000ms`가 `max(100ms) = 100ms`로 줄어든다.
+
+gRPC의 4가지 통신 패턴은 서로 다른 시나리오를 커버한다. Unary는 일반 조회, Server Streaming은 대량 데이터 전송, Bidirectional Streaming은 실시간 양방향 상태 동기화. REST로 폴링해야 했던 시나리오들이 스트리밍으로 대체된다.
+
+단, gRPC는 브라우저 직접 호출이 불가능하고 L4 로드 밸런서에서 부하 불균형이 발생한다. **내부 서비스 간 통신은 gRPC, 공개 API는 REST**라는 이원 구조가 일반적인 이유다.
+
+## Kafka와 원자성 보장
+
+비동기 이벤트 통신의 가장 흔한 함정은 이것이다 — DB에는 저장됐는데 이벤트 발행은 실패한 경우. 트랜잭션이 묶이지 않으면 데이터 불일치가 생긴다.
+
+Outbox Pattern은 이를 해결한다. 이벤트를 Kafka에 직접 보내는 대신 **같은 DB 트랜잭션 안에 outbox 테이블에 저장**하고, 별도 폴러 프로세스가 주기적으로 미발행 이벤트를 Kafka에 발행한다. DB 커밋이 곧 이벤트 저장이므로, 둘은 항상 동기화된다.
+
+Kafka의 Consumer Group 구조는 격리를 보장한다. Notification Service가 장애를 일으켜도 Shipping Service의 offset은 독립적으로 진행된다. 복구 후 Notification Service는 자신의 마지막 offset부터 재처리한다.
+
+스키마 진화는 Avro Schema Registry로 관리한다. 새 필드는 반드시 `["null", "string"]` 유니온 타입에 `"default": null`을 붙여 추가해야 한다. Breaking Change가 감지되면 Registry가 등록을 거부 — 배포 전에 막힌다.
+
+## API Composition과 병렬화
+
+MSA에서 관계형 JOIN은 불가능하다. 각 서비스가 자신의 DB를 소유하기 때문이다. "주문 + 사용자 + 배송 + 결제" 정보를 한 응답에 담으려면 여러 서비스를 호출해 조합해야 한다.
+
+순차 호출은 지연을 선형으로 쌓는다. `CompletableFuture.allOf()`로 병렬화하면 가장 느린 서비스 응답 시간으로 완료된다. 500ms 순차 호출이 150ms 병렬 호출로 바뀐다.
+
+N+1 문제도 빠르게 찾아온다. 사용자 100명의 주문을 조회할 때 각 사용자별로 개별 조회를 하면 101회 호출이다. 배치 API — `getOrdersByUserIds(List<Long> ids)` — 를 만들어 메모리에서 grouping하면 2회로 줄어든다.
+
+부분 장애 전략도 설계해야 한다. Shipping Service가 타임아웃이 나도 주문·사용자·결제 정보는 반환할 수 있다. `null` 필드를 허용하는 부분 응답이 "서비스 전체 불가"보다 사용자 경험이 낫다.
+
+## Service Mesh — 인프라로 끌어올리기
+
+서비스가 20개를 넘으면 코드 레벨에서 Circuit Breaker, Retry, mTLS를 관리하는 비용이 폭발한다. 각 서비스마다 Resilience4j 설정을 반복하고, 인증서 갱신 시 모든 서비스를 재배포해야 한다.
+
+Istio는 이 복잡성을 인프라 레벨로 끌어올린다. Envoy Sidecar가 iptables 규칙으로 애플리케이션 코드 수정 없이 모든 트래픽을 가로챈다. Circuit Breaker 임계값 변경은 YAML 수정으로 즉시 적용된다 — 재배포 없이.
+
+mTLS는 SPIFFE ID 기반으로 자동화된다. 인증서는 Istiod가 발급하고 만료 3시간 전에 자동 갱신한다. 애플리케이션은 암호화 사실조차 모른다.
+
+<Aside label="언제 필요한가">
+20개 미만 서비스, 단일 언어, 단순 배포 전략이라면 Service Mesh는 오버엔지니어링이다. Resilience4j 같은 코드 레벨 라이브러리가 더 간단하고 빠르다. Service Mesh는 다언어 환경, 복잡한 트래픽 관리(카나리, A/B 테스트), 강한 보안 요구가 맞물릴 때 비로소 복잡도 비용을 정당화한다.
+</Aside>
+
+## GraphQL Federation — 스키마의 분리와 통합
+
+클라이언트가 여러 서비스 데이터를 조합해야 할 때, REST는 N번의 호출을 요구하고 BFF는 클라이언트별 코드 중복을 만든다. GraphQL Federation은 각 서비스가 자신의 스키마만 관리하면서(`@key` 지시자), Apollo Gateway가 자동으로 하나의 Supergraph로 조합하는 구조다.
+
+핵심은 Entity Resolution이다. Order Service의 `user: User!` 필드를 클라이언트가 요청하면, Gateway가 Order Service에서 `userId`를 받아 User Service의 `_entities` 엔드포인트를 호출한다. 클라이언트는 단 하나의 쿼리를 보낸다.
+
+단, DataLoader 없이 100개 Order의 user를 조회하면 User Service가 100번 개별 호출된다. `DataLoader.newMappedDataLoader`로 배치화하면 1번의 배치 쿼리로 줄어든다. Federation에서 N+1은 자동으로 해결되지 않는다 — 명시적으로 설계해야 한다.
+
+## 정리
+
+- **동기 vs 비동기 선택은 "즉시 응답이 비즈니스 요구사항인가"로 시작한다.** 결제는 동기, 알림은 비동기.
+- **gRPC는 내부 서비스 간 고성능 통신에, REST는 공개 API에** — 이 분리가 불필요한 복잡도를 막는다.
+- **Kafka의 원자성은 Outbox Pattern으로** 보장한다. 이벤트 발행 실패는 DB와 Kafka를 같은 트랜잭션에 묶는 것으로 해결된다.
+- **병렬화는 CompletableFuture.allOf()**, N+1은 배치 API — API Composition의 두 핵심 패턴이다.
+- **Service Mesh와 GraphQL Federation은 강력하지만**, 도입 임계(서비스 수, 복잡도, 운영 인력)를 넘기 전엔 오버엔지니어링이다.
+
+다음 글에서는 MSA의 또 다른 난제 — "각 서비스가 자신의 DB를 소유할 때 분산 트랜잭션을 어떻게 처리하는가" — 를 Saga 패턴과 보상 트랜잭션으로 추적한다.

@@ -1,13 +1,13 @@
 ---
-title: "Spring Cloud Gateway는 왜 Reactive 기반일까"
-description: "Zuul 1.x의 Thread-per-Request 한계부터 Filter 체인 실행 순서, 동적 라우팅, Circuit Breaker 통합까지 — Gateway의 모든 설계 결정을 관통하는 하나의 원칙을 추적한다."
+title: "API Gateway는 왜 단순한 프록시가 아닌가"
+description: "필터 체인의 실행 순서부터 서비스 디스커버리, Rate Limiting, JWT 오프로딩, BFF 패턴까지 — MSA 진입점의 설계 결정을 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [spring-cloud-gateway, reactive, netty, circuit-breaker, route-predicate]
+tags: [msa, api-gateway, spring-cloud-gateway, jwt, rate-limiting]
 difficulty: intermediate
 series:
-  slug: spring-cloud-deep-dive
-  title: Spring Cloud Deep Dive
+  slug: msa-deep-dive
+  title: Msa Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,92 +16,86 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-Spring Cloud Gateway는 Netty 위에서 동작한다. Tomcat 기반인 Zuul 1.x와 달리 이벤트 루프 스레드 몇 개로 수만 개의 동시 요청을 처리한다. 왜 이 선택을 했고, 이 선택이 Predicate 평가, Filter 체인, 동적 라우팅, 장애 격리까지 Gateway의 모든 설계 결정에 어떻게 관통하는가?
+MSA에서 API Gateway는 흔히 "앞단에서 트래픽을 분산하는 Nginx"로 오해받는다. 실제로는 인증, Rate Limiting, 서비스 디스커버리, 클라이언트별 응답 최적화까지 처리하는 **정책 엔진**이다. 이 모든 기능이 하나의 진입점에 집중되는 것은 우연이 아니라 설계다. 그 설계는 어떤 공통 철학 위에 서 있는가?
 
-## 스레드 모델: Thread-per-Request vs 이벤트 루프
+## 단일 진입점이라는 선택
 
-Zuul 1.x의 구조는 단순하다. 요청 1개가 오면 Tomcat 스레드 1개를 점유하고, 업스트림 응답이 올 때까지 그 스레드가 블로킹된다. 기본 스레드 풀이 200개라면 동시에 200개 요청을 처리할 수 있다. 201번째 요청은 큐에서 기다린다.
+Nginx는 L4/L7 트래픽을 분산한다. Spring Cloud Gateway는 거기서 한 발 더 나아가 **필터 체인**으로 모든 처리를 플러그인 방식으로 구성한다.
 
-업스트림 서비스가 느려질수록 상황은 악화된다. 각 스레드가 더 오래 점유되니 더 빨리 고갈된다. "업스트림 서비스 지연 → Gateway 스레드 고갈 → 전체 시스템 응답 불가"라는 연쇄가 발생한다.
-
-Spring Cloud Gateway는 Netty의 이벤트 루프를 사용한다. 요청이 오면 이벤트 루프 스레드가 처리를 시작하고, 업스트림 호출 직후 스레드를 반환한다. 응답이 도착하면 이벤트로 처리를 재개한다. CPU 코어 수 × 2개의 스레드로 수천 개의 동시 연결을 다룰 수 있다.
-
-<Callout type="note" title="트레이드오프">
-이벤트 루프 모델의 대가는 명확하다. **이벤트 루프 스레드에서 블로킹 코드를 실행하면 그 스레드가 처리해야 할 모든 요청이 멈춘다.** `Thread.sleep()`, JDBC 쿼리, 동기 HTTP 호출은 절대 금지다. 블로킹이 불가피하다면 `Schedulers.boundedElastic()`으로 별도 스레드 풀에서 실행해야 한다. 팀이 Reactive 프로그래밍에 익숙하지 않다면 이 제약이 생산성에 상당한 영향을 준다.
-</Callout>
-
-## Reactive Predicate와 Filter 체인
-
-이벤트 루프 기반이라는 선택이 Predicate와 Filter의 설계를 결정한다. 블로킹이 허용되지 않으니 모든 인터페이스가 Reactive 타입을 반환한다.
-
-`RoutePredicateHandlerMapping`은 요청이 오면 `Flux<Route>`를 순회하면서 각 Route의 `AsyncPredicate<ServerWebExchange>.apply(exchange)`를 호출한다. 반환 타입은 `Publisher<Boolean>`이다. 표준 `Predicate<T>.test()`의 `boolean`이 아니다. AND/OR 조합은 `Flux.zip()`으로 두 Predicate를 병렬 평가한 후 결합한다.
+요청은 `NettyWebServer → DispatcherHandler → RoutePredicateHandlerMapping → FilteringWebHandler` 순으로 흐른다. `FilteringWebHandler`가 실제 필터 체인을 실행하는 곳이다. 각 필터는 `Ordered` 인터페이스로 우선순위를 지정하고, Pre-phase(요청 처리) → 라우팅 → Post-phase(응답 처리) 순으로 실행된다.
 
 ```java
-// AsyncPredicate AND 조합 — 병렬 평가
-default AsyncPredicate<T> and(AsyncPredicate<? super T> other) {
-    return t -> Flux.zip(
-        Flux.from(apply(t)),
-        Flux.from(other.apply(t))
-    ).map(tuple -> tuple.getT1() && tuple.getT2());
+// 필터 우선순위: 숫자가 작을수록 먼저
+@Override
+public int getOrder() {
+    return Ordered.HIGHEST_PRECEDENCE + 10; // 최우선 실행
 }
 ```
 
-Filter 체인도 같은 원리다. `GatewayFilter.filter(exchange, chain)`의 반환 타입은 `Mono<Void>`다. `chain.filter(exchange)` 이전이 Pre-filter 로직, `.then()` 이후가 Post-filter 로직이다. Pre-filter는 Order 오름차순으로, Post-filter는 그 역순으로 실행된다.
+`GlobalFilter`는 모든 요청에 적용되고, `GatewayFilter`는 라우트별로 적용된다. 이 둘을 혼동하면 필터가 예상과 다른 순서로 실행되고, JWT 검증 전에 헤더가 변조되거나 Rate Limit이 우회되는 미묘한 버그가 생긴다.
 
-`FilteringWebHandler`는 Global Filter와 Route Filter를 병합한 뒤 `AnnotationAwareOrderComparator`로 정렬해 체인을 구성한다. 핵심 내장 필터의 Order는 건드리면 안 된다. `NettyRoutingFilter`는 `Integer.MIN_VALUE + 1`, `NettyWriteResponseFilter`는 `Integer.MIN_VALUE`다. 인증 필터는 `-100` 이하, 로깅 필터는 `-50` 정도가 실무 권장 범위다.
+## 서비스 위치는 누가 알아야 하는가
 
-## exchange.mutate() — 불변 객체의 수정 패턴
+마이크로서비스는 동적으로 생성되고 제거된다. IP를 하드코딩하면 새 인스턴스가 뜰 때마다 설정 파일을 고쳐야 한다. 서비스 디스커버리는 이 문제를 두 가지 방식으로 푼다.
 
-`ServerWebExchange`, `ServerHttpRequest`, `ServerHttpResponse`는 모두 불변이다. 헤더를 추가하거나 경로를 재작성하려면 `mutate()`로 복사본을 만들어야 한다.
+**Eureka(Client-Side Discovery)**: 클라이언트가 레지스트리를 직접 조회해 인스턴스를 선택한다. Heartbeat(30초 주기)로 건강 상태를 확인하고, 90초간 응답 없으면 제거(Eviction)한다. 네트워크 분할 상황에서는 Self-Preservation Mode가 켜져 기존 등록 정보를 보존한다 — 잘못된 제거보다 오래된 정보가 낫다는 판단이다. 장애 감지에 30~90초가 걸리는 것이 이 구조의 대가다.
+
+**Kubernetes Service(Server-Side Discovery)**: kube-proxy가 iptables/ipvs 규칙으로 Pod로 트래픽을 라우팅한다. 클라이언트는 DNS 이름(`http://user-service`)만 알면 된다. readinessProbe로 Pod 상태를 1~5초 내에 감지하므로 장애 대응이 빠르다. 대신 Kubernetes 없이는 동작하지 않는다.
+
+<Callout type="note" title="트레이드오프">
+Eureka는 클라우드에 독립적이고 가용성 우선이다. Kubernetes Service는 빠른 장애 감지와 단순한 클라이언트 코드를 제공하지만 플랫폼에 종속된다. 금융처럼 빠른 복구가 중요한 서비스라면 Kubernetes의 1~5초 감지가 Eureka의 90초보다 결정적이다.
+</Callout>
+
+## Rate Limiting: 분산 카운터가 필수인 이유
+
+Gateway 인스턴스가 3개 있을 때 각자 로컬 메모리 카운터를 쓰면, 사용자가 인스턴스마다 100개씩 총 300개를 보낼 수 있다. Rate Limit이 무의미해진다.
+
+해결책은 Redis를 중앙 카운터로 두는 것이다. 그런데 "현재 토큰 조회 → 충전 계산 → 소비 확인 → 저장"을 Java 코드 4단계로 구현하면 두 스레드가 동시에 같은 키를 읽을 때 Race Condition이 발생한다. Redis Lua 스크립트가 필수인 이유다 — Redis는 Lua 스크립트를 원자적으로 실행해 중간에 다른 명령이 끼어들 수 없다.
+
+Token Bucket 알고리즘은 평상시 토큰을 쌓아두었다가 버스트 트래픽을 흡수한다. `replenishRate: 100`(초당 100 토큰 충전), `burstCapacity: 200`(최대 보유량)으로 설정하면, 평소 조용하던 클라이언트가 갑자기 200개를 보내도 허용된다. Sliding Window는 정확하지만 타임스탬프를 모두 저장해야 해서 메모리 부담이 크고, 윈도우 경계에서 순간적으로 2배 허용되는 문제가 있다.
+
+## JWT 검증은 한 번만
+
+50개 마이크로서비스가 각자 JWT를 검증하면, 요청당 HMAC 계산이 50번 일어난다. Gateway에서 한 번 검증하고 내부 헤더로 전달하는 것이 옳다.
 
 ```java
-// JWT 클레임을 헤더로 주입하는 패턴
-ServerHttpRequest newRequest = exchange.getRequest().mutate()
-    .header("X-User-Id", userId)
-    .header("X-User-Roles", roles)
-    .headers(headers -> headers.remove(HttpHeaders.AUTHORIZATION))
+// Gateway: JWT 검증 후 헤더 교체
+ServerWebExchange modifiedExchange = exchange.mutate()
+    .request(req -> {
+        req.header("X-User-ID", claims.getSubject());
+        req.headers(headers -> headers.remove("Authorization")); // 원본 제거
+    })
     .build();
-
-return chain.filter(exchange.mutate().request(newRequest).build());
 ```
 
-`RewritePathGatewayFilterFactory`도 같은 패턴이다. 경로를 정규식으로 변환한 뒤 새 Request를 만들고, `GATEWAY_REQUEST_URL_ATTR`을 갱신한다. `NettyRoutingFilter`는 `exchange.getRequest().getURI()`가 아니라 이 속성을 참조해 업스트림 URI를 결정하기 때문에 이 속성 갱신이 누락되면 경로 재작성이 무시된다.
+각 마이크로서비스는 `@RequestHeader("X-User-ID")`만 읽으면 된다. JWT 검증 로직이 없다. 이 구조가 동작하려면 Gateway가 신뢰 경계(Trust Boundary)여야 한다 — 내부 서비스로 직접 오는 요청을 막는 NetworkPolicy나 방화벽이 전제다.
 
-## 동적 라우팅 — CachingRouteLocator와 RefreshRoutesEvent
+OAuth2는 Gateway의 BFF(Backend For Frontend) 역할로 자연스럽게 이어진다. Authorization Code를 클라이언트에 노출하지 않고, Backend가 Google과 직접 토큰을 교환한 뒤 우리 서비스의 JWT를 발급한다. Client Secret이 절대 클라이언트 쪽에 나가지 않는 것이 핵심이다.
 
-정적 YAML 라우트는 재배포 없이 변경할 수 없다. Gateway의 라우팅 계층은 이 문제를 `CachingRouteLocator` + `RefreshRoutesEvent`로 해결한다.
+## BFF: 클라이언트마다 다른 진실
 
-`CachingRouteLocator`는 `CompositeRouteLocator`(YAML 기반 `RouteDefinitionRouteLocator` + 커스텀 `RouteLocator`)의 결과를 메모리에 캐시한다. `RefreshRoutesEvent`가 발행되면 캐시를 무효화하고 하위 RouteLocator를 재조회한다.
+공통 API 하나로 웹, 모바일, 관리자를 모두 만족시키려 하면 오버페칭(불필요한 데이터 포함)과 언더페칭(부족해서 여러 번 호출)이 동시에 발생한다. BFF(Backend For Frontend)는 클라이언트별로 최적화된 API 레이어를 둔다.
 
-Config Server 연동 시 흐름은 다음과 같다. Config Server에서 라우트 설정을 변경하고 `/actuator/busrefresh`를 호출하면, Spring Cloud Bus가 모든 Gateway 인스턴스에 `EnvironmentChangeEvent`를 전파한다. Gateway는 이를 수신해 `RefreshRoutesEvent`를 발행하고, 수십 초 내에 재배포 없이 트래픽 전환이 완료된다.
+모바일 BFF는 이름과 주문 상태 3개만 5KB로 반환한다. 웹 BFF는 GraphQL로 클라이언트가 필요한 필드만 선택하게 한다. 두 BFF 모두 내부에서 마이크로서비스를 병렬로 호출한다.
 
-## 장애 격리 — Timeout과 Circuit Breaker
-
-이벤트 루프 기반이어도 연결 자체는 유지된다. 업스트림이 응답 없이 5분을 버티면 Netty 연결이 5분간 점유되고, 이 연결이 쌓이면 연결 수 한계에 도달한다. `connect-timeout`과 `response-timeout` 설정이 필수인 이유다.
-
-```yaml
-spring:
-  cloud:
-    gateway:
-      httpclient:
-        connect-timeout: 1000    # TCP 핸드셰이크 타임아웃 (ms)
-        response-timeout: 5s     # 응답 첫 바이트 수신 타임아웃
+```java
+// 순차: 300ms + 200ms + 150ms = 650ms
+// 병렬: max(300, 200, 150) = 300ms
+return Mono.zip(userMono, ordersMono, paymentMono)
+    .map(tuple -> DashboardResponse.from(
+        tuple.getT1(), tuple.getT2(), tuple.getT3()));
 ```
-
-라우트별 오버라이드는 `metadata.response-timeout`으로 설정한다. 글로벌 설정보다 라우트별 설정이 우선한다.
-
-Circuit Breaker는 타임아웃보다 한 단계 위의 장애 격리다. `SpringCloudCircuitBreakerFilterFactory`가 Resilience4j의 `ReactiveCircuitBreaker.run()`으로 업스트림 호출을 감싼다. Circuit Breaker가 OPEN 상태면 `chain.filter()`를 아예 호출하지 않고 즉시 Fallback으로 분기한다. 다운된 서비스에 불필요한 부하를 가하지 않는다.
-
-Retry와 Circuit Breaker를 함께 쓸 때 순서가 중요하다. **Retry가 바깥(먼저 실행), Circuit Breaker가 안쪽(나중 실행)이어야 한다.** Retry가 3회 재시도를 모두 소진한 후 그 실패를 Circuit Breaker가 하나의 논리적 실패로 카운트해야 Circuit Breaker가 너무 일찍 열리지 않는다.
 
 <Aside label="설계 철학">
-Spring Cloud Gateway의 모든 구성 요소 — Reactive Predicate, 불변 Exchange, CachingRouteLocator, Reactive Circuit Breaker — 는 하나의 원칙에서 파생된다. **이벤트 루프 스레드를 블로킹하지 않는다.** 이 원칙을 지키는 대가로 높은 동시성과 업스트림 장애 격리를 얻는다.
+BFF는 팀 소유권 문제와 직결된다. 중앙 BFF 팀이 모든 클라이언트의 API를 개발하면 병목이 된다. 프론트엔드 팀이 자신의 BFF를 소유하고 독립적으로 배포할 때 BFF의 가치가 실현된다.
 </Aside>
 
 ## 정리
 
-- Zuul 1.x는 Thread-per-Request, Gateway는 이벤트 루프다. 업스트림 지연이 클수록 차이는 극대화된다.
-- `AsyncPredicate`, `Mono<Void>` 반환 Filter, `exchange.mutate()` 패턴은 모두 Non-Blocking 제약의 귀결이다.
-- Filter 실행 순서는 Order 값으로 결정된다. 인증 필터(`-100`)가 `NettyRoutingFilter`(`MIN_VALUE+1`)보다 반드시 먼저 실행되어야 한다.
-- 동적 라우팅은 `RefreshRoutesEvent`로 캐시를 무효화해 재배포 없이 라우트를 변경한다.
-- Retry는 바깥, Circuit Breaker는 안쪽에 두어야 논리적 실패 단위로 카운트된다.
+- API Gateway의 필터 체인은 `Ordered` 인터페이스로 순서가 결정된다. 순서가 틀리면 인증이 우회된다.
+- 서비스 디스커버리는 Eureka(가용성 우선, 30~90초 감지)와 Kubernetes Service(빠른 감지, 플랫폼 종속) 중 요구사항에 따라 선택한다.
+- Rate Limiting은 Redis + Lua 스크립트로만 분산 환경에서 정확하게 동작한다. 로컬 카운터는 무의미하다.
+- JWT 검증은 Gateway에서 한 번, 이후 내부 헤더로 전달한다. 이것이 신뢰 경계의 의미다.
+- BFF는 클라이언트별 최적화이자 팀 소유권의 구조화다.
+
+다음 글에서는 이 Gateway 뒤에서 서비스 간 호출이 실패할 때 — Circuit Breaker와 Retry가 어떻게 연쇄 장애를 막는지 추적한다.
