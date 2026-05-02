@@ -1,0 +1,130 @@
+---
+title: "MySQL 백업은 왜 --single-transaction 없이 믿을 수 없나"
+description: "mysqldump 일관성 보장 원리부터 XtraBackup의 Hot Backup, Binary Log 기반 PITR, RTO/RPO 설계, 실전 복구 절차까지 — MySQL 백업·복구의 핵심을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [mysql, backup, pitr, xtrabackup, mysqldump]
+difficulty: intermediate
+series:
+  slug: mysql-deep-dive
+  title: Mysql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+백업 파일이 있다고 해서 복구가 된다는 보장은 없다. `--single-transaction` 없이 덤프한 파일은 테이블 간 시점이 어긋나 FK 오류를 일으키고, Binary Log 없이 매일 풀 덤프만 받아도 RPO는 23시간이다. MySQL 백업·복구 체계에서 어떤 선택이 어떤 결과를 낳는가?
+
+## 논리 백업의 일관성 문제
+
+mysqldump는 각 테이블을 순서대로 `SELECT *`로 읽어 SQL 파일로 변환한다. 아무 옵션 없이 실행하면 `orders`를 덤프하는 동안 다른 트랜잭션이 `order_items`에 행을 추가할 수 있고, `order_items`를 덤프하는 시점은 `orders`와 다르다. 복원 시 FK 오류가 발생하는 이유다.
+
+`--single-transaction`은 이 문제를 InnoDB의 MVCC로 해결한다.
+
+```bash
+mysqldump \
+  --single-transaction \
+  --master-data=2 \
+  --quick \
+  --routines --triggers --events \
+  mydb > backup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+내부적으로는 `START TRANSACTION WITH CONSISTENT SNAPSHOT`을 실행해 백업 시작 시점의 스냅샷을 고정한다. 이후 다른 트랜잭션이 커밋해도 백업 세션은 항상 그 스냅샷을 읽는다. `orders`와 `order_items`는 동일한 논리적 시점의 데이터를 갖게 된다.
+
+<Callout type="warning" title="MyISAM은 예외다">
+`--single-transaction`은 InnoDB 전용이다. MyISAM 테이블이 섞여 있으면 해당 테이블은 스냅샷 없이 덤프 시점마다 달라진다. `--lock-all-tables`를 사용하거나 MyISAM을 InnoDB로 전환하라.
+</Callout>
+
+`--master-data=2`는 백업 시점의 Binary Log 파일명과 위치를 주석으로 파일에 삽입한다. 이 정보가 없으면 이후 설명할 PITR이 불가능하다.
+
+## 물리 백업이 10배 빠른 이유
+
+100GB DB를 mysqldump로 복원하면 `INSERT` 실행과 인덱스 재생성으로 6~15시간이 걸린다. XtraBackup은 InnoDB 데이터 파일(`.ibd`)을 OS 수준으로 복사하므로 복원에 30~60분이면 충분하다.
+
+XtraBackup이 Hot Backup(서비스 중단 없는 백업)을 달성하는 원리는 두 스레드의 협력이다.
+
+```
+Thread 1: .ibd 파일을 순서대로 복사 (수십 분 소요)
+Thread 2: 백업 시작 시점부터 Redo Log를 실시간 추적·저장
+
+결과: 복사된 데이터 파일 + 미적용 Redo Log
+```
+
+이 상태로는 복원할 수 없다. `--prepare` 단계에서 InnoDB Crash Recovery와 동일한 과정을 거친다. 커밋된 변경은 Redo Log로 재실행하고, 백업 중 진행 중이던 미완료 트랜잭션은 Undo Log로 롤백한다. 이 단계를 생략하면 복원이 불완전하거나 실패한다.
+
+증분 백업은 각 InnoDB 페이지에 기록된 LSN(Log Sequence Number)을 이용한다. 이전 백업의 LSN보다 큰 페이지만 복사하므로 일일 증분이 1~10GB 수준으로 줄어든다. 적용 순서는 엄격하다.
+
+```bash
+# Full에 Inc1 적용 → Inc2 적용 → 최종 prepare
+xtrabackup --prepare --apply-log-only --target-dir=/backup/full/
+xtrabackup --prepare --apply-log-only --target-dir=/backup/full/ \
+           --incremental-dir=/backup/inc1/
+xtrabackup --prepare --target-dir=/backup/full/ \
+           --incremental-dir=/backup/inc2/
+# 마지막 prepare만 --apply-log-only 없음 (Undo Phase 포함)
+```
+
+중간 단계에서 `--apply-log-only`를 생략하면 미완료 트랜잭션이 롤백되어 이후 증분을 적용할 수 없게 된다.
+
+## Binary Log와 PITR
+
+Full Backup은 특정 시점 T₀의 스냅샷이다. Binary Log는 T₀ 이후 모든 트랜잭션을 순서대로 기록한다. 둘을 합치면 임의의 시점으로 복구할 수 있다.
+
+```
+Full Backup(T₀) + Binary Log 재생(T₀ → T_target-1) = T_target 직전 상태
+```
+
+실수로 `DROP TABLE orders`가 오전 10:30에 실행됐을 때 복구 절차는 다음과 같다.
+
+```bash
+# 1. Binary Log에서 DROP TABLE 위치 찾기
+mysqlbinlog --base64-output=DECODE-ROWS -v mysql-bin.000005 | \
+  grep -i -B 10 "DROP TABLE"
+# at 1234700 ← DROP TABLE Position
+
+# 2. Full Backup 복원 (복구 서버에서)
+xtrabackup --prepare --target-dir=/backup/full/
+xtrabackup --copy-back --target-dir=/backup/full/
+
+# 3. DROP TABLE 직전까지 Binary Log 재생
+mysqlbinlog --skip-gtids \
+  --start-position=5678901 \  # Full Backup 기준 위치
+  --stop-position=1234699 \   # DROP TABLE 직전 COMMIT
+  mysql-bin.000005 | mysql -u root -p
+```
+
+`--stop-datetime` 대신 `--stop-position`을 권장한다. 초 단위 경계에 여러 트랜잭션이 있으면 시간 기반은 오차가 생긴다. GTID 환경에서는 `--skip-gtids`가 필수다. Full Backup 복원 시 `GTID_PURGED`가 설정되는데, Binary Log를 그대로 재생하면 GTID 충돌이 발생한다.
+
+PITR의 전제 조건은 두 가지다. Binary Log가 Full Backup 주기보다 오래 보관되어야 하고, Full Backup에 Binary Log 위치 정보가 포함되어야 한다. 어느 하나라도 빠지면 PITR은 불가능하다.
+
+## 트레이드오프와 선택 기준
+
+<Callout type="note" title="트레이드오프">
+**mysqldump**: 설치 없이 즉시 사용, 텍스트 형태로 특정 테이블 선택 복원과 이기종 마이그레이션이 가능하다. 대신 100GB 이상에서 복원이 수십 시간으로 늘어나고, `--quick` 없이는 OOM 위험이 있다.
+
+**XtraBackup**: 백업 4~6배, 복원 10~20배 빠르다. 증분 백업으로 스토리지도 효율적이다. 별도 설치가 필요하고, `--backup → --prepare → --copy-back` 순서를 잘못 적용하면 복원이 실패한다. 특정 테이블만 선택적으로 복원하기 어렵다.
+
+**혼합 전략**: XtraBackup으로 운영 백업(빠른 복원), mysqldump로 스키마 버전 관리와 특정 테이블 마이그레이션.
+</Callout>
+
+RTO와 RPO는 이 선택을 결정한다. RTO가 2시간 미만이면 mysqldump로는 달성이 불가능하다. RPO가 1시간 미만이면 Binary Log가 없으면 불가능하다. 기술이 먼저가 아니라 비즈니스 요구사항이 먼저다.
+
+DB 크기별 기준을 대략 정리하면 10GB 미만은 mysqldump로 충분하고, 50GB 이상은 XtraBackup이 사실상 표준이다. Binary Log 보관 기간은 Full Backup 주기의 2배 이상을 유지해야 복구 가능 구간에 공백이 생기지 않는다.
+
+<Aside label="3-2-1 규칙">
+백업 복사본 3개, 2가지 다른 미디어, 1개는 오프사이트. 클라우드 환경에서는 같은 AZ 디스크 + 다른 AZ S3 + 다른 리전 S3로 구현한다. Binary Log도 DB 서버 외 별도 서버에 스트리밍해야 DB 서버 전체 장애 시 유실을 막는다.
+</Aside>
+
+## 정리
+
+- `--single-transaction`은 InnoDB MVCC 스냅샷으로 테이블 간 일관성을 보장한다. 없으면 FK 오류가 나는 백업이 만들어진다.
+- XtraBackup은 Redo Log 추적으로 Hot Backup을 달성한다. `--prepare` 단계 없이는 복원이 불가능하다.
+- PITR은 Full Backup + Binary Log의 조합이다. Binary Log 보관 기간이 Full Backup 주기보다 짧으면 복구 불가 구간이 생긴다.
+- RTO/RPO 목표를 먼저 정하고 백업 방식을 결정하라. 반대 순서는 언제나 실패한다.
+- 백업은 리허설로만 검증된다. 복원해보지 않은 백업은 존재하지 않는 것과 같다.
+
+복구 리허설에서 측정한 MTTR이 RTO를 초과한다면, 그 순간이 백업 전략을 바꿔야 할 때다.

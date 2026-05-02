@@ -1,0 +1,113 @@
+---
+title: "MySQL 쿼리 최적화의 공통 원리 — 인덱스를 죽이는 패턴들"
+description: "서브쿼리 반복 실행부터 묵시적 형변환까지, MySQL Optimizer가 인덱스를 포기하는 조건과 실행계획을 읽어 수치로 개선하는 방법론을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [mysql, query-optimization, explain, index, subquery]
+difficulty: intermediate
+series:
+  slug: mysql-deep-dive
+  title: Mysql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MySQL 쿼리가 느려졌을 때 가장 흔한 반응은 "인덱스를 걸면 되겠지"다. 그런데 인덱스를 추가했는데도 Optimizer가 여전히 Full Scan을 선택하는 경우가 있다. 왜 그런가? 그리고 Optimizer가 인덱스를 포기하게 만드는 패턴들 사이에는 어떤 공통 원리가 흐르는가?
+
+## 인덱스가 무력화되는 하나의 원리
+
+7개 챕터를 관통하는 핵심은 하나다 — **컬럼에 변환이 적용되면 인덱스는 쓸 수 없다.**
+
+B+Tree 인덱스는 원래 컬럼값 기준으로 정렬된 구조다. `WHERE YEAR(created_at) = 2024`처럼 컬럼에 함수를 씌우면, 인덱스에 저장된 값과 비교 대상이 달라지므로 순서대로 탐색할 수 없다. 전체를 스캔할 수밖에 없다.
+
+같은 원리가 타입 불일치 조인에도 적용된다. `users.id(BIGINT)`와 `orders.user_id(VARCHAR)`를 조인하면 MySQL은 `CONVERT(orders.user_id, SIGNED)`를 암묵적으로 적용한다. 컬럼에 함수가 씌워졌으므로 `orders.user_id` 인덱스는 무효가 된다.
+
+```sql
+-- 인덱스 무효: 컬럼에 변환 적용
+WHERE YEAR(created_at) = 2024          -- 함수
+WHERE user_code = 123                  -- VARCHAR 컬럼에 INT 리터럴
+ON users.id = orders.user_id           -- BIGINT vs VARCHAR
+
+-- 인덱스 유지: 상수가 컬럼 타입으로 변환
+WHERE bigint_col = '123'               -- 리터럴이 BIGINT로 변환, 컬럼은 그대로
+WHERE created_at >= '2024-01-01'       -- 범위 조건, 컬럼 변환 없음
+```
+
+`EXPLAIN`에서 의심해야 할 신호는 명확하다. 인덱스가 있는 테이블에서 `type: ALL`이 나오거나 `key: NULL`이 보이면, 컬럼에 무언가가 씌워져 있다고 의심하라.
+
+## 서브쿼리가 O(n²)이 되는 구조
+
+`EXPLAIN`의 `select_type: DEPENDENT SUBQUERY`는 즉각 개선 대상이다. 이 표시는 외부 쿼리의 각 Row마다 서브쿼리가 반복 실행된다는 뜻이다.
+
+```sql
+-- users 5만 건이면 orders 서브쿼리 5만 번 실행
+SELECT u.id, u.name
+FROM users u
+WHERE u.id IN (
+    SELECT o.user_id FROM orders o WHERE o.status = 'PAID'
+);
+```
+
+`EXPLAIN`에서 `rows=1`이라고 적혀 있어도 느릴 수 있다. 그 `rows=1`은 서브쿼리 한 번의 비용이고, 실제 비용은 `(외부 rows) × (서브쿼리 실행 횟수)`다.
+
+Optimizer는 이 상황을 세 가지 방식으로 처리한다. `SUBQUERY`(독립 실행, 1번)가 이상적이고, `MATERIALIZED`(임시 테이블 실체화)가 중간이며, `DEPENDENT SUBQUERY`(반복 실행)가 최악이다. Optimizer가 자동으로 Semi-Join으로 변환하기도 하지만, 서브쿼리에 `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 포함되면 변환이 불가능하다.
+
+<Callout type="warning" title="DEPENDENT SUBQUERY 즉시 개선">
+`EXPLAIN`에서 이 표시를 발견하면 JOIN으로 변환하거나, 서브쿼리를 CTE로 실체화한 뒤 조인하라. `EXPLAIN ANALYZE`의 `loops` 값이 외부 Row 수와 같다면 반복 실행 중이다.
+</Callout>
+
+## 임시 테이블이 성능을 죽이는 조건
+
+`Extra: Using temporary`는 메모리 임시 테이블이 생겼다는 뜻이다. 문제는 결과 크기가 `tmp_table_size`(기본 16MB)를 초과하면 디스크 임시 테이블로 전환된다는 점이다. 평소엔 빠르다가 월말 집계처럼 데이터가 폭증하는 순간 갑자기 30초짜리 쿼리가 되는 이유가 여기 있다.
+
+임시 테이블을 만드는 조건은 일관된다 — 집계(`GROUP BY`), 중복 제거(`DISTINCT`), 집합 연산(`UNION`), 윈도우 함수. 파생 테이블(FROM 절 서브쿼리)이라도 내부에 `GROUP BY`나 집계함수가 없으면 Optimizer가 외부 쿼리와 병합(Merge)해서 임시 테이블을 만들지 않는다.
+
+CTE는 두 가지로 처리된다. 단순 필터/컬럼 선택이면 `Merged`(임시 테이블 없음), 집계를 포함하면 `Materialized`(임시 테이블 1회 생성). Materialized CTE의 장점은 여러 곳에서 참조해도 재실행이 없다는 것이다.
+
+```sql
+-- Materialized CTE: GROUP BY → 임시 테이블 1회
+WITH order_stats AS (
+    SELECT user_id, SUM(amount) AS total
+    FROM orders GROUP BY user_id
+)
+SELECT u.name, os.total
+FROM users u JOIN order_stats os ON os.user_id = u.id;
+
+-- 디스크 전환 모니터링
+SHOW STATUS LIKE 'Created_tmp_disk_tables';
+-- Created_tmp_disk_tables / Created_tmp_tables > 10% → tmp_table_size 증가 고려
+```
+
+## 정렬이 인덱스를 탈 수 있는 조건
+
+`Extra: Using filesort`는 정렬에 인덱스를 사용하지 못했다는 뜻이다. B+Tree Leaf 노드는 인덱스 키 순서로 이미 정렬되어 연결되어 있으므로, ORDER BY가 인덱스 순서와 일치하면 추가 정렬이 필요 없다.
+
+인덱스 `(user_id, created_at)`이 있을 때, `WHERE user_id = 1 ORDER BY created_at DESC`는 인덱스 역방향 스캔으로 처리된다. filesort 없음. 그런데 `ORDER BY created_at ASC, amount DESC`처럼 방향이 혼합되거나, `ORDER BY created_at`만 있는데 `user_id` 조건이 없으면(leftmost prefix 위반) filesort가 발생한다.
+
+<Aside label="LIMIT과의 조합이 핵심">
+인덱스 정렬 + LIMIT은 매우 강력하다. 인덱스 순서대로 20건만 읽고 멈추면 되기 때문이다. 반면 filesort + LIMIT은 전체를 정렬한 뒤 자른다. 100만 건 테이블에서 `LIMIT 20`을 쓴다면 이 차이가 수백 배 성능 차이로 나타난다.
+</Aside>
+
+윈도우 함수는 항상 임시 테이블을 사용한다(`EXPLAIN Extra: Using temporary`). WHERE로 먼저 대상 범위를 줄이면 임시 테이블 크기가 줄어든다. 또한 같은 `PARTITION BY + ORDER BY`를 쓰는 여러 윈도우 함수는 `WINDOW` 절로 묶어 정렬을 1회만 수행하도록 최적화할 수 있다.
+
+## 트레이드오프
+
+<Callout type="note" title="인덱스 추가와 Optimizer의 판단">
+인덱스를 추가해도 Optimizer가 선택하지 않는 경우가 있다. 조건에 해당하는 Row 비율이 30% 이상이면 인덱스를 타는 것보다 Full Scan이 효율적이라고 판단한다. 인덱스를 쓰면 각 Row에 대해 Clustered Index 접근이 추가로 필요하기 때문이다. 이 경우 단일 컬럼 인덱스 대신 복합 인덱스로 선택도를 높이거나, 파티셔닝을 검토한다.
+
+인덱스를 추가할수록 INSERT/UPDATE/DELETE 성능은 소폭 감소하고 Buffer Pool 압박이 증가한다. `EXPLAIN ANALYZE`로 수치를 비교해 읽기 성능 향상이 쓰기 비용을 정당화하는지 판단하는 것이 원칙이다.
+</Callout>
+
+## 정리
+
+- `type: ALL` + 인덱스 있음 → 컬럼에 함수/형변환이 적용됐는지 먼저 확인하라.
+- `DEPENDENT SUBQUERY` → JOIN으로 변환하거나 CTE로 실체화하라. `EXPLAIN ANALYZE`의 `loops` 값이 증거다.
+- `Using temporary` + 디스크 전환 → `Created_tmp_disk_tables`를 모니터링하고, 쿼리 구조를 개선하거나 `tmp_table_size`를 조정하라.
+- `Using filesort` → ORDER BY 컬럼을 인덱스에 포함시키되, 방향을 통일하고 leftmost prefix를 지켜라.
+- 묵시적 형변환(문자셋 불일치, 타입 불일치 JOIN)은 조인 컬럼 타입을 통일하는 것이 유일한 근본 해결책이다.
+
+다음 글에서는 파티셔닝이 이 문제들을 어떤 방식으로 우회하는지, 그리고 언제 파티셔닝이 인덱스보다 나은 선택인지 추적한다.

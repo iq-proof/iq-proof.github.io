@@ -1,0 +1,145 @@
+---
+title: "MySQL 보안 설계의 세 기둥 — 권한, 연결, 환경 분리"
+description: "최소 권한 원칙과 Role 기반 권한 관리부터 SSL/TLS 강제, 데이터 마스킹을 통한 환경 분리까지, MySQL 운영 보안의 핵심 구조를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [mysql, security, least-privilege, ssl, data-masking]
+difficulty: intermediate
+series:
+  slug: mysql-deep-dive
+  title: Mysql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MySQL 보안 사고는 대부분 "편의를 위해 넘어간 것들"이 쌓여서 터진다. `ALL PRIVILEGES`를 부여한 애플리케이션 계정, 암호화되지 않은 연결, 개발 환경에 그대로 복사된 운영 개인정보. 이 세 가지는 따로 보면 각각의 문제처럼 보이지만, 실제로는 하나의 설계 원칙 부재에서 나온다. 왜 최소 권한 원칙만으로 보안 사고의 대부분을 막을 수 있는가?
+
+## 과도한 권한이 만드는 위험
+
+`GRANT ALL PRIVILEGES ON *.* TO 'app'@'%'`는 편리하다. 문제가 생겨도 권한 때문은 아닐 테니 원인 파악이 빠를 것이라는 착각도 있다. 실제로는 정반대다.
+
+SQL Injection 취약점이 있을 때, 애플리케이션 계정에 DDL 권한이 있으면 공격자는 테이블을 삭제하거나 `LOAD DATA INFILE`로 서버 파일을 읽을 수 있다. 배치 스크립트에 버그가 있을 때, 공유 계정을 쓰면 누가 `DELETE FROM orders WHERE 1=1`을 실행했는지 추적할 수 없다.
+
+최소 권한 설계는 단순하다. 계정을 역할 단위로 분리하고, 각 역할에 필요한 권한만 부여한다.
+
+```sql
+-- 서비스 계정: DML만, 특정 DB만
+CREATE USER 'app_writer'@'10.0.1.%' IDENTIFIED BY 'StrongPass123!';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mydb.* TO 'app_writer'@'10.0.1.%';
+-- CREATE, DROP, ALTER, TRUNCATE 없음
+
+-- 민감 컬럼 제외한 컬럼 레벨 권한
+CREATE USER 'support_user'@'10.0.3.%' IDENTIFIED BY 'SupportPass!';
+GRANT SELECT (id, name, email, status, created_at)
+  ON mydb.users TO 'support_user'@'10.0.3.%';
+-- phone_number, social_id 조회 불가
+```
+
+DDL이 필요한 배포는 별도 `deploy_user` 계정으로 분리하고, 배포 파이프라인에서만 활성화한다. 운영 중 서비스 계정은 `ALTER TABLE`을 실행할 이유가 없다.
+
+## MySQL 8.0 Role — 권한 묶음을 단위로 관리하기
+
+사용자가 10명일 때는 개별 `GRANT`로 관리할 수 있다. 100명이 넘으면 역할(Role)이 없으면 관리가 불가능해진다.
+
+```sql
+-- Role 생성 및 권한 부여
+CREATE ROLE 'backend_role', 'analyst_role', 'dba_role';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mydb.* TO 'backend_role';
+GRANT SELECT ON mydb.* TO 'analyst_role';
+GRANT ALL PRIVILEGES ON *.* TO 'dba_role';
+
+-- 사용자에게 Role 할당
+CREATE USER 'alice'@'10.0.1.50' IDENTIFIED BY 'AlicePass!';
+GRANT 'backend_role' TO 'alice'@'10.0.1.50';
+SET DEFAULT ROLE ALL TO 'alice'@'10.0.1.50';
+```
+
+Role의 핵심 이점은 변경 전파다. `backend_role`에서 특정 테이블의 `DELETE` 권한을 제거하면, 이 Role을 가진 모든 사용자에게 즉시 반영된다. 사용자 한 명씩 `REVOKE`를 실행할 필요가 없다.
+
+<Callout type="note" title="트레이드오프">
+Role 기반 관리는 변경을 단순하게 만들지만, Role 설계가 잘못되면 과도한 권한이 여러 사용자에게 한 번에 전파된다. Role 설계 초기에 최소 권한 원칙을 철저히 적용해야 한다. 개별 `GRANT` 방식은 사용자 수에 비례해 관리 비용이 증가하지만, Role 방식은 Role 수에만 비례한다.
+</Callout>
+
+## SSL/TLS와 비밀번호 정책 — 연결 자체를 신뢰할 수 없다면
+
+권한 설계가 완벽해도 네트워크에서 자격증명이 평문으로 흐른다면 의미가 없다. 같은 네트워크의 공격자가 `tcpdump`로 MySQL 패킷을 캡처하면 사용자명과 비밀번호를 그대로 얻는다.
+
+```bash
+# my.cnf
+[mysqld]
+ssl_ca   = /etc/mysql/ssl/ca.pem
+ssl_cert = /etc/mysql/ssl/server-cert.pem
+ssl_key  = /etc/mysql/ssl/server-key.pem
+require_secure_transport = ON  # 비SSL 연결 전면 거부
+```
+
+`require_secure_transport = ON`을 켜면 SSL 없는 모든 연결이 `Error 3159`로 거절된다. 계정별로도 `ALTER USER 'app'@'10.0.1.%' REQUIRE SSL`로 SSL을 강제할 수 있다.
+
+비밀번호 정책은 인증 강화의 다른 축이다.
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+SET GLOBAL validate_password.policy = STRONG;
+SET GLOBAL validate_password.length = 12;
+
+-- 계정 잠금: 5회 실패 시 1일 잠금
+CREATE USER 'secured_user'@'%'
+  IDENTIFIED BY 'MyStr0ng@Pass!'
+  FAILED_LOGIN_ATTEMPTS 5
+  PASSWORD_LOCK_TIME 1
+  PASSWORD EXPIRE INTERVAL 90 DAY
+  PASSWORD HISTORY 12;
+```
+
+<Aside label="운영 주의사항">
+`require_secure_transport = ON`을 기존 운영 환경에 갑자기 활성화하면, SSL 미설정 클라이언트가 모두 연결에 실패한다. `performance_schema.session_ssl_status`에서 SSL 없는 연결을 먼저 파악하고, 모든 클라이언트가 SSL을 사용하는 것을 확인한 뒤에 설정을 적용해야 한다.
+</Aside>
+
+## 환경 분리와 데이터 마스킹 — 개발자가 운영 DB에 접근하면 안 된다
+
+보안 사고의 상당수는 의도적 공격이 아니라 개발자의 실수에서 나온다. 잘못 설정된 `DATABASE_URL`로 운영 DB에 `DELETE FROM test_data WHERE 1=1`을 실행하거나, 운영 덤프를 그대로 개발 환경에 복사해 50명의 개발자가 실 고객 개인정보에 접근하는 경우다.
+
+기술적 강제 없이 환경 변수나 개발자 주의에만 의존하면 사람이 실수할 때 막을 방법이 없다.
+
+```sql
+-- 환경별 계정 분리: 호스트 제한으로 교차 접근 차단
+CREATE USER 'app_prod'@'10.0.prod.%'
+  IDENTIFIED BY 'ProdStrongPass@2024!' REQUIRE SSL;
+GRANT SELECT, INSERT, UPDATE, DELETE ON prod_mydb.* TO 'app_prod'@'10.0.prod.%';
+
+CREATE USER 'app_dev'@'10.0.dev.%'
+  IDENTIFIED BY 'DevPass@2024!';
+GRANT SELECT, INSERT, UPDATE, DELETE ON dev_mydb.* TO 'app_dev'@'10.0.dev.%';
+-- 개발 계정으로 prod_mydb 접근 시도 → Access denied
+```
+
+개발 환경에서 실제와 유사한 데이터가 필요할 때는 마스킹 뷰를 활용한다. MySQL 8.0.31+의 Dynamic Data Masking 컴포넌트를 쓰거나, 직접 뷰를 만들어 원본 테이블 접근을 차단한다.
+
+```sql
+CREATE VIEW users_masked AS
+SELECT
+    id,
+    CONCAT(SUBSTR(name,1,1), REPEAT('*', GREATEST(LENGTH(name)-1,1))) AS name,
+    CONCAT('user', id, '@masked-dev.com') AS email,
+    CONCAT(SUBSTR(phone,1,3), '-****-', SUBSTR(phone,9,4)) AS phone,
+    created_at, status
+FROM users;
+
+-- 개발 계정에 원본 아닌 뷰만 허용
+GRANT SELECT ON prod_mydb.users_masked TO 'dev_readonly'@'10.0.dev.%';
+```
+
+마스킹의 핵심은 형식 보존과 결정론적 출력이다. `user1@masked-dev.com`처럼 id 기반으로 마스킹하면 FK 관계가 유지되고 테스트가 가능하다. 매 실행마다 다른 랜덤 값을 쓰면 FK 관계가 깨지고 테스트 재현성도 사라진다.
+
+## 정리
+
+- 서비스 계정에는 DML만 부여한다. DDL은 배포 전용 계정으로 분리하고, 배포 파이프라인에서만 활성화한다.
+- MySQL 8.0 Role로 권한을 역할 단위로 묶으면, 100명 규모에서도 변경이 단순해진다.
+- `require_secure_transport = ON`과 `validate_password` 플러그인은 연결 자체의 신뢰도를 높인다. SSL 인증서 만료 모니터링을 빠뜨리지 말 것.
+- 환경 분리는 네트워크(VPC) + 계정(호스트 제한) + 데이터(마스킹)의 세 층으로 구성한다. 코드나 환경변수만으로는 실수를 막을 수 없다.
+
+권한을 최소화하고, 연결을 암호화하고, 환경을 분리하는 것 — 이 세 원칙을 기술적으로 강제하는 순간, 보안은 개발자 주의에서 시스템 구조로 이동한다.

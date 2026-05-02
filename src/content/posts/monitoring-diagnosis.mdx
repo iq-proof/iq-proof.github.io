@@ -1,0 +1,133 @@
+---
+title: "MySQL은 어디서 얼마나 걸리는가"
+description: "Performance Schema의 누적 통계부터 InnoDB 상태 스냅샷, sys 스키마, MySQL 8.0 히스토그램, 운영 장애 패턴까지 — 데이터 기반 진단 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [mysql, performance-schema, innodb, sys-schema, query-optimization]
+difficulty: intermediate
+series:
+  slug: mysql-deep-dive
+  title: Mysql Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+MySQL 성능 문제의 대부분은 추측에서 시작된다. "이 쿼리가 느릴 것 같다"는 직관이 틀렸을 때, 우리는 엉뚱한 인덱스를 추가하고 문제는 그대로 남는다. MySQL은 이 추측을 데이터로 대체할 도구를 이미 내장하고 있다 — 그 도구들을 어떻게 읽어야 하는가?
+
+## 진단의 출발점: Performance Schema
+
+Performance Schema는 MySQL이 스스로를 측정하는 장치다. SQL 실행, 파일 I/O, 락 대기, 뮤텍스 경합 — 모든 이벤트에 측정 포인트(instrument)가 박혀 있고, 그 데이터가 메모리 내 테이블(consumer)에 누적된다.
+
+가장 먼저 열어야 할 테이블은 `events_statements_summary_by_digest`다.
+
+```sql
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR                        AS exec_count,
+    SUM_TIMER_WAIT / 1e12             AS total_sec,
+    AVG_TIMER_WAIT / 1e12             AS avg_sec,
+    SUM_NO_INDEX_USED + SUM_NO_GOOD_INDEX_USED AS full_scan_count
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT IS NOT NULL
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+```
+
+`SUM_TIMER_WAIT`는 서버 재시작 이후 이 쿼리 패턴이 DB 자원을 얼마나 소비했는지의 누적 합이다. "지금 느린 쿼리"가 아니라 "지금까지 가장 많은 자원을 가져간 쿼리"를 드러낸다. 이 숫자가 크면, 그게 먼저 건드려야 할 쿼리다.
+
+대기 병목은 `events_waits_summary_global_by_event_name`에서 찾는다. `wait/io/file/innodb/innodb_data_file`이 상위에 있으면 Buffer Pool이 부족해 디스크를 반복해서 읽고 있다는 신호다. `wait/lock/table/sql/handler`가 높으면 락 경합이 문제다.
+
+## sys 스키마: 진단의 속도
+
+Performance Schema는 강력하지만 날 것이다. `sys` 스키마는 그 위에 얹힌 가독성 레이어다 — 피코초를 `'23 ms'`로, 바이트를 `'1.2 GiB'`로 변환해주는 뷰 모음.
+
+```sql
+-- Full Scan 쿼리를 한 줄로
+SELECT db, query, exec_count, total_latency, no_index_used_count
+FROM sys.statements_with_full_table_scans
+WHERE db = 'mydb'
+ORDER BY total_latency DESC
+LIMIT 10;
+
+-- 현재 Lock 대기 체인
+SELECT wait_age, waiting_query, blocking_query
+FROM sys.innodb_lock_waits;
+
+-- 미사용 인덱스 후보
+SELECT object_schema, object_name, index_name
+FROM sys.schema_unused_indexes
+WHERE object_schema = 'mydb';
+```
+
+서비스가 갑자기 느려졌을 때의 30초 진단 순서는 단순하다: `innodb_lock_waits` → `statements_with_full_table_scans` → `statement_analysis` → `statements_with_temp_tables`. 이 네 뷰가 문제의 90%를 커버한다.
+
+## InnoDB 상태 스냅샷
+
+`SHOW ENGINE INNODB STATUS`는 sys 스키마가 커버하지 못하는 영역을 채운다. 섹션이 많아 보이지만, 문제 유형에 따라 보는 곳이 다르다.
+
+**Buffer Pool**: `Buffer pool hit rate 999 / 1000`을 찾는다. 999/1000은 99.9%다. 950 아래면 Buffer Pool이 부족해 디스크를 반복 읽고 있다는 뜻이다. `Modified db pages`(Dirty Pages)가 전체의 75%를 넘으면 Checkpointing 병목이 쓰기 I/O를 터뜨릴 수 있다.
+
+**Transactions**: `ACTIVE 450 sec` 같은 장기 트랜잭션을 찾는다. 트랜잭션이 열린 채로 방치되면 두 가지 문제를 동시에 일으킨다 — Undo Log가 쌓이고, 보유한 락 때문에 다른 쿼리가 대기한다.
+
+**Latest Detected Deadlock**: 데드락은 항상 순환 대기다. TX1이 A를 보유하고 B를 기다리는 동안 TX2가 B를 보유하고 A를 기다린다. `HOLDS THE LOCK`과 `WAITING FOR THIS LOCK`을 추적하면 패턴이 보인다. 해결은 항상 같은 순서로 리소스에 접근하도록 애플리케이션을 수정하는 것이다.
+
+## MySQL 8.0의 진단 보조 도구
+
+Optimizer가 잘못된 실행계획을 선택하는 이유는 대부분 통계 부정확이다. `status` 컬럼에 PENDING(95%), PAID(5%)처럼 불균등한 분포가 있어도, Cardinality=2라는 정보만으로는 Optimizer가 두 값을 동등하게 취급한다.
+
+**히스토그램**은 이 공백을 메운다.
+
+```sql
+ANALYZE TABLE orders UPDATE HISTOGRAM ON status WITH 100 BUCKETS;
+```
+
+한 번의 Full Scan으로 분포를 기록해두면, Optimizer는 `WHERE status = 'PAID'`가 5%임을 알고 인덱스를 선택하고, `WHERE status = 'PENDING'`이 95%임을 알고 Full Scan을 선택한다. 인덱스 추가 없이 실행계획이 바뀐다.
+
+**Invisible Index**는 인덱스 삭제 전 영향도를 측정하는 안전장치다.
+
+```sql
+ALTER TABLE orders ALTER INDEX idx_old INVISIBLE;
+-- 인덱스 데이터는 유지, Optimizer는 무시
+-- 문제 발생 시
+ALTER TABLE orders ALTER INDEX idx_old VISIBLE;  -- 수 밀리초 복구
+```
+
+DROP 후 슬로우 쿼리가 터지면 수십 분짜리 재생성을 감수해야 한다. Invisible로 먼저 검증하면 복구가 즉각적이다.
+
+<Callout type="note" title="트레이드오프">
+Invisible Index는 Optimizer가 사용하지 않아도 **쓰기 비용은 그대로다**. 결국 DROP이 목표고, Invisible은 검증 단계일 뿐이다. 히스토그램은 자동 갱신이 없다 — 데이터 분포가 크게 바뀌면 `ANALYZE TABLE`을 다시 실행해야 한다. Optimizer Hint는 이 모든 방법이 실패했을 때의 최후 수단이다.
+</Callout>
+
+## 운영 장애 패턴
+
+진단 도구를 알아도, 반복되는 장애 패턴을 모르면 실전에서 늦는다. 세 가지가 가장 흔하다.
+
+**MDL 연쇄 차단**: 오전 9시에 개발자가 대형 테이블에 `ALTER TABLE`을 실행한다. 열려 있는 장기 트랜잭션 하나 때문에 X-MDL을 얻지 못하고 대기한다. 문제는 그다음이다 — MDL 큐에 대기자가 생기면, 이후 들어오는 `SELECT`도 큐 뒤에 줄을 선다. 수십 초 만에 수십 개의 쿼리가 멈춘다.
+
+```sql
+-- 장기 트랜잭션 찾기
+SELECT t.trx_mysql_thread_id, TIMESTAMPDIFF(SECOND, t.trx_started, NOW()) AS sec
+FROM information_schema.INNODB_TRX t
+ORDER BY t.trx_started;
+-- 찾으면 KILL
+```
+
+**Buffer Pool 오염**: 오전 2시 배치가 100GB 테이블을 Full Scan한다. Buffer Pool이 배치 데이터로 가득 차고, 서비스 쿼리의 Hot Page가 밀려난다. 오전 2~4시 동안 캐시 미스율이 폭증하고 디스크 I/O가 따라 오른다. 배치는 Replica에서 실행하는 것이 근본 해결이다.
+
+**디스크 풀**: Binary Log 자동 만료 설정이 없으면 파일이 무한 누적된다. Undo Tablespace는 장기 트랜잭션이 있으면 줄어들지 않는다. `df -h`가 80%를 넘으면 알람이 울려야 하고, `PURGE BINARY LOGS`와 `binlog_expire_logs_seconds` 설정이 즉각 처방이다.
+
+<Aside label="공통 원인">
+세 패턴 모두 뿌리가 같다 — 장기 미완료 트랜잭션. MDL을 보유하고, Undo Log를 쌓고, 락을 놓지 않는다. `innodb_lock_wait_timeout`과 애플리케이션 레벨의 트랜잭션 타임아웃 설정이 예방의 핵심이다.
+</Aside>
+
+## 정리
+
+- Performance Schema의 `events_statements_summary_by_digest`는 "지금 느린 쿼리"가 아니라 "지금까지 자원을 가장 많이 쓴 쿼리"를 드러낸다. 추측 대신 이 숫자를 먼저 열어라.
+- sys 스키마는 Performance Schema의 가독성 레이어다. `statements_with_full_table_scans` → `innodb_lock_waits` → `statement_analysis` 순서로 30초 안에 병목의 윤곽을 잡는다.
+- InnoDB Status의 Buffer Pool 히트율, Dirty Pages 비율, 장기 트랜잭션 세 숫자가 운영 건강도의 바로미터다.
+- MySQL 8.0의 히스토그램과 Invisible Index는 인덱스 추가 없이 실행계획을 개선하고, 인덱스 삭제 전 영향도를 안전하게 측정하는 도구다.
+- 운영 장애의 대부분은 MDL 연쇄 차단, Buffer Pool 오염, 디스크 풀 세 패턴 중 하나다 — 진단 쿼리를 미리 준비해두면 장애 대응이 30초로 줄어든다.
