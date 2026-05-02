@@ -1,0 +1,122 @@
+---
+title: "Axon과 순수 Spring으로 배우는 CQRS+ES 설계 결정"
+description: "어노테이션 뒤에 숨은 CommandBus, EventStore, Tracking Processor의 동작 원리부터, Axon 없이 직접 구현했을 때 드러나는 CQRS의 본질까지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [cqrs, event-sourcing, axon, spring, event-driven]
+difficulty: intermediate
+series:
+  slug: cqrs-event-sourcing-deep-dive
+  title: Cqrs Event Sourcing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Axon Framework는 `@CommandHandler`, `@EventSourcingHandler`, `@QueryHandler` 세 어노테이션으로 CQRS + Event Sourcing의 핵심 구조를 표현한다. 어노테이션은 간결하지만, 그 뒤에서 CommandBus 라우팅, Aggregate 재구성, Tracking Token 추적이 조용히 돌아가고 있다. 이 추상화의 작동 원리를 모르면, `@EventSourcingHandler`에서 이메일을 발송하거나 `apply()` 없이 상태를 바꾸는 실수가 재구축 때 뒤늦게 터진다. 그렇다면 이 프레임워크가 자동으로 해주는 것들의 본질은 무엇인가?
+
+## 세 메시지 버스가 만드는 경계
+
+Axon은 내부적으로 세 개의 독립된 버스를 운영한다.
+
+- **CommandBus**: 1:1 라우팅. Command 하나는 정확히 하나의 Handler로 간다.
+- **EventBus**: 1:N 브로드캐스트. 이벤트 하나는 0개 이상의 Handler 모두에게 전달된다.
+- **QueryBus**: 읽기 전용 1:1 (또는 Scatter-Gather). 상태를 변경하지 않는다.
+
+이 구분은 단순한 패턴 분류가 아니다. **쓰기와 읽기의 책임을 물리적으로 분리**하는 설계다. CommandBus를 통과한 요청은 Aggregate를 변경하고, QueryBus를 통과한 요청은 오직 읽기 모델만 조회한다. Spring Boot AutoConfiguration은 `axon-spring-boot-starter` 의존성 하나로 이 세 버스를 모두 Bean으로 등록하고, 어노테이션이 붙은 메서드를 스캔해 각 버스에 자동으로 연결한다.
+
+## Aggregate가 살고 죽는 방식 — apply()의 두 얼굴
+
+`AggregateLifecycle.apply(event)`를 호출하면 두 가지 일이 동시에 일어난다. 첫째, 해당 `@EventSourcingHandler`가 **즉시** 호출되어 Aggregate 상태가 업데이트된다. 둘째, 이벤트가 현재 Unit of Work의 큐에 추가된다. 이벤트 스토어에는 트랜잭션 커밋 시점에 저장된다.
+
+`@EventSourcingHandler`가 같은 메서드로 두 상황에서 호출된다는 점이 핵심이다.
+
+```
+상황 1 — Command 처리 중:
+  WithdrawMoneyCommand 수신
+  → handle() 에서 apply(new MoneyWithdrawn(...)) 호출
+  → @EventSourcingHandler on(MoneyWithdrawn) 즉시 호출 (상태 업데이트)
+  → 커밋 시 이벤트 스토어에 저장
+
+상황 2 — Aggregate 재구성:
+  EventStore에서 "account-ACC-001" 이벤트 스트림 로드
+  → 순서대로 @EventSourcingHandler 반복 호출
+  → 현재 상태 완성
+```
+
+두 경우 모두 같은 메서드가 실행된다. 그래서 `@EventSourcingHandler` 안에 이메일 발송이나 외부 API 호출이 있으면, Aggregate를 재구성할 때마다 그 부수효과가 재실행된다. **`@EventSourcingHandler`는 순수 상태 전환만 담당한다**는 규칙은 선택이 아니라 생존 조건이다.
+
+검증 로직도 여기 두면 안 된다. 불변식 검증은 `@CommandHandler`에서, 상태 업데이트는 `@EventSourcingHandler`에서. 그리고 `@EventSourcingHandler`에서는 `balanceAfter` 절대값을 사용하는 것이 누적 계산보다 안전하다 — 동일 이벤트가 두 번 재생되더라도 같은 결과가 나오기 때문이다.
+
+## Tracking Processor — 비동기 읽기 모델의 엔진
+
+프로젝션은 Subscribing과 Tracking 두 가지 방식으로 이벤트를 받는다.
+
+Subscribing Event Processor는 이벤트 발행 스레드에서 동기적으로 처리한다. Command 완료 시점에 읽기 모델도 최신 상태가 보장된다. 대신 Projection 처리 지연이 Command 처리 시간에 그대로 더해지고, 리플레이가 불가능하다.
+
+Tracking Event Processor는 별도 스레드에서 이벤트 스토어를 폴링한다. 각 Processor가 처리한 위치를 **Tracking Token**으로 저장하므로, 재시작 시 중단된 위치부터 재처리한다. Token을 초기화하면 처음부터 전체 이벤트를 다시 처리하는 리플레이(재구축)가 가능하다.
+
+```
+token_entry 테이블:
+  processor_name      | segment | token (globalIndex)
+  account-summary     | 0       | 10500
+  account-summary     | 1       | 10498
+```
+
+Segment는 `hash(aggregateId) % segmentCount`로 이벤트를 배정한다. 같은 Aggregate의 이벤트는 항상 같은 Segment로 가므로 순서가 보장되고, 다른 Aggregate 이벤트는 병렬로 처리된다. `threadCount: 4` 설정이 곧 4개 Segment를 뜻한다.
+
+재구축 순서는 단순하다: `shutdownProcessor` → `resetTokens`(`@ResetHandler` 호출, 읽기 모델 초기화) → `startProcessor`. `@ResetHandler` 없이 재구축하면 기존 데이터 위에 이벤트를 재처리해 UNIQUE 제약 위반이 발생한다.
+
+## Subscription Query — Eventual Consistency를 정면 돌파
+
+CQRS의 실무 고통 중 하나는 "Command 완료 후 읽기 모델이 아직 업데이트되지 않았다"는 상황이다. 단순 폴링은 타이밍이 맞지 않고, Subscribing Processor로 강한 일관성을 구현하면 Command 처리가 느려진다.
+
+Axon의 Subscription Query는 이 사이를 파고든다. 초기 조회값을 즉시 반환하되, 이후 읽기 모델이 업데이트될 때마다 구독자에게 push한다. 구독은 반드시 **Command 전에** 설정해야 한다. Command가 먼저 처리되면 이미 발행된 이벤트를 구독자가 놓친다.
+
+```java
+// 올바른 순서
+SubscriptionQueryResult<?, ?> sub = queryGateway.subscriptionQuery(...);
+commandGateway.send(new ConfirmOrderCommand(id)); // Command는 구독 후
+sub.updates().filter(...).take(1).subscribe(update -> {
+    result.setResult(update);
+    sub.close(); // 반드시 close
+});
+```
+
+<Callout type="warning" title="구독 누수">
+`SubscriptionQueryResult.close()`를 호출하지 않으면 서버 측 연결이 유지되어 메모리 누수가 발생한다. `doOnCancel`이나 타임아웃 핸들러에서도 반드시 `sub.close()`를 호출해야 한다.
+</Callout>
+
+## 트레이드오프 — Axon이냐, 직접 구현이냐
+
+Axon이 자동화하는 것들을 직접 구현하면 그 본질이 드러난다.
+
+| 항목 | Axon | 직접 구현 |
+|---|---|---|
+| Aggregate 재구성 | 자동 | 이벤트 로드 + `apply()` 반복 직접 |
+| Command 라우팅 | 어노테이션 스캔 | `Map<Class, CommandHandler>` 직접 관리 |
+| Projection 병렬 처리 | Segment 자동 | Kafka 파티션 키로 대체 |
+| Subscription Query | 내장 | SSE/WebSocket 직접 구현 |
+
+직접 구현 시 가장 흔히 놓치는 두 가지가 있다.
+
+**이벤트 스토어 낙관적 잠금**: `UNIQUE(stream_id, version)` 제약 없이 동시 쓰기를 허용하면 이벤트 순서가 깨진다. 저장 시 `DuplicateKeyException`을 `OptimisticConcurrencyException`으로 변환하는 것이 첫 번째 과제다.
+
+**체크포인트와 읽기 모델 원자성**: Projection 처리 결과와 체크포인트(현재까지 처리한 위치)는 **같은 트랜잭션**에 저장해야 한다. 읽기 모델은 업데이트됐는데 체크포인트 저장이 실패하면, 재시작 시 같은 이벤트를 두 번 처리해 중복이 생긴다.
+
+<Aside label="선택 기준">
+단일 서비스에서 Spring에 익숙한 팀이라면 직접 구현이 더 단순할 수 있다. 분산 환경, Saga, Subscription Query까지 필요하다면 Axon이 정당화된다. 중간 지점으로 Axon Server 없이 In-Process Axon을 쓰는 방식도 있다 — 분산 라우팅 없이 보일러플레이트만 제거한다.
+</Aside>
+
+## 정리
+
+- Axon의 세 버스(Command, Event, Query)는 쓰기와 읽기의 책임을 물리적으로 분리한다.
+- `@EventSourcingHandler`는 Command 처리 중에도, 재구성 중에도 동일하게 호출된다. 부수효과는 절대 금지다.
+- Tracking Processor는 Token 기반으로 위치를 추적하며, `@ResetHandler` + Token 리셋으로 재구축이 가능하다.
+- Subscription Query는 Command 전에 구독을 설정해야 Eventual Consistency 지연을 정확히 처리할 수 있다.
+- 직접 구현 시 낙관적 잠금과 체크포인트 원자성이 가장 먼저 챙겨야 할 두 가지다.
+
+다음 글에서는 이 구조 위에 Saga 패턴을 얹어, 분산 트랜잭션을 이벤트로 조율하는 방법을 추적한다.

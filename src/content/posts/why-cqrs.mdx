@@ -1,0 +1,98 @@
+---
+title: "CQRS는 왜 필요한가 — 단일 모델이 붕괴되는 과정"
+description: "JPA 단일 Entity가 쓰기와 읽기를 동시에 담당할 때 발생하는 임피던스 불일치부터, 세 가지 수준의 CQRS 스펙트럼과 적용 판단 기준까지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [cqrs, event-sourcing, ddd, jpa, architecture]
+difficulty: intermediate
+series:
+  slug: cqrs-event-sourcing-deep-dive
+  title: Cqrs Event Sourcing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@OneToMany`를 추가하면 됐고, `@Fetch(LAZY)`로 버텼고, 그다음엔 `LEFT JOIN FETCH`를 넣었다. 어느 순간 JPA Entity는 쓰기 불변식도 제대로 보호하지 못하고, 읽기 조회도 제대로 못 하는 어중간한 상태가 된다. 왜 단일 모델은 도메인이 복잡해질수록 조용히 무너지는가?
+
+## 쓰기와 읽기의 요구사항은 구조적으로 다르다
+
+쓰기가 원하는 것은 **정규화, 불변식, 트랜잭션**이다. 잔고 차감 불변식을 보호하려면 데이터 중복이 없어야 하고, 변경은 하나의 트랜잭션으로 원자적으로 일어나야 한다.
+
+읽기가 원하는 것은 정반대다. **비정규화, 사전 집계, 조인 없는 단순 SELECT**. 계좌 목록 화면에서 소유자 이름, 잔고, 최근 거래 일자를 한 번의 쿼리로 가져오려면 여러 테이블의 데이터가 이미 한 테이블에 모여 있어야 한다.
+
+단일 Entity가 두 세계를 동시에 만족시키려 할 때 충돌이 발생한다. 이것이 **쓰기-읽기 임피던스 불일치**다. 충돌이 만드는 증상은 세 가지 방향으로 나타난다.
+
+**N+1.** 계좌 목록을 가져오면 각 계좌의 거래 내역을 별도 쿼리로 100번 더 조회한다. `LAZY`로 설정해도 Jackson 직렬화 시 접근하면 `LazyInitializationException`. `EAGER`로 바꾸면 항상 N+1.
+
+**잠금 충돌.** 이체 처리 중 `account` row에 `ROW LOCK`이 걸린다. 동시에 조회 API가 같은 row에 접근하면 이체가 끝날 때까지 대기한다. InnoDB MVCC로 부분 완화되지만 인덱스 경합은 피할 수 없다.
+
+**Entity 오염.** 조회 화면을 위해 `ownerName`, `monthlyAvgBalance`, `lastTxAt` 같은 필드가 Entity에 계속 추가된다. 불변식 보호 로직 `transfer()`는 이 잡동사니 필드들 사이에 묻힌다.
+
+## 쓰기 모델과 읽기 모델은 목적이 다르다
+
+분리의 핵심은 패키지 이름을 바꾸는 것이 아니다. "이 데이터가 불변식 보호에 필요한가, 아니면 화면 조회에 필요한가"를 기준으로 두 모델을 완전히 다르게 설계하는 것이다.
+
+**쓰기 모델**은 불변식에 필요한 최소 데이터만 담는다. 은행 계좌 이체 불변식에 필요한 것은 `balance`와 `status`뿐이다. `ownerName`은 이체 검증과 무관하므로 없다. 쓰기 모델은 강한 일관성을 보장한다 — 트랜잭션 커밋 즉시.
+
+**읽기 모델**은 조회 화면에 맞게 비정규화된 별도 뷰다. `account_summary` 테이블에는 `ownerName`, `balance`, `lastTxAt`이 이미 합쳐져 있어 조인 없이 단순 SELECT 한 번으로 목록 화면이 완성된다. 읽기 모델은 최종 일관성을 허용한다 — 쓰기 완료 후 수십 ms~수 초 후 반영.
+
+```
+쓰기 모델 (Account Aggregate):
+  id, ownerId, balance, status
+  → 불변식 검증, 이벤트 발행
+
+읽기 모델 (AccountSummaryView):
+  accountId, ownerName, balance, status, lastTxAt
+  → 단순 SELECT, 조인 없음, 사전 계산 완료
+```
+
+두 모델의 동기화는 **쓰기 모델이 이벤트를 발행하고, Projection이 그 이벤트를 소비해 읽기 모델을 갱신**하는 방식으로 이루어진다. 이 구조가 CQRS(Command Query Responsibility Segregation)의 본질이다.
+
+## CQRS는 스펙트럼이다
+
+"CQRS를 도입하겠습니다"라는 결정 직후에 물어야 할 것이 있다. "어느 수준의 CQRS인가?" 패키지만 `command/`와 `query/`로 나누고 내부에서 같은 Entity를 쓰면 아무것도 달라지지 않는다. N+1도 남고, 잠금 충돌도 남는다.
+
+수준은 세 단계로 나뉜다.
+
+**Simple CQRS**: 같은 DB, 같은 테이블. 쓰기는 JPA Entity, 읽기는 JPQL DTO 프로젝션 또는 QueryDSL. N+1과 Entity 오염은 해결되지만 잠금 충돌과 저장소 다양화는 불가능하다.
+
+**저장소 분리 CQRS**: 다른 DB 또는 다른 스키마. 쓰기는 정규화된 PostgreSQL, 읽기는 비정규화된 별도 테이블(또는 Redis, Elasticsearch). 동기화는 이벤트, CDC(Debezium), 또는 배치. 잠금 충돌이 해결되고 읽기 DB를 독립적으로 스케일 아웃할 수 있다.
+
+**Event-Driven CQRS**: 이벤트 스토어 + Projection. 쓰기 완료 시 이벤트를 이벤트 스토어에 저장하고 Kafka로 발행하면 각 Projection이 소비해 역할별 읽기 모델을 갱신한다. 완전한 감사 로그, 시간 여행(과거 시점 상태 재현), 읽기 모델 재구축이 가능하다.
+
+<Callout type="note" title="트레이드오프">
+수준이 높아질수록 해결되는 문제가 많아지는 대신 운영 복잡도도 높아진다. Simple CQRS는 학습 비용이 낮지만 저장소 다양화가 불가능하다. Event-Driven CQRS는 시간 여행과 재구축이 가능하지만 이벤트 스키마 진화, Projection 관리, 이벤트 스토어 운영이 따라온다. "현재 겪는 구체적인 고통을 해결하는 최소한의 수준"이 선택 원칙이다.
+</Callout>
+
+## CQRS가 해결하는 세 가지 고통
+
+단일 모델이 만드는 고통은 세 가지 방향으로 수렴한다.
+
+**Aggregate 오염.** 스프린트마다 조회 요구사항이 추가될수록 Order 클래스에 연관관계가 쌓인다. 이메일 발송을 위해 Product 상세 정보가 필요해지면 `Order → OrderLine → Product → ProductImage` 4단계 연관관계가 생긴다. 통계 대시보드를 위해 Customer, Address가 추가된다. 반년 후 Order 클래스는 2,000줄, 연관관계 10개. 불변식 `confirm()` 로직을 찾기 위해 스크롤을 내린다. CQRS 후 Order는 `customerId`(ID 참조만), `status`, `lines`(재고 확인용 quantity만). 연관관계 0개, 250줄.
+
+**읽기-쓰기 성능 충돌.** 주문 목록 API가 느려서 `Order`에 `totalAmount` 필드를 추가해 사전 계산값을 저장한다. 이제 주문 생성, 항목 추가, 할인 적용, 반품 처리 — 모든 쓰기 경로에서 `totalAmount`를 재계산해 동기화해야 한다. 동기화 누락 버그가 생긴다. CQRS 후 `order_summary.total_amount`는 Projection만 갱신한다. 쓰기 트랜잭션에 동기화 코드가 없다.
+
+**역할별 뷰 충돌.** 관리자는 사기 점수와 IP 주소가 필요하고, 배송 담당자는 상품 크기와 무게가, 회계팀은 세금계산서와 정산 상태가, CS팀은 주문+반품+문의를 통합해서 봐야 한다. 단일 API가 역할별로 분기되고, Order는 모든 역할의 데이터를 알아야 한다. CQRS 후 각 역할은 독립 읽기 모델과 독립 API를 갖는다. 역할이 추가돼도 Order Aggregate는 변경하지 않는다.
+
+## 언제 도입하지 말아야 하는가
+
+CQRS가 항상 옳은 선택은 아니다. 단순 CRUD 도메인(공지사항, FAQ, 사용자 설정)에서는 JPA + DTO 프로젝션으로 충분하다. MVP 단계에서 요구사항이 매주 변경된다면 이벤트 스키마를 고정하는 것이 과부담이다. 팀이 이벤트 기반 아키텍처를 운영해본 경험이 없다면 Projection 실패 시 원인 파악조차 어렵다.
+
+CQRS 도입 전에 먼저 시도해볼 것들이 있다. N+1은 `@EntityGraph`나 QueryDSL DTO 프로젝션으로 해결된다. 복잡한 집계는 DB Materialized View가 담당할 수 있다. 읽기 성능은 Redis 캐시나 Read Replica로 개선될 수 있다. 이 방법들로 해결된다면 CQRS는 불필요하다.
+
+<Aside label="판단 기준">
+"지금 겪는 문제가 무엇인가? 그 문제가 CQRS 없이 해결 가능한가? CQRS 도입 비용을 팀이 감당할 수 있는가." 세 질문에 순서대로 답하면 수준이 결정된다.
+</Aside>
+
+## 정리
+
+- 쓰기(정규화 + 불변식)와 읽기(비정규화 + 집계)의 요구사항은 구조적으로 충돌한다. 단일 모델은 이 충돌을 N+1, Entity 오염, 잠금 충돌로 표출한다.
+- 쓰기 모델은 불변식 보호에만 집중하고, 읽기 모델은 화면 목적에 맞게 비정규화된다. 이벤트가 둘을 연결한다.
+- CQRS는 Simple → 저장소 분리 → Event-Driven 세 수준의 스펙트럼이다. 현재 고통을 해결하는 최소 수준을 선택한다.
+- 단순 CRUD, MVP 단계, 강한 일관성 필수 도메인에서는 CQRS가 비용 대비 편익이 낮다.
+
+다음 글에서는 Command와 Query를 명확히 분리하는 구체적인 설계 패턴과, Command Handler가 이벤트를 발행하는 메커니즘을 추적한다.

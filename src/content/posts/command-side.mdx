@@ -1,0 +1,145 @@
+---
+title: "CQRS는 왜 Command와 Query를 완전히 다른 세계로 나누는가"
+description: "CQS 원칙부터 Command 객체 설계, Handler 책임 분배, Bus 미들웨어, 낙관적 잠금, 결과 반환 패턴까지 — CQRS 쓰기 경로의 설계 결정을 하나의 철학으로 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [cqrs, event-sourcing, command-pattern, domain-driven-design, optimistic-locking]
+difficulty: intermediate
+series:
+  slug: cqrs-event-sourcing-deep-dive
+  title: Cqrs Event Sourcing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+CQRS는 "읽기와 쓰기를 분리하라"는 원칙으로 소개되지만, 실제로 구현하다 보면 곧 의문이 생긴다. Command가 왜 `void`를 반환해야 하는가? Handler는 어디까지 알아야 하는가? 낙관적 잠금 충돌이 나면 누가 재시도를 책임지는가? 이 질문들은 각기 다른 것처럼 보이지만, 하나의 원칙에서 파생된다 — **"질문하는 행위가 답을 바꿔서는 안 된다."**
+
+## CQS에서 CQRS로 — 원칙이 아키텍처가 되는 순간
+
+1988년 Bertrand Meyer가 정의한 CQS(Command-Query Separation)는 단순하다. 모든 메서드는 상태를 변경하거나(Command), 데이터를 반환하거나(Query) 둘 중 하나만 해야 한다. `getUnreadNotifications()`가 읽음 처리까지 하면, 이 메서드를 디버깅 목적으로 호출한 순간 데이터가 바뀐다. 로그에 찍히고, 캐시가 깨지고, 부하 테스트가 실제 쓰기 테스트가 된다.
+
+CQRS는 이 원칙을 메서드 수준에서 아키텍처 수준으로 끌어올린다. 같은 Service 클래스, 같은 Entity, 같은 저장소를 공유하되 메서드만 분리하는 것(CQS)과, Command 경로와 Query 경로가 완전히 다른 모델·저장소·스택을 가지는 것(CQRS)은 질적으로 다르다.
+
+```
+CQS 이후:
+┌──────────────────────────────────┐
+│         OrderService             │
+│  void confirmOrder()   Command   │
+│  OrderDto getOrder()   Query     │
+│  (같은 DB, 같은 Entity)           │
+└──────────────────────────────────┘
+
+CQRS 이후:
+┌──────────────────────┐    ┌──────────────────────────┐
+│  Command Side        │    │  Query Side              │
+│  ConfirmOrderCommand │    │  GetOrderDetailQuery     │
+│  → OrderAggregate    │    │  → OrderDetailView       │
+│  → Event Store       │    │  → 읽기 DB               │
+└──────────────────────┘    └──────────────────────────┘
+          │                           ▲
+          └── 이벤트 기반 동기화 ──────┘
+```
+
+## Command는 의도다 — DTO와 다른 이유
+
+잘못 설계된 Command는 CQRS의 모든 이점을 무너뜨린다. `UpdateOrderCommand { status, reason, trackingNo, ... }` 같은 범용 Command가 있으면 Handler는 매번 "이게 확인인가, 취소인가, 배송인가"를 분기로 추론해야 한다. Command는 DTO가 아니다 — **"이런 데이터가 있다"가 아니라 "이런 의도로 이것을 해달라"는 선언**이다.
+
+올바른 Command는 세 가지 특성을 가진다.
+
+첫째, 이름이 동사+명사 형태로 의도를 표현한다. `ConfirmOrderCommand`, `CancelOrderCommand`, `ShipOrderCommand`. 이 이름은 도메인 이벤트의 원인이 되고(`OrderConfirmed`, `OrderCancelled`), 도메인 전문가가 사용하는 언어와 일치한다.
+
+둘째, 불변(Immutable)이다. Java `record`가 이 역할에 딱 맞는다. Command는 사용자 의도의 스냅샷이므로 생성 후 변경되면 처음 의도와 달라진다.
+
+셋째, 검증 책임이 명확히 나뉜다. **구문 검증(형식이 올바른가)은 Command 생성자에서**, **의미 검증(불변식을 만족하는가)은 Aggregate 도메인 메서드에서**. 잔고가 충분한지는 Command가 아니라 `Account.withdraw()`가 확인한다.
+
+## Command Handler — 조율자이지 결정자가 아니다
+
+Handler는 비즈니스 로직을 직접 수행하는 곳이 아니다. Handler가 불변식 검증을 직접 하기 시작하면 Aggregate는 데이터 컨테이너가 되고, 도메인 로직이 Handler 전체에 흩어진다.
+
+Handler의 책임은 정확히 네 단계다: Repository에서 Aggregate 로드 → Aggregate 도메인 메서드 호출 → Repository에 저장 → 트랜잭션 경계 관리. 불변식 검증과 상태 변경과 도메인 이벤트 등록은 전부 Aggregate 안에 있어야 한다.
+
+```java
+@CommandHandler
+@Transactional
+public void handle(WithdrawMoneyCommand command) {
+    Account account = accountRepository.findById(command.accountId())
+        .orElseThrow(() -> new AccountNotFoundException(command.accountId()));
+
+    account.withdraw(Money.of(command.amount()), command.requestedBy());
+    // Account.withdraw() 내부:
+    //   if (balance < amount) throw InsufficientBalanceException  ← 의미 검증
+    //   this.balance = balance.subtract(amount)                   ← 상태 변경
+    //   registerEvent(new MoneyWithdrawn(...))                    ← 이벤트 등록
+
+    accountRepository.save(account);
+    // void — Handler는 잔고를 반환하지 않는다
+}
+```
+
+두 Aggregate에 걸친 불변식(예: 계좌 이체)은 Domain Service로 캡슐화한다. Handler가 직접 두 Aggregate를 조작하면 그 불변식이 Handler에 새어 나온다.
+
+## Command Bus — 횡단 관심사의 집결지
+
+Command Bus의 진짜 가치는 라우팅이 아니라 **미들웨어 파이프라인**이다. 로깅, 인증/인가, 멱등성 체크, 트랜잭션 — 이것들을 각 Handler에 중복 구현하면 새 Command를 추가할 때마다 같은 코드를 반복해야 한다.
+
+```
+commandBus.send(command)
+  → [미들웨어 1] 로깅 (Command 수신 + 소요 시간)
+  → [미들웨어 2] 인가 (Command별 권한 확인)
+  → [미들웨어 3] 멱등성 체크 (동일 UUID 재전송 무시)
+  → [미들웨어 4] 트랜잭션 시작
+  → [Handler] 실제 처리
+  → [미들웨어 4] 커밋 or 롤백
+  → 완료
+```
+
+새 Command를 추가하면 Handler만 작성하면 된다. 횡단 관심사는 자동으로 적용된다.
+
+<Callout type="note" title="트레이드오프">
+Command Bus는 추상화 레이어를 하나 추가한다. 디버깅 시 흐름을 추적하려면 미들웨어 체인을 따라가야 한다. 단일 서비스 내 단순한 CQRS라면 직접 구현으로 충분하다. 분산 환경에서 재시도·모니터링·원격 라우팅이 필요하다면 Axon Framework의 Command Gateway가 이 복잡성을 대신 처리해준다.
+</Callout>
+
+## 낙관적 잠금 — 쓰기 경로의 동시성 경계
+
+두 사용자가 동시에 같은 계좌에서 출금하면 둘 다 잔고가 충분하다고 판단한 뒤 각자 출금을 진행할 수 있다. CQRS에서 읽기 모델은 잠금 없이 조회하므로, 쓰기 경로의 동시성 제어가 더 중요해진다.
+
+낙관적 잠금은 "충돌을 막지 않고 감지한다". JPA의 `@Version` 필드가 이 역할을 한다.
+
+```java
+@Entity
+public class Account {
+    @Version
+    private Long version;
+}
+```
+
+저장 시 `UPDATE account SET balance=?, version=6 WHERE id=? AND version=5` — version 조건이 맞지 않으면 `affected rows = 0`이고 JPA는 `OptimisticLockingFailureException`을 던진다. Event Sourcing에서는 `UNIQUE(stream_id, version)` 제약이 같은 역할을 한다. 두 번째 INSERT가 UNIQUE violation으로 실패한다.
+
+충돌 시 재시도 전략은 지수 백오프 + Jitter(동시 재시도 분산)다. 충돌 빈도가 20%를 넘는 "핫 레코드"가 있다면 낙관적 잠금의 한계이므로 비관적 잠금이나 계좌 파티셔닝을 검토해야 한다.
+
+## Command 응답 최소화와 Eventual Consistency
+
+Command가 읽기 모델을 즉시 조회해 반환하면 무슨 일이 생기는가? Event Sourcing 환경에서 이벤트 → Kafka → Projection 처리는 수십 ms가 걸린다. Command Handler가 그 직후 읽기 모델을 조회하면 구버전 데이터를 반환한다. **Command 응답에 읽기 모델 데이터를 포함하지 말아야 하는 이유**가 여기 있다.
+
+대신 네 가지 패턴이 있다.
+
+- **Fire-and-Forget**: 202 Accepted만 반환. 처리 완료 알림 없음. 이메일 발송, 리포트 생성에 적합.
+- **Acknowledgement + Polling**: 202 + `requestId` 반환. 클라이언트가 주기적으로 상태를 조회. 장시간 배치 처리에 적합.
+- **낙관적 UI 업데이트**: 버튼 클릭 즉시 클라이언트가 UI를 예상 상태로 변경. 실패 시 롤백. 빠른 처리 + 매끄러운 UX에 적합.
+- **SSE/WebSocket**: 202 응답 후 Projection이 완료되면 서버가 push. 주문 상태 실시간 추적에 적합.
+
+Command 응답에 포함할 수 있는 것은 Command 자체에서 도출 가능한 데이터뿐이다 — 생성된 리소스 ID, 예상 상태, 처리 시각. 읽기 모델을 추가 조회하지 않는다.
+
+## 정리
+
+- CQS는 "질문이 답을 바꾸지 않는다"는 원칙이고, CQRS는 이를 아키텍처로 확장한 것이다.
+- Command는 DTO가 아니라 의도다. `UpdateXxx` → `ConfirmXxx`, `CancelXxx`. 이름이 이벤트 스트림의 언어를 결정한다.
+- 비즈니스 로직은 Aggregate 안에 응집된다. Handler는 조율자이고, Bus는 횡단 관심사의 집결지다.
+- 낙관적 잠금은 충돌을 막지 않고 감지한다. 충돌 빈도가 높아지면 설계를 재검토해야 한다.
+- Command 응답에 읽기 모델을 포함하면 Eventual Consistency를 깨뜨린다. 낙관적 UI 업데이트나 SSE로 UX와 아키텍처를 동시에 만족하라.
+
+다음 글에서는 이 쓰기 경로가 만들어낸 이벤트들을 어떻게 저장하고, Event Sourcing이 기존 상태 저장과 무엇이 근본적으로 다른지 추적한다.
