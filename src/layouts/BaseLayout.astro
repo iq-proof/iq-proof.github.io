@@ -2,6 +2,7 @@
 import { SITE } from '@/consts';
 import Header from '@/components/Header.astro';
 import Footer from '@/components/Footer.astro';
+import Sidebar from '@/components/Sidebar.astro';
 import GoatCounter from '@/components/GoatCounter.astro';
 import SearchModal from '@/components/SearchModal.astro';
 import JsonLd from '@/components/JsonLd.astro';
@@ -15,7 +16,7 @@ interface Props {
   updatedDate?: Date;
   ogType?: 'website' | 'article';
   tags?: string[];
-  category?: 'dev' | 'ai';
+  category?: 'dev' | 'ai' | 'agent';
 }
 
 const {
@@ -89,10 +90,22 @@ const resolvedOgImage = new URL(ogImage, Astro.site).toString();
 <span class="ink-drop ink-drop-3" aria-hidden="true"></span>
 
 <Header />
-<main class="flex-1">
-  <slot />
-</main>
+<div class="layout-shell">
+  <Sidebar />
+  <main class="flex-1 min-w-0">
+    <slot />
+  </main>
+</div>
 <Footer />
+
+<style is:global>
+  .layout-shell {
+    display: flex;
+    flex: 1 1 auto;
+    width: 100%;
+    align-items: stretch;
+  }
+</style>
 <SearchModal />
 <GoatCounter />
 </body>
