@@ -1,0 +1,113 @@
+---
+title: "Docker 컨테이너 리소스 관리의 철학"
+description: "CPU shares·quota·cpuset부터 메모리 OOM Score·Swap 전략까지, cgroup 기반 리소스 격리가 '예측 가능한 멀티 테넌시'를 어떻게 구현하는지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, cgroup, resource-limits, performance, monitoring]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Docker 컨테이너는 기본적으로 리소스를 무제한 사용한다. 16코어 서버에서 메모리 누수가 있는 컨테이너 하나가 28GB를 차지하고, 나머지 컨테이너들이 OOM Killer에 무작위로 종료되는 광경은 드문 일이 아니다. 그렇다면 리소스 제한은 단순히 "한 컨테이너가 너무 많이 먹지 못하게 막는 것"인가? 아니다. Docker의 리소스 관리 전략 전체를 관통하는 하나의 철학이 있다 — **예측 가능성(predictability)**. CPU 스케줄링, 메모리 격리, I/O 우선순위, 모니터링까지, 이 챕터들은 그 철학의 다른 표현이다.
+
+## cgroup — 예측 가능성의 기반
+
+Docker 리소스 제한은 Linux cgroup(control group) 위에 구현된다. 컨테이너를 시작하면 Docker는 `/sys/fs/cgroup/` 아래에 컨테이너 전용 cgroup 디렉토리를 만들고, 제한값을 파일로 기록한다. 커널은 이 파일을 읽어 스케줄링 결정을 내린다.
+
+CPU 제한에는 세 가지 축이 있다. **Shares**는 경쟁 상황의 상대적 가중치다. `--cpu-shares=2048`인 컨테이너는 `1024`짜리 컨테이너의 두 배를 얻지만, 유휴 시에는 제한이 없다. **Quota**(`--cpus=2.5`)는 절대적 상한선으로, 유휴 여부와 무관하게 100ms 주기당 250ms 이상 실행되지 못한다. **Cpuset**은 특정 코어에 프로세스를 고정한다. NUMA 환경에서는 `--cpuset-cpus="0-7" --cpuset-mems="0"`으로 CPU와 메모리를 같은 노드에 묶어야 원격 메모리 접근 패널티를 피할 수 있다.
+
+```bash
+# Quota 설정 확인 — 컨테이너 내부에서
+cat /sys/fs/cgroup/cpu/cpu.cfs_period_us  # 100000
+cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us   # 250000 (= 2.5 cores)
+```
+
+세 방식의 선택 기준은 워크로드의 성격이다. 레이턴시 민감 서비스는 Quota로 예측 가능한 상한을 두고, 배치 작업은 Shares로 유휴 CPU를 최대한 활용하고, 고성능 데이터베이스는 Cpuset으로 캐시 지역성을 보장한다.
+
+## 메모리 계층 — Hard·Soft·Swap
+
+메모리 제한도 단일 숫자가 아니다. 세 계층으로 구성된다.
+
+```
+Hard Limit  (--memory=4g)        — 초과 시 OOM Killer
+     ↓
+Soft Limit  (--memory-reservation=2g) — 호스트 압박 시 우선 회수
+     ↓
+Swap Limit  (--memory-swap=4g)   — memory + swap 합산 상한
+```
+
+`--memory=4g --memory-swap=4g`는 swap을 비활성화한다는 뜻이다(합산 = RAM 한도). Production 웹 서버에 권장되는 설정이다. `--memory-swap=-1`은 무제한 swap을 허용하는데, SSD도 RAM 대비 1,000배 느리다는 점에서 데이터베이스에는 치명적이다.
+
+OOM Killer가 발동하면 어느 프로세스를 먼저 종료할지는 **OOM Score**로 결정된다. 점수가 높을수록 먼저 종료된다. `--oom-score-adj` 플래그로 조정할 수 있다.
+
+<Callout type="note" title="OOM Score 전략">
+중요도에 따라 adj를 설정하면 OOM 발생 시 덜 중요한 컨테이너가 먼저 종료된다.
+
+| 컨테이너 | oom-score-adj | 역할 |
+|---------|--------------|------|
+| API Server | -500 | 핵심 서비스, 마지막에 종료 |
+| Worker | 0 | 기본값 |
+| Cache | +500 | 먼저 종료해도 무방 |
+</Callout>
+
+## CPU Throttling — 보이지 않는 레이턴시 원인
+
+Quota를 설정하면 컨테이너가 주기 내 허용량을 소진한 순간 **throttling**이 발생한다. 코드는 실행되지 않고 다음 주기를 기다린다. 이 현상은 `docker stats`의 CPU% 수치에 잘 드러나지 않지만, cgroup 파일을 보면 드러난다.
+
+```bash
+cat /sys/fs/cgroup/cpu/docker/<CONTAINER_ID>/cpu.stat
+# nr_periods    10000
+# nr_throttled   4500   ← 45% 제한됨
+# throttled_time 45000000000
+```
+
+Throttled 비율이 20%를 넘으면 CPU limit 증가를 검토해야 한다. 또는 `--cpu-period=200000 --cpu-quota=400000`처럼 period를 늘리면 같은 코어 수에서도 burst를 더 허용할 수 있다.
+
+## I/O — 잊혀진 리소스 경쟁
+
+CPU와 메모리에 집중하다 보면 디스크 I/O 경쟁을 놓치기 쉽다. 로그를 쏟아내는 컨테이너가 데이터베이스 컨테이너의 I/O를 굶길 수 있다.
+
+`--blkio-weight`는 CPU shares와 유사한 상대적 우선순위다. `--device-write-bps /dev/sda:50mb`는 절대적 상한이다. 그러나 가장 효과적인 전략은 로그, 임시 파일처럼 영속성이 필요 없는 쓰기를 **tmpfs**로 옮기는 것이다. 메모리 기반이라 디스크 I/O 자체가 없고, 속도는 10GB/s 수준이다.
+
+```bash
+docker run --tmpfs /var/log:rw,size=2g myapp:latest
+```
+
+Storage driver로는 overlay2가 권장된다. devicemapper 대비 읽기·쓰기 모두 2-4배 빠르며, Linux 4.0+ 이상에서 안정적이다.
+
+<Aside label="설계 철학">
+Docker 리소스 관리의 모든 결정은 같은 질문으로 수렴한다 — "이 컨테이너가 다른 컨테이너에 얼마나 영향을 줄 수 있는가?" CPU shares·quota·OOM score·blkio weight 전부, **격리를 통한 예측 가능성**이라는 단일 목표의 다른 표현이다. 제한을 설정하는 것은 컨테이너를 가두는 것이 아니라, 이웃 컨테이너를 보호하는 것이다.
+</Aside>
+
+## 모니터링 — 제한값은 출발점이다
+
+리소스 제한을 설정했다고 끝이 아니다. 워크로드는 시간이 지나면 변한다. Prometheus + cAdvisor 조합은 컨테이너별 CPU·메모리·I/O 메트릭을 15초 단위로 수집한다.
+
+주목해야 할 신호는 세 가지다. 첫째, 메모리 사용량의 **선형 증가** — 누수의 전형적 패턴이다. 둘째, CPU throttled 비율 **20% 초과** — limit 증가가 필요하다. 셋째, `container_memory_failcnt` 증가 — OOM이 발생했다는 신호다.
+
+```promql
+# CPU Throttling 비율
+rate(container_cpu_cfs_throttled_seconds_total[5m])
+  / rate(container_cpu_cfs_periods_total[5m])
+
+# 메모리 사용률
+container_memory_usage_bytes / container_spec_memory_limit_bytes * 100
+```
+
+## 정리
+
+- CPU 제한은 Shares(경쟁 시 가중치), Quota(절대 상한), Cpuset(코어 고정) 세 축으로 구성된다. 워크로드 특성에 따라 선택한다.
+- 메모리는 Hard·Soft·Swap 세 계층으로 관리하고, Production에서는 Swap을 비활성화(`--memory-swap=<memory>`)하는 것이 기본이다.
+- CPU Throttling은 `cpu.stat`의 `nr_throttled`로 진단한다. 20% 초과 시 limit을 올려라.
+- I/O 경쟁은 tmpfs와 blkio-weight로 격리하고, storage driver는 overlay2를 쓴다.
+- 제한값은 정적 설정이 아니라 모니터링으로 지속적으로 조정해야 하는 기준선이다.
+
+다음 글에서는 이 리소스 격리 위에서 네트워크 격리가 어떻게 구현되는지, Docker의 네트워크 네임스페이스와 iptables 규칙을 추적한다.

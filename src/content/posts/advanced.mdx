@@ -1,0 +1,126 @@
+---
+title: "Docker는 어떻게 컨테이너를 만드는가"
+description: "docker run 한 줄 뒤에서 dockerd, containerd, runc가 협력하는 과정부터 OCI 표준이 이 분리를 가능하게 한 이유까지, 런타임 스택의 설계를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, container-runtime, oci, runc, containerd]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`docker run nginx`를 입력하는 순간, 실제로 무슨 일이 일어나는가? Docker CLI가 마법처럼 컨테이너를 만드는 것처럼 보이지만, 그 뒤에는 세 개의 분리된 런타임이 협력하는 정교한 계층 구조가 있다. 이 구조가 왜 분리되어 있고, 각 계층이 어떤 책임을 지는가?
+
+## 세 계층으로 나뉜 이유
+
+초기 Docker(1.x)는 모놀리식이었다. dockerd 하나가 이미지 관리, 네트워크, 볼륨, 컨테이너 실행까지 전부 담당했다. 이 구조의 치명적 단점은 **dockerd를 재시작하면 모든 컨테이너가 중단**된다는 것이었다.
+
+현재 Docker는 세 계층으로 나뉜다.
+
+```
+docker run nginx
+      │
+  dockerd           ← 사용자 편의 기능 (이미지, 네트워크, 볼륨)
+      │ gRPC
+  containerd        ← 컨테이너 생명주기 + OCI 번들 변환
+      │ OCI Bundle
+  runc              ← 실제 프로세스 생성 (Namespace + Cgroup)
+      │ clone() + execve()
+  Container Process
+```
+
+이 분리 덕분에 dockerd를 업데이트해도 containerd가 컨테이너를 계속 유지한다. Kubernetes는 한 발 더 나아가 dockerd를 아예 제거하고 containerd를 직접 호출한다(v1.24+).
+
+## OCI 표준이 분리를 가능하게 했다
+
+세 계층이 서로 교체 가능한 이유는 **OCI(Open Container Initiative)** 표준이 인터페이스를 정의했기 때문이다. OCI는 세 가지를 표준화한다.
+
+- **Runtime Spec**: 컨테이너를 어떻게 실행할지 — `config.json` + `rootfs/`로 구성된 OCI 번들
+- **Image Spec**: 이미지를 어떻게 패키징할지 — manifest, config, layers
+- **Distribution Spec**: 이미지를 어떻게 배포할지 — Registry API
+
+containerd가 runc를 crun이나 kata-containers로 교체할 수 있는 것도, Docker 이미지를 Podman이 그대로 쓸 수 있는 것도 이 표준 덕분이다. OCI 번들(`config.json` + `rootfs/`)만 만들 수 있다면 어떤 런타임이든 컨테이너를 실행할 수 있다.
+
+## runc가 실제로 하는 일
+
+runc는 OCI Runtime Spec의 참조 구현체다. `config.json`을 파싱한 뒤 다음 순서로 컨테이너를 만든다.
+
+```
+1. Linux Namespace 생성  (PID, NET, MNT, UTS, IPC)
+2. Cgroup 설정           (CPU, Memory, I/O 제한)
+3. rootfs 마운트         (OverlayFS)
+4. Capabilities 설정
+5. Seccomp 필터 적용
+6. clone() 시스템 콜      (새 프로세스 생성)
+7. execve()              (컨테이너 PID 1 실행)
+```
+
+runc가 `create`와 `start`를 분리하는 이유가 있다. `create` 단계에서 Namespace와 Cgroup이 준비되면, containerd가 이 시점에 네트워크 인터페이스(veth pair)를 연결한다. 그 다음에야 `start`로 프로세스를 실행한다. `docker run`은 이 두 단계를 한 번에 수행하는 래퍼다.
+
+## containerd의 역할 — Content Store와 Snapshot
+
+containerd는 단순히 runc를 호출하는 래퍼가 아니다. 두 가지 핵심 메커니즘을 담당한다.
+
+**Content Store**: 모든 이미지 레이어를 SHA256 해시로 관리한다. 같은 내용이면 같은 해시 → 한 번만 저장된다. 100개 이미지가 같은 alpine 베이스를 쓴다면 그 레이어는 디스크에 하나만 존재한다.
+
+**Snapshot**: 이미지의 읽기 전용 레이어들 위에 컨테이너 전용 쓰기 레이어를 얹는다. OverlayFS가 이를 투명하게 합쳐 컨테이너에 하나의 rootfs로 보여준다. 컨테이너가 파일을 수정하면 원본은 건드리지 않고 쓰기 레이어에 Copy-on-Write로 복사본을 만든다.
+
+containerd는 멀티테넌시를 위해 **Namespace**를 사용한다. Docker가 사용하는 namespace는 `moby`, Kubernetes는 `k8s.io`다. `ctr -n moby container ls`로 Docker 컨테이너를 직접 확인할 수 있다.
+
+## OCI 이미지의 실체
+
+`docker pull nginx`가 받아오는 것은 실제로 다음 구조다.
+
+```
+Image Index (Fat Manifest)
+├── linux/amd64 → Manifest A
+│   ├── Config (아키텍처, Cmd, Env, diff_ids)
+│   └── Layers [sha256:a3ed95..., sha256:9f13e0..., ...]
+└── linux/arm64 → Manifest B
+    └── ...
+```
+
+같은 태그(`nginx:latest`)로 x86 서버는 amd64 레이어를, Apple Silicon은 arm64 레이어를 받는다. 모든 참조는 SHA256 해시 기반이므로 무결성이 자동으로 보장된다.
+
+`docker run --memory=512m --cpus=2 nginx`가 내부적으로 만드는 `config.json`은 다음과 같다.
+
+```json
+{
+  "linux": {
+    "resources": {
+      "memory": { "limit": 536870912 },
+      "cpu": { "quota": 200000, "period": 100000 }
+    },
+    "namespaces": [
+      {"type": "pid"}, {"type": "network"},
+      {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}
+    ]
+  }
+}
+```
+
+Docker가 제공하는 사용자 친화적 옵션(`--memory`, `--cpus`)은 모두 이 JSON 필드로 변환되어 runc에 전달된다.
+
+<Callout type="note" title="트레이드오프">
+계층 분리는 안정성과 교체 가능성을 얻는 대신 복잡성을 댓가로 치른다. 컨테이너 실행 경로가 `dockerd → containerd → runc → clone()/execve()`로 길어지고, 문제가 생겼을 때 어느 계층인지 파악해야 한다. Kubernetes가 dockershim을 제거한 이유 중 하나도 이 불필요한 hop을 줄이기 위해서였다. 각 계층이 맡은 책임을 명확히 알수록 문제를 더 빠르게 찾을 수 있다.
+</Callout>
+
+<Aside label="rootless 컨테이너">
+runc는 `--rootless` 모드에서 User Namespace를 사용해 일반 사용자 권한으로 컨테이너를 실행할 수 있다. 컨테이너 내부에서는 UID 0(root)로 보이지만, 호스트에서는 UID 100000 같은 일반 사용자로 매핑된다. 컨테이너 탈출 시에도 호스트 root 권한을 얻을 수 없으므로 멀티테넌트 환경에서 중요한 보안 수단이다.
+</Aside>
+
+## 정리
+
+- `docker run`은 dockerd → containerd → runc 세 계층을 순서대로 거쳐 `clone() + execve()`로 끝난다.
+- OCI 표준이 이 계층들을 교체 가능하게 만든다. runc 대신 crun, kata-containers를 사용할 수 있는 것도 이 덕분이다.
+- containerd의 Content Store는 SHA256 기반 중복 제거로 디스크를 절약하고, Snapshot은 OverlayFS로 Copy-on-Write를 구현한다.
+- `docker run`의 모든 옵션은 결국 `config.json`의 `linux.resources`와 `linux.namespaces` 필드로 변환되어 runc에 전달된다.
+
+계층이 많아 보이지만 각 계층의 책임은 명확하다 — dockerd는 편의, containerd는 관리, runc는 실행. 이 분리가 dockerd를 재시작해도 컨테이너가 살아있는 이유다.

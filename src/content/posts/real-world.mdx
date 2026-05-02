@@ -1,0 +1,101 @@
+---
+title: "Docker로 Full-stack 서비스를 운영한다는 것은 무엇인가"
+description: "웹 앱 컨테이너화부터 데이터베이스 영속성, Reverse Proxy, 모니터링, 로그 집계, 백업, 다층 아키텍처까지 — Docker 기반 프로덕션 스택의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, docker-compose, fullstack, nginx, monitoring]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`docker-compose up` 한 줄로 React 프론트엔드, Node.js 백엔드, PostgreSQL, Redis, Nginx, Prometheus, ELK 스택이 동시에 뜬다. 이게 가능한 이유는 Docker가 "격리"만 제공하는 도구가 아니기 때문이다. Docker는 **서비스 간 계약을 코드로 명시하는 방법**이다. 그렇다면 이 계약을 올바르게 설계하지 않으면 무슨 일이 벌어지는가?
+
+## 환경의 통일 — "내 컴퓨터에서는 됩니다"의 종말
+
+전통적인 개발 환경은 개발자 수만큼 다르다. Node 버전, Python 버전, PostgreSQL 버전, 포트 충돌 — 팀원이 늘어날수록 온보딩 비용이 선형으로 증가한다.
+
+Docker Compose는 이 문제를 `docker-compose.yml` 한 파일로 봉인한다. 모든 서비스의 이미지, 환경 변수, 포트, 볼륨, 의존 순서가 선언되어 있고, 누가 어느 운영체제에서 실행해도 동일한 환경이 구성된다.
+
+개발 환경과 프로덕션 환경의 차이도 파일 분리로 관리한다. `docker-compose.yml`은 볼륨 마운트와 `nodemon`으로 Hot Reload를 지원하고, `docker-compose.prod.yml`은 Multi-stage Build로 이미지를 최소화하고 Nginx로 정적 파일을 서빙한다. 두 파일의 차이가 바로 "개발 편의성"과 "프로덕션 안전성" 사이의 트레이드오프를 명시한다.
+
+## 데이터 영속성 — 컨테이너는 죽어도 데이터는 살아야 한다
+
+컨테이너는 본질적으로 임시 존재다. `docker-compose down`을 실행하면 컨테이너 레이어에 쌓인 데이터는 사라진다. 데이터베이스를 Volume 없이 운영하는 것은 그 자체로 운영 사고다.
+
+```yaml
+services:
+  postgres:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+
+volumes:
+  postgres_data:
+```
+
+`/docker-entrypoint-initdb.d`에 SQL 파일을 마운트하면 컨테이너 최초 실행 시 스키마와 시드 데이터가 자동으로 적용된다. Health Check와 `depends_on: condition: service_healthy` 조합은 데이터베이스가 준비되기 전에 백엔드가 연결을 시도하는 레이스 컨디션을 방지한다.
+
+<Callout type="warning" title="Volume 없는 데이터베이스 컨테이너">
+`docker-compose down` 후 `up`을 다시 실행하면 새 컨테이너가 생성된다. Volume이 없으면 모든 데이터가 사라진다. `-v` 플래그 없이는 Volume이 삭제되지 않으므로, 데이터를 지우려면 `docker-compose down -v`를 명시적으로 실행해야 한다.
+</Callout>
+
+## 트래픽의 단일 진입점 — Reverse Proxy의 역할
+
+여러 서비스를 각자 다른 포트로 노출하는 구성은 클라이언트 입장에서 관리가 불가능해진다. Nginx를 Reverse Proxy로 두면 단일 진입점(80/443)에서 경로 기반으로 서비스를 라우팅할 수 있다.
+
+```nginx
+location /api {
+    proxy_pass http://backend:8080;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+
+location / {
+    root /usr/share/nginx/html;
+    try_files $uri $uri/ /index.html;
+}
+```
+
+프론트엔드는 Multi-stage Build로 빌드된 정적 파일을 Nginx가 직접 서빙하고, API 요청만 백엔드로 프록시한다. 이 구조에서 백엔드 포트는 외부에 노출되지 않는다 — `ports` 대신 `expose`로 내부 네트워크에만 열어둔다.
+
+Traefik은 Docker 레이블만으로 라우팅을 정의하고 Let's Encrypt 인증서를 자동으로 발급한다. Nginx는 설정을 직접 관리하는 대신 더 세밀한 제어를 제공한다. 정적 인프라라면 Nginx, 서비스가 자주 추가·제거되는 동적 환경이라면 Traefik이 맞다.
+
+<Callout type="note" title="트레이드오프 — Nginx vs Traefik">
+Nginx는 최고 성능과 세밀한 설정 제어를 제공하지만 서비스가 추가될 때마다 설정 파일을 수정하고 리로드해야 한다. Traefik은 Docker 레이블로 서비스 추가를 자동화하고 SSL을 관리해주지만, 복잡한 rewrite 규칙에서는 Nginx보다 표현력이 부족하다.
+</Callout>
+
+## 관찰 가능성 — 보이지 않으면 관리할 수 없다
+
+서비스가 여러 컨테이너로 분산되면 `docker logs`를 하나씩 뒤지는 방식은 한계를 맞는다. Prometheus + Grafana는 메트릭을, ELK 스택은 로그를 중앙에서 관리한다.
+
+Prometheus는 15초마다 각 서비스의 `/metrics` 엔드포인트를 스크랩해 시계열 데이터로 저장한다. Node.js 서비스에 `prom-client`를 붙이면 HTTP 요청 수, 응답 시간, 에러율을 커스텀 메트릭으로 노출할 수 있다. Grafana는 이 데이터를 대시보드로 시각화하고, AlertManager는 CPU 80% 초과나 에러율 5% 초과 같은 조건에서 Slack으로 알림을 보낸다.
+
+로그는 Logstash(또는 Fluentd)가 수집해 Elasticsearch에 인덱싱한다. Kibana의 KQL 쿼리 `level: "error" AND service: "backend"`로 모든 컨테이너의 에러 로그를 한 화면에서 시간순으로 볼 수 있다. 모든 로그는 구조화된 JSON 형식으로 출력해야 Elasticsearch가 필드 단위로 인덱싱할 수 있다.
+
+## 백업 — 테스트하지 않은 백업은 백업이 아니다
+
+컨테이너가 재시작해도 Volume이 있으면 데이터는 보존된다. 하지만 Volume 자체가 손상되거나, 호스트 서버가 죽거나, 실수로 `docker-compose down -v`를 실행하면 그 어떤 Volume도 데이터를 지키지 못한다.
+
+3-2-1 백업 규칙은 운영 환경의 최소 요건이다 — 원본 1개, 로컬 백업 1개, 원격(S3 등) 백업 1개. `pg_dump`를 매일 새벽 실행하고 gzip으로 압축해 로컬에 저장한 뒤 S3로 동기화하는 파이프라인은 별도 백업 컨테이너로 구성할 수 있다.
+
+<Aside label="복구 테스트의 중요성">
+백업 파일이 있어도 복구 스크립트에 버그가 있거나, 파일이 손상되어 있거나, 버전 불일치가 있으면 실제 장애 상황에서 복구에 실패한다. GitLab은 2017년 백업이 있었지만 복구 스크립트 버그로 300GB 데이터를 잃었다. 월 1회 복구 테스트는 선택이 아니라 의무다.
+</Aside>
+
+## 정리
+
+- Docker Compose는 서비스 간 계약을 코드로 명시한다. `docker-compose.yml`이 환경 일관성의 유일한 진실이다.
+- 데이터베이스 컨테이너에 Volume이 없으면 `down`과 동시에 데이터가 사라진다.
+- Nginx Reverse Proxy는 포트 노출을 최소화하고, Multi-stage Build는 프로덕션 이미지를 최소화한다. 두 가지 모두 공격 표면을 줄이는 같은 철학이다.
+- 관찰 가능성(Prometheus + ELK)과 백업은 기능이 아니라 운영 인프라의 일부다. 처음부터 스택에 포함해야 한다.
+
+다음 글에서는 이 스택을 Kubernetes로 옮길 때 `docker-compose.yml`의 어떤 개념이 그대로 이어지고, 어디서 완전히 다른 사고방식이 필요한지 추적한다.

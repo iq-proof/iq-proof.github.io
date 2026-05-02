@@ -1,0 +1,142 @@
+---
+title: "코드 한 줄이 프로덕션에 닿기까지"
+description: "git push부터 Kubernetes 클러스터 동기화까지, Docker CI/CD 파이프라인의 핵심 설계 결정을 추적한다 — 이미지 태깅, 레지스트리, 보안 스캔, GitOps, 배포 전략까지."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, ci-cd, gitops, canary, security-scanning]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git push` 한 번으로 5분 안에 프로덕션에 도달하는 코드와, 30분짜리 수동 절차를 거쳐 배포되는 코드의 차이는 무엇인가? 그리고 그 5분 안에 어떤 결정들이 자동으로 이루어지는가?
+
+## 파이프라인의 골격
+
+자동화된 Docker CI/CD 파이프라인은 크게 여섯 단계로 나뉜다: **빌드 → 태깅 → 레지스트리 저장 → 보안 스캔 → GitOps 동기화 → 배포 전략 실행**. 각 단계는 독립적인 결정을 담고 있고, 그 결정들이 모여 전체 파이프라인의 안전성과 속도를 결정한다.
+
+GitHub Actions 기준으로 최소한의 골격은 이렇다.
+
+```yaml
+jobs:
+  build-and-push:
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          push: ${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+`cache-from: type=gha`가 핵심이다. GitHub Actions Cache를 레이어 캐시로 쓰면 의존성 레이어가 변경되지 않은 빌드는 5분에서 30초로 줄어든다. 레이어 순서 — 변경 빈도가 낮은 `package.json` 복사 및 `npm ci`를 먼저, 소스 코드 복사는 나중에 — 가 이 캐시 효율을 결정한다.
+
+## 태그는 이력이다
+
+`latest`만 쓰는 팀은 "어떤 버전이 지금 떠 있는가"라는 질문에 답할 수 없다. 태그는 단순한 레이블이 아니라 **추적 가능성(traceability)의 기반**이다.
+
+프로덕션 환경의 표준 태깅 전략은 세 레이어로 구성된다.
+
+```bash
+# 릴리스 태그 푸시 시 자동 생성
+myapp:v1.2.3       # 정확한 버전 (롤백 기준)
+myapp:1.2          # Major.Minor (자동 업데이트 허용)
+myapp:1            # Major (호환성 기준)
+myapp:latest       # 최신 stable (개발 환경용)
+myapp:sha-abc1234  # Git 커밋 (디버깅 기준)
+```
+
+`docker/metadata-action`을 쓰면 태그 생성 로직을 파이프라인 안에서 선언적으로 관리할 수 있다. 태그가 한 번 레지스트리에 푸시되면 절대 덮어쓰지 않는 것(Immutable Tags)이 원칙이다 — 같은 태그가 다른 이미지를 가리키는 순간 전체 이력이 무의미해진다.
+
+## Private Registry와 보안 스캔
+
+Docker Hub는 익명 풀 기준 100회/6시간 제한이 있다. CI/CD 규모가 커지면 이 제한에 걸린다. Private Registry(Harbor, ECR, GCR)는 이 문제를 해결하면서 동시에 **보안 정책의 시행 지점**이 된다.
+
+Harbor의 경우 이미지 푸시 시 자동 스캔을 활성화하고, High 이상 취약점이 있는 이미지의 풀을 차단하는 정책을 설정할 수 있다. CI/CD 파이프라인 안에서는 Trivy로 동일한 게이트를 구현한다.
+
+```yaml
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: myapp:${{ github.sha }}
+    severity: 'CRITICAL,HIGH'
+    exit-code: '1'   # Critical/High 발견 시 파이프라인 실패
+```
+
+<Callout type="warning" title="보안 스캔의 현실적 운용">
+모든 취약점을 수정하는 것은 불가능하다. Critical은 즉시 차단, High는 7일 이내 수정, Medium은 다음 릴리스 목표로 우선순위를 나누는 것이 현실적이다. False positive는 `.trivyignore`에 사유와 만료일을 명시하고 예외 처리한다.
+</Callout>
+
+스캔을 통과한 이미지는 Cosign으로 서명한다. 서명된 이미지만 Kubernetes Admission Controller를 통과하도록 설정하면 "스캔되지 않은 이미지가 프로덕션에 뜨는" 상황을 구조적으로 차단할 수 있다.
+
+## GitOps — Git이 배포의 진실
+
+전통적 CI/CD는 파이프라인이 `kubectl apply`를 직접 실행하는 **Push 모델**이다. GitOps는 반대로 작동한다 — 파이프라인은 Git 저장소의 매니페스트를 업데이트하고, 클러스터 안의 에이전트(ArgoCD, Flux)가 그 변경을 감지해 자동으로 동기화하는 **Pull 모델**이다.
+
+```
+CI 파이프라인:
+  이미지 빌드 → 레지스트리 푸시 → Git 매니페스트 업데이트
+
+ArgoCD (클러스터 안):
+  Git 변경 감지 → 현재 상태와 비교 → Kubernetes 동기화
+```
+
+이 구조의 핵심 이점은 **모든 배포 변경이 Git 커밋으로 남는다**는 것이다. 롤백은 `git revert`고, 감사(audit)는 Git 로그다. `selfHeal: true` 설정 시 누군가 `kubectl`로 직접 변경해도 Git 상태로 자동 복구된다.
+
+## 배포 전략 — 위험의 분산
+
+이미지가 레지스트리에 올라가고 GitOps로 동기화 트리거가 걸렸다면, 마지막 질문은 "어떻게 새 버전을 클러스터에 투입할 것인가"다.
+
+Kubernetes 기본 Rolling Update는 `maxUnavailable`과 `maxSurge` 두 파라미터로 점진적 교체를 제어한다. 더 세밀한 제어가 필요하면 Argo Rollouts를 쓴다.
+
+**Blue/Green**: 새 버전(Green)을 완전히 준비한 뒤 트래픽을 즉시 전환한다. 문제가 생기면 서비스 포인터를 다시 이전 버전(Blue)으로 돌리면 된다. 리소스가 2배 필요하지만 롤백이 즉각적이다.
+
+**Canary**: 새 버전에 5% → 25% → 50% → 100% 순으로 트래픽을 점진적으로 흘린다. 각 단계에서 에러율과 레이턴시를 측정하고, 임계값을 초과하면 자동 롤백한다.
+
+```yaml
+strategy:
+  canary:
+    steps:
+    - setWeight: 10
+    - analysis:
+        templates:
+        - templateName: success-rate   # 에러율 1% 초과 시 롤백
+    - setWeight: 50
+    - pause: {duration: 5m}
+```
+
+<Aside label="전략 선택 기준">
+개발/내부 도구는 Rolling Update, 중요 서비스는 Blue/Green, 트래픽이 많고 장애 영향이 큰 서비스는 Canary. Canary는 안전하지만 복잡도와 배포 시간이 늘어난다 — 모든 배포에 Canary를 쓰는 것이 항상 옳지는 않다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="파이프라인 설계의 트레이드오프">
+**속도 vs 안전성**: 보안 스캔, Canary 분석, 각 단계의 대기 시간은 파이프라인을 느리게 만든다. PR 환경에서는 Critical 취약점 스캔만, main 브랜치는 전체 스캔을 적용하는 식으로 환경별로 게이트를 달리 설정하는 것이 현실적이다.
+
+**자동화 vs 제어**: `selfHeal: true` + `autoPromotionEnabled: true` 조합은 사람 없이도 배포가 완료된다. 하지만 프로덕션 환경의 주요 릴리스는 `pause: {}` — 수동 승인 게이트 — 를 유지하는 것이 안전하다.
+
+**비용 vs 안정성**: Blue/Green은 리소스가 2배, Canary는 파이프라인 복잡도가 증가한다. 서비스 중요도에 따라 비용을 정당화할 수 있는지 판단해야 한다.
+</Callout>
+
+## 정리
+
+- **빌드**: Multi-stage Dockerfile + GitHub Actions Cache로 레이어 재사용 — 5분 빌드를 30초로.
+- **태깅**: `v1.2.3`, `sha-abc1234`, `latest`를 동시에 붙인다. `latest`만 쓰는 것은 이력을 포기하는 것이다.
+- **보안**: Trivy로 빌드 단계에서 차단하고, Cosign으로 서명한다. 스캔 없이 배포된 이미지는 신뢰할 수 없다.
+- **GitOps**: Git이 배포의 단일 진실이다. ArgoCD가 diff를 감지하고 클러스터를 맞춘다.
+- **배포 전략**: 서비스 중요도에 따라 Rolling → Blue/Green → Canary를 선택한다. Canary + 메트릭 기반 자동 롤백이 가장 안전하지만 가장 복잡하다.
+
+`git push` 한 줄 뒤에는 이 모든 결정들이 자동으로 실행된다. 그 결정들을 의식적으로 설계한 팀과 아닌 팀의 차이는 장애가 났을 때 드러난다.

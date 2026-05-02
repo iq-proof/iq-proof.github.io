@@ -1,0 +1,95 @@
+---
+title: "컨테이너 패턴의 통일된 철학은 무엇인가"
+description: "Microservices부터 Graceful Shutdown까지, 8개 챕터를 관통하는 하나의 원칙 — '관심사 분리를 컨테이너 경계로 구현하라'를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, container-patterns, microservices, kubernetes, sidecar]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+8개 챕터를 나란히 놓고 보면 공통점이 보인다. Microservices, Sidecar, Ambassador, Adapter, Init Container, Health Check, Graceful Shutdown, Configuration Management — 이것들은 각각 다른 문제를 다루지만, 모두 같은 질문에 답한다. **"이 책임을 어느 컨테이너가 져야 하는가?"** 왜 그 경계를 그렇게 그어야 하는가?
+
+## 하나의 원칙: 관심사 분리를 컨테이너 경계로 구현한다
+
+전통적인 모놀리스는 비즈니스 로직, 로깅, 재시도, 인증, 설정 로딩, 종료 처리가 한 프로세스 안에 뒤섞인다. 이 시리즈의 모든 패턴은 그 뒤엉킨 책임들을 **컨테이너 단위로 분리**하는 방법이다.
+
+- Sidecar는 "로깅은 앱 코드가 아니라 별도 컨테이너가 진다"는 결정이다.
+- Ambassador는 "재시도와 Circuit Breaker는 앱 코드가 아니라 외부 통신 전담 컨테이너가 진다"는 결정이다.
+- Adapter는 "프로토콜 변환은 레거시도, 현대 서비스도 아닌 중간 컨테이너가 진다"는 결정이다.
+- Init Container는 "DB 마이그레이션과 사전 검증은 메인 앱이 시작되기 전, 다른 컨테이너가 진다"는 결정이다.
+
+각 패턴의 이름이 달라도 논리는 동일하다. **책임 하나 = 컨테이너 하나.**
+
+## Microservices — 첫 번째 경계 결정
+
+서비스 분리는 가장 큰 단위의 관심사 분리다. User Service, Order Service, Payment Service는 각자의 도메인 경계를 가지며, 각자의 데이터베이스를 소유한다. 이 경계를 잘못 그으면 모든 하위 패턴이 무의미해진다.
+
+DDD(Domain-Driven Design)가 제시하는 Bounded Context가 컨테이너 경계와 일치할 때 마이크로서비스는 작동한다. 반대로 기술 레이어(UI/Business/Data)로 서비스를 자르거나, 너무 작게 잘라 Nano-service를 만들면 네트워크 오버헤드와 관리 복잡도만 증가한다.
+
+서비스 간 통신 결정도 같은 논리다. "즉시 응답이 필요한가?" → REST/gRPC. "비동기로 처리해도 되는가?" → Message Queue. 통신 방식 선택은 서비스 간 결합도를 결정하고, 결합도가 낮을수록 각 서비스가 진정한 독립성을 가진다.
+
+## Sidecar와 Ambassador — Pod 안의 책임 분리
+
+Pod 수준에서 같은 원칙이 반복된다. 메인 컨테이너는 비즈니스 로직만, 나머지 책임은 사이드카가 가져간다.
+
+```
+┌─────────────────────────────────────┐
+│ Pod                                 │
+│  ┌──────────┐    ┌───────────────┐  │
+│  │ App      │    │ Sidecar       │  │
+│  │ 비즈니스   │◄──►│ 로깅/모니터링/  │  │
+│  │ 로직만     │    │ 프록시/설정동기화│  │
+│  └──────────┘    └───────────────┘  │
+│  localhost / 공유 볼륨                │
+└─────────────────────────────────────┘
+```
+
+Sidecar가 범용 보조 컨테이너라면, Ambassador는 외부 통신 전담 Sidecar다. 앱 코드는 `http://localhost:6380`에 요청하면 끝이다. 연결 풀, 재시도, Circuit Breaker — 그것은 Ambassador의 책임이다.
+
+<Callout type="note" title="트레이드오프">
+Sidecar 패턴은 Pod가 무거워진다는 대가를 치른다. 각 사이드카는 메모리와 CPU를 추가로 소비한다. 노드 전체에 동일한 기능이 필요하다면(예: 모든 노드의 로그 수집) Sidecar 대신 DaemonSet이 더 효율적이다. 패턴 선택은 격리 수준과 리소스 효율 사이의 트레이드오프다.
+</Callout>
+
+## Adapter와 Init Container — 시간 축과 공간 축의 분리
+
+Adapter는 **공간 축**의 분리다. 현대 서비스와 레거시 시스템 사이에 컨테이너 하나를 끼워 넣어 프로토콜과 포맷 변환을 전담시킨다. REST → SOAP 변환, JSON → XML 변환, API v1 → v2 변환 모두 앱 코드를 건드리지 않고 Adapter 컨테이너만 교체하면 된다.
+
+Init Container는 **시간 축**의 분리다. "메인 앱이 시작되기 전에 완료되어야 할 작업"을 별도 컨테이너가 순차적으로 처리한다. DB 마이그레이션, 설정 다운로드, 서비스 의존성 대기 — 이것들이 메인 앱 코드 안에 있으면 앱이 복잡해지고, 실패 시 전체가 엉킨다. Init Container는 이 작업들을 시간적으로 분리해 "모든 준비가 완료된 상태에서만 메인 앱이 시작된다"는 보장을 만든다.
+
+## Health Check와 Graceful Shutdown — 생명주기 계약
+
+컨테이너 패턴에서 놓치기 쉬운 것은 컨테이너의 **생명주기 계약**이다. Kubernetes는 세 가지 질문을 주기적으로 한다.
+
+- "시작됐는가?" (Startup Probe)
+- "살아있는가?" (Liveness Probe)
+- "트래픽 받을 준비가 됐는가?" (Readiness Probe)
+
+이 세 질문에 다른 엔드포인트로 답해야 한다는 것이 핵심이다. Liveness에 의존성 체크를 넣으면 DB가 일시적으로 끊겼을 때 멀쩡한 앱이 재시작된다. Liveness는 프로세스 자체만, Readiness는 의존성 포함이 올바른 분리다.
+
+Graceful Shutdown은 종료 시점의 계약이다. SIGTERM을 받으면 새 요청을 거부하고, 진행 중인 요청이 완료될 때까지 기다리고, 리소스를 정리한 후 종료한다. 이 계약을 지키지 않으면 롤링 업데이트 중 502 에러가 발생한다. PreStop Hook으로 Readiness를 false로 먼저 전환하는 것은 "Service에서 제외된 후 종료한다"는 순서를 보장하기 위해서다.
+
+## Configuration Management — 설정도 관심사다
+
+설정은 코드가 아니다. 12-Factor App의 세 번째 원칙이 이것이다. ConfigMap은 일반 설정, Secret은 민감 정보, Vault는 동적 시크릿 — 이 계층 구조도 관심사 분리다. 애플리케이션 코드는 `os.getenv('DATABASE_URL')`로 읽고, 어떤 환경에서 어떤 값이 주입되는지는 코드 바깥의 책임이다.
+
+<Aside label="공통 패턴">
+이 시리즈의 모든 패턴은 결국 같은 질문으로 수렴한다. "이 책임을 지금 이 코드/컨테이너가 져야 하는가, 아니면 다른 곳으로 위임해야 하는가?" 위임할 때마다 경계가 생기고, 경계가 명확할수록 각 컨테이너는 독립적으로 배포, 스케일, 교체될 수 있다.
+</Aside>
+
+## 정리
+
+- 컨테이너 패턴 8개는 각각 다른 이름을 가지지만 하나의 원칙 — **관심사 분리를 컨테이너 경계로 구현한다** — 의 다른 표현이다.
+- Microservices는 도메인 단위, Sidecar/Ambassador는 Pod 내 기능 단위, Adapter는 프로토콜 변환, Init Container는 시간 순서, Health Check와 Graceful Shutdown은 생명주기 계약, Configuration Management는 설정과 코드의 분리다.
+- 패턴을 선택할 때는 항상 트레이드오프가 따른다. 격리가 강해질수록 리소스 오버헤드와 운영 복잡도가 올라간다. 경계를 그을 때마다 그 대가를 알고 그어야 한다.
+- 가장 흔한 실수는 패턴을 개별적으로 적용하는 것이다. 이 패턴들은 함께 작동할 때 의미가 있다 — Readiness Probe 없는 Graceful Shutdown은 절반짜리 계약이고, Init Container 없는 Microservices는 시작 순서를 앱 코드가 책임져야 한다.
+
+다음 글에서는 이 패턴들이 실제 Kubernetes 운영 환경에서 어떻게 조합되는지, 그리고 각 패턴이 잘못 설정됐을 때 어떤 증상으로 나타나는지 추적한다.

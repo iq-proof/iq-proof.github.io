@@ -1,0 +1,142 @@
+---
+title: "컨테이너 디버깅은 왜 이렇게 어려운가"
+description: "격리된 컨테이너 내부를 들여다보는 방법부터 네트워크 장애, 성능 병목, 자주 반복되는 문제 패턴까지 — 컨테이너 트러블슈팅의 전체 지형을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, kubernetes, debugging, observability, containers]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+컨테이너는 격리를 팔고, 디버거는 투명성을 원한다. 이 둘은 근본적으로 충돌한다. 쉘이 없는 distroless 이미지, 재시작하면 사라지는 로그, 겹겹이 쌓인 네임스페이스 — 컨테이너 환경에서 "왜 안 되지?"는 왜 이렇게 대답하기 어려운가?
+
+## 격리의 대가: 들어가는 방법부터
+
+컨테이너가 정상이라면 `docker exec -it myapp /bin/bash` 한 줄로 충분하다. 문제는 정상이 아닐 때다.
+
+쉘이 없는 컨테이너(distroless, scratch 기반)는 `exec` 자체가 실패한다. 이때 두 가지 경로가 있다. 첫째는 같은 네임스페이스를 공유하는 디버깅 컨테이너를 붙이는 것이다.
+
+```bash
+# 같은 PID·네트워크 네임스페이스 공유
+docker run -it --rm \
+  --pid=container:myapp \
+  --net=container:myapp \
+  --cap-add SYS_PTRACE \
+  nicolaka/netshoot
+```
+
+둘째는 호스트에서 직접 컨테이너의 네임스페이스로 뛰어드는 `nsenter`다.
+
+```bash
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+sudo nsenter -t $PID -m -u -i -n -p /bin/bash
+```
+
+Kubernetes에서는 `kubectl debug pod/myapp -it --image=nicolaka/netshoot --share-processes`가 같은 역할을 한다. 공통 원리는 하나다 — 컨테이너 격리의 단위는 **네임스페이스**이고, 네임스페이스에 진입할 수 있으면 내부가 보인다.
+
+## 로그: 블랙박스의 첫 번째 단서
+
+로그는 가장 먼저 봐야 한다. 그런데 컨테이너 로그에는 함정이 있다. 컨테이너가 재시작되면 이전 로그는 사라진다(Kubernetes는 `--previous` 옵션으로 한 세대 전까지 보존한다).
+
+구조화 로그(JSON)를 쓰면 `jq`로 즉시 쿼리할 수 있다.
+
+```bash
+# ERROR 레벨만 + trace_id로 상관관계 추적
+docker logs myapp | jq 'select(.level == "ERROR") | {ts: .timestamp, msg: .message, trace: .trace_id}'
+```
+
+로그가 너무 많아 성능 문제가 생기면 로그 레벨을 올리거나(`WARN`/`ERROR`만) 로테이션을 건다.
+
+```bash
+docker run \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  myapp
+```
+
+중앙 집중식 로깅(Fluentd → Elasticsearch, Promtail → Loki)은 컨테이너 수명 주기와 로그 수명 주기를 분리한다. 컨테이너가 죽어도 로그는 살아 있다.
+
+## 네트워크: 가장 흔한 침묵의 실패
+
+컨테이너 네트워크 문제는 패턴이 세 가지로 수렴한다.
+
+**Connection Refused** — 서비스가 시작되지 않았거나, 잘못된 포트를 듣고 있다. `docker exec myapp netstat -tln`으로 실제 listening 포트를 확인한다.
+
+**Connection Timeout** — 네트워크 경로가 없거나 방화벽이 막고 있다. `ping`이 되는데 `curl`이 안 되면 레이어 4(TCP) 문제다. `tcpdump`로 패킷이 도달하는지 확인한다.
+
+**Name Resolution Failed** — 가장 흔한 원인은 컨테이너가 서로 다른 Docker 네트워크에 있는 것이다.
+
+```bash
+# 같은 네트워크 없으면 서비스 이름 해석 불가
+docker network create mynetwork
+docker run --network mynetwork --name api myapi
+docker run --network mynetwork --name web myweb
+```
+
+<Callout type="note" title="트레이드오프">
+`--network host`는 NAT 오버헤드가 없어 최고 성능을 내지만, 포트 충돌이 발생하고 컨테이너 격리가 사라진다. bridge 네트워크는 격리를 보장하지만 DNS 해석 실패가 잦다. 대부분의 프로덕션 환경은 사용자 정의 bridge 네트워크를 쓴다.
+</Callout>
+
+심층 분석이 필요할 때는 `tcpdump`를 쓴다. 단, 프로덕션에서는 CPU 5–10% 오버헤드와 민감 정보 노출을 고려해 짧은 시간, 특정 포트 필터만 걸어 쓴다.
+
+## 성능: 측정하지 않으면 최적화할 수 없다
+
+성능 병목은 네 곳에서 온다 — CPU, 메모리, Disk I/O, 네트워크. `docker stats`는 이 네 가지를 컨테이너 단위로 실시간 보여주는 출발점이다.
+
+CPU가 100%인데 애플리케이션이 느리다면 cgroup throttling을 의심한다.
+
+```bash
+# Throttling 발생 횟수
+docker exec myapp cat /sys/fs/cgroup/cpu/cpu.stat
+# nr_throttled: 1234 → CPU 제한을 올려야 한다
+docker update --cpus=2.0 myapp
+```
+
+메모리가 계속 증가한다면 누수다. Python은 `memory_profiler`, Java는 `jmap -dump`로 heap을 떠서 Eclipse MAT나 VisualVM으로 분석한다. OOMKilled는 누수 수정 전까지는 `--memory` 값을 올리는 것이 임시방편이다.
+
+이미지 크기도 성능이다. `dive` 도구로 레이어별 낭비 공간을 확인하고, Multi-stage build로 런타임 이미지에서 빌드 도구를 분리하면 이미지가 1/8 이하로 줄어드는 경우가 흔하다.
+
+## 반복되는 문제 패턴
+
+같은 문제가 반복된다. 패턴을 외우면 진단 시간이 줄어든다.
+
+| 상태 | 원인 | 첫 확인 명령 |
+|:---|:---|:---|
+| `ImagePullBackOff` | 이미지명 오타, private registry 인증 없음 | `kubectl describe pod` → Events |
+| `CrashLoopBackOff` | 앱 크래시, 환경 변수 누락, 헬스체크 실패 | `kubectl logs --previous` |
+| `OOMKilled` | 메모리 제한 초과 | `docker inspect` → `State.OOMKilled` |
+| Permission Denied | non-root 사용자, SELinux | `ls -la` + `whoami` |
+| Exec Format Error | ARM 이미지를 AMD64 호스트에서 실행 | `docker inspect` → `Architecture` |
+
+`CrashLoopBackOff`의 재시작 간격은 지수적으로 늘어난다(0s → 10s → 20s → 40s…). 빠르게 로그를 보려면 첫 재시작 직후 `kubectl logs --previous`를 실행한다.
+
+## 도구: 올바른 도구가 디버깅 시간을 90% 줄인다
+
+수동으로 `docker ps`와 `docker logs`를 반복하는 것과 적절한 도구를 쓰는 것은 30분 vs 3분 차이다.
+
+- **k9s**: Kubernetes를 위한 TUI. Pod 선택 → `l`(로그) → `s`(쉘), 키 3개로 끝난다.
+- **stern**: `stern myapp`으로 `myapp-*` 모든 Pod의 로그를 색으로 구분해 스트리밍한다.
+- **nicolaka/netshoot**: tcpdump, dig, iperf3, curl 등 네트워크 디버깅 도구가 모두 들어간 이미지. 문제가 있는 컨테이너의 네트워크 네임스페이스에 붙인다.
+- **Prometheus + Grafana**: 로그는 사후 분석이고, 메트릭은 실시간 감지다. cAdvisor로 컨테이너 메트릭을 수집하고 Grafana로 시각화하면 OOM이 오기 전에 메모리 추세를 볼 수 있다.
+
+<Aside label="도구 선택 원칙">
+모든 도구를 배울 필요는 없다. kubectl + k9s + stern + netshoot 네 가지만 능숙하게 쓸 수 있으면 컨테이너 문제의 80%는 해결된다. 도구는 원리를 이해한 뒤에 생산성을 높이는 수단이지, 원리를 대체하지 않는다.
+</Aside>
+
+## 정리
+
+- 컨테이너 격리는 네임스페이스 단위다. `nsenter`나 디버깅 컨테이너로 네임스페이스에 진입하면 내부가 보인다.
+- 로그는 구조화(JSON)하고 컨테이너 수명과 분리해 저장한다. Trace ID로 서비스 간 연결을 추적한다.
+- 네트워크 문제는 OSI 레이어 순서대로 ping → curl → tcpdump로 좁혀간다. 가장 흔한 원인은 같은 네트워크에 없는 것이다.
+- 성능 문제는 반드시 측정 먼저다. `docker stats` → cgroup 확인 → 프로파일러 순서로 병목을 찾는다.
+- `ImagePullBackOff`, `CrashLoopBackOff`, `OOMKilled` 같은 상태 이름은 원인 카테고리를 직접 가리킨다. 패턴을 외우면 첫 확인 명령이 바로 나온다.
+
+컨테이너 디버깅의 어려움은 격리 자체가 아니라, 격리를 투명하게 볼 도구와 방법을 모르는 데서 온다.

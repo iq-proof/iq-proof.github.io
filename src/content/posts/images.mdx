@@ -1,0 +1,134 @@
+---
+title: "Docker 이미지 크기가 10배 차이 나는 이유"
+description: "Dockerfile 레이어 순서부터 멀티 스테이지 빌드, BuildKit 캐시 마운트, Distroless 보안까지 — Docker 빌드 최적화의 통합 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [docker, dockerfile, buildkit, container-security, image-optimization]
+difficulty: intermediate
+series:
+  slug: docker-deep-dive
+  title: Docker Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+같은 Node.js 앱을 컨테이너화했는데 한 팀은 이미지가 1.1GB, 다른 팀은 150MB다. CI 빌드 시간도 5분 대 30초다. 코드는 동일하다. 차이는 Dockerfile 몇 줄에서 나온다. 왜 이렇게 벌어지는가?
+
+## 레이어는 순서가 전부다
+
+Docker 빌드 캐시는 레이어 단위로 동작한다. 한 레이어가 무효화되면 그 아래 모든 레이어가 재실행된다. 이 단순한 규칙이 빌드 시간 전체를 결정한다.
+
+```dockerfile
+# 나쁜 예: 소스 변경마다 npm install 재실행
+FROM node:18-alpine
+COPY . /app          # ← 소스 변경 시 캐시 파괴
+WORKDIR /app
+RUN npm install      # ← 매번 5분
+
+# 좋은 예: 의존성 파일 먼저, 소스는 나중에
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production   # ← 소스 변경해도 캐시 유지
+COPY . .
+```
+
+캐시 키는 `COPY`의 경우 파일 체크섬(SHA256)이다. `package.json`이 바뀌지 않으면 `npm ci`는 캐시에서 꺼낸다. 소스 파일 한 줄 바꿔도 `npm ci`가 다시 돌던 팀과 30초 만에 끝나는 팀의 차이가 여기서 생긴다.
+
+`.dockerignore`는 이 전략의 보조 수단이다. `node_modules/`, `.git/`, `dist/`를 제외하지 않으면 `COPY . .` 단계에서 수백 MB가 빌드 컨텍스트로 전송되고, 체크섬 계산도 느려진다. `.dockerignore` 하나로 빌드 컨텍스트를 850MB에서 10MB로 줄인 사례가 드물지 않다.
+
+## 멀티 스테이지: 빌드 도구를 이미지에서 쫓아내라
+
+단일 스테이지 Go 이미지는 Go 컴파일러째로 배포된다. 크기 850MB. 멀티 스테이지로 바이너리만 추출하면 8MB다. 100배 차이는 과장이 아니다.
+
+```dockerfile
+# 빌드 스테이지
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
+
+# 프로덕션 스테이지
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/server /server
+USER nobody:nobody
+ENTRYPOINT ["/server"]
+```
+
+최종 이미지는 `scratch` 위에 바이너리 하나만 올라간다. Go 컴파일러, 소스 코드, `go mod` 캐시는 전부 빌드 스테이지에 남고 최종 이미지에는 포함되지 않는다. Node.js라면 `FROM node:18-alpine AS builder`에서 빌드하고 프로덕션 스테이지에는 `dist/`와 `node_modules/`만 복사한다.
+
+BuildKit은 의존성이 없는 스테이지를 자동으로 병렬 실행한다. 프론트엔드 빌드와 백엔드 빌드가 독립적이라면 동시에 돌아간다. `DOCKER_BUILDKIT=1` 또는 `docker buildx`를 쓰면 된다.
+
+## BuildKit 캐시 마운트: 패키지 매니저 캐시를 영속화하라
+
+`RUN go mod download`가 매번 2분 30초를 잡아먹는다면 캐시 마운트가 해법이다.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.21-alpine
+
+WORKDIR /app
+COPY go.mod go.sum ./
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o server .
+```
+
+`--mount=type=cache`는 빌드 컨테이너가 사라져도 캐시 디렉토리를 호스트에 유지한다. `go.mod`가 바뀌어도 이미 다운로드된 모듈은 재사용한다. `go mod download` 2분 30초 → 5초, 30배 단축이다. npm은 `/root/.npm`, pip는 `/root/.cache/pip`, Maven은 `/root/.m2`를 마운트하면 같은 효과를 얻는다.
+
+CI/CD에서는 원격 캐시가 더 유효하다. `--cache-to type=registry,ref=myapp:cache`로 레지스트리에 캐시를 올리고 다음 러너가 `--cache-from`으로 당겨온다. 서로 다른 머신에서 돌아가는 GitHub Actions 러너들이 캐시를 공유할 수 있다.
+
+## 베이스 이미지 선택과 보안
+
+이미지 크기와 보안은 같은 방향을 가리킨다. 패키지가 적을수록 공격 표면도 작다.
+
+```
+node:18        → 1.1GB, 취약점 500+
+node:18-slim   → 250MB, 취약점 ~200
+node:18-alpine → 180MB, 취약점 50
+distroless     → 150MB, 취약점 10 이하
+scratch(static) → 8MB,  취약점 0
+```
+
+Alpine은 musl libc 기반이라 glibc 의존 네이티브 모듈이 있으면 재컴파일이 필요하다. Distroless는 쉘이 없어서 `docker exec bash`가 안 된다. 디버깅이 어렵다는 단점이 있지만 공격자도 쉘을 실행할 수 없다.
+
+<Callout type="warning" title="root로 실행하면 컨테이너 탈출이 호스트 침해로">
+컨테이너가 root로 실행 중일 때 탈출 취약점이 터지면 호스트 root 권한을 그대로 얻는다. `USER appuser`를 Dockerfile 마지막에 추가하는 것만으로 이 위험을 크게 줄일 수 있다.
+</Callout>
+
+보안 스캔은 Trivy로 자동화한다. `trivy image --severity CRITICAL,HIGH --exit-code 1 myapp:latest`를 CI 파이프라인에 넣으면 CRITICAL/HIGH 취약점이 있는 이미지는 배포 단계로 넘어가지 않는다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+최적화 깊이는 유지보수 비용과 맞바꾼다. Alpine은 작지만 musl 호환성 문제가 튀어나올 수 있다. Scratch는 가장 작고 안전하지만 디버깅이 거의 불가능하다. Distroless는 그 중간이다. 멀티 스테이지가 복잡해질수록 Dockerfile을 읽고 수정하는 비용도 오른다. 팀의 운영 역량에 맞는 수준을 선택해야 한다.
+</Callout>
+
+조직 단위에서는 공통 베이스 이미지 전략이 큰 레버리지를 준다. 20개 마이크로서비스가 각자 `FROM python:3.11-slim`을 쓰면 공통 레이어가 20번 저장된다. `mycompany/python-base:3.11`을 하나 만들어 공유하면 레이어가 한 번만 저장되고, 보안 패치도 베이스 하나만 업데이트하면 전체 서비스에 전파된다.
+
+<Aside label="BuildKit Secrets">
+ARG로 npm 토큰을 전달하면 `docker history`에 평문으로 남는다. `--mount=type=secret,id=npmrc`를 쓰면 빌드 시에만 임시 마운트되고 이미지 레이어에 흔적이 남지 않는다. Private 레지스트리 접근, SSH 키 마운트도 같은 패턴으로 처리한다.
+</Aside>
+
+## 정리
+
+- **레이어 순서**: 변경 빈도가 낮은 것(의존성)을 위에, 높은 것(소스)을 아래에. 이것만 바꿔도 빌드 시간이 10배 달라진다.
+- **멀티 스테이지**: 빌드 도구는 빌드 스테이지에 가두고, 최종 이미지에는 실행에 필요한 것만 복사한다.
+- **캐시 마운트**: `--mount=type=cache`로 패키지 매니저 캐시를 영속화하면 의존성 변경 후에도 재다운로드를 피할 수 있다.
+- **베이스 이미지**: Alpine → Distroless → Scratch 순으로 크기와 보안이 강화되지만 디버깅 난이도도 함께 올라간다.
+- **보안 자동화**: Trivy 스캔과 Cosign 서명을 CI 파이프라인에 넣어 취약한 이미지가 프로덕션에 도달하지 못하도록 막는다.
+
+이미지 크기와 빌드 시간의 10배 차이는 언어나 프레임워크가 만드는 것이 아니라 Dockerfile을 어떻게 읽고 쓰느냐가 만든다.
