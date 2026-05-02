@@ -1,0 +1,177 @@
+---
+title: "성능 테스트 도구는 왜 아키텍처가 결과를 결정하는가"
+description: "고루틴 기반 VU부터 Executor 선택, 토큰 재사용, 백분위수 해석, InfluxDB 연동, 실전 주문 플로우까지 — k6가 설계 결정마다 드러내는 성능 테스트의 핵심 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [k6, performance-testing, load-testing, goroutine, grafana]
+difficulty: intermediate
+series:
+  slug: performance-testing-deep-dive
+  title: Performance Testing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+성능 테스트 도구를 선택할 때 대부분은 "VU 몇 개까지 지원하나"만 본다. 하지만 JMeter가 1000 VU에 2~3GB를 쓸 때 k6가 50MB로 같은 부하를 만들어내는 이유는 스펙 차이가 아니라 **아키텍처 선택**의 차이다. 그리고 그 선택은 테스트 결과 해석, 시나리오 설계, 실시간 관찰 방식 전체에 연쇄적으로 영향을 미친다. 왜 도구의 내부 구조가 측정값의 신뢰성을 결정하는가?
+
+## VU는 스레드가 아니다
+
+k6의 Virtual User는 OS 스레드가 아니라 Go 런타임의 **고루틴**이다. 고루틴은 시작 시 약 2KB의 스택을 할당하고, 필요에 따라 동적으로 확장된다. OS 스레드가 보통 1~8MB의 스택을 고정 예약하는 것과 근본적으로 다르다.
+
+Go 스케줄러는 **M:N 모델**을 사용한다. 1000개의 고루틴이 4개의 OS 스레드 위에서 동작한다. HTTP 응답을 기다리는 동안 고루틴은 CPU를 반납하고(yield), 스케줄러가 준비된 다른 고루틴에 CPU를 할당한다. 이 work stealing 메커니즘 덕분에 I/O 대기 중심 워크로드에서는 수천 개의 고루틴이 실질적인 병렬성을 달성한다.
+
+```
+고루틴 1000개 + CPU 코어 4개:
+
+┌─ OS Thread 1 ─┬─ OS Thread 2 ─┬─ OS Thread 3 ─┬─ OS Thread 4 ─┐
+├─ Goroutine 1  ├─ Goroutine 5  ├─ Goroutine 9  ├─ Goroutine 13 │
+├─ Goroutine 2  ├─ Goroutine 6  ├─ Goroutine 10 ├─ Goroutine 14 │
+├─ ...          ├─ ...          ├─ ...          ├─ ...          │
+│  (250개)      │  (250개)      │  (250개)      │  (250개)      │
+└───────────────┴───────────────┴───────────────┴───────────────┘
+```
+
+결과적으로 JMeter는 1000 VU에 약 2~3GB 메모리가 필요하고, k6는 같은 부하를 50~100MB로 처리한다. 이 차이는 단순한 자원 절약이 아니다 — **테스트 머신 자체가 병목이 되는 상황을 예방**한다. 테스트 도구가 메모리 압박을 받으면 측정값이 왜곡된다.
+
+<Callout type="note" title="트레이드오프">
+고루틴 기반 설계는 CPU 바운드 작업에 취약하다. Lua 스크립트 안의 무거운 연산, 대량 정렬, 암호화 — 이런 작업은 고루틴이 CPU를 양보하지 않으므로 이벤트 루프를 점유한다. k6 6.0 이후의 Threaded I/O는 이 한계를 부분적으로 완화하지만, 스크립트 실행 자체는 단일 스레드 컨텍스트에 묶여 있다.
+</Callout>
+
+## Executor 선택이 측정값을 결정한다
+
+k6의 시나리오 설계는 executor 선택에서 시작한다. 5가지 executor는 부하를 생성하는 방식이 근본적으로 다르다.
+
+```
+ramping-vus: VU 수 자체를 증가/감소
+  VU ╱╲       → 병목점 위치 찾기, 최대 수용 VU 측정
+
+constant-vus: VU 수 고정
+  VU ─────    → 안정성 검증, 기준 성능 측정
+
+ramping-arrival-rate: 도착률(req/s) 제어, VU는 동적 조정
+  req/s ╱───  → "초당 100개 요청" 유지 (VU는 자동)
+
+per-vu-iterations: VU당 정확한 반복 횟수
+  VU 5 × 10회 = 정확히 50 요청
+
+shared-iterations: 총 반복 횟수를 VU들이 분담
+  총 1000회를 VU 100개가 나눠서 실행
+```
+
+`ramping-arrival-rate`가 특히 중요하다. 실제 서비스는 "VU 100명이 동시에 있다"가 아니라 "초당 50개 요청이 들어온다"는 관점으로 운영된다. VU 기반 executor는 응답 시간이 느려지면 자연스럽게 전체 요청률이 떨어진다 — 도착률을 고정하면 응답 지연이 생길 때 VU 수가 늘어나므로, 시스템 압박이 정직하게 측정된다.
+
+`thresholds`는 이 executor 선택과 결합될 때 의미가 완성된다.
+
+```javascript
+thresholds: {
+  'http_req_duration{group:checkout}': ['p(95)<800'],
+  'payment_success': ['rate>=0.95'],
+}
+```
+
+threshold 실패는 exit code 1을 반환한다. CI/CD 파이프라인에서 이것이 배포 중단 신호가 된다. 임의의 평균값이 아니라 **p95라는 명확한 기준**이 판정의 근거다.
+
+## 평균은 거짓말한다
+
+```
+응답시간: [100, 100, 100, 100, 1000] ms
+평균: 280ms
+p95: 1000ms
+```
+
+평균 280ms는 "괜찮다"는 신호처럼 보이지만, 5%의 사용자가 1초를 기다리고 있다. 성능 테스트에서 평균만 측정하는 것은 병원에서 환자 평균 체온만 보고 개별 고열 환자를 놓치는 것과 같다.
+
+히스토그램 분포 모양이 진단을 제공한다.
+
+```
+정상 (종 모양):     ╱╲        → 대부분 중간값 근처
+비정상 (긴 꼬리):   ╱╲_______ → 일부 요청이 극도로 느림 (병목점)
+이중봉우리:         ╱╲  ╱╲    → 두 종류의 요청이 섞임 (캐시 vs DB)
+```
+
+이중봉우리는 특히 중요한 신호다. 캐시 히트(50ms)와 DB 직접 조회(500ms)가 섞이면 평균은 중간 어딘가에 놓인다. 문제를 해결하려면 두 그룹을 분리해서 분석해야 한다. k6의 `tags`가 이 분리를 가능하게 한다.
+
+```javascript
+http.get('http://api.example.com/products', {
+  tags: { type: 'static' },    // 정적 자산
+});
+http.post('http://api.example.com/order', {
+  tags: { type: 'dynamic' },   // DB 쓰기
+});
+
+// thresholds:
+'http_req_duration{type:static}': ['p(95)<100'],
+'http_req_duration{type:dynamic}': ['p(95)<500'],
+```
+
+<Aside label="p99.9 신뢰성">
+p99.9를 의미 있게 측정하려면 최소 1000개 샘플이 필요하다. 샘플이 600개뿐이라면 p99.9는 0.6개 데이터로 추정되므로 신뢰할 수 없다. 단기 테스트에서는 p95와 p99로 충분하다.
+</Aside>
+
+## 실시간 관찰이 없으면 절반의 테스트다
+
+k6의 표준 출력은 테스트 완료 후에만 결과를 보여준다. 하지만 메모리 누수, DB 커넥션 풀 고갈, GC 압박은 **테스트 진행 중** 특정 시점에 발생한다. 전체 평균에 묻히면 보이지 않는다.
+
+InfluxDB + Grafana 연동이 이 gap을 메운다. `--out influxdb` 플래그 하나로 k6는 1초마다 시계열 데이터를 InfluxDB에 전송하고, Grafana는 이를 실시간으로 시각화한다.
+
+```bash
+k6 run \
+  --out influxdb \
+  -e INFLUXDB_ADDR=http://localhost:8086 \
+  -e INFLUXDB_ORG=myorg \
+  -e INFLUXDB_BUCKET=k6 \
+  -e INFLUXDB_TOKEN=<token> \
+  test.js
+```
+
+커스텀 메트릭 4종은 기술 지표를 비즈니스 지표로 연결한다.
+
+```javascript
+import { Counter, Gauge, Trend, Rate } from 'k6/metrics';
+
+const ordersCompleted = new Counter('orders_completed'); // 누적 증가만
+const activeSessions = new Gauge('active_sessions');    // 현재 값 (증감)
+const checkoutDuration = new Trend('checkout_duration'); // 분포 통계
+const paymentSuccess = new Rate('payment_success');     // true/false 비율
+```
+
+"응답시간 250ms"는 엔지니어 지표다. "결제 성공률 94%가 테스트 3분 시점부터 하락"은 의사결정 지표다.
+
+## 실전 플로우: 단계별로 쪼개야 원인이 보인다
+
+단일 API를 독립적으로 테스트하면 `/products`가 50ms로 빠르다는 것을 알 수 있다. 하지만 실제 사용자는 로그인 → 검색 → 상세 → 장바구니 → 결제의 연속된 흐름을 경험한다. 각 단계가 다른 성능 특성을 가진다.
+
+`group()`은 이 단계를 메트릭 레이블로 분리한다.
+
+```javascript
+group('Login', function() {
+  // http_req_duration{group:Login} 자동 태깅
+  http.post(baseUrl + '/auth/login', credentials);
+});
+
+group('Checkout', function() {
+  // http_req_duration{group:Checkout} 자동 태깅
+  http.post(baseUrl + '/checkout/prepare', cartData);
+});
+```
+
+결과:
+```
+http_req_duration{group:Login}......: p(95)=250ms ✓
+http_req_duration{group:Checkout}...: p(95)=650ms ← 여기가 느림
+```
+
+"전체 응답시간 평균 380ms"로는 알 수 없었던 것이, 그룹 분리 후에는 "결제 준비 단계가 병목"이라는 구체적인 타겟이 된다.
+
+장시간 테스트에서 토큰 갱신 로직은 필수다. 토큰이 30분 만료인데 1시간 테스트를 돌리면, 30분 이후의 모든 데이터가 401 에러로 오염된다. VU 초기화 시점에 토큰을 확인하고, 만료 5분 전에 refresh token으로 갱신하는 패턴이 이를 예방한다.
+
+## 정리
+
+- k6의 고루틴 기반 VU는 JMeter 대비 20~50배 메모리 효율로, 테스트 머신 자체가 병목이 되는 상황을 예방한다.
+- Executor 선택은 "몇 명이 동시 접속"(VU 기반) vs "초당 몇 요청"(도착률 기반)의 관점 차이를 만든다. 측정 목적에 맞는 executor를 고르지 않으면 잘못된 부하 프로필이 생성된다.
+- 평균 대신 p95를 threshold 기준으로 쓰고, 히스토그램 분포 모양으로 병목 패턴을 식별한다.
+- InfluxDB + Grafana 없이는 "언제" 문제가 발생했는지 알 수 없다. 실시간 관찰은 사후 분석이 아니라 테스트 설계의 일부다.

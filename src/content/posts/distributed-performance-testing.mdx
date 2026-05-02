@@ -1,0 +1,106 @@
+---
+title: "성능 테스트가 거짓말을 하는 이유"
+description: "단일 머신 k6의 한계부터 JVM 컨테이너 메모리 오인식, Circuit Breaker 복구 검증까지, 실제 트래픽을 재현하는 테스트 인프라의 설계 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [performance-testing, k6, distributed-load, chaos-engineering, jvm]
+difficulty: intermediate
+series:
+  slug: performance-testing-deep-dive
+  title: Performance Testing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"테스트는 통과했다. 그런데 프로덕션이 죽었다." 이 문장은 성능 테스트의 근본 문제를 정확히 드러낸다. 단일 머신의 k6는 CPU가 포화되고, 로컬 JVM은 호스트 메모리를 통째로 인식하며, Circuit Breaker는 설정만 존재하고 동작은 검증된 적 없다. 왜 우리의 테스트는 프로덕션을 재현하지 못하는가?
+
+## 단일 머신은 병목이 다르다
+
+개발자 랩톱에서 `k6 run -u 50000` 을 실행하면 SUT(System Under Test)가 아닌 k6 자체가 먼저 죽는다. VU당 약 100KB 메모리가 필요하므로 5만 VU는 5GB, OS 파일 디스크립터 한계로 수천 개 연결 이상은 `too many open files` 에러가 난다. 측정하고 싶은 대상이 병목이 되기 전에 테스트 도구가 먼저 포화된다.
+
+해결은 단순하다 — k6 Operator로 Kubernetes에서 pod를 나눈다. `parallelism: 10`으로 10개 pod을 띄우면 총 VU는 pod 수 × pod당 VU다. 각 pod은 독립적인 네트워크 인터페이스와 파일 디스크립터를 갖는다. 단일 머신 대비 CPU 사용률이 95%에서 30%로 떨어지는 것은 k6가 더 효율적이어서가 아니라, 병목이 사라졌기 때문이다.
+
+```yaml
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: distributed-load-test
+  namespace: k6-operator
+spec:
+  parallelism: 10
+  arguments: >-
+    -u 1000
+    -d 5m
+    --out influxdb=http://influxdb:8086/k6
+  cleanup: "post"
+```
+
+<Callout type="note" title="트레이드오프">
+분산 k6는 Kubernetes 클러스터, InfluxDB, Grafana 스택을 전제한다. 로컬 개발 반복에는 과잉이다. 1만 VU 이상의 프로덕션 검증에만 투자 가치가 있다. 마이크로초 수준 타이밍은 pod 간 clock skew로 측정이 부정확하다 — 절대 시간이 아닌 상대적 임계값(`p(95)<500`)으로 판단해야 한다.
+</Callout>
+
+## 호출 체인 어디서 300ms가 나오는가
+
+서비스를 독립적으로 벤치마크하면 User Service p95 = 50ms, Order Service p95 = 100ms, Payment Service p95 = 60ms가 나온다. 그런데 실제 사용자 요청은 300ms다. 왜인가?
+
+단독 측정은 의존성 없는 이상 환경이다. Order가 User를 호출하는 동안 User는 DB를 조회하고, 그 위에 네트워크 왕복, 컨텍스트 스위칭, 직렬화 오버헤드가 쌓인다. 이 차이를 보려면 Span이 필요하다.
+
+OpenTelemetry의 Span 계층 구조는 호출 트리를 추적한다. `order.create` Span 안에 `order.getUser`와 `order.charge` Span이 자식으로 달린다. Jaeger UI에서 각 Span의 시작·끝 타임스탬프를 비교하면 "300ms 중 160ms는 Payment"라는 사실이 즉각 드러난다.
+
+병목을 특정했다면 다음 질문은 구조다. User와 Payment 호출이 순차라면 총 시간은 `t_user + t_payment`이고, 병렬이면 `max(t_user, t_payment)`다. `CompletableFuture.allOf`로 전환하면 평균 응답시간이 248ms에서 152ms로 줄어든다 — 두 서비스 중 빠른 쪽을 기다리는 시간이 사라지기 때문이다.
+
+## JVM은 컨테이너를 모른다 — Java 8u191 이전에는
+
+Kubernetes pod에 `memory limit: 1Gi`를 설정해도 Java 8 구버전은 이를 무시한다. JVM은 `/proc/meminfo`를 읽어 호스트 전체 메모리(64GB)를 인식하고, Heap을 16GB로 자동 설정한다. 컨테이너 제한 1GB와 충돌 — OOMKilled.
+
+Java 8u191부터 `UseContainerSupport`가 추가되어 cgroup을 읽는다. Java 9 이후는 기본 활성화다. 실제로 필요한 설정은 비율이다.
+
+```dockerfile
+ENV JAVA_OPTS="\
+  -XX:+UseContainerSupport \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:InitialRAMPercentage=50.0 \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200"
+```
+
+`MaxRAMPercentage=75`는 1GB 제한에서 Heap을 750MB로 잡는다. 나머지 25%는 Metaspace(~100MB), Code Cache(~50MB), 스레드 스택, Direct Buffer가 채운다. Heap만 설정하고 Non-Heap을 잊으면 합계가 제한을 초과해 OOMKilled가 반복된다.
+
+CPU 제한은 다른 방식으로 작동한다. `limits.cpu: 1000m`은 CFS 스케줄러에게 100ms period마다 100ms의 CPU 시간을 허용한다는 의미다. 4개 스레드가 경쟁하면 각자의 실행 시간이 쪼개지고, 할당량을 소진하면 다음 period까지 스로틀된다. CPU 제한을 500m → 2000m으로 높이면 처리량이 8 req/s에서 50 req/s로 늘어나는 이유가 여기 있다.
+
+<Aside label="메모리 설계 원칙">
+`requests`는 스케줄링 기준(예약), `limits`는 OOM 기준(차단)이다. `requests == limits`로 설정하면 JVM GC가 heap을 확장할 여유가 없고, Non-Heap 합산 시 제한을 초과해 OOMKilled 위험이 높아진다. 권장: `requests = 예상 정상 사용 × 50%`, `limits = 예상 피크 × 150%`.
+</Aside>
+
+## 장애는 테스트가 끝난 뒤에 온다
+
+단위 테스트는 정상 경로만, 부하 테스트는 처리량만 검증한다. "User Service가 갑자기 5초 응답을 시작하면 Order Service는 어떻게 되는가?"는 아무도 테스트하지 않는다 — Chaos Engineering이 필요한 이유다.
+
+Chaos Monkey(Spring Boot)는 AOP로 메서드를 가로채 지연, 예외, 메모리 압박을 주입한다. 설정된 pointcut 메서드 호출마다 "지금 공격할 것인가?"를 결정하고, Latency 공격이면 `Thread.sleep(1000-5000ms)`를 삽입한다. 이것이 실제 프로덕션 장애와 같은 효과를 낸다 — User Service가 5초 응답을 시작하면 타임아웃 설정된 Circuit Breaker가 이를 감지한다.
+
+Circuit Breaker의 상태 전환은 측정 가능하다. `failureRateThreshold=50, slidingWindowSize=10`이면 최근 10개 호출 중 5개 이상 실패 시 OPEN으로 전환된다. OPEN 상태에서는 User Service를 호출하지 않고 즉시 Fallback을 반환한다 — 5000ms 지연이 5ms Fallback으로 바뀐다. 10초(`waitDurationInOpenState`) 후 HALF_OPEN으로 전환하고, 탐색 호출 3개(`permittedNumberOfCallsInHalfOpenState`) 중 충분히 성공하면 CLOSED로 복구된다.
+
+```
+Circuit Breaker 효과 (장애 구간 30-70초):
+─ CB 없음: p95 = 5500ms, 모든 요청 대기
+─ CB 있음: p95 = 50ms (Fallback), 즉시 응답
+```
+
+빠른 실패(Fast Fail)는 지연의 확산을 막는다. 한 서비스의 느림이 Thread Pool을 고갈시키고 다른 서비스까지 연쇄 마비시키는 Cascade Failure — Circuit Breaker는 이 전파를 차단한다.
+
+<Callout type="note" title="트레이드오프">
+Chaos Engineering은 프로덕션에서 신중해야 한다. Canary 배포(1% 트래픽)와 비즈니스 시간 외 실행, 인력 대기를 전제로 단계적으로 도입한다. 개발/스테이징에서 먼저 모든 공격 유형을 검증한 뒤 프로덕션으로 확장하는 것이 안전하다.
+</Callout>
+
+## 정리
+
+- 단일 k6의 병목은 SUT가 아닌 k6 자체다. 1만 VU 이상은 k6 Operator로 분산하라.
+- 서비스 단독 벤치마크는 의존성 오버헤드를 누락한다. OpenTelemetry Span으로 호출 체인 전체를 측정하라.
+- Java 8u191 이전 JVM은 컨테이너 메모리 제한을 무시한다. `UseContainerSupport + MaxRAMPercentage=75`로 cgroup 기반 설정을 강제하라.
+- 장애 시나리오는 행복한 경로 테스트로 발견되지 않는다. Chaos Monkey로 주입하고 Circuit Breaker 전환을 직접 검증하라.
+
+성능 테스트가 "통과"했다는 것은 테스트한 범위 안에서만 통과했다는 뜻이다. 범위가 현실과 얼마나 가까운가가 테스트의 진짜 가치를 결정한다.

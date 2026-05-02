@@ -1,0 +1,108 @@
+---
+title: "DB 성능 튜닝은 어디서 시작해야 하는가"
+description: "HikariCP 풀 크기 공식부터 OFFSET 페이징의 O(n) 함정까지, 실무 DB 성능 문제의 구조적 원인과 해결 전략을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [hikaricp, connection-pool, query-optimization, cache, pagination]
+difficulty: intermediate
+series:
+  slug: performance-testing-deep-dive
+  title: Performance Testing Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+DB 성능 문제는 대부분 세 곳 중 하나에서 발생한다 — 커넥션 풀, 쿼리 자체, 캐시와 페이징 전략. 문제는 이 세 층위가 서로 맞물려 있어서 하나를 잘못 건드리면 다른 곳이 망가진다는 점이다. 어디서, 어떤 순서로 손을 대야 하는가?
+
+## 커넥션 풀: "크면 좋다"는 착각
+
+HikariCP의 `maximumPoolSize`를 100으로 설정하면 안전하다고 느끼기 쉽다. 실제로는 반대다. 풀 크기가 커질수록 DB가 유지해야 하는 연결 메모리(연결당 약 1MB)가 늘고, OS가 스케줄링해야 하는 스레드 수가 늘어 컨텍스트 스위칭 오버헤드가 쌓인다.
+
+HikariCP 공식은 단순하다.
+
+```
+Pool Size = Tn × (Cm - 1) + 1
+```
+
+`Tn`은 애플리케이션 스레드 수(일반적으로 CPU 코어 수), `Cm`은 한 스레드가 동시에 점유하는 DB 연결 수다. 8코어 서버에서 연결을 동시에 2개 쓴다면 `8 × (2 - 1) + 1 = 9`. 여기에 안전 마진 20~30%를 더하면 15~20이 적정값이다.
+
+연결을 새로 만드는 비용은 재사용 비용의 약 300배다. TCP 핸드셰이크, TLS 협상, MySQL 인증을 합산하면 18~38ms가 들지만, 기존 연결을 꺼내 쓰면 0.1ms다. 풀이 존재하는 이유가 바로 이 격차다.
+
+<Callout type="note" title="트레이드오프">
+풀 크기를 늘리면 pending 확률은 줄지만 메모리와 스케줄링 비용이 선형으로 증가한다. 반대로 줄이면 자원은 아끼지만 피크 트래픽에서 pending 큐가 쌓이기 시작한다. `pending` 메트릭이 1% 이상이면 +2~3, 0%가 지속되면 -2로 점진적 조정이 맞다.
+</Callout>
+
+## 쿼리: EXPLAIN을 읽지 않으면 보이지 않는다
+
+느린 쿼리의 원인 두 가지는 **Full Table Scan**과 **N+1**이다. 둘 다 `EXPLAIN ANALYZE` 없이는 발견하기 어렵다.
+
+`EXPLAIN`에서 가장 먼저 볼 컬럼은 `type`이다. `ALL`은 Full Table Scan을 뜻한다. 5천만 건 테이블에서 `type=ALL`이면 실행 시간이 5초를 넘는다. `CREATE INDEX idx_users_email ON users(email)` 한 줄로 `type=ref`로 바꾸면 0.2ms로 줄어든다. 22,000배 차이다.
+
+N+1은 JPA의 지연 로딩이 만들어내는 구조적 문제다. `findAll()`로 주문 1,000건을 가져온 뒤 루프에서 `order.getCustomer().getName()`을 호출하면, 각 주문마다 `SELECT * FROM customers WHERE id = ?`가 실행된다. 예상 쿼리 1개가 실제로는 1,001개가 된다.
+
+```java
+// 문제
+List<Order> orders = orderRepository.findAll();
+orders.stream().map(o -> o.getCustomer().getName()); // N+1 발생
+
+// 해결
+@Query("SELECT o FROM Order o JOIN FETCH o.customer")
+List<Order> findAllWithCustomer();
+```
+
+Fetch Join은 `JOIN FETCH`로 연관 엔티티를 한 번에 가져온다. 1,001개 쿼리가 1개로 줄고, DB CPU는 85%에서 15%로 떨어진다.
+
+<Aside label="모니터링">
+p6spy를 붙이면 실제 실행되는 SQL이 로그에 찍힌다. 배포 전에 `grep -c "SELECT" logs/p6spy.log`로 쿼리 수를 세는 것만으로도 N+1을 조기에 발견할 수 있다.
+</Aside>
+
+## 커넥션 고갈: pending이 0이 아닌 순간
+
+커넥션 풀 고갈은 예고 없이 찾아온다. 느린 쿼리 한 개가 연결을 붙잡고, 새로운 요청들이 연결을 기다리다 30초 타임아웃을 맞는다. 결과는 서비스 전체 다운이다.
+
+핵심 메트릭은 세 가지다. `active`(사용 중), `idle`(대기 중), `pending`(연결을 얻지 못하고 큐에서 기다리는 요청 수). **`pending`이 0보다 크면 고갈이 시작됐다는 신호다.** `pending > 0` 알람을 30초 간격으로 설정하는 것만으로도 사고 대응 시간을 분 단위에서 초 단위로 줄일 수 있다.
+
+읽기 쿼리에 `@Transactional`을 붙이는 습관도 풀 압박을 키운다. `@Transactional(readOnly = true)`로 바꾸면 DB가 락을 잡지 않아 동시성이 올라가고, 트랜잭션 오버헤드가 줄어 연결 점유 시간이 짧아진다.
+
+## 캐시: Hit Rate가 전부다
+
+Redis를 도입해도 Hit Rate가 50%라면 평균 응답시간은 2배 개선에 그친다. DB 접근의 절반이 여전히 일어나기 때문이다. Hit Rate 80% 이상이 실질적인 목표다. 이 수준에서 DB 쿼리 수는 80% 줄고, 동시 수용 사용자는 10배로 늘어난다.
+
+캐시 전략은 세 가지다. Cache-Aside(읽기 시 채움), Write-Through(쓰기 시 동기화), Write-Behind(쓰기 비동기). 대부분의 서비스는 Cache-Aside가 맞다. 구현이 단순하고, 실제로 읽히는 데이터만 캐시에 쌓인다.
+
+가장 흔한 버그는 **캐시 무효화 누락**이다. DB를 업데이트하면서 `redisTemplate.delete("user:" + id)`를 호출하지 않으면, 사용자는 변경 전 데이터를 계속 받는다. 캐시 무효화는 테스트 코드로 검증해야 한다. "업데이트 후 캐시 키가 존재하지 않음"을 단언하는 테스트 한 줄이 이 버그를 예방한다.
+
+## OFFSET 페이징: 뒤로 갈수록 망가진다
+
+`LIMIT 20 OFFSET 1000000`은 MySQL에게 100만 건을 스캔하고 버린 뒤 20건을 반환하라는 명령이다. 시간 복잡도는 `O(OFFSET + LIMIT)`. 1페이지는 50ms이지만, 5만 페이지는 30초가 된다. 선형이 아니라 사실상 지수적으로 느려진다.
+
+커서 기반 페이징은 이 문제를 구조적으로 없앤다.
+
+```java
+@Query("""
+    SELECT o FROM Order o
+    WHERE o.createdAt < :cursor
+    AND (o.createdAt != :cursor OR o.id < :cursorId)
+    ORDER BY o.createdAt DESC, o.id DESC
+    LIMIT :pageSize
+    """)
+List<Order> findByCursor(
+    @Param("cursor") LocalDateTime cursor,
+    @Param("cursorId") Long cursorId,
+    @Param("pageSize") int pageSize);
+```
+
+`WHERE` 조건이 인덱스로 직접 위치를 찾아가므로, 어느 페이지든 항상 10ms다. 페이지 번호 직접 이동이 불가능하고 구현이 복잡해지지만, 100만 건 이상 테이블에서 무한 스크롤을 구현해야 한다면 선택지는 사실상 하나다.
+
+## 정리
+
+- 커넥션 풀은 공식(`Tn × (Cm - 1) + 1`)으로 계산하고, `pending` 메트릭으로 조정한다. "크면 좋다"는 틀렸다.
+- N+1은 Fetch Join이나 `@EntityGraph`로 없애고, Full Table Scan은 복합 인덱스로 막는다. `EXPLAIN ANALYZE`가 진단의 시작이다.
+- 캐시는 Hit Rate 80% 이상을 목표로, 무효화 로직을 테스트 코드로 검증한다.
+- OFFSET이 10만을 넘는다면 커서 기반으로 전환을 검토한다.
+
+네 층위는 독립적이지 않다. 쿼리가 느리면 연결을 오래 점유해 풀이 고갈되고, 풀이 고갈되면 캐시가 있어도 DB 요청이 타임아웃을 만난다. 어디서 시작할지 모를 때는 `pending` 메트릭을 먼저 보라. 그게 현재 가장 압박받는 층위를 가리킨다.
