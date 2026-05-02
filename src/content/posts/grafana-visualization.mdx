@@ -1,0 +1,147 @@
+---
+title: "관찰 가능성 스택은 어떻게 하나로 연결되는가"
+description: "Grafana 플러그인 구조부터 Exemplar를 통한 메트릭-트레이스 연결, 증상 기반 알림 설계, RED/USE 진단 프레임워크까지, 관찰 가능성의 통합 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [observability, grafana, prometheus, alerting, red-use]
+difficulty: intermediate
+series:
+  slug: observability-deep-dive
+  title: Observability Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Prometheus는 메트릭을 수집하고, Loki는 로그를 저장하고, Tempo는 트레이스를 보관한다. 세 시스템은 완전히 다른 백엔드다. 그런데 Grafana 대시보드에서 p99 그래프의 점 하나를 클릭하면 해당 요청의 트레이스로 즉시 이동한다. 이 연결은 어떻게 가능한가? 그리고 이 구조가 새벽 3시 장애 대응 방식을 어떻게 바꾸는가?
+
+## 플러그인이 세 백엔드를 통합한다
+
+Grafana는 단순한 시각화 도구가 아니라 **플러그인 기반 데이터 통합 플랫폼**이다. Prometheus, Loki, Tempo는 각각 독립적인 DataSource 플러그인으로 등록되고, 각 플러그인은 `query()`, `testDatasource()`, `metricFindQuery()` 세 인터페이스를 구현한다.
+
+패널에서 쿼리가 실행될 때의 흐름은 다음과 같다.
+
+```
+Frontend → POST /api/ds/query → Grafana Server
+→ DataSource 플러그인 → 백엔드 API (Prometheus/Loki/Tempo)
+→ DataFrame 변환 → 그래프 렌더링
+```
+
+Variable도 같은 구조다. `label_values(http_requests_total, service)` 쿼리는 실제로 Prometheus의 `/api/v1/label/service/values`를 호출한다. 드롭다운에서 서비스를 선택하는 순간 `$service` 값이 쿼리 템플릿에 치환되어 대시보드 전체의 쿼리가 재실행된다. 드롭다운은 UI 요소가 아니라 **쿼리 파라미터 인젝터**다.
+
+세 DataSource의 연결은 설정 파일에 명시적으로 선언된다.
+
+```yaml
+datasources:
+  - name: Prometheus
+    uid: prometheus-prod
+    jsonData:
+      exemplarTraceIdDestinations:
+        - datasourceUid: tempo-prod   # Exemplar → Tempo
+  - name: Loki
+    uid: loki-prod
+    jsonData:
+      derivedFields:
+        - matcherRegex: '"traceId":"([a-f0-9]+)"'
+          datasourceUid: tempo-prod   # 로그 → Tempo
+  - name: Tempo
+    uid: tempo-prod
+    jsonData:
+      lokiSearch:
+        datasourceUid: loki-prod      # Trace → Loki 역방향
+```
+
+세 백엔드의 연결 방향이 설정 레이어에 고정되어 있다. 런타임에 "이 traceId로 Tempo를 열어라"는 결정은 이미 이 설정에서 정의된 것이다.
+
+## Exemplar — 메트릭 위에 올라탄 트레이스 포인터
+
+Prometheus의 일반 샘플은 `{레이블} 값 타임스탬프` 형태다. OpenMetrics Exemplar는 여기에 traceId를 붙인다.
+
+```
+http_request_duration_seconds_bucket{le="1.0"} 1235 1704067215000
+# {traceID="4bf92f3577b34da6a3ce929d0e0e4736"} 0.89
+```
+
+버킷별로 **최신 Exemplar 1개**만 보관된다. Micrometer는 `Timer.record()` 시점에 현재 OTel Context의 traceId를 읽어 응답 시간이 속하는 버킷에 기록한다. 결과적으로 le="1.0" 버킷의 Exemplar는 "최근에 0.5~1.0초 사이로 처리된 요청 중 하나의 traceId"가 된다.
+
+Grafana Time series 패널에서 Exemplars 토글을 켜면 p99 선 위에 다이아몬드 점이 나타난다. 그 점을 클릭하면 Tempo로 이동한다. 이 흐름을 가능하게 하는 설정은 세 줄이다.
+
+```bash
+# Prometheus 실행 옵션
+prometheus --enable-feature=exemplar-storage
+
+# Spring Boot application.yml
+management.metrics.distribution.percentiles-histogram.http.server.requests: true
+```
+
+<Callout type="warning" title="샘플링 함정">
+Head Sampling을 10%로 설정하면 드롭된 90% 요청은 OTel Context에 유효한 Span이 없어 Exemplar가 기록되지 않는다. Exemplar를 최대한 활용하려면 `sampling.probability=1.0` 또는 Tail Sampling과 조합해야 한다. Exemplar는 있는데 Tempo에 Trace가 없는 상황이 이 불일치에서 발생한다.
+</Callout>
+
+## 알림은 원인이 아니라 증상을 봐야 한다
+
+"CPU 80% 초과" 알림은 새벽 3시에 울리지만 대부분 조치가 필요 없다. 알림이 반복되면 팀은 알림을 무시하기 시작하고, 그러다 진짜 장애 알림도 놓친다. **알림 피로(alert fatigue)**는 설계 실패다.
+
+올바른 알림의 기준은 하나다 — "사용자가 지금 영향을 받고 있는가?"
+
+```yaml
+# 증상 기반 (올바름)
+- alert: HighErrorRate
+  expr: |
+    sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+    / sum(rate(http_requests_total[5m])) by (service)
+    > 0.01
+  for: 5m   # 순간 스파이크가 아닌 지속적 이상만
+
+# 원인 기반이지만 정당한 경우
+- alert: DiskFull
+  expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1
+  for: 10m  # "곧 서비스 중단"이 확실한 원인만 허용
+```
+
+`for: 5m`은 작은 설정값이 아니다. 배포 직후 30초짜리 에러 스파이크를 알림으로 보내지 않겠다는 의도적 결정이다.
+
+Alertmanager의 그룹핑은 알림 폭풍을 막는다. DB가 다운되면 이를 의존하는 10개 서비스가 동시에 알림을 발동한다. `group_by: [alertname, cluster]`와 `group_wait: 30s`를 설정하면 30초 동안 모인 10개 알림이 하나의 메시지로 전송된다. 페이저가 10번 울리는 대신 1번 울린다.
+
+<Aside label="Burn Rate">
+SLO 99.9% 환경에서 Burn Rate 14란 현재 에러율이 오류 예산을 14배 속도로 소진하고 있다는 의미다. 43분짜리 월간 오류 예산을 약 3분 만에 소진하는 속도다. 짧은 윈도우(1h)와 긴 윈도우(5m) 모두 임계치를 초과할 때만 알림을 발송하는 Multiwindow 방식이 오탐을 2% 미만으로 유지하면서 실제 장애를 놓치지 않는다.
+</Aside>
+
+## RED → USE → Trace 순서로 좁혀나간다
+
+방법론이 없으면 장애 시 수십 개의 패널을 감에 의존해 뒤진다. **RED → USE → Trace** 순서는 이 탐색을 체계화한다.
+
+**RED**는 서비스 계층을 본다. Rate(처리량이 정상인가), Error(에러율이 증가했는가), Duration(응답 시간이 늘었는가). 이 세 지표가 정상이면 장애가 아니다. 이상이 있을 때만 다음 단계로 넘어간다.
+
+**USE**는 인프라 계층을 본다. Utilization(리소스 사용률), Saturation(큐잉/대기 발생 여부), Error(리소스 자체 에러). DB 연결 풀이 48/50이고 `hikaricp_connections_pending > 0`이라면 병목이 여기 있다.
+
+실제 진단 예시를 따라가면 이 순서의 위력이 보인다.
+
+```
+14:30: 주문 API p99 1초 → 4초로 급증
+↓ RED 확인 (2분)
+  Rate: 정상, Error: 소폭 증가, Duration: 명확한 이상
+↓ USE 확인 (3분)
+  DB 연결 풀: 40/50 → 48/50, pending = 5 ← 병목 발견
+↓ Exemplar 클릭 → Tempo Trace (1분)
+  HikariCP connection acquire: 3,500ms ← 연결 대기가 병목
+↓ 조치
+  max-pool-size 증가 (임시) + 슬로우 쿼리 인덱스 추가 (근본)
+총 진단: ~10분
+```
+
+<Callout type="note" title="트레이드오프">
+RED는 서비스 팀이 쉽게 이해하지만 인프라 병목을 볼 수 없다. USE는 인프라 병목을 명확히 파악하지만 사용자 영향을 직접 확인하지 못한다. 두 방법론은 보완 관계다 — RED가 "증상이 있는가"를 확인하고, USE가 "어떤 리소스가 원인인가"를 좁힌다. 하나만 쓰면 절반의 진단만 가능하다.
+</Callout>
+
+## 정리
+
+- Grafana는 DataSource 플러그인 구조로 Prometheus/Loki/Tempo를 통합하고, 세 백엔드의 연결 방향은 설정 파일에 명시적으로 선언된다.
+- Exemplar는 Histogram 버킷에 traceId를 첨부해 메트릭 그래프에서 Tempo 트레이스로 직접 점프하는 경로를 만든다. Head Sampling과의 불일치를 주의해야 한다.
+- 알림은 원인(CPU 80%)이 아니라 증상(에러율 1%, p99 2초)을 봐야 한다. `for` 기간과 그룹핑이 알림 피로를 막는다.
+- RED → USE → Trace 순서는 장애 진단을 체계화한다. 방법론이 있으면 새벽 3시에도 냉정하게 좁혀나갈 수 있다.
+
+다음 글에서는 Spring Boot Actuator가 이 관찰 가능성 스택에 메트릭과 트레이스를 어떻게 노출하는지, 그리고 Micrometer의 계측 추상화가 어떤 설계 결정을 숨기고 있는지 추적한다.

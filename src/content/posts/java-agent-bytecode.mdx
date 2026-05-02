@@ -1,0 +1,163 @@
+---
+title: "Java Agent는 코드 한 줄 없이 어떻게 계측하는가"
+description: "premain()부터 ByteBuddy @Advice 인라인 삽입까지, OTel Java Agent가 Spring MVC와 JDBC를 자동 계측하는 전체 메커니즘을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java-agent, bytecode, opentelemetry, bytebuddy, instrumentation]
+difficulty: intermediate
+series:
+  slug: observability-deep-dive
+  title: Observability Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`-javaagent:opentelemetry-javaagent.jar` 한 줄을 JVM 옵션에 추가하면 Spring MVC, JDBC, Redis, Kafka가 자동으로 계측된다. 코드를 한 줄도 건드리지 않았는데 Trace가 생긴다. 어떻게 가능한가? 그리고 이 마법이 깨지는 순간은 언제인가?
+
+## JVM이 main()보다 먼저 부르는 것
+
+Java Agent의 시작은 `premain()`이다. JVM은 `-javaagent` 옵션을 발견하면 Agent JAR의 `MANIFEST.MF`를 읽어 `Premain-Class`를 찾고, 애플리케이션의 `main()`보다 먼저 해당 클래스의 `premain(String agentArgs, Instrumentation inst)`를 호출한다.
+
+```
+JVM 구동 → premain() → ClassFileTransformer 등록 → main() → 클래스 로딩마다 transform() 호출
+```
+
+`premain()` 안에서 `inst.addTransformer(new MyTransformer())`를 호출하면 등록 완료다. 이후 JVM이 클래스를 로딩할 때마다 등록된 `ClassFileTransformer.transform()`이 호출된다. 반환값이 `null`이면 원본 바이트코드 그대로, `byte[]`를 반환하면 그 바이트코드로 클래스가 정의된다.
+
+핵심은 실행 순서다. `premain()`이 `main()` 이전에 실행되므로, 애플리케이션의 어떤 클래스도 로딩되기 전에 Transformer를 심어둘 수 있다. 이것이 "코드 변경 없는 계측"의 물리적 기반이다.
+
+일반 JAR과 Agent JAR의 차이는 `MANIFEST.MF` 항목 두 개뿐이다.
+
+```properties
+Premain-Class: com.example.MyAgent
+Can-Retransform-Classes: true
+```
+
+`agentmain()`은 이미 실행 중인 JVM에 동적으로 붙을 때 사용한다. Attach API로 PID를 지정해 연결하면 `agentmain()`이 호출되고, `retransformClasses()`로 이미 로딩된 클래스를 재변환할 수 있다. arthas, VisualVM, JProfiler가 이 방식을 쓴다. `premain()`이 "시작 전 계약"이라면 `agentmain()`은 "실행 중 개입"이다.
+
+## 바이트코드를 직접 건드리는 세 가지 방법
+
+클래스 파일 안에는 Java 소스코드가 없다. JVM 스택 머신 명령어로 이루어진 바이트코드만 있다. `javap -c OrderService.class`를 실행하면 이 명령어가 그대로 보인다.
+
+```bash
+public int add(int, int);
+  Code:
+     0: iload_1      # a를 스택에 push
+     1: iload_2      # b를 스택에 push
+     2: iadd         # pop 두 값, 더해서 push
+     3: ireturn
+```
+
+이 바이트코드를 다루는 도구는 세 가지다.
+
+**ASM**은 방문자(Visitor) 패턴으로 바이트코드 명령어를 직접 삽입한다. `INVOKESTATIC`, `LSTORE`, `LLOAD` 같은 JVM 명령어를 수동으로 작성해야 한다. 스택 상태를 잘못 계산하면 `VerifyError`가 발생한다. 성능은 최고지만 유지보수는 지옥이다.
+
+**Javassist**는 Java 소스코드 문자열로 조작한다. `method.insertBefore("long $startTime = System.nanoTime();")` 형태로 쓸 수 있어 직관적이지만, 런타임에 소스를 컴파일해야 하므로 느리고 타입 안전성이 없다.
+
+**ByteBuddy**는 선언적 DSL과 `@Advice` 어노테이션으로 동작한다. 내부적으로 ASM을 사용하므로 성능은 ASM 수준이면서, 추상화 수준은 훨씬 높다. OTel Agent, Mockito, Spring CGLIB이 모두 ByteBuddy를 선택한 이유다.
+
+ByteBuddy `@Advice`의 핵심 원리는 **인라인 삽입**이다. `TimingAdvice.onEnter()`를 실제로 호출하는 것이 아니라, 그 메서드의 바이트코드를 대상 메서드 안으로 복사해 넣는다. 별도 메서드 호출 오버헤드가 없고, `TimingAdvice` 클래스를 인스턴스화하지도 않는다.
+
+```java
+public class TimingAdvice {
+
+    @Advice.OnMethodEnter
+    static long onEnter(@Advice.Origin("#m") String methodName) {
+        return System.nanoTime();
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class)
+    static void onExit(@Advice.Origin("#m") String methodName,
+                       @Advice.Enter long startTime,
+                       @Advice.Thrown Throwable thrown) {
+        long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
+        String status = thrown != null ? "[ERROR]" : "[OK]";
+        System.out.printf("[Agent] %s %d ms %s%n", methodName, elapsedMs, status);
+    }
+}
+```
+
+`@Advice.OnMethodExit`에 `onThrowable = Throwable.class`가 없으면 예외 발생 시 Exit 코드가 호출되지 않는다. 계측 누락의 흔한 원인이다.
+
+## OTel Agent 안에 수백 개의 계측이 들어있는 이유
+
+약 180MB짜리 `opentelemetry-javaagent.jar` 안에는 `inst/` 폴더에 수백 개의 계측 모듈 JAR이 shadow jar 형태로 내장되어 있다. 각 모듈은 `InstrumentationModule`과 `TypeInstrumentation`으로 구성된다.
+
+```java
+@AutoService(InstrumentationModule.class)
+public class SpringMvcInstrumentationModule extends InstrumentationModule {
+    public SpringMvcInstrumentationModule() {
+        super("spring-webmvc", "spring-webmvc-6.0");
+    }
+
+    @Override
+    public List<TypeInstrumentation> typeInstrumentations() {
+        return List.of(new DispatcherServletInstrumentation());
+    }
+}
+
+public class DispatcherServletInstrumentation implements TypeInstrumentation {
+    @Override
+    public ElementMatcher<TypeDescription> typeMatcher() {
+        return named("org.springframework.web.servlet.DispatcherServlet");
+    }
+
+    @Override
+    public void transform(TypeTransformer transformer) {
+        transformer.applyAdviceToMethod(
+            named("doDispatch").and(takesArguments(
+                HttpServletRequest.class, HttpServletResponse.class)),
+            DispatcherServletAdvice.class.getName()
+        );
+    }
+}
+```
+
+`premain()` 실행 시 `ServiceLoader<InstrumentationModule>`로 모든 모듈을 로딩하고, 각 모듈의 `typeMatcher()`를 ByteBuddy `AgentBuilder`에 등록한다. 이후 `DispatcherServlet`이 로딩되는 순간 `doDispatch()` 메서드에 Span 생성 코드가 인라인으로 삽입된다.
+
+`DispatcherServletAdvice.onEnter()`에서 HTTP 요청 헤더의 `traceparent`를 추출해 Span을 생성하고 `span.makeCurrent()`로 `ThreadLocal`에 저장한다. 같은 요청 스레드에서 JDBC 쿼리가 실행되면, JDBC Advice가 `Context.current()`로 `ThreadLocal`의 HTTP Span을 꺼내 부모로 설정한다. 이것이 부모-자식 Span이 자동으로 연결되는 원리다.
+
+<Callout type="warning" title="자동 계측의 경계">
+OTel Agent가 계측하는 것은 알려진 라이브러리 목록에 있는 것뿐이다. 사내 공통 HTTP 클라이언트, 커스텀 ThreadPool 기반 비동기 처리, 내부 메시지 브로커 SDK는 목록에 없으므로 Trace에 잡히지 않는다. `-Dotel.javaagent.debug=true`를 추가하면 "Skipping: com.example.CustomClient (no matching instrumentation)"로 즉시 진단된다. 미지원 라이브러리는 `InstrumentationModule`을 구현해 `-Dotel.javaagent.extensions=my-extension.jar`로 배포하거나, `@Observed`로 수동 계측한다.
+</Callout>
+
+## 오버헤드와 샘플링 전략
+
+Agent 적용의 실측 오버헤드는 Spring Boot 앱, 초당 1,000 요청 기준으로 CPU +1~3%, 메모리 +50~100MB, p99 응답 시간 +0.5~2ms, JVM 시작 시간 +2~3초다. `premain()` 실행 중 수백 개 모듈 초기화와 ByteBuddy `AgentBuilder` 구성이 시작 시간의 대부분을 차지한다. 이후 클래스 변환은 최초 1회만 발생하고 캐싱되며, `@Advice` 인라인 삽입 덕분에 요청당 오버헤드는 Span당 약 2~3μs에 불과하다.
+
+100% 수집은 비용 폭발로 이어진다. 초당 1,000 요청, Span 10개, 1KB면 하루 864GB다. 실무 권장은 **Tail Sampling**이다. OTel Collector에서 Trace 완료까지 대기한 뒤 정책으로 수집 여부를 결정한다.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 30s
+    policies:
+      - name: errors-policy
+        type: status_code
+        status_code: {status_codes: [ERROR]}    # 에러 100%
+      - name: slow-traces-policy
+        type: latency
+        latency: {threshold_ms: 1000}            # 1초 이상 100%
+      - name: probabilistic-policy
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}  # 나머지 1%
+```
+
+Head Sampling(`parentbased_traceidratio`)은 환경변수 설정만으로 구현이 단순하지만, 에러 요청도 90%가 드롭된다. 장애 시 Trace가 없어 디버깅이 불가능해지는 상황이 생긴다. Tail Sampling은 Collector에 Trace 임시 보관 메모리가 필요하고, 동일 traceId의 Span이 여러 Collector에 분산되지 않도록 LoadBalancing Exporter로 traceId 기반 라우팅을 설정해야 한다.
+
+<Callout type="note" title="트레이드오프">
+Agent 방식의 가장 큰 장점은 코드 변경 없이 레거시 서비스에도 적용할 수 있다는 것이다. 대신 Lambda나 빠른 재시작이 요구되는 컨테이너 환경에서는 +2~3초 시작 시간이 부담이 된다. 이 경우 OTel SDK를 직접 의존성으로 추가하거나 GraalVM Native Image를 검토한다. Agent 자체는 별도 ClassLoader로 격리되므로 앱과 버전 충돌은 없지만, `@Advice` 코드 안에서 쓰는 클래스는 반드시 Bootstrap ClassLoader에 등록해야 한다.
+</Callout>
+
+<Aside label="설계 철학">
+Java Agent 메커니즘은 JVM의 "모든 것은 클래스 로딩을 통한다"는 원칙 위에 서 있다. `premain()`은 그 클래스 로딩 파이프라인에 훅을 거는 공식 창구다. OTel이 수백 개의 라이브러리를 자동 계측할 수 있는 것도, Mockito가 Mock 객체를 동적으로 생성할 수 있는 것도 모두 같은 메커니즘의 다른 표현이다.
+</Aside>
+
+## 정리
+
+- `premain()`은 `main()` 이전에 실행되어 `ClassFileTransformer`를 등록한다. 이후 모든 클래스 로딩 시 Transformer가 개입할 기회를 얻는다.
+-

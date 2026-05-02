@@ -1,0 +1,136 @@
+---
+title: "Observability는 왜 세 신호가 함께여야 하는가"
+description: "메트릭, 트레이스, 로그가 분리되면 증상만 보인다. Spring Boot Actuator 자동 구성부터 Kubernetes 네이티브 배포, 실전 장애 진단까지 세 신호의 연결 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [observability, spring-boot, micrometer, opentelemetry, kubernetes]
+difficulty: intermediate
+series:
+  slug: observability-deep-dive
+  title: Observability Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+새벽 3시에 알림이 울린다. "order-service p99 응답 시간 3초 초과." 로그를 grep해도 ERROR가 없다. DB 서버 CPU도 정상이다. 메트릭은 뭔가 이상하다고 말하지만, 어디가 왜 이상한지는 알려주지 않는다. 메트릭, 트레이스, 로그 — 이 세 신호가 연결되지 않으면 왜 이런 상황이 반복되는가?
+
+## MeterRegistry 자동 구성 — 메트릭의 출발점
+
+Spring Boot Actuator를 classpath에 넣으면 메트릭이 "자동으로 나온다"고 알려져 있다. 실제로는 자동 구성 체인이 작동한다. `MeterRegistryAutoConfiguration`이 `CompositeMeterRegistry`를 만들고, classpath에 `micrometer-registry-prometheus`가 있으면 `PrometheusMeterRegistryAutoConfiguration`이 활성화되어 `/actuator/prometheus` 엔드포인트가 생긴다.
+
+JVM, HikariCP, HTTP, Logback 메트릭은 각각의 `AutoConfiguration`이 `MeterBinder` Bean을 통해 자동 등록한다. 커스텀 메트릭을 추가하려면 같은 방식을 따른다.
+
+```java
+@Component
+public class OrderMeterBinder implements MeterBinder {
+    private final OrderRepository orderRepository;
+
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        Gauge.builder("order.pending.count", orderRepository,
+                      repo -> repo.countByStatus(OrderStatus.PENDING))
+             .description("처리 대기 중인 주문 수")
+             .register(registry);
+    }
+}
+```
+
+`MeterFilter`로 공통 태그 추가, 불필요한 메트릭 제거, Histogram 설정을 중앙에서 제어할 수 있다. 메트릭이 5,000개를 넘으면 Prometheus 스크레이프 자체가 느려진다. `hikaricp.connections.pending`이 올라가기 시작하면 DB 연결 병목이 임박했다는 신호다 — 하지만 왜 그런지는 트레이스를 봐야 한다.
+
+<Callout type="note" title="트레이드오프">
+모든 메트릭을 노출하면 모니터링 데이터가 풍부해지지만 Prometheus 메모리와 스크레이프 시간이 증가한다. uri 태그 정규화(`/api/orders/{id}`)와 `MeterFilter.deny()`로 카디널리티를 제어하는 것이 실무의 핵심이다.
+</Callout>
+
+## Micrometer Tracing — Sleuth 이후의 세계
+
+Spring Boot 3.x로 업그레이드하면 Sleuth가 사라진다. Sleuth는 Spring Boot 3.x를 지원하지 않는다. 대신 Micrometer Tracing이 actuator에 직접 통합됐다.
+
+계층 구조는 명확하다. `micrometer-tracing`이 벤더 중립 API를 제공하고, `micrometer-tracing-bridge-otel`이 OTel SDK와 연결하고, `opentelemetry-exporter-otlp`가 Collector로 전송한다. 앱 코드는 `io.micrometer.tracing.Tracer`만 보면 된다.
+
+Spring Boot 3.x에서 `@Observed` 하나로 Span과 Timer가 동시에 생성된다. 내부에서는 `ObservationAspect` → `ObservationHandler` 체인이 동작한다.
+
+```java
+@Observed(
+    name = "order.processing",          // Timer 이름
+    contextualName = "processOrder",     // Span 이름
+    lowCardinalityKeyValues = {"payment.method", "CARD"}
+)
+public Order processOrder(Order order) {
+    return doProcess(order);
+}
+```
+
+`lowCardinalityKeyValues`는 Span attribute와 Metric 태그 **모두**가 된다. `highCardinalityKeyValues`는 Span attribute **만** 된다 — `order.id` 같은 무한 카디널리티 값을 Prometheus 시계열에 넣지 않으면서 Trace에서는 볼 수 있게 하는 설계다.
+
+## 리액티브 Context 전파 — WebFlux의 함정
+
+WebFlux 환경에서 Trace가 자꾸 끊기는 이유는 ThreadLocal이다. MVC에서는 요청 스레드가 하나이므로 ThreadLocal에 Span을 저장해도 안전하다. WebFlux는 `flatMap` 경계마다 스레드가 바뀔 수 있어서 ThreadLocal이 사라진다.
+
+Reactor의 답은 `Context`다. 구독(Subscription) 단위로 전파되며 스레드 전환에 독립적이다. `Hooks.enableAutomaticContextPropagation()`을 설정하면 Reactor가 operator 경계에서 Reactor Context와 ThreadLocal을 자동으로 동기화한다. Spring Boot 3.2+에서는 이 설정이 자동으로 적용된다.
+
+```java
+return orderService.getOrder(id)
+    .flatMap(order -> {
+        // 스레드가 바뀌어도 Span.current()가 유효하다
+        return paymentService.charge(order);
+    });
+```
+
+`Mono.fromCallable()`에서 `subscribeOn(Schedulers.boundedElastic())`을 쓴다면 `.contextCapture()`로 현재 ThreadLocal을 Reactor Context로 명시적으로 캡처해야 한다. Java 21 Virtual Thread를 선택할 수 있다면, WebFlux의 Context 전파 복잡성 없이 유사한 성능을 얻을 수 있다.
+
+## Kubernetes 네이티브 배포 — Operator 패턴
+
+로컬에서 작동하는 Observability가 Kubernetes에 배포하면 안 된다. Pod IP는 계속 바뀌고, Prometheus에 고정 IP를 등록하는 방식은 Pod 재시작 즉시 스크레이프가 끊긴다.
+
+Prometheus Operator의 `ServiceMonitor`가 답이다. `matchLabels`로 서비스를 선택하면 Prometheus가 Kubernetes API를 통해 Pod IP를 자동으로 추적한다.
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-service
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [production]
+  selector:
+    matchLabels:
+      app: order-service
+  endpoints:
+    - port: management
+      path: /actuator/prometheus
+      interval: 15s
+```
+
+OTel Operator의 `Instrumentation` CRD로 `-javaagent`를 Pod에 자동 주입할 수 있다. Deployment에 어노테이션 한 줄만 추가하면, OTel Operator가 MutatingAdmissionWebhook을 통해 InitContainer로 Agent JAR를 복사하고 `JAVA_TOOL_OPTIONS` 환경변수를 주입한다. Agent 버전 업그레이드는 CRD 하나를 수정하고 Rolling restart하면 된다.
+
+Actuator 포트 분리(`management.server.port=9090`)는 필수다. 8080은 외부 LoadBalancer에, 9090은 ClusterIP로만 접근하게 설정하면 Spring Security 없이도 Actuator를 보호할 수 있다.
+
+## 세 신호의 연결 — 12분 안에 원인 찾기
+
+이론이 실전이 되는 순간은 장애 때다.
+
+**1단계 (0~3분): RED 대시보드**. p99만 급증하고 p50은 정상이면 전체 부하 문제가 아니라 특정 조건의 요청만 느린 것이다. 에러율에서 HTTP 408이 보이면 타임아웃이다.
+
+**2단계 (3~10분): Exemplar → Trace**. Grafana의 p99 그래프에서 스파이크 시점의 다이아몬드(◆)를 클릭하면 해당 시점의 traceId로 Tempo가 열린다. Trace를 보면 어느 Span이 3.2초를 잡아먹는지 바로 보인다 — 이 시나리오에서는 `HikariCP.getConnection`이다. DB 쿼리 자체(23ms)는 빠르다.
+
+**3단계 (10~12분): Loki**. traceId로 로그를 필터링하면 "Connection is not available, request timed out after 3000ms"가 나온다. 그 이전 로그를 보면 `customer_id` 조회 쿼리가 4.5초 걸렸다는 기록이 있다. 슬로우 쿼리가 50개 연결을 모두 점유했고, 나머지 요청이 연결을 기다리다 타임아웃으로 실패한 것이다.
+
+```
+TraceQL: { resource.service.name = "order-service" && duration > 1s }
+LogQL:   {service="order-service"} | json | traceId="4bf9..."
+```
+
+메트릭은 "뭔가 이상하다"고 말한다. Trace는 "어디가 느리다"고 말한다. 로그는 "정확히 왜다"를 말한다. 세 신호가 traceId로 연결될 때, 65분이 걸리던 진단이 12분이 된다.
+
+## 정리
+
+- `MeterRegistry` 자동 구성 체인을 이해하면 어떤 메트릭이 왜 나오는지, 왜 안 나오는지 설명할 수 있다.
+- `@Observed`는 Span과 Timer를 동시에 생성한다. `lowCardinalityKeyValues`는 Metric 태그도 되고, `highCardinalityKeyValues`는 Span attribute만 된다.
+- WebFlux에서 Trace가 끊기면 `Hooks.enableAutomaticContextPropagation()` 설정을 확인하라.
+- Kubernetes에서는 `ServiceMonitor` + `Instrumentation` CRD로 Observability 설정을 코드가 아닌 선언으로 관리한다.
+- 메트릭 → Exemplar → Trace → 로그의 연결이 완성될 때, 관찰 가능성(Observability)이라는 단어의 의미가 실감된다.

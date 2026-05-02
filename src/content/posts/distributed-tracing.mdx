@@ -1,13 +1,13 @@
 ---
 title: "분산 추적은 어떻게 서비스 경계를 넘는가"
-description: "TraceContext 전파부터 Baggage, MDC 자동 주입, Zipkin 시각화까지 — Spring Cloud 분산 추적의 전체 흐름을 하나의 구조로 추적한다."
+description: "Trace와 Span의 데이터 모델부터 W3C TraceContext 전파, 비동기 Context 손실까지 — 분산 추적이 마이크로서비스를 꿰뚫는 원리를 추적한다."
 pubDate: 2026-05-02
 category: dev
-tags: [spring-cloud, distributed-tracing, zipkin, micrometer-tracing, mdc]
+tags: [observability, distributed-tracing, opentelemetry, trace-context]
 difficulty: intermediate
 series:
-  slug: spring-cloud-deep-dive
-  title: Spring Cloud Deep Dive
+  slug: observability-deep-dive
+  title: Observability Deep Dive
   order: 1
 draft: false
 featured: false
@@ -16,116 +16,117 @@ featured: false
 import Callout from '@/components/mdx/Callout.astro';
 import Aside from '@/components/mdx/Aside.astro';
 
-MSA에서 장애가 발생하면 어떤 서비스가 범인인지 바로 알기 어렵다. 각 서비스의 로그는 분산돼 있고, "결제가 안 됩니다"라는 신고 하나를 추적하려면 Gateway, Order, Payment, External API를 모두 뒤져야 한다. 분산 추적은 이 흩어진 조각들을 하나의 식별자로 꿰는 기술이다. Spring Cloud Sleuth에서 Micrometer Tracing으로 이어지는 이 구조는 어떻게 서비스 경계를 넘어 컨텍스트를 전달하는가?
+"주문 API가 가끔 3초가 걸린다 — 어디서 막히는지 모르겠다." 로그를 뒤져 각 서비스의 타임스탬프를 손으로 더하는 대신, traceId 하나로 Grafana Tempo를 열면 어떤 Span에서 2.7초가 소모됐는지 한 눈에 보인다. 어떻게 가능한가? 그리고 왜 `CompletableFuture` 한 줄이 이 연결을 조용히 끊어버리는가?
 
-## TraceContext — 분산 추적의 기본 단위
+## Trace와 Span — 나무 구조로 요청을 추적한다
 
-분산 추적의 핵심은 `TraceContext`라는 작은 구조체다. 세 가지 ID가 전부다.
-
-- **traceId**: 전체 요청 체인을 식별하는 ID. Client에서 시작해 모든 서비스를 거치는 동안 동일한 값을 유지한다.
-- **spanId**: 한 서비스 내의 작업 단위 ID. 서비스마다 새로 생성된다.
-- **parentSpanId**: 부모 서비스의 spanId. 이 값으로 트리 구조가 만들어진다.
+Trace는 하나의 분산 요청 전체다. Span은 그 안의 작업 단위다. 둘의 관계는 `parentSpanId`로 만들어진다.
 
 ```
-Gateway:          traceId=abc123, spanId=111, parentId=null
-  Order Service:  traceId=abc123, spanId=222, parentId=111
-    Payment:      traceId=abc123, spanId=333, parentId=222
+Span 1 (SERVER): POST /orders [0~234ms]
+  └─ Span 2 (CLIENT): POST /order-service [1~233ms]
+       └─ Span 3 (SERVER): POST /orders [2~232ms]
+            └─ Span 4 (CLIENT): POST /payment-service [50~230ms]
+                 └─ Span 5 (SERVER): POST /payments [51~229ms]
+                      └─ Span 6 (CLIENT): INSERT payments [52~120ms]
 ```
 
-traceId는 변하지 않는다. spanId만 서비스마다 새로 태어난다. 이 단순한 규칙이 Zipkin UI에서 전체 호출 체인을 렌더링할 수 있는 이유다.
+API Gateway가 요청을 받으면 `traceId`를 새로 생성한다. 이후 모든 서비스가 이 ID를 공유한다. 각 서비스는 자신의 `spanId`를 생성하고, 자신을 호출한 Span의 `spanId`를 `parentSpanId`로 기록한다. Tempo가 이 트리를 재구성할 때 쓰는 것이 바로 이 `parentSpanId`다.
 
-Spring Boot 3.x에서는 `spring-cloud-starter-sleuth` 대신 `micrometer-tracing-bridge-brave`를 사용한다. Sleuth가 Spring Cloud 전용이었다면, Micrometer Tracing은 범용 추상화 레이어다. Brave(Zipkin 호환)와 OpenTelemetry 구현체 중 하나를 선택할 수 있다.
+Span Kind는 이 나무에서 각 노드의 역할을 구분한다. `SERVER`는 요청을 받는 쪽, `CLIENT`는 요청을 보내는 쪽이다. 서비스 A가 B를 호출하면 Span이 두 개 생긴다 — A의 `CLIENT` Span이 부모, B의 `SERVER` Span이 자식. 타임라인에서 CLIENT 안에 SERVER가 포함된 것처럼 보이는 이유다.
 
-## Propagator — 컨텍스트가 HTTP 헤더를 타는 방법
+<Callout type="note" title="Span 이름 카디널리티">
+`span.setName("GET /orders/99437/items")`처럼 주문 ID를 Span 이름에 넣으면 Tempo에서 수십만 개의 고유 이름이 만들어져 집계가 불가능해진다. 이름은 `"GET /orders/{orderId}/items"`로 템플릿화하고, 실제 ID는 `span.setAttribute("order.id", "99437")`로 분리해야 한다.
+</Callout>
 
-TraceContext는 HTTP 헤더에 실려 서비스 경계를 넘는다. 이를 담당하는 것이 `Propagator`다.
+## traceparent — 서비스 간 Context 전파의 표준
 
-발신 요청(inject)에서는 현재 TraceContext를 HTTP 헤더로 직렬화한다. 수신 요청(extract)에서는 헤더에서 컨텍스트를 복원해 새 SERVER Span의 부모로 삼는다.
+서비스 경계를 넘을 때 traceId와 spanId는 HTTP 헤더로 전달된다. W3C TraceContext 표준(RFC 9532)이 정의한 형식이다.
 
 ```
-발신 헤더 (B3 형식):
-  X-B3-TraceId: abc123...
-  X-B3-SpanId: 222...
-  X-B3-ParentSpanId: 111...
-  X-B3-Sampled: 1
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             ▲  ▲                               ▲               ▲
+           version  traceId(128비트)          parentId(64비트)  flags
 ```
 
-B3는 Zipkin 기본 형식이고, W3C TraceContext(`traceparent` 헤더)는 OpenTelemetry와 Jaeger가 기본으로 사용하는 IETF 표준이다. 기존 Zipkin 환경이라면 B3, 신규 OTel 환경이라면 W3C를 선택한다. 두 형식 모두 지원하도록 설정할 수도 있다.
+`parentId` 자리에 들어가는 것은 **보내는 쪽의 spanId**다. 받는 서비스는 이 값을 자신의 `parentSpanId`로 설정하고, 새 `spanId`를 생성한다. 이름이 헷갈리는 이유는 W3C 표준이 수신자 관점에서 필드를 명명했기 때문이다.
 
-RestTemplate과 WebClient에는 인터셉터가 자동으로 등록돼 inject/extract를 처리한다. 직접 호출 코드를 건드릴 필요가 없다.
+`flags`의 마지막 비트가 샘플링 결정이다. `01`이면 이 Trace의 모든 Span을 수집하라는 신호, `00`이면 Span 생성 자체를 생략해도 된다. 이 결정은 Root 서비스에서 한 번 내려지고, 모든 하위 서비스가 그대로 따른다. 중간에 바꾸면 일부만 수집된 불완전 Trace가 만들어진다.
 
-## MDC — traceId가 로그에 찍히는 경로
+W3C 표준 이전에는 Zipkin이 `X-B3-TraceId`, Jaeger가 `uber-trace-id`를 각자 사용했다. 서로 다른 벤더 간 Trace 연결은 불가능했다. 레거시 시스템과 OTel을 함께 운영할 때는 `OTEL_PROPAGATORS=tracecontext,baggage,b3multi` 설정으로 두 형식을 동시에 주입하면 마이그레이션 기간 동안 Trace를 이을 수 있다.
 
-Span이 시작될 때 `MDCScopeDecorator`가 `MDC.put("traceId", ...)` 와 `MDC.put("spanId", ...)`를 호출한다. Logback의 `%X{traceId}`는 이 MDC에서 값을 읽는다. Span이 종료되면 Scope가 닫히면서 MDC가 이전 값으로 복원된다.
+## Context 전파 — Carrier 패턴이 분리하는 것
 
-```xml
-<!-- logback-spring.xml -->
-<pattern>
-  %d{HH:mm:ss.SSS} %5p [${spring.application.name},%X{traceId},%X{spanId}] %logger{36} - %msg%n
-</pattern>
-```
-
-이 설정 하나로 모든 동기 요청의 로그에 traceId가 자동으로 붙는다.
-
-문제는 스레드가 바뀔 때다. `@Async`, `CompletableFuture.runAsync()`, Reactor 체인은 새 스레드에서 실행되므로 ThreadLocal 기반의 MDC가 자동으로 전파되지 않는다.
+OTel이 traceparent를 HTTP 헤더에 넣고 빼는 방법은 `TextMapPropagator` + `TextMapSetter/Getter` 패턴이다. 전파 로직(W3C 규칙)과 전송 매체(HTTP 헤더, Kafka 헤더, gRPC Metadata)를 분리한 설계다.
 
 ```java
-// @Async: TaskDecorator로 MDC 복사
-executor.setTaskDecorator(runnable -> {
-    Map<String, String> contextMap = MDC.getCopyOfContextMap();
-    return () -> {
-        try {
-            if (contextMap != null) MDC.setContextMap(contextMap);
-            runnable.run();
-        } finally {
-            MDC.clear();
-        }
-    };
+// 나가는 요청에 헤더 삽입
+propagator.inject(Context.current(), request,
+    (carrier, key, value) -> carrier.setHeader(key, value));
+
+// 들어오는 요청에서 Context 복원
+Context extracted = propagator.extract(Context.current(), request,
+    (carrier, key) -> carrier.getHeader(key));
+try (Scope scope = extracted.makeCurrent()) {
+    // 이 블록 안의 Span은 추출된 Context의 자식이 된다
+}
+```
+
+OTel Agent가 설치되어 있으면 Spring MVC와 RestTemplate에서 이 패턴이 자동으로 적용된다. 단, `new RestTemplate()`처럼 Spring Bean이 아닌 방식으로 생성하면 Agent가 Interceptor를 주입하지 못해 Trace가 끊긴다.
+
+## 비동기의 함정 — ThreadLocal은 스레드를 따라간다
+
+OTel Context는 ThreadLocal에 저장된다. 스레드가 바뀌면 Context가 없다.
+
+```java
+// 나쁜 코드 — 다른 스레드에서 Span.current()는 빈 NOOP Span이다
+CompletableFuture.supplyAsync(() -> {
+    callExternalService();  // traceparent 헤더 없이 나간다 → Trace 끊김
 });
+
+// 올바른 코드 — 제출 시점의 Context를 캡처해서 실행 시점에 복원한다
+Context context = Context.current();
+CompletableFuture.supplyAsync(context.wrap(() -> {
+    callExternalService();  // traceparent 헤더가 정상적으로 삽입된다
+}));
 ```
 
-Reactor(WebFlux)는 `Hooks.enableAutomaticContextPropagation()`을 활성화하면 `context-propagation` 라이브러리가 스레드 전환 시점마다 ThreadLocal을 자동으로 복원한다. Spring Boot 3.x + WebFlux 조합에서는 이 설정이 자동으로 적용된다.
+`@Async` 전체에 적용하려면 Executor를 교체하면 된다.
 
-## Baggage — 비즈니스 컨텍스트를 코드 변경 없이 전파하기
-
-userId나 tenantId를 모든 서비스에 전달해야 할 때, 메서드 파라미터로 계속 끌고 다니거나 매 서비스마다 헤더를 수동으로 추출/삽입하는 대신 **Baggage**를 쓸 수 있다.
-
-Baggage는 TraceContext에 추가 데이터를 붙여 자동으로 전파하는 메커니즘이다.
-
-```yaml
-management:
-  tracing:
-    baggage:
-      remote-fields: [user-id, tenant-id]      # 서비스 간 전파
-      correlation-fields: [user-id, tenant-id]  # MDC 자동 연동
+```java
+@Bean
+public ExecutorService asyncExecutor() {
+    return ContextExecutorService.wrap(Executors.newFixedThreadPool(10));
+}
 ```
 
-`remote-fields`에 선언된 필드는 HTTP 헤더(`X-B3-Bag-user-id` 등)로 자동 전파된다. `correlation-fields`에 선언하면 `CorrelationScopeDecorator`가 Baggage 값을 MDC에 자동으로 복사한다. Gateway에서 `BaggageField.create("user-id").updateValue(userId)`를 한 번 호출하면, 이후 모든 하위 서비스 로그에 `user-id`가 자동으로 포함된다.
+`ContextExecutorService`는 `submit()` 호출 시점의 Context를 캡처하고, 실제 실행 스레드에서 `makeCurrent()`로 복원한다. 모든 `@Async` 작업에 자동으로 Context가 전파된다.
 
-<Callout type="warning" title="Baggage 사용 시 주의">
-remote 필드는 HTTP 헤더로 전파되므로 외부에서 위조할 수 있다. Gateway에서 외부 입력 Baggage 헤더를 제거하고 JWT 검증 후 신뢰할 수 있는 값으로 재설정해야 한다. 값은 짧은 ID 정도로 제한하고, 민감 정보(이메일, 비밀번호)는 절대 넣지 않는다.
-</Callout>
+Java 21 Virtual Thread는 이 문제를 부분적으로 완화한다. Virtual Thread도 ThreadLocal을 가지며, I/O 블로킹으로 Carrier Thread가 교체될 때도 Virtual Thread의 ThreadLocal은 유지된다. `spring.threads.virtual.enabled=true` 설정 후 OTel Agent와 함께 사용하면 대부분의 경우 추가 설정 없이 Context가 전파된다. 단, Virtual Thread 안에서 명시적으로 새 스레드를 생성할 때는 여전히 `Context.wrap()`이 필요하다.
 
-Baggage와 Span 태그의 차이를 혼동하기 쉽다. **Baggage**는 다른 서비스로 전파되지만 Zipkin에서 검색할 수 없다. **Span 태그**는 Zipkin에 저장돼 검색 가능하지만 다른 서비스로 전파되지 않는다. userId를 Zipkin에서 검색하려면 태그로, 다른 서비스에 전달하려면 Baggage로, 둘 다 필요하면 동시에 사용한다.
+## Span을 풍부하게 — Attribute와 Event의 설계 원칙
 
-## 트레이드오프
+Trace가 "3초 걸렸다"는 사실만 알려주면 절반의 가치다. "어떤 결제 수단으로 처리했는지", "재시도가 몇 번 발생했는지"가 Span에 있어야 Trace가 진단 도구가 된다.
 
-<Callout type="note" title="트레이드오프">
-자동 계측만 사용하면 오버헤드는 최소지만 HTTP 레벨 정보만 얻는다. `@NewSpan`으로 메서드 단위 Span을 추가하면 Zipkin 타임라인이 세밀해지지만 Span 수가 늘고 Zipkin 전송 부하도 증가한다. `@ContinueSpan + @SpanTag`는 새 Span 없이 현재 Span에 태그만 추가해 중간 지점이다. 운영에서는 샘플링 확률도 핵심 변수다. 100 RPS 미만이면 1.0(전수 추적), 1000 RPS 이상이면 0.01~0.05가 적절하다. 오류 발생 요청은 항상 100% 샘플링하는 커스텀 Sampler를 조합하면 장애 분석 데이터를 보장하면서 일반 오버헤드를 최소화할 수 있다.
-</Callout>
+Attribute 설계의 핵심은 카디널리티다.
 
-Zipkin 서버가 다운되면 `AsyncReporter`의 로컬 큐에 Span이 쌓이다가 큐가 넘치면 드롭된다. 서비스 자체는 영향을 받지 않는다. 이것이 "Fail Open" 설계다 — 추적 인프라 장애가 서비스 장애로 전파되지 않도록 설계된 의도적 선택이다.
+- **낮은 카디널리티** (수십~수백 종류): Span Attribute로 기록한다. TraceQL에서 검색 가능하고, Micrometer Observation의 `lowCardinalityKeyValues`로 설정하면 메트릭 태그로도 사용된다.
+- **높은 카디널리티** (order.id, user.id 등): Span Attribute로 넣으면 Tempo 인덱스가 폭발한다. `span.addEvent()`의 Attributes에 넣거나 로그에 남긴다. Event의 Attribute는 인덱싱되지 않아 카디널리티 제한이 없다.
 
-<Aside label="설계 철학">
-분산 추적의 모든 구성 요소 — Propagator, MDC 자동 주입, Baggage, AsyncReporter — 는 같은 원칙을 공유한다. *관측 코드가 비즈니스 코드를 오염시키지 않아야 한다*. TraceContext는 ThreadLocal에 숨어 있고, Propagator는 RestTemplate 인터셉터 뒤에 숨어 있고, MDC는 로그 패턴 하나로 처리된다. 비즈니스 코드는 `log.info("...")`만 호출하면 된다.
+예외는 `span.setAttribute("error.message", e.getMessage())`가 아니라 `span.recordException(e)`로 기록해야 한다. OTel이 `exception.type`, `exception.message`, `exception.stacktrace`를 표준 형식의 Span Event로 자동 생성한다.
+
+OTel Agent는 MDC에 `traceId`와 `spanId`를 자동으로 주입한다. Logback 패턴에 `%X{traceId}`를 추가하면 모든 로그에 Trace 정보가 포함된다. Loki에서 traceId로 검색하면 해당 요청의 모든 로그를 꺼낼 수 있고, Grafana에서 메트릭 → Trace → 로그로 드릴다운하는 경로가 완성된다.
+
+<Aside label="트레이드오프">
+Span Attribute가 많을수록 Tempo 인덱스 크기와 직렬화 비용이 늘어난다. OTel SDK는 기본적으로 Span당 128개 Attribute를 제한한다. 표준 HTTP/DB Attribute는 Agent가 자동으로 붙이고, 비즈니스 Attribute는 낮은 카디널리티 값 10개 이내로 유지하는 것이 실용적인 균형이다.
 </Aside>
 
 ## 정리
 
-- traceId는 서비스를 넘어도 변하지 않는다. spanId만 서비스마다 새로 생성된다.
-- Propagator가 inject/extract로 HTTP 헤더를 통해 TraceContext를 전파한다.
-- MDC 자동 주입은 동기 코드에서만 공짜다. `@Async`와 Reactor에서는 명시적 설정이 필요하다.
-- Baggage는 코드 변경 없이 비즈니스 컨텍스트를 전파하지만 Zipkin에서 검색되지 않는다. 검색이 필요하면 Span 태그를 함께 사용한다.
-- Zipkin 장애가 서비스 장애로 이어지지 않는 것은 설계 결정이지 버그가 아니다.
+- Trace는 `traceId`로 묶인 Span의 나무다. `parentSpanId`가 트리를 만들고, Tempo가 이를 조회 시에 재구성한다.
+- W3C `traceparent` 헤더가 서비스 간 Context를 전달한다. `parentId` 자리에는 보내는 쪽의 `spanId`가 들어간다.
+- ThreadLocal 기반 Context는 스레드 경계를 자동으로 넘지 못한다. `Context.wrap()` 또는 `ContextExecutorService`로 명시적으로 전달해야 한다.
+- Span Attribute는 낮은 카디널리티만, 높은 카디널리티 값은 `addEvent()` 또는 로그로 분리한다.
+- `span.recordException(e)` + MDC의 traceId로 Trace와 로그를 연결하면 분산 추적이 완성된다.
 
-다음 글에서는 Zipkin의 `parentId` 기반 트리 재구성과 Elasticsearch 백엔드 구성, 그리고 운영 환경에서 샘플링 전략을 동적으로 조정하는 방법을 다룬다.
+다음 글에서는 Prometheus가 메트릭을 수집하는 Pull 모델의 내부 구조와, TSDB가 시계열을 어떻게 압축하는지 추적한다.
