@@ -1,0 +1,109 @@
+---
+title: "InnoDB는 왜 데이터를 Page 단위로 읽고 쓰는가"
+description: "16KB Page부터 WAL까지, InnoDB의 모든 물리 저장 결정이 하나의 원칙 — I/O 비용 최소화 — 에서 비롯됨을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [innodb, database-internals, buffer-pool, wal, page]
+difficulty: intermediate
+series:
+  slug: database-internals
+  title: Database Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`SELECT * FROM orders WHERE id = 42`를 실행하면 InnoDB는 id=42인 행 하나를 읽지 않는다. 그 행이 속한 **16KB Page 전체**를 메모리에 올린다. 왜 이 설계를 선택했는가? 그리고 이 선택 하나가 Buffer Pool, Row Format, Tablespace, WAL의 모든 설계를 어떻게 결정하는가?
+
+## I/O 단위가 모든 것을 결정한다
+
+디스크 I/O는 CPU나 메모리 연산과 근본적으로 다르다. CPU 연산은 나노초, 메모리 접근은 수십 나노초인 데 반해 디스크 I/O는 밀리초 단위다. 10만 배 차이다.
+
+InnoDB가 16KB를 I/O의 최소 단위로 선택한 이유는 여기 있다. HDD 섹터(512B~4KB), SSD 내부 페이지(4KB~16KB), OS 파일시스템 블록(4KB~8KB)을 고려하면, 16KB는 "한 번의 I/O로 실용적인 양의 데이터를 올릴 수 있는 균형점"이다. 너무 작으면 I/O 횟수가 늘어나고, 너무 크면 필요 없는 데이터까지 올라온다.
+
+이 16KB Page가 InnoDB 계층 구조의 기반이다.
+
+```
+Tablespace (.ibd 파일)
+  └── Segment (Leaf / Non-Leaf / Rollback 등 논리 단위)
+        └── Extent (1MB = 64개 Page, 연속 공간)
+              └── Page (16KB — I/O의 최소 단위)
+                    └── Row (실제 데이터)
+```
+
+Extent가 64개 Page를 **연속** 공간으로 묶는 이유도 같은 원칙이다. 1 Page씩 흩어져 할당하면 Full Table Scan이어도 물리적으로 Random I/O가 발생한다. 연속 1MB 블록을 확보해야 Sequential I/O가 가능하다. HDD 기준으로 Sequential I/O와 Random I/O의 속도 차이는 100배가 넘는다.
+
+## Page 내부와 Buffer Pool
+
+Page 안에서 User Records는 키 기준 논리적 링크드 리스트로 정렬된다. 물리적 위치는 삽입 순서, 논리적 순서는 포인터로 유지하므로 삽입 시 전체 재정렬이 필요 없다. Page Directory가 Record 그룹의 오프셋을 저장해 O(log n) 탐색을 지원한다.
+
+B-Tree Leaf Node들은 `FIL_PAGE_PREV / FIL_PAGE_NEXT` 포인터로 연결된다. `WHERE id BETWEEN 100 AND 200` 같은 범위 스캔은 첫 번째 Leaf Page를 찾은 후 포인터를 따라 순회하므로 Sequential I/O가 된다.
+
+Buffer Pool은 이 Page를 메모리에서 관리하는 캐시 레이어다. 핵심은 **단순 LRU를 쓰지 않는다**는 점이다.
+
+```
+┌──────────────────────┐ ┌─────────────────┐
+│  Young 서브리스트 (63%)│ │ Old 서브리스트 (37%)│
+│  Hot Page — 자주 접근  │ │ 새로 로드된 Page   │
+└──────────────────────┘ └─────────────────┘
+                              ↑ 새 Page 진입점 (Midpoint)
+```
+
+새 Page는 Old 서브리스트 Head(Midpoint)에 삽입된다. Old에서 `innodb_old_blocks_time`(기본 1초) 이후 재접근해야만 Young으로 승급된다. Full Table Scan이 수천 Page를 올려도 1초 이내에 다시 접근하면 Young으로 이동하지 않는다. 아침 출근 시간에 야간 배치 작업이 Buffer Pool을 오염시키는 문제를 이 설계로 차단한다.
+
+<Callout type="note" title="트레이드오프">
+Buffer Pool 크기를 물리 메모리의 70~80% 이상으로 설정하면 OS Swap이 발생해 오히려 성능이 저하된다. Midpoint 전략은 Full Scan 오염을 막지만, `innodb_old_blocks_time`을 너무 높이면 진짜 새로운 Hot Page의 Young 승급이 지연된다.
+</Callout>
+
+## Row Format과 저장 효율
+
+Page당 Row 수는 Row 크기에 반비례한다. 평균 Row 크기가 200 bytes이면 한 Page에 ~81개, 800 bytes이면 ~20개다. 동일한 100만 건을 저장할 때 후자는 4배 더 많은 Page I/O를 유발한다.
+
+InnoDB DYNAMIC Format(MySQL 5.7+ 기본값)은 이 비용을 여러 방식으로 줄인다.
+
+NULL 허용 컬럼은 NULL 비트맵(컬럼 수 / 8 bytes)에만 표시하고 데이터 공간을 0 bytes 사용한다. VARCHAR는 선언 크기가 아닌 실제 데이터 길이만 저장한다. Row 크기가 ~8KB를 넘으면 가장 긴 가변 컬럼을 External Page로 이동하고 레코드에는 20 bytes 포인터만 남긴다.
+
+모든 Row에는 숨겨진 시스템 컬럼이 붙는다. `DB_TRX_ID`(6 bytes)와 `DB_ROLL_PTR`(7 bytes)는 MVCC를 위해 필수다. PK를 정의하지 않으면 `DB_ROW_ID`(6 bytes)가 추가된다. PK를 항상 명시적으로 정의해야 하는 이유 중 하나다.
+
+## Tablespace와 공간 관리
+
+`innodb_file_per_table = ON`(기본값)이 중요한 이유는 공간 회수에 있다. 테이블마다 독립 `.ibd` 파일이 생성되므로 `DROP TABLE`이나 `TRUNCATE TABLE` 시 파일 자체를 삭제해 OS에 즉시 공간을 반환한다.
+
+OFF 상태에서는 모든 테이블이 `ibdata1`에 저장된다. `ibdata1`은 한 번 커지면 절대 줄어들지 않는다. 수천만 건을 DELETE해도 `ibdata1` 크기는 그대로다. 인스턴스를 재생성하지 않고는 회수할 방법이 없다.
+
+`DELETE FROM logs WHERE created_at < '2022-01-01'`은 Row에 삭제 표시만 하고 Page를 OS에 반환하지 않는다. 공간을 즉시 회수하려면 TRUNCATE(file_per_table=ON)나 `OPTIMIZE TABLE`이 필요하다. Undo Tablespace(`undo_001`, `undo_002`)는 MVCC 이전 버전을 저장한다. 오래 실행되는 트랜잭션은 그 시점부터의 Undo Log를 전부 유지해야 하므로 Undo Tablespace가 급격히 커질 수 있다.
+
+## WAL — 내구성과 성능의 균형
+
+"COMMIT된 트랜잭션은 크래시 후에도 손실되지 않는다"는 ACID의 D(Durability)를 순진하게 구현하면 수정된 모든 Page를 COMMIT 시 디스크에 써야 한다. 한 트랜잭션이 수십 Page를 수정하면 수십 번의 Random I/O가 발생한다.
+
+WAL(Write-Ahead Logging)은 이 문제를 우회한다. COMMIT 시 수정된 Page 대신 **변경 내용 로그(Redo Log)만 순서대로 디스크에 쓴다**. Sequential I/O 한두 번으로 내구성이 보장된다. Buffer Pool의 Dirty Page는 Page Cleaner Thread가 비동기로 나중에 flush한다.
+
+크래시 후 복구는 두 단계다. Redo Phase에서 마지막 Checkpoint LSN 이후의 모든 로그를 재생해 커밋/미완료 트랜잭션을 모두 복원한다. Undo Phase에서 COMMIT 마커 없는 미완료 트랜잭션을 Undo Log로 롤백한다.
+
+`innodb_flush_log_at_trx_commit` 설정이 이 균형을 조절한다.
+
+| 값 | 동작 | 내구성 | 성능 |
+|---|---|---|---|
+| 1 (기본) | COMMIT마다 fsync | 완전 | 낮음 |
+| 2 | COMMIT마다 write(fsync 없음) | MySQL 크래시 안전 | 2~5배 향상 |
+| 0 | 백그라운드 1초마다 flush | 최대 1초 손실 | 5~10배 향상 |
+
+높은 동시성 환경에서는 Group Commit이 이 비용을 줄인다. 여러 COMMIT을 큐에 모아 단 한 번의 fsync로 처리한다. `Innodb_os_log_fsyncs / Com_commit` 비율이 1보다 작으면 Group Commit이 동작 중이다.
+
+<Aside label="설계 철학">
+InnoDB의 모든 결정은 하나의 원칙으로 수렴한다 — "Random I/O를 Sequential I/O로, 동기 I/O를 비동기 I/O로". Page는 Random Access의 단위를 키워 횟수를 줄이고, Extent는 연속 공간으로 Sequential을 만들고, Buffer Pool은 Dirty Page flush를 지연하고, WAL은 COMMIT I/O를 Sequential 로그 하나로 압축한다.
+</Aside>
+
+## 정리
+
+- InnoDB의 모든 I/O는 16KB Page 단위다. 1 Row를 읽어도 16KB가 메모리에 올라온다.
+- Extent(1MB)는 연속 공간을 보장해 Sequential I/O를 가능하게 한다. HDD에서 Random과 Sequential의 차이는 100배 이상이다.
+- Buffer Pool의 Midpoint Insertion은 Full Table Scan이 Hot Page를 교체하는 오염을 차단한다.
+- `innodb_file_per_table = ON`은 반드시 유지해야 한다. OFF에서 ibdata1은 줄어들지 않는다.
+- WAL은 COMMIT을 Sequential 로그 쓰기로 압축해 내구성과 성능을 동시에 달성한다. Redo는 커밋을 재현하고, Undo는 미완료를 취소한다.
+
+다음 글에서는 이 Page 구조 위에 세워진 B-Tree 인덱스가 어떻게 동작하는지, 그리고 Clustered Index와 Secondary Index의 I/O 비용 차이가 쿼리 플래너 결정에 어떤 영향을 주는지 추적한다.

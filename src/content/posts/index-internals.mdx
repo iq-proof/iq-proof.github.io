@@ -1,0 +1,121 @@
+---
+title: "데이터베이스 인덱스는 왜 B+Tree인가"
+description: "Binary Search Tree의 한계부터 Covering Index, Composite Index 순서 설계, 인덱스를 무력화하는 쿼리 패턴까지, B+Tree가 만들어내는 모든 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [database, btree, index, innodb, mysql]
+difficulty: intermediate
+series:
+  slug: database-internals
+  title: Database Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+InnoDB의 인덱스 설계 결정들 — Clustered Index, Covering Index, Composite Index 컬럼 순서, `YEAR(created_at)` 금지 — 은 서로 독립적인 규칙처럼 보인다. 그런데 이 모든 것은 하나의 근거에서 나온다. **디스크 I/O 횟수를 최소화하라**. 왜 그 답이 B+Tree인가?
+
+## Binary Tree가 아닌 이유
+
+Binary Search Tree로 100만 건 인덱스를 만들면 이론상 높이는 약 20이다. 노드 하나 방문 = 디스크 I/O 1회라면 단일 조회에 20번의 I/O가 필요하다. HDD 기준 160ms, SSD도 2ms. 문제는 높이만이 아니다. 순차 삽입(`1, 2, 3, ...`)을 하면 트리가 편향되어 사실상 연결 리스트가 된다. 균형 유지를 위한 회전 연산은 디스크에서 여러 페이지를 수정한다.
+
+B+Tree의 설계 목표는 단순하다. **한 번의 I/O(한 페이지 = 16KB)로 최대한 많은 정보를 담는다**. 노드 하나에 수백 개의 키를 넣어 트리 높이를 3~4로 줄인다.
+
+```
+Fan-out 계산 (BIGINT PK):
+  Internal Node: 8(키) + 6(포인터) = 14 bytes
+  Fan-out = 16,384 / 14 ≈ 1,170
+
+높이 3의 최대 Row 수:
+  1,170² × 81(rows/leaf) ≈ 1.1억 건
+  → 대부분의 실제 테이블 = 높이 3~4
+  → PK 단일 조회 = 3~4번의 I/O
+```
+
+Full Scan과 비교하면 100만 건 테이블에서 약 12,000 I/O 대 3~4 I/O, 4,000배 차이가 난다.
+
+## Clustered와 Secondary — 두 번 읽는 비용
+
+InnoDB에서 테이블 자체가 B+Tree다. Clustered Index의 Leaf Node가 곧 Row 데이터를 담는다. 별도 데이터 파일이 없다. PK 기준으로 Leaf가 연결 리스트로 이어지기 때문에 `WHERE id BETWEEN 1000 AND 2000`은 시작 Leaf를 찾은 뒤 포인터를 순회하면 끝난다.
+
+Secondary Index는 다르다. Leaf에는 인덱스 컬럼 값과 PK만 저장된다. Row 전체가 없다. `WHERE user_id = 1`을 실행하면 Secondary Index에서 PK 목록을 먼저 수집하고, 그 PK들로 Clustered Index를 다시 탐색한다. 이것이 **Double Lookup**이다.
+
+<Callout type="warning" title="Double Lookup의 비용">
+`user_id = 1`인 Row가 100건이면 Secondary Index 탐색 후 Clustered Index를 100번 따로 탐색한다. 각 탐색이 다른 Leaf Page로 가는 Random I/O이므로 결과 건수에 비례해 비용이 선형으로 증가한다.
+</Callout>
+
+Secondary Index Leaf에 PK가 자동으로 포함되는 덕분에 `SELECT id FROM orders WHERE user_id = 1`은 Clustered Index에 접근하지 않아도 된다. 이것이 Covering Index의 핵심 원리다.
+
+## Covering Index — Double Lookup을 0으로
+
+SELECT + WHERE + ORDER BY의 모든 컬럼이 하나의 인덱스 안에 있으면 Clustered Index 접근이 사라진다. EXPLAIN의 `Extra: Using index`가 이 상태를 나타낸다.
+
+```sql
+-- Double Lookup 발생
+CREATE INDEX idx_user_id ON orders(user_id);
+SELECT user_id, amount, status FROM orders WHERE user_id = 1;
+-- Extra: (없음) → Clustered Index 접근 발생
+
+-- Covering Index
+CREATE INDEX idx_covering ON orders(user_id, amount, status);
+SELECT user_id, amount, status FROM orders WHERE user_id = 1;
+-- Extra: Using index → 테이블 접근 없음
+```
+
+설계 공식은 단순하다. `(WHERE 등치 조건) + (ORDER BY / 범위 조건) + (SELECT 추가 컬럼)`. 목록 조회 API, 페이지네이션, 집계 쿼리에서 극적인 효과가 있다. `user_id=1`인 Row 10,000건 기준으로 Non-Covering은 약 30,000 I/O, Covering은 약 10 I/O다.
+
+<Aside label="PK는 자동 포함">
+Secondary Index Leaf = (인덱스 컬럼, PK). PK를 명시적으로 인덱스에 추가할 필요가 없다. `SELECT id, user_id FROM orders WHERE user_id = 1`은 `idx_user_id`만으로 Covering이 된다.
+</Aside>
+
+## Composite Index — 순서가 전부다
+
+`(status, user_id, created_at)` 인덱스의 Leaf는 이 순서로 사전 정렬된다. `WHERE user_id = 1`은 `user_id`가 있는 위치를 알 수 없다. status에 따라 여러 곳에 분산되어 있기 때문이다. 이것이 **Leftmost Prefix Rule**이다.
+
+```
+인덱스 (a, b, c) 사용 가능한 패턴:
+  WHERE a = ?              → a만 사용
+  WHERE a = ? AND b = ?    → a, b 사용
+  WHERE a = ? AND b > ?    → a, b까지 Range Scan
+  WHERE a = ? AND b > ? AND c = ? → a, b까지만 (c는 ICP 필터만)
+  WHERE b = ?              → 사용 불가
+```
+
+범위 조건 이후 컬럼이 Range Scan에서 제외되는 이유도 정렬 구조에서 나온다. `b > 10` 범위 내에서 `c`는 `b` 값마다 다시 정렬되므로 연속 범위로 읽을 수 없다. `key_len`이 예상보다 짧게 나오면 중간 컬럼이 빠진 것이다.
+
+컬럼 순서 결정 원칙: 등치 조건을 먼저, 범위 조건과 ORDER BY를 나중에. Cardinality 순서로 배치하라는 조언은 등치 조건끼리 사이에서만 보조 기준이 된다.
+
+## 인덱스를 무력화하는 패턴
+
+인덱스는 컬럼의 원래 값으로 정렬된다. 함수나 연산을 거친 값은 인덱스에 없다.
+
+```sql
+-- ❌ 함수 적용 — Full Scan
+WHERE YEAR(created_at) = 2024
+WHERE amount * 1.1 > 10000
+
+-- ✅ 범위 조건으로 변환 — Range Scan
+WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01'
+WHERE amount > 10000 / 1.1
+```
+
+암묵적 형변환도 같은 문제를 유발한다. `user_id BIGINT` 컬럼에 `WHERE user_id = '12345'`를 쓰면 MySQL이 컬럼을 형변환하여 인덱스를 쓰지 못한다. `LIKE '%keyword'`는 끝이 고정되지 않아 B+Tree의 연속 범위를 특정할 수 없어 Full Scan이다. `LIKE 'keyword%'`는 시작이 고정되므로 Range Scan이 가능하다.
+
+JPA에서도 같은 함정이 있다. `FUNCTION('YEAR', o.createdAt) = :year` 같은 JPQL 함수, `IgnoreCase`가 생성하는 `LOWER(email)`, 파라미터 타입 불일치 — 전부 인덱스를 무력화한다.
+
+<Callout type="note" title="트레이드오프">
+인덱스는 공짜가 아니다. 인덱스 10개 = INSERT 비용 10배(I/O 기준). Selectivity가 낮은 컬럼(status, gender)의 단독 인덱스는 결과의 30% 이상을 반환하면 Full Scan보다 느릴 수 있다. `performance_schema.table_io_waits_summary_by_index_usage`로 COUNT_READ=0인 인덱스를 식별하고, MySQL 8.0의 `INVISIBLE INDEX`로 안전하게 비활성화한 뒤 영향을 확인하고 제거하라.
+</Callout>
+
+## 정리
+
+- B+Tree는 노드 하나에 수백 개의 키를 담아 트리 높이를 3~4로 줄인다. 이것이 모든 인덱스 설계의 출발점이다.
+- Clustered Index의 Leaf = Row 데이터. Secondary Index의 Leaf = (인덱스 컬럼, PK). Double Lookup은 이 구조에서 필연적으로 발생한다.
+- Covering Index는 Double Lookup을 0으로 만든다. SELECT + WHERE + ORDER BY 컬럼을 인덱스에 담는다.
+- Composite Index의 컬럼 순서는 B+Tree 정렬 구조에서 도출된다. 등치 조건 먼저, 범위/ORDER BY 나중.
+- 인덱스를 무력화하는 공통 원인은 하나다 — 컬럼 값이 아닌 변환된 값으로 비교한다.
+
+다음 글에서는 Query Optimizer가 이 B+Tree 통계를 어떻게 읽고 실행 계획을 세우는지, 그리고 통계가 잘못됐을 때 어떤 일이 벌어지는지 추적한다.

@@ -1,0 +1,152 @@
+---
+title: "MySQL은 SQL을 어떻게 실행하는가"
+description: "Parse Tree부터 Handler_read_* 변수까지, MySQL 쿼리 실행의 다섯 단계와 Cost-Based Optimizer의 판단 근거, 그리고 그 판단이 틀리는 이유를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [mysql, query-execution, optimizer, explain, statistics]
+difficulty: intermediate
+series:
+  slug: database-internals
+  title: Database Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`EXPLAIN`을 보면 `type: ref`, `key: idx_user_id`인데 쿼리가 여전히 느리다. 인덱스는 분명히 걸려 있다. 그런데 왜? 이 질문에 답하려면 SQL 문자열이 MySQL에 도달한 순간부터 결과가 반환되기까지 무슨 일이 벌어지는지를 알아야 한다. 그리고 Optimizer가 실행계획을 선택하는 기준 — 그리고 그 기준이 틀리는 이유를 알아야 한다.
+
+## 다섯 단계: Parse에서 Execute까지
+
+MySQL은 SQL을 다섯 단계로 처리한다.
+
+**Parse** 단계는 SQL 문자열을 토큰 스트림으로 쪼개고, 이를 Parse Tree(AST)로 조립한다. 문법 오류는 여기서 잡힌다. 테이블이나 컬럼이 실제로 존재하는지는 아직 모른다.
+
+**Preprocess** 단계는 Parse Tree를 Resolved Query Tree로 바꾼다. 테이블과 컬럼이 실제로 존재하는지 확인하고, 권한을 검사하며, `SELECT *`를 실제 컬럼 목록으로 펼친다. "Table doesn't exist" 오류는 Parse가 아닌 이 단계에서 나온다.
+
+**Optimize** 단계가 핵심이다. Resolved Query Tree를 받아 Physical Execution Plan을 만든다. 어떤 인덱스를 쓸지, JOIN 순서를 어떻게 할지, 서브쿼리를 JOIN으로 풀어낼지 — 이 모든 결정이 여기서 내려진다. `EXPLAIN`이 보여주는 것이 바로 이 단계의 출력물이다.
+
+**Execute** 단계는 Plan대로 실제로 Row를 읽는다. MySQL 8.0의 Iterator 모델에서는 각 Plan 노드가 Iterator가 되어 부모가 자식에게 `next()`를 호출하는 Pull-based 방식으로 동작한다.
+
+```
+LimitIterator(10)
+  └─ SortIterator(created_at DESC)
+        └─ IndexLookupIterator(idx_user_id, user_id=1)
+              └─ InnoDB(orders)
+```
+
+각 InnoDB 호출은 `Handler_read_*` 상태 변수로 추적된다. `Handler_read_key`는 인덱스 탐색 시작 횟수, `Handler_read_next`는 순방향 연속 읽기 횟수, `Handler_read_rnd_next`는 Full Table Scan에서 읽은 Row 수다.
+
+```sql
+FLUSH STATUS;
+SELECT * FROM orders WHERE user_id = 1;
+SHOW SESSION STATUS LIKE 'Handler_read%';
+-- Handler_read_key: 1     ← 시작점 탐색 1회
+-- Handler_read_next: 100  ← user_id=1인 Row 100건 순회
+-- Handler_read_rnd_next: 0 ← Full Scan 없음
+```
+
+`Handler_read_rnd_next`가 수십만이라면 인덱스를 쓰지 않는다는 뜻이다. `EXPLAIN`이 없어도 이 변수만으로 Full Scan 여부를 판단할 수 있다.
+
+## Optimizer는 무엇으로 결정하는가
+
+Optimize 단계에서 비용은 두 가지의 합이다.
+
+$$
+\text{Total Cost} = \text{Data Access Cost} + \text{CPU Cost}
+$$
+
+Data Access Cost는 읽어야 하는 Page 수와 `io_block_read_cost`(기본 1.0)의 곱이고, CPU Cost는 처리할 Row 수와 `row_evaluate_cost`(기본 0.1)의 곱이다. 이 상수들은 `mysql.engine_cost`와 `mysql.server_cost` 테이블에 저장되어 있고 조정할 수 있다.
+
+Optimizer는 이 공식에 통계 정보를 대입해 각 접근 방법의 예상 비용을 계산한다. 예상 결과 건수는 다음과 같이 추정된다.
+
+$$
+\text{예상 결과} = \frac{N\_\text{ROWS}}{n\_\text{diff\_pfx01}}
+$$
+
+`N_ROWS`는 테이블 추정 Row 수, `n_diff_pfx01`은 인덱스 첫 컬럼의 고유 값 수(Cardinality)다. 둘 다 통계 테이블(`mysql.innodb_table_stats`, `mysql.innodb_index_stats`)에서 읽어온다.
+
+<Callout type="warning" title="통계는 추정치다">
+`EXPLAIN`의 `rows` 컬럼은 정확한 값이 아니라 통계 기반 추정치다. 데이터 분포가 편중되어 있거나 대규모 변경 후 통계가 갱신되지 않았다면, `rows=100`이라고 표시되어 있어도 실제로는 50,000건을 읽을 수 있다.
+</Callout>
+
+InnoDB 통계 수집은 전수 조사가 아닌 **샘플링**이다. 기본값(`innodb_stats_persistent_sample_pages = 20`)으로는 B+Tree Leaf Page 중 20개만 무작위로 읽어서 전체를 추정한다. 100만 건 테이블에서 20페이지 ≈ 1,620 Row, 전체의 0.16%를 본 것이다.
+
+## 통계가 틀리면 생기는 일
+
+통계 오류가 실행계획을 망치는 가장 흔한 시나리오는 대규모 배치 INSERT다.
+
+```
+Before: orders 100만 건, user_id=1 → 100건
+        통계: n_diff_pfx01 = 10,000
+        예상 결과 = 1,000,000 / 10,000 = 100건 → 인덱스 선택
+
+배치: user_id=1에 100만 건 추가
+        실제 user_id=1 → 100만 건
+
+After (통계 미갱신):
+        예상 결과 = 여전히 100건 → 인덱스 선택
+        실제: 100만 건 Double Lookup → 수분 소요
+```
+
+자동 갱신(`innodb_stats_auto_recalc`)은 Row의 약 10% 이상이 변경될 때 백그라운드에서 비동기로 동작한다. 즉각적이지 않고, 갱신 중에도 쿼리가 실행되므로 이 구간에서 실행계획이 불안정해진다. 대규모 배치 작업 후에는 `ANALYZE TABLE`을 명시적으로 호출하는 것이 안전하다.
+
+또 다른 문제는 값 분포의 편중이다. `status`가 `PAID`(85%), `PENDING`(14%), `CANCELLED`(1%)로 분포되어 있을 때, Cardinality 기반 통계는 세 값이 균등하다고 가정한다. `status = 'CANCELLED'`의 예상 결과가 전체의 33%로 계산되어 Full Scan이 선택될 수 있다. 실제는 1%이므로 인덱스가 훨씬 빠른데도.
+
+```sql
+-- 히스토그램으로 실제 분포 반영
+ANALYZE TABLE orders UPDATE HISTOGRAM ON status WITH 10 BUCKETS;
+
+-- EXPLAIN이 바뀐다
+EXPLAIN SELECT * FROM orders WHERE status = 'CANCELLED'\G
+-- rows: 이제 1%에 맞는 추정 → 인덱스 선택
+```
+
+## JOIN과 Driving Table
+
+JOIN에서 Optimizer의 핵심 결정은 **어떤 테이블을 먼저 읽을 것인가**다. WHERE 조건 후 결과가 가장 적은 테이블을 Driving으로 삼고, Driven Table은 JOIN 조건 컬럼에 인덱스가 있어야 한다.
+
+```
+users(1만 명) JOIN orders(100만 건) WHERE users.grade = 'GOLD'
+
+Case A: users(100명 결과) → Driving
+        100 × idx_lookup(orders, user_id) ≈ 10,100 I/O
+
+Case B: orders(100만 건) → Driving
+        1,000,000 × idx_lookup(users, id) ≈ 1,000,000 I/O
+```
+
+인덱스 없이 Driven Table을 접근하면 O(m × n)이 된다. MySQL 8.0.18부터 이 경우에 Hash Join을 자동으로 선택한다. Build Phase에서 작은 테이블을 Hash Table에 올리고, Probe Phase에서 큰 테이블을 순차 스캔하며 매칭한다. 복잡도는 O(m + n).
+
+<Callout type="note" title="트레이드오프">
+**Hash Join**: 인덱스 없는 대용량 JOIN에서 O(m+n)으로 강하다. 단, Build Phase가 끝나야 첫 Row를 반환할 수 있고, `join_buffer_size`를 초과하면 디스크로 내려가 성능이 급격히 저하된다. Non-equijoin(`>`, `<`, `BETWEEN`)에서는 사용 불가. **NLJ + 인덱스**: 결과 건수가 작을 때 압도적으로 빠르고, LIMIT 있는 쿼리에서 전체를 읽지 않아도 된다.
+</Callout>
+
+## EXPLAIN ANALYZE로 통계 오류 잡기
+
+`EXPLAIN`은 Optimizer의 예측을 보여주지만, `EXPLAIN ANALYZE`는 실제 실행 후 예측과 실제를 비교한다.
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 1\G
+-- -> Index lookup on orders using idx_user_id (user_id=1)
+--    (cost=101.0 rows=100)                         ← 예측
+--    (actual time=0.5..10.2 rows=5000 loops=1)     ← 실제
+```
+
+`rows=100` vs `actual rows=5000` — 50배 오차. 이게 보이면 `ANALYZE TABLE`이 먼저다. 힌트(`FORCE INDEX`)는 그 다음이다.
+
+<Aside label="힌트의 위험">
+`FORCE INDEX`는 인덱스명을 코드에 하드코딩한다. 인덱스가 삭제되거나 이름이 바뀌면 조용히 Full Scan으로 전환된다. 힌트를 쓸 때는 이유를 주석과 이슈 트래커에 반드시 남겨야 한다. 그리고 통계 정비 후 제거 계획을 함께 작성해야 한다.
+</Aside>
+
+## 정리
+
+- MySQL 쿼리는 Parse → Preprocess → Optimize → Execute 순으로 처리된다. `EXPLAIN`은 Optimize 단계의 출력이고, `Handler_read_*`는 Execute 단계의 실측치다.
+- Optimizer의 판단은 통계 기반이다. 통계가 틀리면 실행계획이 틀린다. 대규모 변경 후에는 `ANALYZE TABLE`을 명시적으로 호출하라.
+- 값 분포가 편중된 컬럼은 히스토그램(`ANALYZE TABLE ... UPDATE HISTOGRAM`)으로 Cardinality 통계의 균등 분포 가정을 보완하라.
+- JOIN은 Driving Table(작은 쪽)과 Driven Table(인덱스 필수)의 조합이 성능을 결정한다. Hash Join은 인덱스가 없을 때의 차선책이지 목표가 아니다.
+- `EXPLAIN ANALYZE`의 `(cost=X rows=Y) vs (actual rows=Z)`를 보는 습관을 들이면, "인덱스는 있는데 왜 느리지?"에 대한 답을 대부분 찾을 수 있다.
+
+다음 글에서는 InnoDB의 B+Tree 구조가 Clustered Index와 Secondary Index로 어떻게 구성되고, Double Lookup이 왜 발생하는지, Covering Index가 어떻게 이를 제거하는지 추적한다.

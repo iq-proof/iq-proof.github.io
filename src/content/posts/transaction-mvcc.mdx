@@ -1,0 +1,110 @@
+---
+title: "ACID는 누가 보장하는가"
+description: "Undo Log부터 Gap Lock까지, InnoDB가 ACID 네 글자를 각각 다른 메커니즘으로 구현하는 방식과 그 상호작용을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [database, innodb, acid, mvcc, redo-log]
+difficulty: intermediate
+series:
+  slug: database-internals
+  title: Database Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@Transactional`을 붙이면 ACID가 보장된다고 믿기 쉽다. 하지만 Spring의 애노테이션은 InnoDB에 `BEGIN`과 `COMMIT`/`ROLLBACK` 신호를 전달하는 것에 불과하다. 실제 ACID의 네 글자는 InnoDB 내부의 완전히 다른 메커니즘들이 분담한다. 그렇다면 `CheckedException`이 발생했을 때 데이터가 사라지거나, 격리 수준을 올려도 동시 쓰기 충돌이 사라지지 않는 이유는 무엇인가?
+
+## ACID 담당자 분리
+
+ACID를 하나의 블랙박스로 이해하면 설정 실수를 사후에야 발견한다. 담당자를 분리해서 보면 어디서 무엇이 부서지는지 바로 보인다.
+
+- **A (Atomicity)**: InnoDB Undo Log. 변경 전 상태(Before Image)를 기록해두고, `ROLLBACK` 시 역방향으로 적용한다.
+- **C (Consistency)**: DB 제약조건(PK, FK, CHECK) + 애플리케이션 코드. "재고가 0 미만이 되면 안 된다"는 규칙은 `@Transactional` 안의 비즈니스 로직이 검증해야 한다.
+- **I (Isolation)**: MVCC(읽기) + Row-Level Lock(쓰기). 격리 수준은 Read View를 "언제 생성하는가"의 차이다.
+- **D (Durability)**: Redo Log + WAL. `COMMIT` 시 Sequential Write로 먼저 기록하고, Dirty Page는 나중에 비동기로 쓴다.
+
+`@Transactional`은 이 네 메커니즘을 "묶어서 실행"하게 만드는 조율자일 뿐, ACID 자체를 구현하지는 않는다.
+
+<Callout type="warning" title="rollbackFor 누락 함정">
+Spring의 기본 롤백 규칙은 `RuntimeException`에만 적용된다. `CheckedException`이 발생하면 기본적으로 `COMMIT`된다. `@Transactional(rollbackFor = Exception.class)`를 빠뜨리고 비즈니스 예외를 `CheckedException`으로 설계하면, 첫 번째 DB 변경만 반영되고 두 번째는 실행되지 않은 채로 트랜잭션이 완료된다.
+</Callout>
+
+## MVCC — 읽기가 쓰기를 차단하지 않는 이유
+
+InnoDB의 각 Row에는 숨겨진 컬럼 두 개가 있다. `DB_TRX_ID`(6 bytes, 마지막 변경 트랜잭션 ID)와 `DB_ROLL_PTR`(7 bytes, 이전 버전 Undo Log 위치). 이 두 컬럼이 **버전 체인**을 형성한다.
+
+```
+현재: [balance=6000 | TRX_ID=300 | ROLL_PTR=→UndoB]
+UndoB: [balance=8000 | TRX_ID=200 | ROLL_PTR=→UndoA]
+UndoA: [balance=10000 | TRX_ID=100 | ROLL_PTR=NULL]
+```
+
+`SELECT`를 실행하면 InnoDB는 **Read View**를 생성한다. Read View에는 생성 시점의 활성 트랜잭션 목록(`m_ids`)과 경계값이 담긴다. Row를 읽을 때 현재 버전의 `TRX_ID`가 "내가 봐야 할 버전"인지 판단하고, 아니면 `ROLL_PTR`을 따라 이전 버전으로 내려간다. Lock이 전혀 없다.
+
+격리 수준의 차이는 Read View 생성 시점이다.
+
+- **REPEATABLE READ** (기본값): 트랜잭션의 첫 번째 읽기 시 1회 생성, 이후 고정.
+- **READ COMMITTED**: `SELECT`마다 새 Read View 생성 → 항상 최신 커밋 반영, Non-Repeatable Read 발생 가능.
+
+장기 트랜잭션이 시스템에 미치는 영향이 여기서 나온다. Read View가 살아있는 동안 Purge Thread는 그 시점 이후의 Undo Log를 삭제하지 못한다. 30분짜리 분석 쿼리가 운영 DB에서 실행되면, 그 동안 발생한 모든 UPDATE의 Undo Log가 쌓인다. `SHOW ENGINE INNODB STATUS`의 `History list length`가 수만을 넘으면 다른 세션의 `SELECT`도 버전 체인을 길게 탐색해야 하므로 느려진다.
+
+## Consistent Read vs Current Read
+
+MVCC를 이해했다면 하나의 함정을 더 알아야 한다. 일반 `SELECT`는 Consistent Read(스냅샷)지만, `SELECT ... FOR UPDATE`, `UPDATE`, `DELETE`는 **Current Read**(최신 커밋 버전)다.
+
+같은 트랜잭션 안에서 두 방식을 혼용하면 읽은 값과 실제 수정 기준이 달라진다.
+
+```java
+// 위험한 패턴
+Order order = orderRepository.findById(id);   // Consistent Read: status="PAID"
+// [다른 스레드가 status="REFUNDED"로 변경 + COMMIT]
+order.setStatus("REFUNDING");
+orderRepository.save(order);                   // Current Read + UPDATE → "REFUNDED" 덮어씀
+```
+
+값을 읽고 그 값을 기반으로 수정한다면 반드시 `FOR UPDATE`로 통일해야 한다. `@Lock(LockModeType.PESSIMISTIC_WRITE)`가 이를 JPA에서 표현하는 방법이다.
+
+<Callout type="note" title="트레이드오프">
+Pessimistic Lock(`FOR UPDATE`)은 충돌이 잦을 때 안전하지만 Deadlock 가능성이 있다. Optimistic Lock(`@Version`)은 Lock 없이 높은 처리량을 제공하지만, 충돌 시 재시도가 필요하고 외부 시스템 호출이 포함된 트랜잭션에는 부적합하다. 기준은 단순하다 — 충돌 빈도가 낮고 재시도가 부작용 없을 때는 Optimistic, 그렇지 않으면 Pessimistic.
+</Callout>
+
+## Phantom Read와 Gap Lock
+
+REPEATABLE READ에서 일반 `SELECT`는 Read View 고정으로 Phantom Read를 막는다. 그런데 `FOR UPDATE`는 Current Read이므로 다른 트랜잭션이 삽입한 Row가 보일 수 있다.
+
+InnoDB는 이를 **Gap Lock**으로 해결한다. `SELECT ... FOR UPDATE WHERE amount BETWEEN 1000 AND 5000` 실행 시, 해당 Range의 레코드에 Record Lock을 걸 뿐 아니라 인덱스 간격(Gap)에도 Lock을 건다. 이 Gap에 `INSERT Intention Lock`을 요청하는 다른 트랜잭션은 차단된다.
+
+주의할 점은 Gap Lock끼리는 공존하지만, 두 트랜잭션이 같은 Gap에 Gap Lock을 보유한 채 서로 삽입을 시도하면 순환 대기가 발생한다는 것이다. `INSERT ... ON DUPLICATE KEY UPDATE`를 여러 스레드가 동시에 실행할 때 Deadlock이 빈번한 이유가 여기 있다. Gap Lock이 문제라면 READ COMMITTED로 낮추는 것을 고려할 수 있다 — 단, Phantom Read를 허용해도 되는지 먼저 검토해야 한다.
+
+## Durability — WAL이 내구성과 성능을 동시에 달성하는 방법
+
+`COMMIT` 시 Buffer Pool의 Dirty Page를 즉시 디스크에 쓰면 Random I/O가 발생한다. HDD 기준 수 ms/페이지, COMMIT이 많으면 병목이다.
+
+WAL(Write-Ahead Logging)은 이 문제를 Sequential I/O로 우회한다. 변경 내용을 Redo Log에 순차적으로 먼저 기록(`fsync`)하고, Dirty Page는 백그라운드에서 비동기로 쓴다. COMMIT 성능은 Redo Log Sequential Write 속도와 같아진다.
+
+`innodb_flush_log_at_trx_commit` 설정이 내구성 수준을 결정한다.
+
+| 설정 | COMMIT 동작 | MySQL 크래시 | OS 크래시 |
+|:----:|:------------|:------------|:---------|
+| 1 (기본) | write + fsync | 안전 | 안전 |
+| 2 | write만 | 안전 | 최대 1초 손실 |
+| 0 | 없음 | 최대 1초 손실 | 최대 1초 손실 |
+
+Replica에서 설정 2를 쓰는 것은 합리적이다 — Replica가 OS 크래시로 일부 데이터를 잃어도 Primary의 Binary Log로 재동기화할 수 있기 때문이다. Primary는 반드시 설정 1을 유지해야 한다.
+
+<Aside label="Group Commit">
+동시 접속자가 많을 때, 여러 COMMIT을 묶어 단 1번의 `fsync`로 처리하는 것이 Group Commit이다. `Com_commit / Innodb_os_log_fsyncs` 비율이 1보다 크면 효과적으로 동작 중이다. 이것이 높은 동시성에서 설정 1도 충분히 빠를 수 있는 이유다.
+</Aside>
+
+## 정리
+
+- `@Transactional`은 ACID를 구현하지 않는다. A는 Undo Log, D는 Redo Log, I는 MVCC + Lock, C는 애플리케이션 코드가 각각 담당한다.
+- MVCC에서 격리 수준의 차이는 Read View 생성 시점의 차이다. 장기 트랜잭션은 Undo Log를 축적시켜 시스템 전체 성능에 영향을 준다.
+- Consistent Read(일반 SELECT)와 Current Read(FOR UPDATE, DML)를 혼용하면 읽은 값과 수정 기준이 달라진다 — 읽고 수정할 때는 반드시 `FOR UPDATE`로 통일하라.
+- `innodb_flush_log_at_trx_commit = 0`은 개발 환경에서만 허용된다. Primary 프로덕션 서버는 반드시 1이어야 한다.
+
+다음 글에서는 Undo Log의 물리적 구조와 Purge Thread의 작동 방식, 그리고 `History list length`가 높아질 때 실제로 어떤 쿼리가 느려지는지를 추적한다.
