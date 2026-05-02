@@ -1,0 +1,86 @@
+---
+title: "Linux 프로세스 모델은 왜 이렇게 설계됐는가"
+description: "주소 공간 레이아웃과 PCB부터 CoW, 스레드 모델, 컨텍스트 스위칭, 시그널, CFS 스케줄러까지 — 백엔드 개발자가 알아야 할 리눅스 프로세스 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, process, kernel, jvm, cgroups]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`-Xmx4g`를 설정했는데 JVM 프로세스가 6GB를 쓴다. `BGSAVE` 도중 Redis 메모리가 갑자기 두 배로 치솟는다. 스레드 풀을 500으로 늘렸더니 오히려 처리량이 줄었다. 이 증상들은 서로 다른 문제처럼 보이지만, 뿌리는 하나다 — 리눅스가 **프로세스를 어떻게 다루는지** 모른다는 것. 왜 이 설계 결정들이 내려졌고, 그 결과가 지금 내 서비스에 어떻게 나타나는가?
+
+## 프로세스의 해부학: 주소 공간과 PCB
+
+프로세스는 실행 중인 프로그램에 커널이 부여한 **독립된 가상 주소 공간**이다. 64비트 리눅스에서 이 공간은 낮은 주소부터 코드(`.text`) → 초기화된 데이터(`.data`) → 힙(위로 성장) → ... → 스택(아래로 성장) 순으로 배치된다. Java의 Heap은 JVM이 `mmap()`으로 예약한 영역이고, 스레드마다 독립 스택이 존재한다. `-Xmx4g`는 Java Heap만 제한한다. Metaspace, Code Cache, 스레드 스택, Native Memory는 그 바깥에 따로 존재한다.
+
+커널은 모든 프로세스를 `task_struct`라는 구조체(PCB)로 관리한다. 여기에 프로세스 상태(`R/S/D/T/Z`), 가상 주소 공간 포인터(`mm_struct`), CPU 레지스터 스냅샷, 열린 파일 디스크립터 테이블이 담긴다. `kill -9`가 안 먹히는 프로세스는 대부분 `D` 상태(Uninterruptible Sleep)다. 커널이 디스크 I/O 중 데이터 일관성을 보장하기 위해 `SIGKILL`조차 처리하지 않는 구간이다.
+
+```bash
+# JVM 프로세스의 실제 메모리 분해
+$ jcmd $PID VM.native_memory summary
+Total: reserved=8192MB, committed=4500MB
+- Java Heap  (reserved=4096MB, committed=4096MB)
+- Class      (reserved=1056MB, committed=52MB)   ← Metaspace
+- Thread     (reserved=400MB,  committed=400MB)  ← 200 threads * 2MB
+- Code       (reserved=256MB,  committed=40MB)   ← JIT 코드
+```
+
+## fork()와 CoW: 공짜 스냅샷의 원리
+
+`fork()` 호출 직후 자식 프로세스는 부모의 메모리를 **복사하지 않는다**. 커널은 부모의 페이지 테이블만 복제하고, 모든 페이지를 읽기 전용으로 표시한다. 실제 복사는 어느 쪽이든 해당 페이지에 **쓰기를 시도하는 순간** Page Fault를 통해 그 페이지만 일어난다. 이것이 Copy-On-Write(CoW)다.
+
+Redis `BGSAVE`는 이 원리를 그대로 쓴다. `fork()`로 자식을 만들면 자식은 fork() 시점의 메모리 스냅샷을 "소유"한다. 부모가 계속 쓰기 요청을 받아도 자식은 원본 페이지를 읽는다. 일관된 스냅샷이 복사 비용 없이 생긴다.
+
+<Callout type="warning" title="CoW의 숨겨진 비용">
+쓰기 요청이 많은 Redis 서버에서 BGSAVE 도중 메모리가 최대 2배까지 증가할 수 있다. 수정된 페이지마다 물리 복사본이 생기기 때문이다. 데이터 크기의 1.5~2배 메모리를 확보해야 하는 이유다. 또한 THP(Transparent HugePages)가 활성화되면 CoW 단위가 2MB가 되어 작은 쓰기에도 2MB 전체가 복사된다 — Redis가 THP 비활성화를 강하게 권고하는 이유가 여기 있다.
+</Callout>
+
+## 스레드: 주소 공간을 공유하는 가벼운 프로세스
+
+리눅스 커널에서 스레드와 프로세스는 모두 `task_struct`다. 차이는 `clone()` 시스템 콜에 어떤 플래그를 넘기느냐다. `CLONE_VM` 플래그를 주면 새 `task_struct`가 부모의 `mm_struct`를 **공유**한다 — 이게 스레드다. 페이지 테이블을 복사할 필요가 없으므로 생성이 프로세스보다 5~10배 빠르고, TLB 플러시도 필요 없다.
+
+Java의 Platform Thread(Java 20 이하)는 OS 스레드와 1:1 매핑된다. 스레드 하나가 OS 스레드 하나를 점유하므로, I/O 대기 중인 스레드는 그 동안 OS 스레드를 낭비한다. Tomcat 기본 스레드 풀 200개는 이 비용 때문에 설정된 안전한 한도다.
+
+Java 21 Virtual Thread는 이 매핑을 끊는다. I/O 대기 시 OS 스레드에서 분리(unmount)되고, 완료되면 다시 마운트된다. OS 스레드는 CPU 코어 수만큼만 유지하면서 수백만 Virtual Thread를 다룰 수 있다.
+
+## 컨텍스트 스위칭: 스위칭 자체보다 TLB 플러시가 비싸다
+
+스케줄러가 태스크를 교체할 때 커널은 현재 CPU 레지스터(rip, rsp, 범용 레지스터 등)를 PCB에 저장하고 다음 태스크의 레지스터를 복원한다. 이 작업 자체는 ~1μs 수준이다. 진짜 비용은 **다른 프로세스로 전환할 때 발생하는 TLB 플러시**다.
+
+TLB는 가상 주소 → 물리 주소 변환을 캐싱한다. 프로세스마다 페이지 테이블이 다르므로 프로세스 교체 시 TLB를 비워야 한다. 비워진 TLB는 다음 메모리 접근마다 페이지 테이블 워크(수십~수백 사이클)를 유발한다. 스레드 간 전환은 같은 페이지 테이블을 공유하므로 TLB 플러시가 없다.
+
+`top`에서 `sy`(system) CPU가 높고 `us`(user)가 낮다면, CPU가 실제 작업 대신 스위칭에 시간을 쏟는 중이다. 스레드 수를 CPU 코어 수에 비해 과도하게 늘리면 이 현상이 나타난다. I/O 바운드 작업의 적정 스레드 수는 `CPU 코어 수 × (1 + I/O 대기 시간 / CPU 사용 시간)`에 수렴한다.
+
+## 시그널과 Graceful Shutdown의 연결
+
+`SIGTERM`과 `SIGKILL`은 커널 처리 경로가 다르다. `SIGTERM`은 대상 프로세스의 `pending` 시그널 큐에 추가되고, 프로세스가 커널 모드에서 유저 모드로 복귀할 때 등록된 핸들러가 실행된다. 핸들러를 등록하지 않으면 기본 동작(종료)이 일어난다. `SIGKILL`은 커널이 직접 처리하므로 핸들러 등록이 불가능하고, `D` 상태에서도 즉시 처리되지 않는다.
+
+Kubernetes의 Pod 종료 흐름은 이 원리 위에 서 있다. `SIGTERM` → `terminationGracePeriodSeconds` 대기 → 기간 초과 시 `SIGKILL`. 그런데 Docker에서 `CMD java -jar app.jar`(shell 형식)로 실행하면 `sh`가 PID 1이 되고, `java`는 `sh`의 자식이 된다. `sh`는 기본적으로 `SIGTERM`을 자식에게 전달하지 않는다. 10초 후 `SIGKILL`로 강제 종료되는 이유다. `ENTRYPOINT ["java", "-jar", "app.jar"]`(exec 형식)이나 `tini` 같은 init 프로세스를 쓰면 `java`가 PID 1이 되어 `SIGTERM`을 직접 받는다.
+
+## CFS: vruntime과 CPU Throttling
+
+CFS(Completely Fair Scheduler)는 모든 태스크에 `vruntime`(가상 실행 시간)을 부여한다. 태스크가 실행될수록 `vruntime`이 증가하고, 스케줄러는 항상 `vruntime`이 가장 작은 태스크를 선택한다. `nice` 값은 `vruntime` 증가 속도를 조절하는 가중치다. `nice -20`(최고 우선순위)은 `nice 0` 대비 가중치가 86배 높아 같은 실행 시간에 `vruntime`이 훨씬 천천히 증가한다.
+
+Docker `--cpus=1.5`는 cgroups의 CFS Bandwidth Control로 구현된다. 100ms 주기에서 150ms분 CPU를 허용한다. 4개 스레드가 병렬로 실행되면 37.5ms만에 쿼터를 소진하고, 남은 62.5ms 동안 **CPU Throttling** 상태가 된다. CPU 사용률 지표는 30%처럼 보이지만 실제로는 실행과 대기가 반복된다. 이 구간에 요청이 오면 응답 지연이 발생한다.
+
+<Callout type="note" title="트레이드오프">
+CFS 공정성과 응답 지연은 트레이드오프다. Redis처럼 지연 민감한 서비스는 CPU 어피니티(`taskset -c 0 redis-server`)로 특정 코어에 고정해 L1/L2 캐시 지역성을 높이고 NUMA 원격 접근을 피할 수 있다. 반면 코어를 고정하면 해당 코어에 부하가 집중되고 전체 CPU 활용률이 낮아진다. CPU Throttling이 의심될 때는 `cat /sys/fs/cgroup/cpu/.../cpu.stat`의 `nr_throttled`를 먼저 확인하라.
+</Callout>
+
+## 정리
+
+- 프로세스 주소 공간은 코드 → 데이터 → 힙 → 스택의 구조다. JVM의 `-Xmx`는 Heap만 제한하고 Metaspace, 스레드 스택, Native Memory는 별도다.
+- `fork()` + CoW는 물리 복사 없이 스냅샷을 만든다. Redis BGSAVE의 일관성이 이 원리에서 나오고, 쓰기 비율만큼 메모리가 추가로 필요하다.
+- 리눅스에서 스레드는 주소 공간을 공유하는 `task_struct`다. Java 21 Virtual Thread는 OS 스레드와의 1:1 매핑을 끊어 I/O 대기 비용을 제거한다.
+- 컨텍스트 스위칭의 진짜 비용은 TLB 플러시와 캐시 워밍업이다. `top`의 `sy` 수치와 `/proc/<pid>/status`의 `nonvoluntary_ctxt_switches`로 진단한다.
+- `SIGTERM`은 핸들러 등록 가능, `SIGKILL`은 불가능. Docker PID 1 문제는 exec 형식 ENTRYPOINT로 해결한다.
+- CPU 사용률이 낮은데 응답이 느리면 CFS Throttling을 의심한다. `cpu.stat`의 `nr_

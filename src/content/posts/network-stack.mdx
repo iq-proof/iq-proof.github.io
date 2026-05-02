@@ -1,0 +1,119 @@
+---
+title: "Linux 소켓은 어디서 멈추는가"
+description: "send() 반환이 전송 완료가 아닌 이유부터 Zero Window, Accept Queue 포화, TCP_NODELAY, sendfile()까지 — 커널이 데이터를 움직이는 실제 경로를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, socket, tcp, kernel, zero-copy]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+백엔드 개발자는 매일 소켓을 쓴다. `send()`를 호출하고, `recv()`로 응답을 받고, 연결 풀을 관리한다. 그런데 `send()`가 성공을 반환한 순간, 데이터는 실제로 어디에 있는가? 커널이 데이터를 움직이는 경로를 모르면, 특정 명령어 하나가 서비스 전체를 멈추는 이유를 영원히 파악할 수 없다.
+
+## send()는 전송이 아니라 복사다
+
+`send()`는 유저 공간 버퍼의 데이터를 **커널 송신 버퍼(`sk_sndbuf`)**에 복사하고 반환한다. 실제 네트워크 전송은 그 이후 커널이 비동기로 처리한다.
+
+```
+send(sockfd, buf, len, 0) 호출:
+
+[유저 공간 버퍼]
+    │ copy_from_user
+    ▼
+[커널 sk_buff 할당 → TCP 헤더 추가 → sk_write_queue 삽입]
+    │ ← 여기서 send() 반환!
+    ▼ (비동기)
+[tcp_write_xmit → IP 레이어 → NIC → 네트워크]
+```
+
+`Send-Q`가 그 증거다. `ss -tmn`에서 `Send-Q > 0`이면 커널이 아직 전송하지 못한 데이터가 버퍼에 쌓여 있다는 뜻이다. 상대방이 Zero Window를 광고했거나 네트워크 혼잡으로 전송이 멈춘 상태다.
+
+`close()`를 너무 빨리 호출하면 문제가 생긴다. 프로세스가 즉시 종료되면 송신 버퍼에 남아있던 데이터가 TCP RST와 함께 사라질 수 있다. `SO_LINGER` 설정이나 애플리케이션 레벨 ACK 없이는 데이터 전달을 보장할 수 없다.
+
+## 수신 버퍼가 차면 전체가 멈춘다
+
+수신 측 이야기도 대칭적이다. `recv()`는 커널 수신 버퍼(`sk_rcvbuf`)에서 유저 버퍼로 복사한다. NIC에서 DMA로 들어온 패킷은 `sk_receive_queue`에 쌓이고, 애플리케이션이 읽을 때 비로소 꺼내진다.
+
+애플리케이션이 데이터를 처리하는 속도가 수신 속도보다 느리면 수신 버퍼가 가득 찬다. 그 순간 TCP가 **Zero Window Advertisement**를 송신 측에 보낸다.
+
+<Callout type="warning" title="Zero Window — 흐름 제어의 연쇄 반응">
+수신 버퍼 포화 → `Window Size = 0` 광고 → 송신 측 전송 중지 → 송신 측 `Send-Q` 증가 → 송신 측 `send()` 블로킹. 애플리케이션 하나가 느려지면 반대편 애플리케이션도 멈춘다. `ss -tmn`에서 `Recv-Q`가 가득 찬 소켓이 보이면 이 상태다.
+</Callout>
+
+버퍼 크기는 네트워크 BDP(Bandwidth-Delay Product)를 기준으로 설정한다. 1Gbps, RTT 50ms 환경이라면 BDP = 6.25MB다. 기본값 87,380바이트로는 파이프를 절반도 채울 수 없다.
+
+## Accept Queue — 연결이 쌓이는 곳
+
+소켓이 데이터를 교환하기 전에 연결 수립 단계가 있다. 커널은 이 과정에서 두 개의 큐를 관리한다.
+
+```
+클라이언트 SYN → [SYN Backlog] → ACK 완료 → [Accept Queue] → accept() → 애플리케이션
+```
+
+**SYN Backlog**는 3-way handshake가 진행 중인 반완성 연결을 저장한다. `tcp_max_syn_backlog`로 크기를 제어한다. 이 큐가 가득 차면 새 SYN이 드롭되고 클라이언트는 재전송 후 타임아웃을 경험한다.
+
+**Accept Queue**는 handshake가 완료됐지만 아직 `accept()`를 기다리는 연결을 저장한다. 크기는 `min(net.core.somaxconn, listen() backlog)`다. 기본 `somaxconn`은 128이다. 배포 직후 트래픽이 몰리면 이 큐가 순간적으로 차서 RST가 발생한다. Kubernetes Pod 시작 직후의 `Connection refused`는 대부분 이 원인이다.
+
+```bash
+# LISTEN 소켓 큐 상태
+$ ss -ltnp
+State    Recv-Q  Send-Q
+LISTEN   5       128    ← Recv-Q=5 (대기 연결), Send-Q=128 (큐 최대)
+
+# 오버플로 카운터 확인
+$ netstat -s | grep overflow
+    1234 times the listen queue of a socket overflowed
+```
+
+## 소켓 옵션이 레이턴시를 결정한다
+
+소켓 옵션은 커널의 기본 동작을 바꾸는 스위치다. 실무에서 자주 마주치는 세 가지를 짚는다.
+
+**TCP_NODELAY**: Nagle 알고리즘을 비활성화한다. Nagle은 작은 패킷을 모아 보내려 하는데, 이전 ACK가 오지 않으면 최대 200ms를 기다린다. Delayed ACK(서버가 ACK를 즉시 안 보냄)와 결합하면 400ms 지연이 생긴다. Redis, gRPC처럼 수십 바이트 명령어를 빈번히 주고받는 서비스에서는 `TCP_NODELAY`가 필수다.
+
+**SO_KEEPALIVE**: 커널이 주기적으로 probe 패킷을 보내 죽은 연결을 감지한다. 기본 `tcp_keepalive_time`은 7200초(2시간)다. AWS ELB idle timeout은 60초다. 방화벽이 연결을 끊기 전에 keepalive가 동작하려면 `tcp_keepalive_time`을 방화벽 타임아웃보다 낮게 설정해야 한다.
+
+**SO_REUSEPORT**: 여러 프로세스가 같은 포트를 독립 소켓으로 `listen()`한다. 커널이 해시 기반으로 연결을 분산한다. 하나의 Accept Queue를 두고 벌어지는 `thundering herd` 경합이 사라진다. Nginx의 `listen 80 reuseport`가 이것을 사용한다.
+
+<Callout type="note" title="트레이드오프">
+TCP_NODELAY는 레이턴시를 낮추지만 패킷 수를 늘린다. SO_KEEPALIVE는 죽은 연결을 감지하지만 probe 패킷을 발생시킨다. SO_REUSEPORT는 Accept 경합을 없애지만 rolling restart 시 해당 소켓의 대기 연결이 끊길 수 있다. 각 옵션은 문제 하나를 해결하고 다른 비용을 수반한다.
+</Callout>
+
+## sendfile() — 유저 공간을 건너뛰는 경로
+
+일반 파일 전송은 4번 복사를 거친다: 디스크→Page Cache, Page Cache→유저 버퍼, 유저 버퍼→소켓 버퍼, 소켓 버퍼→NIC. CPU가 중간 두 번을 담당한다.
+
+`sendfile()`은 유저 공간 복사를 제거한다.
+
+```
+read()+write():  디스크 → PageCache → [유저 버퍼] → 소켓버퍼 → NIC  (CPU 2회)
+sendfile():      디스크 → PageCache ─────────────────────────→ NIC  (DMA만)
+```
+
+SG DMA를 지원하는 NIC에서는 Page Cache의 페이지 디스크립터만 소켓에 넘기고, NIC이 직접 Page Cache에서 읽어 전송한다. CPU가 데이터를 만지지 않는다. 512MB 파일 전송 시 `read()+write()`가 CPU 35%를 쓸 때 `sendfile()`은 5%를 쓴다.
+
+Kafka가 Consumer에게 초당 수 GB를 보낼 수 있는 이유가 여기 있다. Java `FileChannel.transferTo()`는 내부적으로 `sendfile64()` 시스템 콜을 사용한다. Nginx의 `sendfile on`도 마찬가지다.
+
+제약은 명확하다. `sendfile()`은 파일→소켓 전용이며, 데이터를 변환할 수 없다. TLS 암호화는 유저 공간에서 수행되므로 HTTPS 서버에서는 `sendfile on` 설정이 있어도 실제로 동작하지 않는다.
+
+<Aside label="커널 파라미터 튜닝 기준">
+고트래픽 서버의 최소 설정 체크리스트: `net.core.somaxconn=4096`, `tcp_max_syn_backlog=8192`, `net.ipv4.tcp_tw_reuse=1`, `ulimit -n 65536`. TIME_WAIT가 폭발하는 근본 원인은 짧은 연결의 반복이다. 파라미터 튜닝은 완화책이고, HTTP Keep-Alive와 Connection Pool이 근본 해결책이다.
+</Aside>
+
+## 정리
+
+- `send()`는 커널 버퍼로의 복사 완료를 의미한다. 실제 전송은 커널이 비동기로 처리한다.
+- 수신 버퍼가 포화되면 TCP Zero Window가 발동해 반대편 `send()`까지 블로킹된다.
+- Accept Queue 크기는 `min(somaxconn, listen backlog)`다. 기본값 128은 트래픽 급증 시 즉시 포화된다.
+- `TCP_NODELAY`는 Nagle 알고리즘을 끄고, `SO_KEEPALIVE`는 죽은 연결을 감지하며, `SO_REUSEPORT`는 Accept 경합을 없앤다.
+- `sendfile()`은 유저 공간 복사를 제거해 CPU 사용률을 극적으로 낮춘다. 단, 데이터 변환이 필요한 경로(TLS, gzip)에서는 동작하지 않는다.
+
+커널이 데이터를 어떻게 움직이는지 알면, 병목이 어디서 생기는지 보이기 시작한다.

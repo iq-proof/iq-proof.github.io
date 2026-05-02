@@ -1,0 +1,125 @@
+---
+title: "Linux I/O 모델은 왜 이렇게 설계됐는가"
+description: "파일 디스크립터의 정체부터 epoll의 O(1) 이벤트 처리까지, Blocking/Non-Blocking/Multiplexing I/O의 설계 결정과 백엔드 프레임워크 선택의 근거를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, io, epoll, event-loop, backend]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Netty가 "Zero-copy"라고 말할 때 실제로 무엇을 줄이는가? Spring WebFlux로 바꿨는데 왜 처리량이 오히려 줄었는가? 이 질문들의 답은 모두 같은 곳에 있다 — 커널이 I/O를 처리하는 방식. 운영 서버에서 `KEYS *` 하나가 전체 Redis를 멈추는 이유도, Tomcat 스레드를 1000개로 늘려도 처리량이 안 오르는 이유도, 커널 레벨에서 보면 동일한 원리로 설명된다.
+
+## 파일 디스크립터 — 커널의 추상화 단위
+
+파일 디스크립터(fd)는 단순한 정수 인덱스다. 하지만 이 인덱스가 가리키는 구조는 세 겹으로 이어진다.
+
+```
+프로세스 task_struct
+└── files_struct (fd 테이블)
+     ├── fd[0] → 파일 테이블 엔트리 (오프셋, 접근 모드)
+     │              └── inode (크기, 권한, 디스크 블록 주소)
+     ├── fd[3] → 파일 테이블 엔트리
+     │              └── inode
+     └── fd[4] → anon_inode:eventpoll  ← epoll 인스턴스도 fd
+```
+
+소켓도 fd다. 파이프도 fd다. epoll 인스턴스도 fd다. `read()`와 `write()`가 파일과 소켓에 동일하게 동작하는 이유가 여기 있다. 커널은 fd 타입에 따라 내부 동작을 다르게 처리하지만, 인터페이스는 통일되어 있다.
+
+시스템 콜은 이 fd를 통해 커널로 진입하는 관문이다. `read(fd, buf, n)` 한 번 호출마다 CPU가 Ring 3(유저 모드)에서 Ring 0(커널 모드)으로 전환되고, 레지스터를 저장하고, 커널 스택으로 교체하고, 결과를 복사한 뒤 다시 되돌아온다. 이 전환 비용이 100ns~1μs다. 1바이트씩 파일을 읽으면 100MB 파일에 1억 번의 시스템 콜, 즉 최대 수백 초의 오버헤드만 낭비한다. 버퍼를 8KB로 키우면 시스템 콜은 12,800번으로 줄고 처리 시간은 0.05초 이하가 된다.
+
+## Blocking I/O — 프로세스가 잠드는 구조
+
+`read(sockfd, buf, n)`을 소켓에 호출했을 때 수신 버퍼가 비어 있다면 프로세스 상태가 `TASK_RUNNING`에서 `TASK_INTERRUPTIBLE`로 바뀐다. 스케줄러는 이 프로세스를 런큐에서 내리고 다른 프로세스를 실행한다. CPU 사용은 0이다.
+
+데이터가 도착하면 NIC가 DMA로 sk_buff(커널 수신 버퍼)에 패킷을 기록하고, 인터럽트를 발생시킨다. 인터럽트 핸들러가 해당 소켓의 대기 큐에서 프로세스를 깨운다(`wake_up_interruptible()`). 프로세스는 다시 런큐에 올라가고, 스케줄러가 CPU를 할당하면 `copy_to_user()`로 데이터가 앱 버퍼로 복사된다.
+
+이 구조의 한계는 명확하다. 연결 하나당 스레드 하나가 필요하다. 동시 연결 10,000개면 OS 스레드 10,000개, 스택 메모리만 8~80GB가 필요하다. 1999년 Dan Kegel이 제기한 C10K 문제가 바로 이 지점이다.
+
+<Callout type="note" title="Blocking I/O가 적합한 경우">
+연결 수가 스레드 풀보다 적고, JDBC 같은 Blocking API를 반드시 써야 하고, 팀이 동기 코드에 익숙하다면 Tomcat이 더 나은 선택일 수 있다. 복잡성 비용 없이 코드가 명확하고 스택 트레이스가 직관적이다.
+</Callout>
+
+## Non-Blocking과 busy-wait의 함정
+
+`fcntl(fd, F_SETFL, flags | O_NONBLOCK)`으로 소켓을 Non-Blocking으로 설정하면 `read()`는 수신 버퍼가 비어 있을 때 `EAGAIN(-11)`을 즉시 반환한다. 프로세스가 잠들지 않는다.
+
+그런데 가장 단순한 Non-Blocking 구현은 EAGAIN을 받으면 즉시 재시도하는 루프다.
+
+```c
+while (1) {
+    n = read(fd, buf, sizeof(buf));
+    if (n > 0) { process(buf, n); break; }
+    if (n < 0 && errno == EAGAIN) continue;  // 즉시 재시도
+}
+```
+
+데이터가 없는 10ms 동안 `read()` 시스템 콜을 1만 번 호출하고 CPU 코어 하나를 100% 소비한다. Blocking I/O는 대기 중 CPU를 0% 쓰는데, busy-wait은 반대로 일하지 않으면서 CPU를 독점한다. `EAGAIN`은 에러가 아니라 "지금은 데이터 없음, 나중에 다시 시도하라"는 신호다. 이것을 에러로 처리해 연결을 끊는 실수도 흔하다.
+
+Non-Blocking I/O 단독으로는 고성능 서버를 만들 수 없다. `epoll` 같은 이벤트 통지 메커니즘과 조합해야 비로소 의미를 갖는다.
+
+## select/poll의 O(N) 벽과 epoll의 O(1) 돌파
+
+`select()`는 관심 fd를 비트마스크로 커널에 전달하고, 커널이 전체를 순회해 준비된 fd를 표시한다. `FD_SETSIZE=1024` 하드 제한이 있고, 호출마다 fd 목록 전체를 복사하고 전체를 스캔한다.
+
+`poll()`은 fd 제한은 없앴지만 구조적 문제는 같다. 연결 10,000개에서 이벤트 하나를 찾으려면 10,000개 fd를 모두 검사한다. 초당 100 이벤트라면 초당 1,000,000번의 fd 검사가 필요하고, 그 중 999,900번은 낭비다.
+
+`epoll`은 다른 질문을 한다. "지금 어느 fd가 준비됐는지 검사해줘"가 아니라 "이벤트 발생하면 알려줘"다.
+
+```
+epoll 내부 구조:
+
+[레드-블랙 트리]  ← epoll_ctl()로 fd 등록/삭제 (O(log N))
+  fd 1000 → epitem (events=EPOLLIN, callback)
+  fd 1001 → epitem (events=EPOLLIN|EPOLLET, callback)
+  ...
+
+[준비 목록]  ← 이벤트 발생 시 callback이 epitem을 여기 추가
+  fd 1001: EPOLLIN 발생
+  fd 3500: EPOLLIN 발생
+
+epoll_wait() → 준비 목록을 그대로 반환 (O(이벤트 수))
+```
+
+fd를 한 번 등록하면 커널이 콜백으로 관리한다. 이벤트가 발생한 fd만 반환하므로 10,000 연결 중 100개에 이벤트가 왔다면 100개만 처리한다. 전체 스캔이 없다.
+
+레벨 트리거(LT)는 데이터가 버퍼에 남아 있는 한 계속 통지한다. 엣지 트리거(ET, `EPOLLET`)는 상태 변화 시 딱 한 번만 통지한다. ET 모드에서는 반드시 Non-Blocking fd와 조합해 `EAGAIN`까지 모든 데이터를 읽어야 한다. 중간에 멈추면 다음 통지가 오지 않아 데이터가 버퍼에 남은 채 무한 대기 상태가 된다. LT는 구현이 안전하고 단순하며, ET는 이벤트 통지 횟수를 줄여 고성능 서버(Nginx)에서 활용한다.
+
+Redis의 `ae_epoll.c`는 이 구조를 가장 깔끔하게 보여주는 예시다. `epoll_wait()`에서 대기하다 이벤트가 발생하면 명령어를 마이크로초 단위로 처리하고 다시 대기한다. 단일 스레드가 수만 연결을 다루면서 CPU를 낭비하지 않는 원리다.
+
+## I/O 모델이 프레임워크 선택을 결정한다
+
+동시 연결 1,000개를 가정할 때 두 모델의 리소스 차이는 크다.
+
+```
+                 Tomcat (스레드 풀)    Netty (이벤트 루프)
+OS 스레드 수     200~1000개           8~16개
+스레드 스택      200MB~1GB            8~16MB
+컨텍스트 스위칭  초당 수만 회          초당 수백 회
+```
+
+I/O 바운드 서비스(DB 쿼리 10ms)에서 Tomcat의 최대 처리량은 `스레드 수 / 대기 시간`으로 제한된다. 스레드 200개면 초당 20,000 req/s가 이론 한계다. WebFlux는 이 계산 자체가 다르다. 이벤트 루프가 I/O 대기 중에 다른 연결을 처리하므로 처리량이 DB 연결 풀에 제한되고, 스레드 수로 제한되지 않는다.
+
+Java 21의 Virtual Thread는 이 공식을 바꾼다. JVM이 JDBC 블로킹을 감지하면 OS 스레드를 반납하고 다른 Virtual Thread를 실행한다. 개발자는 동기 코드를 그대로 쓰지만 OS 스레드 관점에서는 Non-Blocking처럼 동작한다. 단, `synchronized` 블록 안에서 블로킹이 발생하면 OS 스레드가 고정(Pinning)된다.
+
+<Callout type="warning" title="트레이드오프">
+WebFlux가 항상 정답은 아니다. CPU 바운드 작업(이미지 처리, 암호화)은 I/O 대기가 없어 이벤트 루프의 장점이 없다. 이벤트 루프 스레드에서 CPU 집약 작업을 실행하면 해당 스레드가 담당하는 수천 개 연결이 전부 대기한다. 이 경우 `Schedulers.boundedElastic()`으로 오프로딩하거나, Virtual Thread + Tomcat이 더 단순한 선택이다.
+</Callout>
+
+<Aside label="설계 철학">
+파일 디스크립터, 시스템 콜, Blocking/Non-Blocking, select/poll/epoll — 이 모든 개념은 하나의 질문으로 수렴한다. "어떻게 하면 CPU를 낭비 없이 최대한 많은 I/O를 동시에 처리할 수 있는가?" 각 레이어의 설계 결정은 그 질문에 대한 시대별 최선이었다.
+</Aside>
+
+## 정리
+
+- 파일 디스크립터는 정수 인덱스다. 파일, 소켓, 파이프, epoll 인스턴스 모두 같은 인터페이스를 공유한다.
+- 시스템 콜 비용(100ns~1μs)을 줄이려면 버퍼링이 핵심이다. 1바이트씩 읽는 코드는 구조적으로 느릴 수밖에 없다.
+- Blocking I/O는 스레드당 연

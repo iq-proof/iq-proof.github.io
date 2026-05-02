@@ -1,0 +1,102 @@
+---
+title: "Linux 운영 지표, 숫자 뒤의 원인을 어떻게 읽는가"
+description: "top의 us/sy/wa부터 소켓 상태, iostat, strace, perf Flame Graph까지 — 백엔드 서버 병목의 실체를 커널 수준에서 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, performance, debugging, kernel, backend]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+"CPU 사용률 70%인데 왜 응답이 느리지?" — 이 질문에 답하지 못하는 이유는 숫자를 보고 있지만 숫자의 의미를 모르기 때문이다. `top`의 CPU 컬럼, `free -h`의 메모리, `iostat`의 await, 소켓 상태 — 각각은 커널이 특정 정의로 집계한 지표다. 그 정의를 알면 병목은 자명해진다. 그렇다면, 같은 70%를 보고도 왜 어떤 엔지니어는 원인을 바로 짚고 어떤 엔지니어는 인스턴스를 업그레이드하는가?
+
+## CPU 지표 — us/sy/wa는 다른 문제다
+
+`top`의 CPU 영역은 하나의 수치가 아니다. 커널은 각 CPU의 시간을 범주별로 쪼개 집계한다.
+
+- `us` (user): 유저 공간에서 애플리케이션 코드가 실행된 시간. 높으면 알고리즘 최적화나 프로파일링이 필요하다.
+- `sy` (system): 커널 모드 실행 시간. 시스템 콜 처리, 스케줄러, 인터럽트 핸들링이 포함된다. 높으면 과도한 시스템 콜이나 컨텍스트 스위칭을 의심한다.
+- `wa` (iowait): CPU가 I/O 완료를 기다리며 유휴인 시간. 디스크나 네트워크 병목을 가리킨다.
+- `id` (idle): 할 일이 없는 순수 유휴. 0에 가까우면 CPU 포화 상태다.
+
+"CPU 40% 사용"이라는 해석은 틀렸다. `us=15, sy=25`라면 시스템 콜이 유저 로직보다 더 많은 CPU를 소비하고 있다는 뜻이다. Redis처럼 단일 스레드 이벤트 루프 기반의 서비스에서 `sy`가 갑자기 20%를 넘는다면, `strace -c -p $(pgrep redis-server) sleep 5`로 어떤 시스템 콜이 폭발했는지 확인하는 것이 첫 번째 단계다.
+
+<Callout type="note" title="트레이드오프: wa와 이벤트 루프">
+`wa=0%`가 I/O 병목 없음을 의미하지는 않는다. `epoll` 기반 이벤트 루프는 I/O를 비동기로 처리하므로 CPU를 블로킹하지 않는다 — `wa`에 잡히지 않는다. 반대로 스레드 기반 서버에서 스레드가 I/O를 기다리면 `wa`가 높게 나온다. 지표는 구현 방식에 따라 다르게 보인다.
+</Callout>
+
+## 메모리 — available이 핵심이고 캐시는 여유다
+
+`free -h`의 `used`가 14GB라도 `available`이 13GB라면 메모리 부족이 아니다. `buff/cache` 12GB는 커널이 파일 시스템 접근을 가속하기 위해 쌓은 Page Cache다. 애플리케이션이 메모리를 요청하면 커널은 이 캐시를 즉시 반환한다. **실제 사용 가능한 메모리는 `available` 값이다.**
+
+스왑은 다르다. `vmstat 1`의 `so`(swap out)가 발생한다면 물리 메모리가 부족해 페이지를 디스크로 내보내는 것이다. 이 상태에서 메모리 접근은 수 ms의 디스크 지연이 붙는다.
+
+```bash
+# 스왑 사용 중인 프로세스 찾기
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+  swap=$(awk '/VmSwap/{print $2}' /proc/$pid/status 2>/dev/null)
+  [ "${swap:-0}" -gt 0 ] && echo "PID=$pid Swap=${swap}kB"
+done | sort -t= -k3 -rn | head -5
+```
+
+RSS가 매일 지속적으로 증가하는 Java 서비스라면 JVM Heap이 아닌 Native Memory 누수를 의심한다. GC는 Heap을 정리하지만 Metaspace, Direct Buffer, JNI 네이티브 메모리는 별도다. `jcmd $PID VM.native_memory baseline` 이후 부하를 가하고 `detail.diff`로 어느 영역이 커지는지 추적한다.
+
+## I/O — await와 aqu-sz가 포화의 실제 지표다
+
+`iostat -xz 1`에서 `%util=100%`을 보고 "NVMe가 포화됐다"고 판단하면 틀릴 수 있다. HDD는 단일 헤드 구조라 `%util=100%`가 진짜 포화지만, NVMe SSD는 내부 병렬 채널이 64개 이상이다. `%util`은 단순히 "디바이스에 최소 1개의 I/O가 처리 중인 시간 비율"을 의미하므로, 단 1개의 요청으로도 `%util=100%`가 될 수 있다.
+
+NVMe의 실제 포화 신호는 `await`의 상승(`0.1ms → 1ms+`)과 `aqu-sz`의 증가(`1 → 10+`)다. HDD와 NVMe의 정상 범위는 완전히 다르다:
+
+| 디바이스 | 정상 await | 높음 기준 |
+|---|---|---|
+| HDD (7200RPM) | 1~8ms | > 20ms |
+| SATA SSD | 0.1~0.5ms | > 2ms |
+| NVMe (PCIe4) | 0.02~0.1ms | > 0.5ms |
+
+I/O 병목의 원인 프로세스를 찾으려면 `iostat`만으로는 부족하다. `iotop -bo -d 1`이 "어느 프로세스가 얼마나 쓰는지"를 직접 보여준다. Redis `BGSAVE` 중 레이턴시 스파이크가 발생한다면, `iotop`에서 자식 프로세스의 `wMB/s`가 급증하는 것을 확인할 수 있다.
+
+## 네트워크 — CLOSE_WAIT는 버그, TIME_WAIT는 설계다
+
+소켓 상태는 TCP 프로토콜의 현재 위치를 보여준다.
+
+**TIME_WAIT**는 활성 종료 측이 60초간 유지하는 정상 상태다. 문제는 포트 고갈이 발생할 때다. HTTP Keep-Alive 없이 마이크로서비스 A→B 연결을 요청마다 새로 만들면, 초당 1000 req는 60초 동안 최대 60,000개의 TIME_WAIT를 쌓는다. `ip_local_port_range` 기본값인 28,231개를 넘으면 `Cannot assign requested address` 오류가 발생한다. 해결 우선순위: **HTTP Keep-Alive 활성화 → Connection Pool 사용 → `tcp_tw_reuse=1`** 순이다.
+
+**CLOSE_WAIT**는 다르다. 상대방이 FIN을 보냈는데 애플리케이션이 `close()`를 호출하지 않은 상태다. 0이어야 정상이다. 지속적으로 쌓인다면 코드에서 소켓을 닫지 않는 버그, 즉 fd 누수다.
+
+<Callout type="warning" title="CLOSE_WAIT = 애플리케이션 버그">
+TIME_WAIT는 TCP 명세의 정상적 결과다. 하지만 CLOSE_WAIT가 수백 개 쌓이고 줄지 않는다면, 이것은 반드시 코드를 고쳐야 하는 버그를 가리킨다. `ss -tanp state close-wait`로 어느 프로세스의 어느 fd인지 바로 확인할 수 있다.
+</Callout>
+
+## strace와 perf — sy는 strace로, us는 perf로
+
+`top`에서 `sy`가 높으면 `strace`로, `us`가 높으면 `perf`로 접근한다.
+
+`strace -c -p $PID sleep 30`은 30초 동안 어떤 시스템 콜이 몇 번 호출됐고 총 몇 초를 소비했는지 통계를 보여준다. Redis 이벤트 루프라면 `epoll_wait`가 60~70%를 차지해야 정상이다. `futex`나 `mmap`이 상위를 차지한다면 각각 락 경합, 빈번한 메모리 할당을 의심할 수 있다.
+
+운영 환경에서 `strace` 전체 추적은 40~70%의 성능 저하를 유발한다. `-c` 옵션(통계만)은 ~20~30%로 낮지만, 더 안전한 대안은 `perf trace`(eBPF 기반, ~5% 저하)다.
+
+`perf record -F 99 -g -p $PID sleep 30`은 초당 99회 샘플링으로 어떤 함수가 CPU를 소비하는지 기록한다. Flame Graph로 변환하면 호출 스택의 CPU 분포를 한눈에 볼 수 있다. 가장 넓은 타워가 핫스팟이고, 타워의 맨 위 함수가 직접 CPU를 소비하는 함수다. GC 관련 함수가 전체의 25%를 차지한다면 Heap 설정을 재검토해야 한다.
+
+<Aside label="Java perf 필수 옵션">
+Java 애플리케이션에 `perf`를 적용하려면 `-XX:+PreserveFramePointer` 옵션이 필수다. 이 옵션 없이는 JIT 컴파일된 메서드의 콜스택을 추적할 수 없어 `[unknown]`만 보인다.
+</Aside>
+
+## 정리
+
+다섯 챕터를 관통하는 패턴은 하나다 — **지표는 범주를 구분하고, 범주마다 다음 도구가 있다**.
+
+- `sy` 높음 → `strace -c` → 어떤 시스템 콜?
+- `wa` 높음 → `iostat -xz 1` + `iotop` → 어느 디스크, 어느 프로세스?
+- `us` 높음 → `perf record` + Flame Graph → 어떤 함수?
+- 메모리 부족 의심 → `free -h`의 `available` 확인 → `vmstat`의 `si/so`
+- 네트워크 이상 → `ss -s`로 상태 분포 → CLOSE_WAIT > 0이면 코드 버그
+
+숫자를 보는 것과 숫자를 읽는 것은 다르다. 커널이 그 숫자를 어떻게 정의하는지 알면, 진단 경로는 자명해진다.

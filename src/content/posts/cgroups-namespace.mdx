@@ -1,0 +1,117 @@
+---
+title: "컨테이너는 커널 위의 환상이다"
+description: "namespace로 프로세스 공간을 나누고, cgroups로 자원을 묶고, iptables로 네트워크를 꺽는 방식까지 — 컨테이너를 구성하는 커널 메커니즘의 전체 구조를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, container, namespace, cgroups, security]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Docker를 쓰면서 "컨테이너는 가벼운 VM"이라는 설명을 접한다. 틀린 말은 아니지만 본질을 놓친다. 컨테이너는 새로운 OS가 아니라 **기존 커널 위에 격리된 뷰를 만드는 환상**이다. namespace가 프로세스에게 "세상은 너뿐이야"라고 속이고, cgroups가 그 세상에서 쓸 수 있는 자원의 한도를 정하고, iptables가 세상 밖으로 나가는 문의 규칙을 정한다. 그렇다면 이 환상이 무너지는 지점은 어디인가?
+
+## 격리의 기반 — namespace
+
+namespace는 커널 자원에 대한 독립된 뷰다. 프로세스, 네트워크 스택, 파일 시스템, hostname — 이것들을 각각 독립적인 공간으로 나눈다. VM이 하이퍼바이저로 하드웨어를 가상화하는 것과 달리, 컨테이너는 커널을 공유하면서 뷰만 격리한다. 그래서 시작 시간이 수 ms이고 메모리 오버헤드가 수 MB다.
+
+PID namespace가 대표적인 예다. `unshare --pid --mount --fork --mount-proc bash`로 새 PID namespace를 만들면, 그 shell이 PID 1이 된다. 호스트의 수백 개 프로세스는 이 namespace 안에서 보이지 않는다. 반대로 호스트에서는 컨테이너의 모든 프로세스가 보인다 — 다른 PID 번호로.
+
+```
+호스트 PID 공간:          컨테이너 PID namespace:
+  PID 1: systemd            PID 1: java -jar app.jar  (= 호스트 PID 1234)
+  PID 1234: java            PID 2: sh
+```
+
+Network namespace는 컨테이너마다 독립된 네트워크 스택(NIC, IP, 라우팅 테이블, iptables 규칙, 소켓 공간)을 제공한다. 컨테이너 A와 B가 각각 포트 8080을 listen해도 충돌하지 않는 이유다. 각자 다른 namespace에서 다른 소켓 공간을 쓰기 때문이다.
+
+<Aside label="PID 1의 책임">
+컨테이너 내부 PID 1은 고아 프로세스(zombie)를 수거하는 init 역할을 해야 한다. 시그널 핸들러를 등록하지 않으면 SIGTERM을 무시한다. `tini`나 `dumb-init`을 PID 1로 쓰는 이유가 여기에 있다.
+</Aside>
+
+## 자원 제한의 실체 — cgroups
+
+namespace가 뷰를 격리한다면, cgroups는 자원의 한도를 강제한다. `docker run --memory=512m --cpus=1.5`는 커널에 두 개의 파일을 쓰는 행위다.
+
+```bash
+# cgroups v2 경로에서:
+cat /sys/fs/cgroup/.../memory.max
+# 536870912  (512 * 1024 * 1024)
+
+cat /sys/fs/cgroup/.../cpu.max
+# 150000 100000  (150ms / 100ms 주기 = 1.5 CPU)
+```
+
+CPU 제한이 특히 오해를 많이 받는다. CFS(Completely Fair Scheduler) 쿼터 방식은 100ms 주기마다 허용된 CPU 시간을 부여한다. `--cpus=0.5`이면 100ms 주기당 50ms만 실행할 수 있다. 멀티스레드 앱이 4코어로 동시에 실행하면 50ms 쿼터를 12.5ms 만에 소진하고 남은 87.5ms 동안 강제 대기한다. `docker stats`에서 CPU 30%로 보여도 실제 응답이 느린 이유가 여기에 있다.
+
+<Callout type="warning" title="CPU Throttling 진단">
+CPU 사용률이 낮은데 응답이 느리다면 `cpu.stat`의 `nr_throttled`를 먼저 확인하라. 이 수치가 높으면 `--cpus` 값을 올리거나 스레드 수를 줄여야 한다.
+</Callout>
+
+메모리 한도 초과 시 커널은 순서대로 대응한다. `memory.high` 초과 시 프로세스를 스로틀하며 page cache를 회수한다. `memory.max` 초과 시 강제 회수를 시도하고, 실패하면 OOM Killer가 cgroup 내에서 `oom_score`가 가장 높은 프로세스에 SIGKILL을 보낸다. exit code 137, `OOMKilled: true` — 그리고 JVM 로그에는 아무것도 없다.
+
+## JVM과 cgroups의 충돌
+
+OOM 문제는 Java 환경에서 더 복잡하다. Java 8은 Heap 크기를 `/proc/meminfo`에서 읽은 **호스트 전체 메모리**를 기준으로 계산한다. 호스트 메모리가 64GB라면 Heap이 16GB로 설정되지만 컨테이너 한도는 2GB — 즉시 OOM Kill이 발생한다.
+
+Java 11부터 `-XX:+UseContainerSupport`(기본 활성화)가 cgroups의 `memory.max`를 읽어 Heap을 계산한다. 하지만 함정이 하나 더 있다. Heap만이 JVM이 쓰는 메모리의 전부가 아니다.
+
+```
+컨테이너 --memory=2g 기준:
+  Java Heap     1.5GB  (-XX:MaxRAMPercentage=75.0)
+  Metaspace      256MB
+  Thread Stack   100MB  (200 스레드 × 0.5MB)
+  Code Cache     128MB
+  Direct Buffer   64MB
+  합계          ~2.0GB  ← 한도 경계
+```
+
+`-Xmx2g`를 컨테이너 한도와 똑같이 설정하면 Native Memory가 들어갈 자리가 없다. 권장 공식은 `-XX:MaxRAMPercentage=70.0`으로 Heap에 70%만 할당하고 나머지 30%를 Native에 남기는 것이다.
+
+## 네트워크의 구조 — veth pair와 iptables
+
+컨테이너 네트워크는 두 가지 커널 기능 위에 올라선다. veth pair와 iptables.
+
+veth pair는 가상 이더넷 인터페이스의 쌍이다. 한쪽에 들어간 패킷이 다른 쪽에서 나온다. 컨테이너의 `eth0`이 한쪽이고, 호스트의 `vethXXXX`가 다른 쪽이다. 이 `vethXXXX`가 `docker0` bridge에 연결되어 컨테이너를 브리지 네트워크에 합류시킨다.
+
+`-p 8080:80`은 iptables DNAT 규칙을 추가하는 명령이다.
+
+```bash
+# 호스트:8080으로 들어온 TCP 패킷 → 컨테이너IP:80으로 변환
+iptables -t nat -A DOCKER -p tcp --dport 8080 \
+  -j DNAT --to-destination 172.17.0.2:80
+
+# 컨테이너 → 외부 통신 시 source IP를 호스트 IP로 변환
+iptables -t nat -A POSTROUTING -s 172.17.0.0/16 \
+  ! -o docker0 -j MASQUERADE
+```
+
+`ufw deny 8080`을 설정해도 Docker 컨테이너에 접근이 되는 이유가 여기에 있다. ufw는 `INPUT` 체인을 수정하지만, Docker의 DNAT는 `PREROUTING`에서 이미 처리된다. `DOCKER-USER` 체인에 직접 규칙을 넣거나 Docker 자체의 iptables 관리를 비활성화해야 한다.
+
+## 보안의 마지막 층 — capabilities와 seccomp
+
+<Callout type="note" title="트레이드오프">
+namespace와 cgroups는 자원을 격리하고 제한하지만, 커널 자체를 격리하지 않는다. 컨테이너 안에서 커널 취약점을 공격하면 호스트까지 영향이 간다. capabilities와 seccomp는 이 공격 면을 줄이는 두 번째 방어선이다.
+</Callout>
+
+Linux capabilities는 root 권한을 64개의 독립적인 능력으로 분해한다. Docker는 기본적으로 `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE` 등 위험한 capability를 drop한다. 컨테이너에서 `strace`가 안 되는 이유, 1024 미만 포트에 바인딩이 안 되는 이유가 모두 capability 설정이다. `--privileged`는 이 모든 drop을 해제한다 — 사실상 컨테이너 격리를 무너뜨리는 것과 같다.
+
+seccomp는 프로세스가 호출할 수 있는 시스템 콜을 BPF 프로그램으로 필터링한다. Docker 기본 프로파일은 약 400개 시스템 콜 중 ~300개를 허용하고, `ptrace`, `kexec_load`, `open_by_handle_at` 같은 탈출 경로로 악용될 수 있는 것들을 차단한다.
+
+Kubernetes Restricted 정책은 이 두 레이어를 모두 강제한다. `runAsNonRoot: true`, `capabilities.drop: ["ALL"]`, `seccompProfile.type: RuntimeDefault`, `allowPrivilegeEscalation: false` — 각 설정이 막는 공격 벡터가 다르다.
+
+## 정리
+
+- 컨테이너는 커널을 공유한다. namespace는 뷰를 격리하고, cgroups는 자원을 제한하고, iptables는 네트워크를 중개한다.
+- CPU Throttling은 `cpu.stat`의 `nr_throttled`로, OOM Kill은 exit code 137과 `OOMKilled: true`로 확인한다.
+- Java 컨테이너는 `-XX:+UseContainerSupport`와 `MaxRAMPercentage=70.0`을 기본값으로 설정하고, Heap 외에 Native Memory 30%를 남겨야 한다.
+- `--privileged`와 `--net=host`는 격리를 파괴한다. 필요한 capability만 최소로 추가하고, seccomp는 RuntimeDefault 이상을 유지하라.
+
+환상은 이해하고 쓸 때 도구가 되고, 모르고 쓸 때 함정이 된다.

@@ -1,0 +1,131 @@
+---
+title: "리눅스 파일 I/O는 어떻게 설계되어 있는가"
+description: "VFS 추상화부터 fsync 내구성 보장까지, 리눅스 파일 I/O 스택의 다섯 개 레이어가 공유하는 하나의 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [linux, vfs, filesystem, io-stack, fsync]
+difficulty: intermediate
+series:
+  slug: linux-for-backend-deep-dive
+  title: Linux For Backend Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+리눅스에서 `cat /proc/meminfo`와 `cat /var/log/app.log`는 동일한 `read()` 시스템 콜로 동작한다. 하나는 디스크가 없는 가상 파일이고, 하나는 실제 ext4 블록이다. 어떻게 같은 인터페이스로 다른 저장소를 다루는가? 그리고 `write()` 직후 서버가 꺼지면 데이터는 어디까지 살아남는가?
+
+## 모든 것은 파일이다 — VFS의 역할
+
+리눅스 파일 I/O 스택의 가장 위에 VFS(Virtual File System)가 있다. VFS는 파일 시스템 종류에 무관하게 동일한 `open()`, `read()`, `write()`, `close()` 인터페이스를 제공한다. 각 파일 시스템(ext4, tmpfs, procfs, sysfs)은 VFS가 정의한 `file_operations`, `inode_operations` 구조체를 구현할 뿐이다.
+
+```
+[애플리케이션]
+  read(fd, buf, 4096)   ← 동일한 시스템 콜
+         ↓
+[VFS]                   ← 파일 시스템 유형에 따라 분기
+  ┌──────┬──────┬──────┬──────┐
+  │ ext4 │tmpfs │procfs│sysfs │
+  └──────┴──────┴──────┴──────┘
+         ↓              ↓
+    [디스크 I/O]    [커널 메모리 직렬화]
+```
+
+VFS는 네 개의 핵심 오브젝트로 동작한다. **superblock**은 마운트된 파일 시스템 전체 정보를 담는다. **inode**는 파일 메타데이터(크기, 권한, 타임스탬프, 데이터 블록 포인터)를 담되 파일 이름은 담지 않는다. **dentry**는 파일명과 inode의 매핑이며 경로 탐색 캐시(dcache)로 작동한다. **file**은 열린 파일 인스턴스로 fd당 하나씩 생성되어 독립적인 읽기 오프셋(`f_pos`)을 관리한다.
+
+`/proc`와 `/sys`가 디스크 없이 파일처럼 동작하는 이유가 여기에 있다. procfs의 inode는 `read()` 호출 시 그 순간의 커널 자료구조를 텍스트로 직렬화해 반환한다. `ls -la /proc/meminfo`에서 크기가 0으로 보이는 것은 `stat()`이 미리 크기를 모르기 때문이고, 실제로 `read()`를 호출하면 커널이 내용을 동적으로 생성한다.
+
+## 애플리케이션에서 디스크까지 — 블록 레이어
+
+`write()` 시스템 콜은 VFS를 거쳐 파일 시스템 레이어에 닿는다. 여기서 데이터는 우선 **Page Cache**에 기록되고 Dirty 플래그가 붙는다. 실제 디스크 I/O는 비동기로 나중에 발생한다.
+
+Page Cache를 지나면 블록 레이어가 등장한다. 블록 레이어는 두 가지 핵심 역할을 한다.
+
+**병합(Merge)**: 인접한 섹터에 대한 요청을 하나로 합쳐 시스템 콜 횟수를 줄인다. 섹터 100~107에 대한 4KB 쓰기와 섹터 108~115에 대한 4KB 쓰기가 연속으로 들어오면 하나의 8KB 요청으로 합쳐진다.
+
+**정렬(Sort)**: HDD의 경우 헤드 이동 거리를 줄이기 위해 섹터 번호 순으로 요청을 정렬한다. 랜덤한 순서로 들어온 섹터 100→5000→200→4800을 100→200→4800→5000으로 재배열하면 헤드 이동 거리가 65% 줄어든다.
+
+I/O 스케줄러 선택은 여기서 중요해진다. HDD는 `mq-deadline`이 적합하고, NVMe SSD는 `none`이 최적이다. SSD는 내부적으로 자체 큐를 관리하므로 커널 레벨 재정렬이 오히려 레이턴시를 추가한다.
+
+```bash
+$ cat /sys/block/nvme0n1/queue/scheduler
+mq-deadline kyber [none]   # none이 선택됨
+```
+
+`iostat -xz 1`에서 `await`은 블록 레이어 큐 대기 시간과 디바이스 처리 시간의 합이다. `await`이 높고 `%util`이 낮다면 스케줄러 큐 대기가 원인이고, 둘 다 높다면 실제 디바이스 포화다.
+
+## Sequential vs Random — 설계 원칙의 기반
+
+HDD에서 Sequential I/O와 Random I/O의 성능 차이는 약 200배다. 원인은 헤드 탐색(Seek Time) 유무다. 4KB 랜덤 읽기는 헤드 이동에 5~10ms가 걸리지만, Sequential 읽기는 회전 대기(2~4ms)만 필요하다.
+
+SSD는 물리적 탐색이 없지만 여전히 Sequential이 유리하다. 랜덤 쓰기가 많을수록 NAND 플래시의 **쓰기 증폭(Write Amplification Factor)**이 커지기 때문이다. 4KB 랜덤 쓰기 하나가 수백KB 규모의 블록 삭제를 유발할 수 있다.
+
+이 원칙이 주요 시스템의 설계를 결정한다. MySQL InnoDB의 Double Write Buffer는 Dirty 페이지를 먼저 Sequential로 기록한 후 실제 위치에 Random Write하는 방식으로 I/O 패턴을 최적화한다. Kafka는 파티션 파일의 끝에만 추가하는 Sequential Append를 핵심 설계 원칙으로 삼는다. 파티션 수를 무작정 늘리면 파일 간 라운드로빈 쓰기로 사실상 Random I/O 패턴이 된다.
+
+<Callout type="note" title="트레이드오프">
+Sequential I/O 설계는 수정(Update)이나 랜덤 접근을 비효율적으로 만든다. Kafka가 Consumer 오프셋을 별도 토픽으로 분리하고 메시지 삭제 대신 Compaction을 쓰는 것은 "추가만 가능" 제약의 귀결이다. MySQL Double Write Buffer를 끄면(`innodb_doublewrite=OFF`) 쓰기 성능이 5~10% 향상되지만 파셜 페이지 쓰기 위험이 생긴다. 성능과 내구성 사이의 선택은 항상 명시적이어야 한다.
+</Callout>
+
+## write()는 충분하지 않다 — fsync와 내구성
+
+`write()` 호출 직후 데이터는 Page Cache에만 있다. OS의 Write-Back 스레드가 기본 30초 주기로 Dirty 페이지를 디스크에 기록하는데, 그 전에 전원이 꺼지면 데이터는 사라진다.
+
+```bash
+$ cat /proc/meminfo | grep Dirty
+Dirty:    204800 kB   ← 아직 디스크에 없는 데이터 200MB
+```
+
+`fsync(fd)`는 해당 파일의 모든 Dirty 페이지와 메타데이터를 디스크에 기록하고 하드웨어 쓰기 캐시까지 플러시한 후 반환한다. `fdatasync(fd)`는 메타데이터를 생략해 약간 빠르다. Redis AOF가 `fdatasync()`를 쓰는 이유다.
+
+MySQL `innodb_flush_log_at_trx_commit` 설정은 이 지점의 정확한 트레이드오프를 드러낸다.
+
+| 설정 | 동작 | 내구성 | 처리량 |
+|------|------|--------|--------|
+| 1 | 커밋마다 fsync | 100% 보장 | 낮음 |
+| 2 | 초당 1회 fsync | 최대 1초 손실 | 높음 |
+| 0 | 비동기 | 손실 가능 | 최고 |
+
+NVMe SSD에서 `fsync()`는 약 0.1~0.5ms가 소요된다. 초당 수천 트랜잭션 환경에서 설정 1과 2의 처리량 차이는 4배에 달할 수 있다. 금융/결제 서비스는 설정 1이 필수고, 일반 서비스는 설정 2가 합리적인 균형점이다.
+
+원자적 파일 업데이트의 올바른 패턴은 다음과 같다.
+
+```bash
+write(tmp_file)          # 임시 파일에 쓰기
+fsync(tmp_file)          # 내구성 확보
+rename(tmp, target)      # 원자적 교체
+fsync(parent_directory)  # 디렉토리 엔트리 내구성
+```
+
+`rename()`은 원자적이지만 디렉토리 엔트리 업데이트가 Page Cache에만 반영된 상태로 장애가 발생하면 파일이 사라진다. 부모 디렉토리에 대한 `fsync()`까지 완료해야 진정한 내구성이 보장된다.
+
+## 파일 삭제의 실체 — inode와 링크 카운트
+
+inode는 파일 이름을 저장하지 않는다. 파일 이름은 dentry(디렉토리 엔트리)에 있고, dentry가 inode 번호를 가리킨다. 하나의 inode가 여러 이름(하드링크)을 가질 수 있기 때문에 이 분리가 필요하다.
+
+`rm` 명령은 디렉토리 엔트리를 제거하고 inode의 링크 카운트를 1 줄인다. 링크 카운트가 0이 되어도 **열린 fd가 하나라도 있으면 커널은 데이터 블록을 해제하지 않는다**.
+
+```bash
+$ lsof +L1  # 링크 카운트 < 1인 파일 = 삭제됐지만 fd 살아있음
+java  1234  app  18u  REG  8,1  524288000  0  12345  /var/log/app.log (deleted)
+#                              ↑ 500MB를 점유한 삭제된 로그 파일
+```
+
+로그 로테이션 후 디스크 공간이 줄지 않는 정확한 이유가 이것이다. Java 프로세스가 이전 로그 파일의 fd를 유지하는 한 블록은 해제되지 않는다. 프로세스 재시작이나 `cat /dev/null > /proc/<pid>/fd/<n>`으로 fd 내용을 비워 해결한다.
+
+inode는 파일 시스템 포맷 시 개수가 고정된다(ext4 기본: 16KB당 1개). 수백만 개의 소규모 파일이 쌓이면 디스크 공간이 남아도 inode가 소진되어 파일 생성이 불가능해진다.
+
+```bash
+$ df -h     # 공간 50% 남음
+$ df -i     # inode 100% 사용 → "No space left on device"
+```
+
+<Aside label="설계 철학">
+inode/dentry 분리, Page Cache Write-Back, fsync 명시성 — 리눅스 파일 I/O 스택의 모든 설계는 하나의 원칙으로 수렴한다. **"기본은 성능, 내구성은 명시적으로 요청하라."** 이 원칙을 모르고 쓰면 `write()` 성공 후 데이터가 사라지고, 알고 쓰면 내구성과 처리량을 의도적으로 조율할 수 있다.
+</Aside>
+
+## 정리
+
+- VFS는 ext4, tmpfs, procfs, sysfs를 동일한 `read()`/`write()` 인터페이스로 추상화한다. `/proc`
