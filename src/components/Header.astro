@@ -3,8 +3,8 @@ import { SITE, NAV } from '@/consts';
 const currentPath = Astro.url.pathname;
 ---
 
-<header class="sticky top-0 z-40 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--color-border-subtle);">
-  <div class="mx-auto flex items-center justify-between px-6 py-4" style="max-width: var(--container-max);">
+<header class="sticky top-0 z-40 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--color-border-subtle); height: var(--iq-header-height);">
+  <div class="mx-auto flex items-center justify-between h-full px-6" style="max-width: var(--container-max);">
     <!-- Logo -->
     <a href="/" class="flex items-center gap-2.5" aria-label={SITE.name}>
       <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
