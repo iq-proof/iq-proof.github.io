@@ -1,0 +1,102 @@
+---
+title: "Spring @ComponentScan은 어떻게 수천 개의 클래스를 고르는가"
+description: "클래스패스 스캔 파이프라인의 시작인 ConfigurationClassPostProcessor부터 BeanDefinition 등록과 인덱스 최적화까지, Spring이 Bean 후보를 선별하는 전체 흐름을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, component-scan, asm, bean-definition, conditional]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring을 처음 배울 때 `@ComponentScan`은 "패키지 이름을 쓰면 Bean이 자동으로 등록된다"는 마법처럼 보인다. 하지만 수천 개의 `.class` 파일 중에서 `@Component`가 붙은 것만 골라내는 일은 절대 단순하지 않다. Spring은 어떻게 클래스를 **로드하지 않고** 어노테이션을 읽고, 어떤 순서로 후보를 걸러내며, 그 결과를 어디에 저장하는가?
+
+## 파이프라인의 시작 — ConfigurationClassPostProcessor
+
+`@ComponentScan`의 처리는 `refresh()`의 `invokeBeanFactoryPostProcessors()` 단계에서 시작된다. `ConfigurationClassPostProcessor`는 `BeanDefinitionRegistryPostProcessor`를 구현하며, 등록된 BeanDefinition 중 `@Configuration` 후보를 찾아 `ConfigurationClassParser`에 넘긴다.
+
+```java
+public void processConfigBeanDefinitions(BeanDefinitionRegistry registry) {
+    List<BeanDefinitionHolder> configCandidates = new ArrayList<>();
+    for (String beanName : registry.getBeanDefinitionNames()) {
+        BeanDefinition bd = registry.getBeanDefinition(beanName);
+        if (ConfigurationClassUtils.isConfigurationCandidate(bd)) {
+            configCandidates.add(new BeanDefinitionHolder(bd, beanName));
+        }
+    }
+    ConfigurationClassParser parser = new ConfigurationClassParser(...);
+    parser.parse(configCandidates);
+}
+```
+
+파서가 `@ComponentScan`을 발견하면 `ComponentScanAnnotationParser`가 `basePackages`를 결정한다. 우선순위는 명시적 `basePackages` → `basePackageClasses` → **선언 클래스의 패키지** 순이다. `@SpringBootApplication`을 루트 패키지에 두는 관례가 바로 이 세 번째 규칙을 활용하는 것이다.
+
+## 클래스 로드 없이 어노테이션 읽기 — ASM MetadataReader
+
+`ClassPathBeanDefinitionScanner.doScan()`은 `classpath*:com/example/**/*.class` 패턴으로 리소스를 탐색하지만, 각 파일을 `Class.forName()`으로 로드하지 않는다. 대신 ASM의 `ClassReader`가 바이트코드를 직접 파싱한다.
+
+```java
+ClassReader classReader = new ClassReader(inputStream);
+classReader.accept(visitor,
+    ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+```
+
+`SKIP_CODE` 플래그가 핵심이다. 메서드 바이트코드와 디버그 정보를 건너뛰고 `RuntimeVisibleAnnotations`만 읽는다. 5,000개 클래스를 탐색할 때 Metaspace에 적재되는 클래스는 0개다. 필터를 통과한 Bean 후보만 나중에 실제로 로드된다.
+
+`@Service`가 별도 `includeFilter` 없이 감지되는 이유도 여기서 나온다. `AnnotationTypeFilter`는 `hasMetaAnnotation("Component")`를 확인하므로, `@Service → @Component` 체인이 ASM 수준에서 추적된다. `@RestController → @Controller → @Component`도 동일하다.
+
+## 두 단계 필터와 @Conditional
+
+후보 선별은 두 단계로 이루어진다.
+
+**1단계** (`isCandidateComponent(MetadataReader)`): `excludeFilter`가 먼저 평가된다. 하나라도 매칭되면 즉시 탈락이고 `includeFilter`는 평가하지 않는다. `includeFilter`를 통과하면 `ConditionEvaluator.shouldSkip()`으로 `@Conditional`을 평가한다.
+
+**2단계** (`isCandidateComponent(AnnotatedBeanDefinition)`): 구조 기반 필터다. `isIndependent()`는 비정적 내부 클래스를 제거하고, `isConcrete()`는 인터페이스와 abstract 클래스를 걸러낸다. 예외는 `@Lookup` 메서드를 가진 abstract 클래스뿐이다.
+
+`@Conditional` 평가 시점은 두 페이즈로 나뉜다. `PARSE_CONFIGURATION`은 `@Configuration` 클래스 전체를 대상으로 하며, `REGISTER_BEAN`은 개별 `@Bean` 메서드를 대상으로 한다. `@ConditionalOnMissingBean`이 반드시 `REGISTER_BEAN` 페이즈를 사용하는 이유가 있다. 파싱 시점에는 사용자가 정의한 Bean이 아직 등록되지 않았을 수 있기 때문이다. Spring Boot 자동 설정이 사용자 Bean보다 항상 나중에 처리되는 구조가 이 페이즈 분리와 맞물려 "사용자 Bean 우선" 규칙을 보장한다.
+
+## BeanDefinition 등록과 충돌 해결
+
+필터를 통과한 클래스는 `ScannedGenericBeanDefinition`으로 만들어진다. 주목할 점은 이 객체가 클래스 이름을 **문자열로만** 저장한다는 것이다. 실제 `Class` 객체는 Bean 인스턴스를 처음 생성할 때 `AbstractBeanFactory.resolveBeanClass()`가 `Class.forName()`을 호출하며 비로소 로드된다.
+
+등록 전에 `processCommonDefinitionAnnotations()`가 `@Lazy`, `@Primary`, `@DependsOn`, `@Role`을 BeanDefinition 속성으로 변환한다. Bean 이름은 `@Component("명시적이름")`이 없으면 `Introspector.decapitalize()`로 클래스 short name의 첫 글자를 소문자로 바꾼다. `URLParser`처럼 앞 두 글자가 모두 대문자면 그대로 유지된다.
+
+중복 등록 시 `checkCandidate()`의 `isCompatible()` 규칙이 적용된다.
+
+<Callout type="note" title="트레이드오프 — 중복 등록 정책">
+같은 클래스가 중복 스캔되면 조용히 무시된다. 다른 클래스가 같은 이름으로 충돌하면 `ConflictingBeanDefinitionException`이 발생한다. `@Bean` 메서드로 수동 등록된 Bean은 스캔된 Bean보다 우선한다(`existingDef`가 `ScannedGenericBeanDefinition`이 아닌 경우 호환으로 처리). Spring Boot 기본값인 `allowBeanDefinitionOverriding=false`는 이보다 더 강한 정책으로, 어떤 중복이든 `BeanDefinitionOverrideException`을 던진다.
+</Callout>
+
+## 대규모 프로젝트의 출구 — 컴포넌트 인덱스
+
+클래스가 수천 개를 넘어가면 `classpath*:**/*.class` 탐색 비용이 문제가 된다. `spring-context-indexer` 의존성을 추가하면 컴파일 타임에 어노테이션 프로세서가 `META-INF/spring.components` 파일을 생성한다.
+
+```
+com.example.service.OrderService=org.springframework.stereotype.Service
+com.example.repository.OrderRepository=org.springframework.stereotype.Repository
+```
+
+`@Component`에는 이미 `@Indexed`가 메타 어노테이션으로 내장되어 있으므로 별도 설정 없이 모든 스테레오타입 클래스가 인덱싱된다. 런타임에는 `CandidateComponentsIndexLoader`가 클래스패스의 모든 `spring.components` 파일을 수집하고, `findCandidateComponents()`가 파일 탐색 대신 인덱스 Map을 조회한다.
+
+단, `AssignableTypeFilter`나 커스텀 `TypeFilter`가 `includeFilters`에 있으면 인덱스를 사용할 수 없어 기존 ASM 스캔으로 폴백된다. 인덱스는 `AnnotationTypeFilter` 기반 스캔에서만 완전히 작동한다.
+
+<Aside label="Spring Boot 3.x와 AOT">
+Spring Boot 3.x의 AOT(Ahead-of-Time) 처리는 빌드 타임에 BeanDefinition을 분석해 소스 코드로 미리 생성한다. Native Image 빌드에서는 런타임 클래스패스 스캔 자체가 없어지므로 `spring-context-indexer`의 역할은 대부분 AOT가 대체한다. 표준 JVM 배포에서는 여전히 유효하다.
+</Aside>
+
+## 정리
+
+- `@ComponentScan`은 `refresh()` → `invokeBeanFactoryPostProcessors()` 단계에서 `ConfigurationClassPostProcessor`를 통해 처리된다.
+- ASM `ClassReader`가 `.class` 바이트코드에서 어노테이션만 읽는다. 클래스 로드는 Bean 인스턴스 생성 직전까지 미뤄진다.
+- 필터 평가 순서는 `excludeFilter` → `includeFilter` → `@Conditional`이며, `@Conditional`의 페이즈 구분(`PARSE_CONFIGURATION` vs `REGISTER_BEAN`)이 Spring Boot 자동 설정의 "사용자 Bean 우선" 규칙을 가능하게 한다.
+- 스캔 결과는 클래스 이름 문자열만 담은 `ScannedGenericBeanDefinition`으로 저장되고, 실제 Class 객체는 최초 인스턴스 생성 시 로드된다.
+- `spring-context-indexer`는 컴파일 타임 인덱스로 대규모 프로젝트의 시작 시간을 단축하지만, 커스텀 필터가 있으면 ASM 스캔으로 폴백된다.
+
+다음 글에서는 이 파이프라인에서 Bean 이름 충돌이 발생했을 때 `ConfigurationClassParser`가 재귀적으로 새 `@Configuration`을 처리하는 방식과, 그 과정에서 순환 참조가 어떻게 감지되는지 추적한다.

@@ -1,0 +1,125 @@
+---
+title: "Spring @Configuration은 어떻게 싱글톤을 보장하는가"
+description: "Full Mode와 Lite Mode의 구분 기준부터 CGLIB 서브클래스 생성, BeanMethodInterceptor의 인터셉션, @Import의 3가지 처리 경로까지, Spring Core의 설정 메커니즘을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, configuration, cglib, import, bean-lifecycle]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@Configuration` 클래스 안에서 `dataSource()`를 세 번 호출해도 항상 같은 `HikariDataSource` 인스턴스가 반환된다. 반면 `@Configuration(proxyBeanMethods = false)`로 바꾸는 순간 세 번 호출하면 세 개의 서로 다른 인스턴스가 생긴다. 같은 Java 메서드인데 왜 이렇게 다르게 동작하는가?
+
+## Full Mode와 Lite Mode — 판별의 기준
+
+Spring은 설정 클래스를 두 가지 모드로 나눈다. `ConfigurationClassUtils`가 BeanDefinition 메타데이터를 분석해 `"configurationClass"` 속성을 `"full"` 또는 `"lite"`로 표시한다.
+
+**Full Mode** 조건은 단 하나다. `@Configuration`이 선언되어 있고 `proxyBeanMethods`가 `true`(기본값)인 경우다. 이 경우 `ConfigurationClassPostProcessor`가 나중에 CGLIB 서브클래스를 생성한다.
+
+**Lite Mode**는 더 넓다. `@Component`, `@ComponentScan`, `@Import`, `@ImportResource` 중 하나라도 선언된 클래스, 또는 `@Bean` 메서드만 있는 클래스, 그리고 `@Configuration(proxyBeanMethods = false)`로 명시한 클래스 모두가 여기에 해당한다. CGLIB은 생성되지 않는다.
+
+<Callout type="note" title="흔한 오해">
+`@Configuration` 자체가 `@Component`를 메타 어노테이션으로 포함한다. 그러므로 `@Configuration`이 붙은 클래스는 컴포넌트 스캔 대상이기도 하다. 그러나 Full/Lite 판별 기준은 `proxyBeanMethods` 속성이지, `@Component` 포함 여부가 아니다.
+</Callout>
+
+## CGLIB 서브클래스가 만들어지는 시점
+
+Full Mode로 판별된 BeanDefinition은 `ConfigurationClassPostProcessor.postProcessBeanFactory()` 단계에서 `ConfigurationClassEnhancer`를 통해 CGLIB 서브클래스로 교체된다. Bean 인스턴스를 생성하기 이전, BeanDefinition의 `beanClass` 자체를 `AppConfig$$SpringCGLIB$$0`으로 바꾼다.
+
+이 CGLIB 서브클래스의 구조는 다음과 같다.
+
+```
+public class AppConfig$$SpringCGLIB$$0 extends AppConfig
+        implements EnhancedConfiguration {
+
+    public BeanFactory $$beanFactory;   // BeanFactoryAwareGeneratorStrategy가 삽입
+
+    @Override
+    public DataSource dataSource() {    // BeanMethodInterceptor 연결
+        // 컨테이너에서 기존 Bean 반환
+    }
+
+    @Override
+    public void setBeanFactory(BeanFactory bf) {
+        this.$$beanFactory = bf;        // BeanFactoryAwareMethodInterceptor 처리
+    }
+}
+```
+
+`EnhancedConfiguration` 인터페이스는 `BeanFactoryAware`를 확장하므로, Bean 초기화 시 `setBeanFactory()`가 자동으로 호출된다. 이 경로로 `$$beanFactory` 필드에 컨테이너 참조가 주입된다.
+
+CallbackFilter는 메서드별로 Callback을 선택한다. `@Bean` 메서드에는 `BeanMethodInterceptor`, `setBeanFactory()`에는 `BeanFactoryAwareMethodInterceptor`, 나머지에는 `NoOp.INSTANCE`가 배정된다. 모든 메서드가 인터셉션되는 것이 아니다.
+
+## BeanMethodInterceptor — 싱글톤 보장의 핵심
+
+`dataSource()`가 CGLIB 서브클래스를 통해 호출되면 `BeanMethodInterceptor.intercept()`가 실행된다. 이 메서드의 핵심 분기는 하나다.
+
+```java
+if (isCurrentlyInvokedFactoryMethod(beanMethod)) {
+    // 컨테이너가 이 @Bean 메서드를 직접 호출 중
+    // → 실제 객체 생성
+    return cglibMethodProxy.invokeSuper(enhancedConfigInstance, beanMethodArgs);
+}
+// 다른 @Bean 메서드 내부에서 호출
+return beanFactory.getBean(beanName);
+```
+
+`isCurrentlyInvokedFactoryMethod()`는 `SimpleInstantiationStrategy`가 `@Bean` 메서드로 Bean을 생성할 때 ThreadLocal에 저장하는 "현재 컨테이너가 호출 중인 팩토리 메서드"를 확인한다. 컨테이너가 `dataSource` Bean을 최초 생성할 때는 `invokeSuper()`로 실제 객체를 만들고, `orderService()` 내부에서 `dataSource()`를 직접 부를 때는 `beanFactory.getBean("dataSource")`로 이미 캐시된 인스턴스를 반환한다.
+
+`Prototype` 스코프도 정확히 처리된다. `beanFactory.getBean()`이 스코프 정책을 담당하므로 `BeanMethodInterceptor`는 컨테이너 위임만 수행한다.
+
+<Callout type="warning" title="Lite Mode의 함정">
+`@Configuration(proxyBeanMethods = false)`에서 `@Bean` 메서드를 직접 호출하면 CGLIB 인터셉터가 없으므로 매번 새 인스턴스가 생성된다. Lite Mode에서 싱글톤을 보장하려면 반드시 `@Bean` 메서드의 파라미터로 의존성을 주입받아야 한다.
+
+```java
+// ✅ Full/Lite Mode 모두 안전
+@Bean
+public OrderService orderService(DataSource dataSource) {
+    return new OrderService(dataSource);
+}
+```
+</Callout>
+
+## @Import의 세 경로
+
+`@Import`는 단순히 "설정 클래스를 가져온다"가 아니다. 전달하는 클래스의 타입에 따라 `ConfigurationClassParser.processImports()`가 완전히 다른 경로로 분기한다.
+
+**일반 클래스**: `@Configuration`이 없어도 `@Import`로 가져오면 파싱 대상이 된다. `processConfigurationClass()`를 재귀 호출해 내부 `@Bean` 메서드를 처리한다.
+
+**ImportSelector**: `selectImports()`가 반환하는 클래스명 배열을 다시 파싱 대상으로 추가한다. 반환된 클래스에 `@Conditional`이 붙어 있으면 정상적으로 조건 평가가 이루어진다. `@EnableTransactionManagement`가 `TransactionManagementConfigurationSelector`를 통해 `AdviceMode`에 따라 다른 설정을 선택하는 것이 이 패턴이다.
+
+**ImportBeanDefinitionRegistrar**: `registerBeanDefinitions()`에서 `BeanDefinitionRegistry`에 직접 BeanDefinition을 추가한다. 파싱 단계를 거치지 않으므로 인터페이스 타입의 Bean을 `FactoryBean` 패턴으로 등록하는 데 적합하다. MyBatis `@MapperScan`이 각 Mapper 인터페이스마다 `MapperFactoryBean` BeanDefinition을 동적으로 등록하는 것이 대표적인 사례다.
+
+## 트레이드오프 — Full Mode vs Lite Mode
+
+<Callout type="note" title="트레이드오프">
+**Full Mode** (`proxyBeanMethods = true`): `@Bean` 메서드 간 직접 호출이 있을 때 싱글톤을 자동으로 보장한다. 대신 CGLIB 서브클래스 생성 비용이 시작 시간에 추가된다. `final` 클래스나 `final` 메서드에는 사용할 수 없다.
+
+**Lite Mode** (`proxyBeanMethods = false`): CGLIB 생성 비용이 없어 시작 시간이 빠르다. Spring Boot의 `@AutoConfiguration`이 내부적으로 이 모드를 기본으로 사용하는 이유다. 수백 개의 자동 설정 클래스가 모두 Full Mode라면 CGLIB 생성 비용이 누적된다. 단, `@Bean` 메서드 간 직접 호출이 있으면 싱글톤이 깨진다.
+
+런타임 성능 차이는 미미하다. 의미 있는 차이는 시작 시간에 있고, 그 효과는 설정 클래스 수가 많을수록 커진다.
+</Callout>
+
+`DeferredImportSelector`는 `ImportSelector`의 변형으로, 모든 `@Configuration` 파싱이 끝난 뒤에 실행된다. Spring Boot의 `AutoConfigurationImportSelector`가 이 인터페이스를 구현한다. 사용자가 `DataSource` Bean을 직접 선언했는지 파악한 뒤에 자동 설정 `DataSource`를 등록할지 결정해야 하기 때문이다. `@ConditionalOnMissingBean`이 정확하게 동작하려면 사용자 설정이 먼저 등록된 상태여야 한다.
+
+<Aside label="설계 철학">
+Full Mode, Lite Mode, ImportSelector, Registrar — 이 모든 메커니즘은 하나의 질문에 대한 답이다. "어떻게 하면 Java 코드로 Bean 등록을 표현하면서 싱글톤과 조건부 활성화를 동시에 보장할 수 있는가?" CGLIB은 그 답의 구현 수단이고, `@Import`의 세 경로는 복잡도에 따른 탈출구다.
+</Aside>
+
+## 정리
+
+- `@Configuration`이 Full Mode가 되는 조건은 `proxyBeanMethods = true`(기본값)다. Lite Mode는 이 속성을 `false`로 설정하거나 `@Component` 계열 어노테이션을 사용하는 경우다.
+- Full Mode에서 CGLIB 서브클래스는 Bean 인스턴스 생성 이전, `postProcessBeanFactory()` 단계에서 BeanDefinition의 `beanClass`를 교체하는 방식으로 삽입된다.
+- `BeanMethodInterceptor`는 ThreadLocal 기반으로 "컨테이너 직접 호출"과 "다른 `@Bean` 메서드 내부 호출"을 구분해 싱글톤을 보장한다.
+- Lite Mode에서 싱글톤을 유지하려면 `@Bean` 메서드를 직접 호출하지 않고 파라미터로 주입받아야 한다.
+- `@Import`는 일반 클래스, `ImportSelector`, `ImportBeanDefinitionRegistrar` 세 경로로 분기한다. 처리 시점과 `@Conditional` 적용 여부가 각각 다르다.
+
+다음 글에서는 `@Autowired`가 의존성을 주입하는 내부 경로, `AutowiredAnnotationBeanPostProcessor`가 어떻게 타입과 한정자를 조합해 후보 Bean을 결정하는지 추적한다.

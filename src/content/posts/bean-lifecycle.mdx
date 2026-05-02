@@ -1,0 +1,117 @@
+---
+title: "Spring Bean은 어떻게 태어나고 사라지는가"
+description: "doCreateBean()의 8단계 생성 흐름부터 소멸 콜백의 역순 실행, 3단계 순환 참조 캐시, Scope Proxy의 생명주기 불일치 해결까지, Spring Bean의 전 생애를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, bean-lifecycle, dependency-injection, aop, scope]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@Service` 하나를 붙이면 스프링이 "알아서" Bean을 만든다. 하지만 `@Autowired` 필드를 생성자에서 쓰면 NPE가 나고, `@PostConstruct`에서 `@Transactional`이 동작하지 않으며, Singleton에 Prototype을 주입했는데 매번 같은 인스턴스가 돌아온다. 이 버그들은 모두 같은 질문을 가리킨다 — Bean은 정확히 어떤 순서로 태어나고, 어떻게 살다가, 어디서 사라지는가?
+
+## 8단계 생성 흐름 — doCreateBean()
+
+`AbstractAutowireCapableBeanFactory.doCreateBean()`은 Bean 하나를 만드는 전 과정을 담은 메서드다. 순서는 항상 고정이다.
+
+```
+1. createBeanInstance()       생성자 호출 — 모든 필드 null
+2. applyMergedBeanDefinition  @Autowired 메타데이터 스캔·캐싱
+3. addSingletonFactory()      순환 참조 대비 ObjectFactory 등록
+4. populateBean()             @Autowired·@Value·@Resource 실제 주입
+5. invokeAwareMethods()       BeanNameAware, BeanFactoryAware
+6. BPP Before                 ApplicationContextAware, @PostConstruct
+7. invokeInitMethods()        afterPropertiesSet(), init-method
+8. BPP After                  AOP 프록시 생성 (@Transactional 등)
+```
+
+여기서 흔한 실수가 나온다. 생성자(1단계)에서 `@Autowired` 필드를 사용하면 필드는 아직 `null`이다. 주입은 4단계 `populateBean()`에서 일어난다. 초기화 로직이 `@Autowired` 필드를 필요로 한다면 `@PostConstruct`(6단계)에 둬야 한다.
+
+또 하나: `@PostConstruct`에서 `@Transactional`이 동작하지 않는 이유도 이 표에 있다. AOP 프록시는 8단계 BPP After에서 생성된다. 6단계 `@PostConstruct` 실행 시점에는 프록시가 아직 없다. `this.doSomething()`을 `@PostConstruct`에서 호출하면 원본 메서드를 직접 호출하게 되어 트랜잭션이 열리지 않는다.
+
+## 초기화 콜백 세 가지의 실행 순서
+
+`@PostConstruct`, `InitializingBean.afterPropertiesSet()`, `init-method`는 모두 populateBean() 이후에 실행된다. 순서는 항상 고정이다.
+
+```
+1. @PostConstruct      → CommonAnnotationBPP (BPP Before, 6단계)
+2. afterPropertiesSet  → invokeInitMethods() 직접 호출 (7단계)
+3. init-method         → invokeInitMethods() 리플렉션 호출 (7단계)
+```
+
+처리 경로가 다르다. `@PostConstruct`는 `CommonAnnotationBeanPostProcessor`가 리플렉션으로 실행하고, `afterPropertiesSet()`은 `InitializingBean` 인터페이스를 직접 호출한다. 부모 클래스가 있다면 부모의 `@PostConstruct`가 먼저 실행된다(`buildLifecycleMetadata()`가 부모 메서드를 리스트 앞에 삽입하기 때문).
+
+<Callout type="note" title="선택 기준">
+실무 기본은 `@PostConstruct`다. JSR-250 표준이라 스프링 코드에 결합되지 않는다. 외부 라이브러리 클래스를 초기화해야 한다면 `@Bean(initMethod = "...")`, 성능이 매우 중요한 인프라 코드라면 `InitializingBean`(리플렉션 없는 직접 호출)을 선택한다.
+</Callout>
+
+## 소멸 콜백 — 생성의 역순
+
+컨테이너가 종료되면 `destroySingletons()`가 **등록 역순(LIFO)**으로 Bean을 소멸시킨다. 나중에 생성된 Bean이 먼저 사라진다. 의존 관계를 역순으로 정리하기 위해서다.
+
+각 Bean의 소멸 순서도 초기화와 대칭이다.
+
+```
+1. @PreDestroy        → CommonAnnotationBPP (postProcessBeforeDestruction)
+2. destroy()          → DisposableBean 직접 호출
+3. destroy-method     → 리플렉션 호출
+```
+
+부모·자식 클래스에서 `@PreDestroy` 순서는 초기화의 역순 — 자식이 먼저, 부모가 나중이다.
+
+한 가지 함정: **Prototype Bean은 소멸 콜백이 없다.** `registerDisposableBeanIfNecessary()`에서 `!mbd.isPrototype()` 조건으로 Prototype을 `disposableBeans` 등록에서 제외한다. 컨테이너가 Prototype 인스턴스를 추적하지 않기 때문이다. Prototype Bean에 외부 리소스가 있다면 호출자가 직접 `ctx.getBeanFactory().destroyBean(beanName, bean)`을 호출해야 한다.
+
+Spring Boot는 `registerShutdownHook()`을 자동으로 등록하므로 SIGTERM 신호로 소멸 콜백이 실행된다. `kill -9`(SIGKILL)는 JVM을 즉시 종료하므로 ShutdownHook이 실행되지 않는다.
+
+## 3단계 캐시 — 순환 참조를 푸는 방법
+
+A → B → A 같은 필드 주입 순환 참조를 스프링이 해결하는 원리가 3단계 캐시다.
+
+```
+singletonObjects      완성된 Bean (1단계)
+earlySingletonObjects 조기 노출 Bean (2단계)
+singletonFactories    ObjectFactory 람다 (3단계)
+```
+
+흐름은 이렇다. A 생성 시 `createBeanInstance()`로 인스턴스를 만든 직후, 아직 필드가 null인 상태에서 `addSingletonFactory("a", () -> getEarlyBeanReference("a", mbd, rawA))`로 람다를 3단계에 등록한다. 이후 `populateBean()`에서 B가 필요해지고, B를 생성하다가 B의 `populateBean()`에서 다시 A가 필요해진다. 이때 `getSingleton("a", true)`가 3단계 람다를 실행해 A의 early reference를 만들고 2단계로 승격한다. B는 이 early reference를 주입받고 완성된다. A도 B 주입 후 완성되어 1단계에 등록된다.
+
+A에 `@Transactional`이 있으면 람다 실행 시 `AbstractAutoProxyCreator.getEarlyBeanReference()`가 **8단계보다 먼저** 프록시를 만들어 2단계에 저장한다. B는 처음부터 프록시를 주입받는다. 8단계 BPP After에서 동일 Bean을 재처리할 때는 `earlyProxyReferences` Map으로 이미 처리됐음을 감지해 새 프록시를 만들지 않는다.
+
+<Aside label="Spring Boot 2.6+ 기본값">
+Spring Boot 2.6부터 `allowCircularReferences`의 기본값이 `false`로 바뀌었다. 순환 참조 발생 시 `BeanCurrentlyInCreationException`이 즉시 던져진다. "순환 참조는 설계 결함"이라는 입장을 기본으로 강제한다. 필요하면 `spring.main.allow-circular-references: true`로 명시적으로 허용한다.
+</Aside>
+
+## Scope와 생명주기 불일치
+
+Singleton Bean에 Prototype이나 Request Scope Bean을 `@Autowired`로 주입하면, 주입은 Singleton 생성 시 한 번만 일어난다. 이후 Prototype인데 항상 같은 인스턴스가, Request Scope인데 모든 요청이 같은 인스턴스를 공유하는 버그가 생긴다.
+
+해결은 Scope Proxy다.
+
+```java
+@Component
+@Scope(value = "request", proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class ShoppingCart { ... }
+```
+
+`proxyMode`를 지정하면 컨테이너에 두 개의 BeanDefinition이 등록된다. `"shoppingCart"`는 `ScopedProxyFactoryBean`이 만든 CGLIB 프록시, `"scopedTarget.shoppingCart"`는 실제 `ShoppingCart`다. Singleton에 주입되는 것은 프록시다. `cart.add(item)`을 호출할 때마다 프록시가 `Scope.get()`을 호출해 현재 Request에서 실제 인스턴스를 찾는다. 없으면 새로 생성해 Request 속성에 저장한다.
+
+<Callout type="note" title="트레이드오프">
+Scope Proxy는 매 메서드 호출마다 `Scope.get()` 오버헤드가 있고, `@Async` 스레드에서 Request Scope Bean을 사용하면 `RequestContextHolder`에 컨텍스트가 없어 `IllegalStateException`이 발생한다. 명시적인 대안은 `ObjectProvider<T>.getObject()`다 — 호출 시점에 새 인스턴스를 획득하며 오버헤드도 없지만, 사용하는 쪽의 API가 바뀐다.
+</Callout>
+
+## 정리
+
+- Bean 생성 8단계 중 `@Autowired` 주입은 4단계, `@PostConstruct`는 6단계, AOP 프록시는 8단계다. 순서를 모르면 초기화 버그를 예측할 수 없다.
+- 초기화 콜백 순서는 `@PostConstruct` → `afterPropertiesSet()` → `init-method`, 소멸은 반대 방향이며 Bean 등록 역순으로 실행된다.
+- 순환 참조는 3단계 캐시와 early reference로 해결된다. AOP 프록시가 있으면 early reference 단계에서 프록시를 미리 만들어 일관성을 보장한다.
+- Scope 생명주기 불일치는 Scope Proxy 또는 `ObjectProvider`로 해결한다. Prototype Bean의 소멸은 컨테이너가 보장하지 않는다.
+
+스프링이 "알아서" 해주는 것들의 내부를 알면, 알아서 해주지 않는 경우를 예측할 수 있다.

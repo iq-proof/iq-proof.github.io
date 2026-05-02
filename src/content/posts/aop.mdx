@@ -1,0 +1,113 @@
+---
+title: "Spring AOP는 왜 프록시인가 — 9개 챕터로 보는 하나의 구조"
+description: "JDK Proxy와 CGLIB의 바이트코드 차이부터 @Transactional·@Cacheable의 Interceptor 체인, private 메서드 함정과 성능 측정까지, 프록시 AOP의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, aop, proxy, cglib, bytecode]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring AOP는 **런타임 프록시**다. `@Transactional`, `@Cacheable`, `@Secured` — 이 어노테이션들은 모두 같은 인프라 위에서 동작한다. 그 인프라의 뿌리는 "원본 클래스를 수정하지 않고 메서드 호출을 가로챈다"는 단 하나의 아이디어다. 왜 스프링은 이 방식을 선택했고, 그 선택이 어떤 제약을 만들어내는가?
+
+## 두 프록시, 하나의 목적
+
+메서드 호출을 가로채는 방법은 두 가지다. JDK Dynamic Proxy는 `java.lang.reflect.Proxy`로 인터페이스 구현체를 런타임에 생성한다. 생성된 `$Proxy42`는 모든 메서드를 `InvocationHandler.invoke()` 단일 경로로 위임하고, 원본 메서드 호출은 `Method.invoke()` — 리플렉션으로 처리한다.
+
+CGLIB은 다르다. ASM 바이트코드 조작으로 원본 클래스의 **서브클래스**를 생성한다. `OrderService$$SpringCGLIB$$0`은 `OrderService`를 상속하고, 오버라이딩 가능한 메서드마다 `MethodInterceptor.intercept()` 호출 코드를 삽입한다. 원본 메서드 호출은 `super.method()` — 직접 호출이다.
+
+```
+JDK Proxy 호출 경로:
+  호출자 → $Proxy42.pay() → InvocationHandler.invoke()
+         → Advice 체인 → Method.invoke(target, args)  ← 리플렉션
+
+CGLIB 호출 경로:
+  호출자 → OrderService$$CGLIB.placeOrder() → MethodInterceptor.intercept()
+         → Advice 체인 → super.placeOrder()           ← 직접 호출
+```
+
+Spring Boot 2.0부터 기본값이 CGLIB(`proxy-target-class=true`)인 이유는 성능만이 아니다. JDK Proxy는 인터페이스 타입으로만 주입 가능하기 때문에 `@Autowired PaymentServiceImpl svc` 같은 구체 클래스 주입이 `BeanNotOfRequiredTypeException`을 던진다. CGLIB은 서브클래스이므로 구체 클래스 타입 주입이 안전하다. 일관성이 더 큰 이유였다.
+
+## Advisor 체인이 조립되는 방법
+
+`@EnableAspectJAutoProxy`는 `AnnotationAwareAspectJAutoProxyCreator`라는 `BeanPostProcessor`를 등록한다. 이 BPP는 컨텍스트에서 `@Aspect` Bean을 탐색하고, 각 어드바이스 메서드를 `Advisor` 객체로 변환해 캐시한다.
+
+변환 경로는 구체적이다. `ReflectiveAspectJAdvisorFactory`가 `@Around` → `AspectJAroundAdvice`, `@Before` → `AspectJMethodBeforeAdvice` 식으로 어노테이션 타입별 Advice 객체를 생성한다. 각 Advice는 `AspectJExpressionPointcut`과 쌍을 이루어 `InstantiationModelAwarePointcutAdvisorImpl`로 묶인다.
+
+Bean 생성 후 BPP After 단계에서 `wrapIfNecessary()`가 해당 Bean에 매칭되는 Advisor를 찾고, 있으면 `ProxyFactory`로 프록시를 생성해 원본 Bean 대신 컨테이너에 등록한다. `@Transactional`은 `BeanFactoryTransactionAttributeSourceAdvisor`, `@Cacheable`은 `BeanFactoryCacheOperationSourceAdvisor` — 구조는 완전히 동일하다.
+
+<Aside label="구조적 재사용">
+`@Transactional`의 `TransactionInterceptor`와 `@Cacheable`의 `CacheInterceptor`는 1:1로 대응한다. `TransactionAttributeSource` ↔ `CacheOperationSource`, `PlatformTransactionManager` ↔ `CacheManager`. 스프링 AOP는 횡단 관심사마다 동일한 패턴을 재사용한다.
+</Aside>
+
+## Pointcut이 메서드를 선별하는 방법
+
+`execution(* com.example.service.*.*(..))` 같은 표현식은 컨텍스트 시작 시 단 한 번 파싱된다. `AspectJExpressionPointcut`은 파싱 결과를 AST로 캐시하고, 클래스 레벨 매칭(`shadowMatchCache`)과 메서드 레벨 매칭을 순서대로 수행한다.
+
+정적 지시자(`execution`, `within`, `@annotation`)는 컴파일 시점 정보만으로 `alwaysMatches` 또는 `neverMatches`를 결정한다. 반면 `args()`, `bean()` 같은 런타임 지시자는 `isRuntime() = true`를 반환하고 매 메서드 호출마다 3단계 평가를 수행한다. `execution && bean(*Service)` 복합 표현식에서 `execution`을 왼쪽에 두면 단락 평가로 `bean()` 평가 횟수를 줄일 수 있다.
+
+## proceed()의 재귀 구조
+
+`ReflectiveMethodInvocation`은 `currentInterceptorIndex`로 현재 위치를 추적한다. `proceed()`를 호출할 때마다 인덱스가 전진하며 다음 인터셉터가 실행된다. 모든 인터셉터를 소진하면 `invokeJoinpoint()`로 실제 메서드를 호출한다.
+
+`@Around`의 `pjp.proceed()`는 이 `proceed()` 재호출이다. 따라서 여러 `@Around`가 중첩되면 양파 껍질처럼 쌓인다 — `@Order(1)` Aspect가 먼저 진입하고 나중에 복귀한다. 각 Advice 타입의 `proceed()` 위치가 실행 순서를 결정한다.
+
+```
+정상 종료 순서:
+  Around 진입 → Before → 메서드 → AfterReturning → After → Around 복귀
+```
+
+<Callout type="warning" title="proceed() 주의사항">
+`@Around`에서 `pjp.proceed()`를 호출하지 않으면 실제 메서드가 실행되지 않는다. 두 번 호출하면 실제 메서드가 두 번 실행된다 — DB insert 중복, 트랜잭션 상태 오염으로 이어진다.
+</Callout>
+
+## private, final, Self-Invocation — 세 가지 함정
+
+CGLIB이 메서드를 가로채는 방법은 오버라이딩이다. 그래서 오버라이딩이 불가능한 메서드는 AOP가 적용되지 않는다.
+
+`private` 메서드는 `invokespecial` 바이트코드로 컴파일된다 — 컴파일 타임에 정적으로 결정되고 동적 디스패치가 없다. CGLIB 서브클래스가 오버라이딩하려 하면 JVM 검증 오류가 발생한다. `final` 메서드는 언어 규칙상 오버라이딩이 금지된다. `static` 메서드는 `invokestatic`으로 인스턴스 프록시와 무관하다.
+
+Self-Invocation은 다른 이유다. `TransactionInterceptor`가 실제 메서드를 호출할 때 target은 **원본 Bean**이다 — 프록시가 아니다. 따라서 원본 `placeOrder()` 안에서 `this.inner()`를 호출하면 `this`는 원본 객체이고, `inner()`는 프록시를 경유하지 않는다.
+
+```java
+// ❌ Self-Invocation — REQUIRES_NEW 무시됨
+@Service
+public class OrderService {
+    @Transactional
+    public void outer() {
+        this.inner();  // 프록시 우회
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void inner() { ... }
+}
+```
+
+해결책의 우선순위는 명확하다. 별도 Bean으로 분리하는 것이 설계 개선이기도 하다. `AopContext.currentProxy()`는 `exposeProxy = true` 설정이 필요하고 스프링 AOP에 강하게 결합된다. AspectJ 위빙은 근본적 해결이지만 빌드 설정 복잡도가 따라온다.
+
+## 트레이드오프
+
+프록시 방식의 성능 오버헤드는 실측 기준 CGLIB 약 28ns, JDK Proxy 약 38ns(빈 메서드 기준)다. 일반 웹 서비스에서 DB 쿼리가 수 ms라면 프록시 오버헤드 비중은 0.01% 미만이다. 병목은 대부분 I/O다.
+
+<Callout type="note" title="트레이드오프">
+**프록시 방식**: JVM 표준, 설정 간단, 비침습적. 대신 private/final/static/Self-Invocation 불가, 프록시 오버헤드(미미) 존재.
+
+**AspectJ 위빙**: private 메서드, Self-Invocation 모두 해결, 오버헤드 없음. 대신 빌드 도구 설정 복잡, 디버깅 어려움.
+
+실무에서 AspectJ 위빙이 필요한 경우는 드물다. 대부분 설계 문제(Self-Invocation)이거나 잘못된 어노테이션 위치(private 메서드)다.
+</Callout>
+
+## 정리
+
+- Spring AOP의 모든 어노테이션(`@Transactional`, `@Cacheable`, `@Secured`)은 동일한 `Advisor + ProxyFactory + Interceptor` 구조 위에서 동작한다.
+- CGLIB이 기본값인 이유는 성능보다 **구체 클래스 타입 주입의 일관성**이다.
+- AOP가 동작하지 않는 세 패턴 — private/final/static 메서드, Self-Invocation — 은 모두 "프록시가 오버라이딩할 수 없거나, 원본 Bean이 직접 호출된다"는 같은 이유에서 나온다.
+- Pointcut 런타임 매칭(`args()`, `bean()`)은 캐싱되지 않아 매 호출마다 비용이 발생한다. `execution` 위주로 작성하고 복합 표현식에서 비용이 낮은 지시자를 AND 왼쪽에 두는 것이 실용적이다.

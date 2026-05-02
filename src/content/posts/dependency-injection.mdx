@@ -1,0 +1,89 @@
+---
+title: "Spring DI는 왜 생성자 주입을 권장하는가"
+description: "바이트코드 레벨 차이부터 3단계 순환 참조 캐시, @Qualifier 결정 알고리즘, ObjectProvider, @Lazy 프록시까지 — Spring DI 내부 설계의 일관된 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, dependency-injection, proxy, bean-lifecycle]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring은 의존성을 전달하는 방법을 세 가지 제공한다 — 생성자, 필드, 세터. 세 방법 모두 동작하고, 겉으로 보면 차이가 없어 보인다. 그렇다면 왜 공식 문서는 집요하게 생성자 주입을 권장하는가? 그리고 이 선택이 순환 참조, Bean 선택, 지연 초기화 같은 나머지 모든 DI 메커니즘과 어떻게 연결되는가?
+
+## 바이트코드에서 드러나는 세 가지 길
+
+생성자 주입은 `putfield`를 생성자 안에서 실행한다. JVM은 생성자 완료 후 `final` 필드를 변경할 수 없도록 보장하기 때문에, 생성자 주입만이 `private final PaymentService paymentService` 선언을 허용한다. 객체가 만들어지는 순간 모든 의존성이 확정된다.
+
+필드 주입은 다르다. Spring 내부의 `AutowiredAnnotationBeanPostProcessor`가 객체 생성 후 `field.setAccessible(true)` → `field.set(instance, bean)` 순서로 리플렉션을 직접 호출한다. `final` 필드에 이 방식을 시도하면 Java 모듈 시스템이 강화된 Java 9 이후 `IllegalAccessException`이 발생한다. 생성과 주입이 분리되기 때문에 일시적으로 불완전한 객체가 존재하는 구간도 생긴다.
+
+세터 주입은 `method.invoke()`로 setter를 호출한다. 내부에서 `putfield`가 실행되지만 `final`은 선언할 수 없다. 선택적 의존성(`@Autowired(required=false)`)을 표현할 때는 합리적인 선택이다.
+
+<Callout type="note" title="트레이드오프">
+생성자 주입은 파라미터가 늘어날수록 생성자가 길어진다. 이는 단점이 아니라 **"이 클래스가 너무 많은 것을 한다"는 설계 신호**다. 필드 주입은 이 신호를 숨긴다.
+</Callout>
+
+## 순환 참조 — 3단계 캐시의 존재 이유
+
+`A → B → A` 순환이 있을 때 필드/세터 주입은 어떻게 해결하는가. `DefaultSingletonBeanRegistry`는 세 개의 맵을 유지한다.
+
+```
+singletonObjects     (1단계) — 완전히 초기화된 Bean
+earlySingletonObjects (2단계) — 생성 완료, 초기화 전
+singletonFactories   (3단계) — ObjectFactory 람다
+```
+
+A 생성이 시작되면 즉시 3단계에 `() -> getEarlyBeanReference("a", mbd, rawA)` 람다가 등록된다. B가 A를 요청하면 3단계 람다가 실행되어 A의 early reference가 2단계로 올라가고 B에 주입된다. B가 완성된 후 A가 완성되어 1단계에 등록된다.
+
+`@Transactional` 같은 AOP 프록시가 있을 때 2단계 캐시가 필수인 이유도 여기 있다. 람다가 실행되는 시점에 `AbstractAutoProxyCreator.getEarlyBeanReference()`가 CGLIB 프록시를 미리 만들어 2단계에 저장하기 때문에, B에는 원본이 아닌 프록시가 주입된다.
+
+생성자 주입은 이 흐름에 끼어들 수 없다. 인스턴스를 만들려면 B가 필요하고, B를 만들려면 A가 필요한데 A는 아직 `new`조차 못 했다. 3단계에 등록할 인스턴스 자체가 없으므로 `BeanCurrentlyInCreationException`이 즉시 발생한다. 이것이 **버그가 아니라 설계 원칙의 귀결**이다 — 순환 참조는 아키텍처 문제라는 신호다.
+
+## Bean 선택 — @Qualifier가 @Primary를 이기는 이유
+
+같은 타입의 Bean이 여러 개일 때 `DefaultListableBeanFactory.determineAutowireCandidate()`는 다음 순서로 결정한다.
+
+```
+1. @Qualifier 필터링   — findAutowireCandidates()에서 후보 자체를 걸러냄
+2. @Primary 확인       — 남은 후보 중 @Primary가 있으면 선택
+3. @Priority 확인      — javax.annotation.Priority 값 비교
+4. 필드명/파라미터명 매칭 — 이름으로 Bean 이름과 비교
+5. NoUniqueBeanDefinitionException
+```
+
+`@Qualifier`가 `@Primary`보다 앞서는 이유는 처리 단계가 다르기 때문이다. `@Qualifier`는 `findAutowireCandidates()`에서 후보 목록 자체를 필터링하고, `@Primary`는 그 이후에 남은 후보들 중에서 고른다. 명시적 지시가 기본값보다 우선하는 것은 당연하다.
+
+`@Resource`는 다르다. `CommonAnnotationBeanPostProcessor`가 처리하며, 탐색 순서가 역전된다 — 이름 우선, 타입은 폴백이다. `@Resource(name="tossPay")`는 타입을 보기 전에 `"tossPay"`라는 이름으로 직접 `getBean()`을 호출한다.
+
+## ObjectProvider — 지연이 필요한 두 가지 상황
+
+`Optional<T>`와 `ObjectProvider<T>`는 둘 다 Bean이 없을 때 안전하지만 목적이 다르다. `Optional<T>`는 주입 시점에 Bean을 탐색하고 그 결과를 고정한다. `ObjectProvider<T>`는 `getObject()` 호출 시점에 탐색한다.
+
+이 차이가 중요한 두 상황이 있다. 첫째, Singleton에 Prototype Bean을 주입할 때. `@Autowired PrototypeBean bean`은 컨텍스트 시작 시 한 번만 주입되어 이후 같은 인스턴스를 반환한다. `ObjectProvider<PrototypeBean> provider`를 주입받아 `provider.getObject()`를 매번 호출하면 진짜 Prototype 동작을 얻는다. 둘째, 순서가 있는 다중 Bean 처리. `provider.orderedStream()`은 `@Order` 값 기준으로 정렬된 Stream을 반환한다.
+
+## @Lazy — 두 가지 역할의 구분
+
+`@Lazy`는 위치에 따라 완전히 다르게 동작한다.
+
+Bean 선언에 붙이면 `preInstantiateSingletons()` 루프에서 제외될 뿐이다. BeanDefinition은 `refresh()` 시 등록되므로 `containsBean()`은 여전히 `true`를 반환한다. 인스턴스만 최초 `getBean()` 호출 시 생성된다.
+
+주입 지점에 붙이면 다르다. `buildLazyResolutionProxy()`가 `TargetSource`를 감싼 CGLIB/JDK 프록시를 즉시 만들어 필드에 주입한다. 실제 Bean은 `heavyService.method()` 같은 첫 메서드 호출 시 프록시 내부에서 `doResolveDependency()`가 실행되며 생성된다. 생성자 주입에서 `@Lazy B b`를 쓰면 순환 참조가 해결되는 원리가 이것이다 — B의 프록시를 즉시 만들 수 있어 A 생성이 완료되고, 이후 B를 실제로 생성할 때 이미 완성된 A를 받는다.
+
+<Aside label="설계 철학">
+필드 주입, 순환 참조 허용, 전체 Lazy 초기화는 전부 개발자에게 편의를 주지만 문제를 감춘다. 생성자 주입이 강제하는 불편함 — 파라미터 증가, 순환 참조 즉시 실패 — 은 설계 결함을 시작 시점에 드러내는 장치다.
+</Aside>
+
+## 정리
+
+- 생성자 주입만 `final` 필드를 허용한다. 이는 JVM 수준의 불변성 보장이다.
+- 3단계 캐시는 필드/세터 주입의 순환 참조를 해결하지만, 생성자 주입의 순환은 의도적으로 막는다.
+- `@Qualifier` → `@Primary` → 이름 매칭 순서는 "명시 > 기본" 원칙의 구현이다.
+- `ObjectProvider`는 `Optional`이 아니다 — 탐색 시점을 호출 시점으로 미룬다.
+- `@Lazy`의 두 역할(Bean 선언 지연 vs 주입 지점 프록시)을 혼동하면 Lazy가 기대와 다르게 동작한다.

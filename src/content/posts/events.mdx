@@ -1,0 +1,110 @@
+---
+title: "Spring 이벤트는 언제, 어떤 스레드에서 실행되는가"
+description: "publishEvent() 내부 구조부터 @TransactionalEventListener의 트랜잭션 바인딩까지, Spring ApplicationEvent 메커니즘의 실행 흐름을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, application-event, event-listener, transaction, async]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring의 `publishEvent()`는 단순한 메서드 호출처럼 보인다. 하지만 내부에서는 리스너 탐색, 캐시, 동기/비동기 분기, 트랜잭션 동기화가 순서대로 맞물려 동작한다. `@EventListener`를 붙였더니 왜 트랜잭션 커밋 전에 실행되는지, `@Async`를 붙였더니 왜 예외가 사라지는지 — 이 질문들의 답은 모두 같은 내부 구조에 있다.
+
+## 발행에서 리스너 호출까지
+
+`publishEvent()`가 호출되면 `AbstractApplicationContext`가 먼저 이벤트를 정규화한다. 일반 POJO를 발행하면 `PayloadApplicationEvent`로 래핑하고, `ApplicationEvent` 타입이면 그대로 통과한다. 그 다음 `SimpleApplicationEventMulticaster.multicastEvent()`가 호출된다.
+
+멀티캐스터가 하는 첫 번째 일은 리스너 탐색이다. `getApplicationListeners(eventType, sourceType)`은 `ConcurrentHashMap` 기반의 `retrieverCache`를 먼저 뒤진다. 캐시 히트면 즉시 반환, 미스면 등록된 모든 리스너를 순회해 `supportsEvent()`로 필터링하고 `@Order` 기준으로 정렬한 뒤 캐시에 저장한다. 같은 이벤트 타입이 반복 발행되는 실제 운영 환경에서는 거의 항상 캐시 히트가 발생한다.
+
+리스너 목록이 확보되면 각 리스너에 대해 `invokeListener()`를 호출한다. 여기서 `Executor`가 설정돼 있으면 비동기로, 없으면 발행 스레드에서 동기로 실행된다.
+
+```
+publishEvent(event)
+  ↓ POJO → PayloadApplicationEvent 래핑
+  getApplicationEventMulticaster().multicastEvent()
+    ↓
+    getApplicationListeners()
+      retrieverCache 조회 → 히트면 즉시 반환
+      미스 → 전체 탐색 → @Order 정렬 → 캐시 저장
+    ↓
+    for each listener:
+      Executor 있음 → executor.execute(() -> invokeListener())
+      Executor 없음 → invokeListener() [발행 스레드]
+```
+
+## @EventListener는 어떻게 등록되는가
+
+`@EventListener`가 붙은 메서드는 ApplicationListener 인터페이스를 구현하지 않는다. 대신 `EventListenerMethodProcessor`가 모든 싱글톤 빈 초기화가 완료된 직후(`afterSingletonsInstantiated()`) 메서드를 탐색하고, 각 메서드를 `ApplicationListenerMethodAdapter`로 래핑해 컨텍스트에 등록한다.
+
+`ApplicationListenerMethodAdapter`가 `onApplicationEvent()`를 받으면 세 단계를 거친다. `resolveArguments()`로 이벤트를 메서드 인수로 변환하고, `shouldHandle()`에서 `condition` SpEL을 평가하고, 통과하면 리플렉션으로 원본 메서드를 호출한다. 반환값이 있으면 `handleResult()`가 새 이벤트로 즉시 발행한다.
+
+<Callout type="note" title="등록 시점의 함의">
+`@EventListener`는 `afterSingletonsInstantiated()` 이후에 등록된다. 즉 `refresh()` 완료 이전에 발행되는 `ContextRefreshedEvent` 같은 이른 이벤트를 `@EventListener`로 수신하는 것은 보장되지 않는다. 컨텍스트 초기화 중 이벤트를 반드시 수신해야 한다면 `ApplicationListener<T>` 인터페이스 구현이 안전하다.
+</Callout>
+
+`ApplicationListener<T>` 인터페이스와 `@EventListener`의 또 다른 차이는 타입 추론 방식이다. 인터페이스는 컴파일된 바이트코드의 제네릭 시그니처에서 타입을 읽고, `@EventListener`는 메서드 파라미터 타입을 런타임 리플렉션으로 읽는다. 람다로 `ApplicationListener`를 구현하면 제네릭 타입이 소거되어 탐색에 실패할 수 있다.
+
+## 비동기: 스레드가 분리되는 지점
+
+`@Async`를 `@EventListener`와 함께 쓰면 스레드 분리가 `invokeListener()` 내부가 아니라 더 깊은 곳에서 일어난다. 멀티캐스터는 `invokeListener()`를 발행 스레드에서 호출한다. 하지만 대상 빈이 `@Async` 프록시로 감싸져 있으므로, 프록시의 `AsyncExecutionInterceptor`가 실제 메서드 실행을 `TaskExecutor`에 제출하고 즉시 반환한다.
+
+이것이 "멀티캐스터에 `Executor`를 설정하는 방식"과 `@Async`의 결정적 차이다. 전자는 멀티캐스터의 for 루프 자체가 모든 리스너를 executor에 제출해 일괄 비동기 처리한다. 후자는 리스너별로 비동기/동기를 혼용할 수 있다.
+
+비동기 리스너에서 예외가 발생하면 발행 스레드로 전파되지 않는다. `void` 반환 메서드의 예외는 `AsyncUncaughtExceptionHandler`가 받는다. 기본 구현은 로그만 남기므로, 운영 환경에서는 명시적인 핸들러를 구성해야 한다.
+
+<Callout type="warning" title="트레이드오프">
+**`@Async` + `@EventListener`**: 리스너별 세밀한 제어, `@EnableAsync` 필요, Self-Invocation 주의.  
+**멀티캐스터 Executor 설정**: 설정 한 곳에서 전체 제어, 동기/비동기 혼용 불가.  
+비동기 리스너 간 `@Order`는 제출 순서만 제어하며 완료 순서를 보장하지 않는다. 비동기 리스너는 서로 독립적으로 설계해야 한다.
+</Callout>
+
+## 실행 순서: @Order가 작동하는 위치
+
+`@Order`는 `retrieveApplicationListeners()`의 정렬 단계에서 적용된다. 결과는 `retrieverCache`에 저장되므로, 같은 이벤트 타입에 대해 정렬은 한 번만 수행된다. 동기 환경에서는 이 순서가 실행 순서와 동일하다.
+
+순서를 지정할 때 주의할 점이 두 가지 있다. 첫째, 같은 `@Order` 값을 가진 리스너 사이의 순서는 보장되지 않는다. 순서가 중요한 로직에는 고유한 값을 써야 한다. 둘째, `@Order(1)` 리스너에서 예외가 발생하면 `ErrorHandler`가 없는 기본 설정에서 예외가 전파돼 `@Order(2)` 이후 리스너들은 실행되지 않는다.
+
+<Aside label="설계 원칙">
+리스너 간 실행 순서에 의존하는 설계는 이벤트 기반 아키텍처의 느슨한 결합 원칙을 위반한다. 순서가 명시적으로 필요하다면 이벤트 체인(리스너 반환값으로 다음 이벤트 발행)이나 서비스 메서드의 직접 호출을 고려하라.
+</Aside>
+
+## 트랜잭션 바운드 이벤트
+
+`@TransactionalEventListener`는 이벤트 발행 시점과 리스너 실행 시점을 분리하는 메커니즘이다. `onApplicationEvent()`가 호출되면 리스너를 즉시 실행하는 대신 `TransactionSynchronization`을 등록하고 반환한다. 실제 실행은 트랜잭션의 지정된 `phase`에서 일어난다.
+
+```
+@Transactional 메서드 실행 중
+  publisher.publishEvent(event)
+    → TransactionSynchronization 등록 (이벤트 보관)
+    → 즉시 반환
+  ↓
+트랜잭션 완료
+  beforeCommit()  → BEFORE_COMMIT 리스너 실행
+  [커밋]
+  afterCommit()   → AFTER_COMMIT 리스너 실행
+  afterCompletion(COMMITTED 또는 ROLLED_BACK)
+                  → AFTER_COMPLETION / AFTER_ROLLBACK 리스너 실행
+```
+
+`BEFORE_COMMIT`은 원래 트랜잭션이 아직 활성 상태이므로 리스너 내 DB 작업이 같은 트랜잭션에 포함된다. 예외가 발생하면 원래 트랜잭션을 롤백할 수 있다. `AFTER_COMMIT`은 트랜잭션이 닫힌 후이므로 DB 작업이 필요하면 `@Transactional(propagation = REQUIRES_NEW)`로 새 트랜잭션을 열어야 한다.
+
+활성 트랜잭션이 없는 상태에서 이벤트를 발행하면 기본 설정(`fallbackExecution = false`)에서는 리스너가 조용히 무시된다. 테스트에서 트랜잭션 없이 동작을 확인하려면 `fallbackExecution = true`를 설정하되, 프로덕션과 동작이 달라진다는 점을 인식해야 한다.
+
+가장 일반적인 실전 패턴은 `@Async + @TransactionalEventListener(AFTER_COMMIT) + @Transactional(REQUIRES_NEW)` 조합이다. 커밋 확정 후 별도 스레드에서 독립 트랜잭션으로 이메일이나 외부 API를 처리하는 구조다.
+
+## 정리
+
+- `publishEvent()`는 동기다. 기본 `SimpleApplicationEventMulticaster`는 발행 스레드에서 모든 리스너를 순차 실행하고 모두 완료된 후 반환한다.
+- `@EventListener`는 어댑터 패턴이다. `EventListenerMethodProcessor`가 메서드를 `ApplicationListenerMethodAdapter`로 래핑해 기존 `ApplicationListener` 인프라에 편승한다.
+- `@Async`의 스레드 분리는 멀티캐스터가 아니라 AOP 프록시 안에서 일어난다. 비동기 예외는 발행 스레드로 전파되지 않으므로 `AsyncUncaughtExceptionHandler`가 필수다.
+- `@TransactionalEventListener`의 핵심은 `TransactionSynchronization` 등록이다. 이벤트는 발행 즉시 큐에 들어가고 트랜잭션 완료 시 지정된 `phase`에서 소진된다.
+
+Spring 이벤트의 모든 질문은 결국 "어느 스레드에서, 어느 트랜잭션 단계에서 실행되는가"로 귀결된다.

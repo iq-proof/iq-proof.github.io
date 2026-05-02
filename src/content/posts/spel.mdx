@@ -1,0 +1,119 @@
+---
+title: "Spring의 타입 변환 시스템은 어떻게 작동하는가"
+description: "SpEL 파싱 파이프라인과 ${...}/#{...} 처리 경로의 차이부터 PropertyEditor·Converter·GenericConverter 세 계층의 협력 구조까지, Spring Core의 값 주입 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, spel, conversion-service, type-converter, value-injection]
+difficulty: intermediate
+series:
+  slug: spring-core-deep-dive
+  title: Spring Core Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@Value("${server.port}")` 와 `@Value("#{@dataSource.maxPoolSize * 2}")` 는 같은 어노테이션이지만 완전히 다른 처리 경로를 거친다. 하나는 Bean이 생성되기 전에 처리되고, 다른 하나는 생성된 이후에야 평가된다. 그리고 둘 다 결국 "문자열을 `int`로 바꾸는" 타입 변환 문제에 닿는다. Spring Core의 값 주입 시스템은 왜 이렇게 설계됐는가?
+
+## SpEL 파싱 — 문자열이 AST가 되는 과정
+
+`SpelExpressionParser.parseExpression()`이 호출되면 세 단계의 파이프라인이 작동한다.
+
+```
+"orderService.amount * 2"
+  ↓ Tokenizer
+  [IDENTIFIER("orderService"), DOT, IDENTIFIER("amount"), STAR, LITERAL_INT(2)]
+  ↓ InternalSpelExpressionParser (재귀 하강)
+  OpMultiply(
+    CompoundExpression(VariableReference("orderService"), PropertyOrFieldReference("amount")),
+    IntLiteral(2)
+  )
+  ↓ SpelExpression (AST 루트)
+```
+
+**Tokenizer**는 문자열을 의미 단위로 분리한다. `@`는 `BEAN_REF`, `T(`는 타입 연산자, `?:`는 Elvis 연산자로 분류된다. **재귀 하강 파서**는 연산자 우선순위를 문법에 직접 인코딩해 `1 + 2 * 3`을 항상 `7`로 평가한다. `*`가 `+`보다 높은 우선순위를 가지므로 `OpMultiply(2, 3)`이 먼저 구성된다.
+
+파싱 결과인 `SpelExpression`은 불변 AST를 보유하며 스레드 안전하다. 반복 호출되는 표현식(이벤트 리스너 조건, 캐시 키 등)은 파싱 결과를 `ConcurrentHashMap`으로 캐시해야 한다. `StandardBeanExpressionResolver`는 이 패턴을 이미 내부적으로 사용한다.
+
+## ${...}와 #{...}의 처리 시점 차이
+
+두 구문의 핵심 차이는 **처리 시점**이다.
+
+`${server.port}`는 `BeanFactoryPostProcessor` 단계에서 처리된다. `PropertySourcesPlaceholderConfigurer`가 모든 `BeanDefinition`을 순회하며 플레이스홀더를 PropertySource 값으로 치환한다. Bean 인스턴스가 생성되기 전이다.
+
+`#{@dataSource.maxPoolSize * 2}`는 Bean 초기화 단계에서 처리된다. `AutowiredAnnotationBeanPostProcessor`가 `@Value` 값을 읽고, `StandardBeanExpressionResolver`가 SpEL을 평가한다. 이 시점에는 이미 `dataSource` Bean이 존재해야 한다.
+
+```
+${server.port} 처리 순서:
+  invokeBeanFactoryPostProcessors()
+  → PropertySourcesPlaceholderConfigurer
+  → BeanDefinition 내 "8080" 으로 치환 완료
+  (Bean 생성 시작)
+
+#{@dataSource.maxPoolSize * 2} 처리 순서:
+  finishBeanFactoryInitialization()
+  → dataSource Bean 생성 (의존 관계)
+  → MyBean 생성
+  → AutowiredAnnotationBeanPostProcessor
+  → SpEL 평가 → 결과값 주입
+```
+
+중첩 사용에서 이 순서가 드러난다. `#{${multiplier} * 100}`은 동작한다 — `${multiplier}`가 먼저 PlaceholderConfigurer에서 `"3"`으로 치환된 뒤, `#{3 * 100}`이 SpEL로 평가된다. 반대인 `${#{expr}}`은 동작하지 않는다. PlaceholderConfigurer는 `#{...}`를 건드리지 않는다.
+
+<Callout type="note" title="EvaluationContext 보안">
+`StandardEvaluationContext`는 `T(Runtime).getRuntime().exec(...)` 같은 표현식도 실행한다. 사용자 입력을 SpEL로 평가할 때는 반드시 `SimpleEvaluationContext`를 사용해야 한다. 타입 참조(`T()`), Bean 참조(`@bean`), 리플렉션 기반 메서드 호출이 차단된다.
+</Callout>
+
+## PropertyEditor와 Converter의 공존
+
+값이 주입될 때 마지막 관문은 타입 변환이다. `"8080"`을 `int`로 바꾸는 일이다. Spring은 이를 두 세대의 시스템으로 처리한다.
+
+**PropertyEditor**는 JavaBeans의 GUI 도구에서 왔다. `Object value` 필드를 인스턴스 변수로 보유하므로 스레드 안전하지 않다. `Thread A`가 `setAsText("8080")`을 호출한 직후, `Thread B`가 `setAsText("9090")`을 덮어쓰면 `Thread A`의 `getValue()`는 `9090`을 반환한다. Spring은 이를 매번 복사본을 만들어 우회한다.
+
+**Converter**는 Spring 3.0에서 설계됐다. `Converter<S, T>`는 상태가 없고 단방향이다. 싱글톤으로 등록해 재사용할 수 있다.
+
+변환 시도 순서는 `TypeConverterDelegate`가 결정한다.
+
+```
+타입 변환 요청 ("8080" → int)
+
+  1. ConversionService.canConvert(String, int)?
+     → 가능하면 ConversionService.convert() 사용
+
+  2. PropertyEditorRegistry에서 int 타입 에디터 조회
+     → 있으면 복사본 생성 후 setAsText() 호출
+
+  3. 기본 변환 (Integer.parseInt 등)
+```
+
+ConversionService가 우선한다. PropertyEditor는 레거시 호환을 위한 폴백이다.
+
+## ConversionService — Converter의 중앙화
+
+`DefaultConversionService`에는 200개 이상의 Converter가 기본 등록된다. `String → Number`, `String → Enum`, `String → UUID`, `String → Duration`(ISO-8601 형식), 컬렉션 간 변환까지 포함된다.
+
+커스텀 Converter를 등록하는 인터페이스는 세 가지다.
+
+- **`Converter<S, T>`**: 1:1 단순 변환. 대부분의 경우 이것으로 충분하다. 함수형 인터페이스이므로 람다로 등록할 수 있다.
+- **`ConverterFactory<S, R>`**: 소스 하나에서 타겟 타입 계층 전체를 커버한다. `String → 모든 Enum`처럼 같은 소스에서 다양한 관련 타입으로 변환할 때 Converter 10개 대신 Factory 하나로 처리한다.
+- **`GenericConverter + ConditionalConverter`**: `TypeDescriptor`로 제네릭 타입 정보(`List<Integer>`의 `Integer`)와 필드 어노테이션에 접근한다. `@DateTimeFormat`이 이 경로로 동작한다. `matches()` 메서드가 `false`를 반환하면 이 Converter는 건너뛰고 다음 후보를 탐색한다.
+
+<Callout type="warning" title="ConversionService 등록 위치">
+`Converter`를 `@Component`로 등록해도 자동으로 `ConversionService`에 추가되지 않는다. Spring MVC에서는 `WebMvcConfigurer.addFormatters()`를 사용해야 한다. Spring Boot에서는 `Converter` 타입 Bean이 `ApplicationConversionService`에 자동 등록된다. `@Value` 주입에 적용되려면 Bean 이름이 정확히 `"conversionService"`여야 `AbstractBeanFactory`가 자동으로 감지한다.
+</Callout>
+
+<Aside label="트레이드오프">
+PropertyEditor는 완전히 제거되지 않는다. 수많은 레거시 코드와 스프링 내장 에디터(`ResourceEditor`, `FileEditor` 등)가 이 위에 있다. Spring은 Converter를 권장하면서 PropertyEditor를 폴백으로 유지하는 공존 전략을 택했다. 이 결정이 `TypeConverterDelegate`의 "ConversionService 먼저, PropertyEditor 나중" 순서를 만든다.
+</Aside>
+
+## 정리
+
+- SpEL 파싱은 Tokenizer → 재귀 하강 파서 → AST 3단계다. `SpelExpression`은 스레드 안전하므로 캐시해 재사용해야 한다.
+- `${...}`는 Bean 생성 전 BeanDefinition 단계, `#{...}`는 Bean 초기화 단계에서 처리된다. 이 순서 때문에 `#{${key}}`는 동작하고 `${#{expr}}`은 동작하지 않는다.
+- 타입 변환 시도 순서는 ConversionService → PropertyEditor → 기본 변환이다. ConversionService가 우선한다.
+- 커스텀 Converter 선택: 단순 1:1이면 `Converter<S, T>`, 타겟 계층이면 `ConverterFactory`, 어노테이션·제네릭 정보가 필요하면 `GenericConverter`다.
+
+Spring Core의 값 주입 시스템은 단일 설계가 아니다 — 두 세대의 타입 변환 시스템과 두 처리 시점을 가진 표현식 구문이 협력하며 하위 호환성을 지킨다.
