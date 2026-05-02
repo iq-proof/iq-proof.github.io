@@ -1,0 +1,103 @@
+---
+title: "Java 행위 패턴은 왜 모두 같은 문제를 푸는가"
+description: "if-else 지옥부터 복잡한 객체 간 통신까지, Strategy·Observer·Command·State 등 11가지 행위 패턴이 공유하는 하나의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, design-patterns, behavioral-patterns, oop]
+difficulty: intermediate
+series:
+  slug: java-design-patterns
+  title: Java Design Patterns
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+GoF의 행위 패턴(Behavioral Patterns) 11가지를 처음 마주하면 각각 다른 문제를 푸는 독립된 기법처럼 보인다. Strategy는 알고리즘을 교체하고, Observer는 변화를 알리고, Command는 요청을 객체화한다. 그런데 이것들이 같은 챕터에 묶여 있는 이유가 있다. 이 패턴들은 겉모습만 다를 뿐, **변하는 것과 변하지 않는 것을 분리하라**는 단 하나의 원칙을 각기 다른 맥락에서 구현한다. 왜 이 원칙이 그토록 반복되는가?
+
+## 모든 패턴이 피하는 것: 조건문의 증식
+
+행위 패턴들이 등장하기 전 코드에는 공통된 냄새가 있다. `if-else` 또는 `switch`가 메서드마다, 클래스마다 반복된다. 결제 수단이 세 가지면 세 개의 분기, 상태가 네 가지면 모든 메서드에 네 개의 분기가 생긴다. 새 경우가 추가될 때마다 이미 작동하는 코드를 열어 수정해야 한다. OCP(Open-Closed Principle) 위반이다.
+
+```java
+// 조건문 증식의 전형
+public void processPayment(String method, double amount) {
+    if (method.equals("CREDIT_CARD")) {
+        // 50줄
+    } else if (method.equals("PAYPAL")) {
+        // 50줄
+    } else if (method.equals("BANK_TRANSFER")) {
+        // 50줄
+    }
+    // 새 수단 추가 = 이 메서드 수정
+}
+```
+
+이 구조의 문제는 단순히 코드가 길다는 것이 아니다. **알고리즘 선택 로직과 알고리즘 실행 로직이 같은 장소에 있다**는 것이다. 행위 패턴은 이 두 가지를 물리적으로 분리한다.
+
+## 분리의 네 가지 축
+
+11개 패턴은 분리의 대상에 따라 네 가지 축으로 묶인다.
+
+**알고리즘 분리** — Strategy, Template Method, Interpreter는 "어떻게 처리할 것인가"를 캡슐화한다. Strategy는 알고리즘 전체를 교체하고, Template Method는 골격은 고정한 채 단계만 교체하고, Interpreter는 문법 규칙 자체를 클래스로 표현한다. 셋 다 조건문을 다형성으로 대체한다.
+
+**통신 분리** — Observer, Mediator, Chain of Responsibility는 "누가 누구에게 어떤 경로로 알릴 것인가"를 캡슐화한다. Observer는 Subject가 Observer 목록만 알고, Mediator는 객체들이 서로를 모르고 중재자만 알고, Chain of Responsibility는 요청자가 처리자를 몰라도 된다.
+
+**요청 분리** — Command와 Memento는 "무엇을 했는가"를 객체로 만든다. Command는 실행 의도를 저장하고, Memento는 실행 이전 상태를 저장한다. 이 둘이 협력하면 완전한 Undo/Redo가 가능하다.
+
+**상태·순회 분리** — State와 Iterator는 "현재 맥락이 무엇인가"를 캡슐화한다. State는 현재 상태에 따라 같은 메서드 호출이 다르게 동작하도록 하고, Iterator는 컬렉션 내부 구조를 감춘 채 순회를 제공한다.
+
+<Aside label="패턴 선택 기준">
+"변하는 것이 알고리즘인가?" → Strategy / Template Method  
+"변하는 것이 통신 경로인가?" → Observer / Mediator / Chain of Responsibility  
+"변하는 것이 요청의 종류인가?" → Command / Visitor  
+"변하는 것이 상태인가?" → State / Memento
+</Aside>
+
+## 핵심 메커니즘: 다형성이 조건문을 대체하는 방식
+
+Strategy와 State는 구조가 거의 동일하다. 둘 다 인터페이스 + 구현체 + Context로 이루어진다. 차이는 **누가 교체하느냐**다. Strategy는 외부(클라이언트)가 교체하고, State는 Context 스스로 또는 State 객체가 전환을 결정한다.
+
+```java
+// Strategy: 클라이언트가 선택
+cart.setPaymentStrategy(new CreditCardStrategy(...));
+
+// State: Context가 스스로 전환
+public class PlayingState implements State {
+    public void pause() {
+        player.setState(new PausedState(player)); // 스스로 전환
+    }
+}
+```
+
+Observer는 이 구조를 일대다로 확장한다. Subject는 Observer 인터페이스만 알고, 구체적인 Observer가 무엇인지 모른다. `notifyObservers()`는 인터페이스를 통한 다형적 호출이다. 새 Observer를 추가해도 Subject 코드는 변하지 않는다.
+
+Chain of Responsibility는 한발 더 나아간다. Handler가 다음 Handler를 참조하므로 체인 자체를 런타임에 재구성할 수 있다. HTTP 미들웨어 파이프라인이 이 패턴의 실전 표본이다.
+
+<Callout type="note" title="Double Dispatch — Visitor의 핵심">
+Visitor 패턴은 여기서 가장 정교하다. `shape.accept(visitor)`가 호출되면 런타임에 Shape 타입이 결정되고, 그 안에서 `visitor.visit(this)`가 호출되면 또다시 런타임에 Visitor 타입이 결정된다. 두 번의 다형적 디스패치가 일어나므로 `instanceof` 없이 타입별로 다른 연산을 수행할 수 있다. 단, Element 타입이 자주 추가되는 구조에서는 역효과가 난다 — 모든 Visitor를 수정해야 하기 때문이다.
+</Callout>
+
+## 트레이드오프
+
+패턴을 쓸수록 클래스 수가 늘어난다. Strategy로 결제 수단 5개를 구현하면 인터페이스 1개 + 구현체 5개 + Context 1개 = 7개 클래스다. 조건문 하나가 7개 클래스가 된다. 이 교환이 언제 유리한가?
+
+**새로운 경우가 자주 추가될 때** 패턴이 이긴다. 여섯 번째 결제 수단을 추가할 때 기존 코드를 전혀 수정하지 않아도 된다. 반면 변형이 세 가지로 고정되고 추가될 가능성이 없다면 조건문이 더 단순하다.
+
+**각 경우를 독립적으로 테스트해야 할 때** 패턴이 이긴다. `CreditCardStrategy`는 `ShoppingCart` 없이 단독으로 테스트할 수 있다.
+
+**Command 패턴의 Undo 비용**은 따로 검토해야 한다. Undo를 지원하려면 모든 Command가 `undo()` 를 구현해야 하고, 그 구현이 `execute()`만큼 복잡하다. 구현 비용이 두 배다. 텍스트 에디터처럼 Undo가 핵심 기능이라면 감수할 만하다. 단순 큐잉 목적이라면 `undo()` 없는 단순 Command로도 충분하다.
+
+**Memento의 메모리 비용**도 현실적이다. 상태를 저장할 때마다 깊은 복사가 일어난다. 히스토리 개수에 상한을 두거나(게임 세이브 슬롯처럼) Flyweight로 공유 가능한 부분을 줄여야 한다.
+
+## 정리
+
+- 11개 행위 패턴은 모두 "변하는 것을 변하지 않는 것에서 분리"하는 원칙의 다른 표현이다.
+- 조건문을 다형성으로 대체하는 것이 핵심 메커니즘이다. 클래스 수가 늘어나는 것은 그 대가다.
+- Strategy·State는 알고리즘/행동을, Observer·Mediator는 통신 경로를, Command·Memento는 요청과 상태를 캡슐화한다.
+- "이 코드에서 무엇이 자주 변하는가?"라는 질문이 패턴 선택의 출발점이다.
+
+다음에는 이 시리즈에서 다루지 않은 생성 패턴(Creational Patterns)과 구조 패턴(Structural Patterns)이 행위 패턴과 어떻게 협력하는지 — 예컨대 Factory가 어떻게 Strategy 선택을 단순화하는지 — 살펴본다.

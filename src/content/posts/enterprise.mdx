@@ -1,0 +1,144 @@
+---
+title: "Java 레이어드 아키텍처 패턴, 왜 이렇게 나뉘어 있는가"
+description: "DTO의 보안 경계부터 Specification의 규칙 조합까지, 레이어드 아키텍처를 구성하는 5개 패턴의 설계 철학과 트레이드오프를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, design-patterns, layered-architecture, spring, dto]
+difficulty: intermediate
+series:
+  slug: java-design-patterns
+  title: Java Design Patterns
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring 기반 백엔드 코드를 처음 열면 `Controller → Service → Repository` 구조가 눈에 들어온다. 각 계층에는 DTO, DAO, Service, Unit of Work, Specification이라는 패턴이 붙어 있다. 이것들은 왜 존재하는가? 그리고 이 패턴들 사이에는 어떤 공통된 철학이 흐르는가?
+
+## 하나의 원칙에서 나온 다섯 패턴
+
+DTO, DAO, Service Layer, Unit of Work, Specification — 겉으로 보면 각각 별개의 패턴이다. 하지만 이 패턴들은 모두 **"관심사의 분리(Separation of Concerns)"** 라는 하나의 원칙에서 파생된다.
+
+Entity를 그대로 API 응답으로 내려보내면 `password` 필드가 노출되고, JPA 연관관계가 무한 순환을 일으키고, Lazy Loading 예외가 터진다. 비즈니스 로직을 Controller에 쓰면 같은 로직이 REST 컨트롤러, 메시지 컨슈머, 배치 프로세서에 각각 복사된다. SQL을 Service에 직접 쓰면 DB가 바뀔 때 수백 개 파일을 고쳐야 한다.
+
+이 다섯 패턴은 각자 다른 '혼재'를 분리하는 방법이다.
+
+## DTO — 계층 경계의 방화벽
+
+**Data Transfer Object**는 계층 사이에 흐르는 데이터의 모양을 명시적으로 선언하는 객체다. Entity와 외부 세계 사이에 방화벽을 세운다.
+
+```java
+// Entity를 직접 반환 — password, orders 연관관계 전부 노출
+@GetMapping("/{id}")
+public User getUser(@PathVariable Long id) {
+    return userRepository.findById(id).orElseThrow();
+}
+
+// DTO로 변환 — 필요한 필드만, 안전하게
+@GetMapping("/{id}")
+public UserResponse getUser(@PathVariable Long id) {
+    User user = userRepository.findById(id).orElseThrow();
+    return UserResponse.from(user);  // 정적 팩토리 메서드
+}
+```
+
+DTO는 요청과 응답의 형태가 다를 때 그 차이를 명시적으로 표현한다. 회원가입 요청(`SignupRequest`)과 로그인 요청(`LoginRequest`)과 프로필 수정 요청(`UpdateProfileRequest`)은 모두 User와 관련되지만, 필드 구성과 검증 규칙이 다르다. 하나의 Entity로 이 차이를 표현하려면 검증 애노테이션이 충돌한다.
+
+정적 팩토리 메서드 `from(entity)`는 변환 책임을 DTO 자신이 갖게 만든다. 변환 로직이 분산되지 않는다.
+
+## DAO — SQL의 캡슐화
+
+**Data Access Object**는 데이터베이스 접근 코드를 비즈니스 로직으로부터 격리한다.
+
+```
+Service Layer        DAO Interface        DAO Implementation
+─────────────        ─────────────        ──────────────────
+userDAO.findById()  →  findById(Long)   →  SQL + JDBC + ResultSet 매핑
+```
+
+인터페이스를 통해 분리하면 두 가지를 얻는다. 첫째, Service는 SQL을 모른 채 비즈니스 로직에 집중한다. 둘째, 테스트에서 `MockUserDAO`로 교체하면 실제 DB 없이 Service 로직을 검증할 수 있다.
+
+DAO와 Repository는 자주 혼용되지만 추상화 수준이 다르다. DAO는 테이블 중심(`insert()`, `selectById()`)이고, Repository는 도메인 컬렉션 중심(`save()`, `findById()`)이다. Spring Data JPA의 `JpaRepository`는 Repository 패턴의 구현체다.
+
+## Service Layer — 비즈니스 로직의 집결지
+
+Controller는 HTTP를 다루고, Repository는 DB를 다룬다. 비즈니스 로직은 어디에 두어야 하는가? **Service Layer**다.
+
+```java
+@Service
+@Transactional
+public class OrderServiceImpl implements OrderService {
+    public Order createOrder(CreateOrderCommand command) {
+        User user = findAndValidateUser(command.getUserId());      // 사용자 검증
+        Product product = findAndValidateProduct(...);             // 재고 확인
+        OrderAmount amount = calculateOrderAmount(...);            // 금액 계산
+        Order order = createOrderEntity(user, product, command, amount);
+        orderRepository.save(order);
+        decreaseStock(product, command.getQuantity());             // 재고 차감
+        processPoints(user, command.getUsedPoints(), ...);        // 포인트 처리
+        sendOrderNotification(user, order);                        // 알림 발송
+        return order;
+    }
+}
+```
+
+비즈니스 로직이 Service에 있으면, REST 컨트롤러와 메시지 컨슈머와 배치 프로세서 모두 같은 Service를 호출한다. 중복이 없다. `@Transactional`은 메서드 범위의 트랜잭션을 선언적으로 관리한다.
+
+<Callout type="warning" title="God Service 안티패턴">
+`ApplicationService` 하나에 모든 도메인 로직을 몰아넣으면 수천 줄짜리 클래스가 된다. 도메인 단위로 Service를 분리하라 — `UserService`, `OrderService`, `PaymentService`.
+</Callout>
+
+## Unit of Work — 원자성의 보장
+
+여러 Repository를 차례로 호출하면 중간에 실패했을 때 데이터가 불일치 상태가 된다. 주문은 생성됐는데 재고 차감이 실패한다면?
+
+**Unit of Work**는 비즈니스 트랜잭션 동안 변경된 객체들을 추적했다가 한 번에 커밋한다.
+
+```
+registerNew(order)      → INSERT 대기
+registerDirty(product)  → UPDATE 대기
+registerRemoved(item)   → DELETE 대기
+commit()                → BEGIN TRANSACTION → INSERT → UPDATE → DELETE → COMMIT
+                          실패 시 전체 ROLLBACK
+```
+
+Identity Map은 Unit of Work의 부산물이다. 같은 ID로 두 번 조회해도 DB를 두 번 치지 않는다 — 같은 객체 인스턴스를 반환한다.
+
+Spring에서 `@Transactional`과 JPA `EntityManager`가 이 패턴의 구현체다. Dirty Checking은 `registerDirty()`를 자동으로 처리한다 — 엔티티를 수정만 해도 트랜잭션 종료 시 자동으로 UPDATE가 발생한다.
+
+## Specification — 규칙의 조합 가능성
+
+조회 조건이 복잡해지면 Repository에 메서드가 폭발한다. `findByCategoryAndPriceAndDiscount()`, `findByCategoryAndStock()` … 조건이 10개면 이론상 1024개 메서드가 필요하다.
+
+**Specification**은 비즈니스 규칙을 객체로 캡슐화하고 AND/OR/NOT으로 조합 가능하게 만든다.
+
+```java
+Specification<Product> available = new AvailableProductSpecification();
+Specification<Product> discounted = new DiscountedProductSpecification();
+Specification<Product> premium = new PremiumProductSpecification();
+
+// 동적 조합
+Specification<Product> spec = available.and(discounted).or(premium);
+List<Product> result = productRepository.find(spec);
+```
+
+`AvailableProductSpecification`은 "재고 > 0 AND 상태 = ACTIVE"라는 규칙을 한 곳에 가둔다. 이 규칙이 변경되면 한 곳만 고친다. Service에서, 통계 코드에서, 알림 코드에서 각각 조건을 복사해서 쓰는 대신.
+
+Spring Data JPA의 `JpaSpecificationExecutor`는 이 패턴을 JPA Criteria API로 연결해 실제 SQL로 변환한다.
+
+<Aside label="설계 철학">
+이 다섯 패턴의 공통점은 **"변경의 이유를 하나로 제한"** 한다는 것이다. DTO는 API 스펙이 바뀔 때만 변한다. DAO는 DB 접근 방식이 바뀔 때만 변한다. Service는 비즈니스 규칙이 바뀔 때만 변한다. 각자 변경 이유가 다르기 때문에 분리한다 — 이것이 단일 책임 원칙의 계층 구조 버전이다.
+</Aside>
+
+## 정리
+
+- **DTO**: Entity와 외부 세계 사이의 방화벽. 민감 정보 제거, 요청별 다른 검증 규칙, API 안정성.
+- **DAO**: SQL을 Service로부터 격리. 인터페이스 기반으로 테스트 가능성 확보.
+- **Service Layer**: 비즈니스 로직의 유일한 집결지. `@Transactional`로 원자성 선언.
+- **Unit of Work**: 여러 변경사항을 하나의 트랜잭션으로. JPA의 Dirty Checking이 구현체.
+- **Specification**: 비즈니스 조건을 객체화, AND/OR로 조합하여 조회 메서드 폭발 방지.
+
+패턴은 규칙이 아니라 **반복되는 문제에 대한 이름 붙여진 해결책**이다. 다음 글에서는 이 계층 구조가 무너지는 지점 — 도메인 로직이 Service를 넘어 Repository까지 흘러내려가는 상황 — 을 추적한다.

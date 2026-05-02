@@ -1,0 +1,127 @@
+---
+title: "Java 함수형 패턴의 공통 철학은 무엇인가"
+description: "Functional Interface, Stream Pipeline, Optional, Sealed Classes까지 — Java 현대 패턴들이 공유하는 '선언적 제어'의 원리와 트레이드오프를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, functional, stream, optional, sealed-classes]
+difficulty: intermediate
+series:
+  slug: java-design-patterns
+  title: Java Design Patterns
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 8부터 21까지, 언어는 계속 새로운 문법을 추가했다. Lambda, Stream, Optional, Sealed Classes — 이것들은 서로 무관한 기능 추가처럼 보인다. 그런데 이 패턴들을 나란히 놓고 보면 하나의 공통 질문이 보인다. **"제어권을 누가 쥐는가?"**
+
+## 문제의 근원: 명령형 코드의 세 가지 부채
+
+Before 코드들은 형태는 달라도 같은 문제를 공유한다.
+
+첫째, **"어떻게(How)"가 "무엇을(What)"을 덮는다**. `for` 루프 안에서 필터와 변환과 누적이 한꺼번에 섞이면, 코드는 실행 순서를 서술하느라 의도를 잃는다.
+
+둘째, **중간 상태가 노출된다**. `activeProducts`, `affordableProducts`, `names` 같은 임시 리스트는 로직의 단계를 보여주는 게 아니라 메모리 할당 경로를 보여준다.
+
+셋째, **타입 시스템이 의도를 담지 못한다**. `null`을 반환하는 메서드는 "값이 없을 수 있다"는 사실을 시그니처에서 숨긴다. `Object`를 받는 `instanceof` 체인은 "여기는 세 가지 타입만 올 수 있다"는 설계 의도를 숨긴다.
+
+## 함수형 인터페이스: 로직을 값으로 만들기
+
+Functional Interface는 이 중 첫 번째 문제를 공략한다. 핵심은 단순하다 — **메서드를 변수처럼 전달할 수 있게 되면, 로직이 데이터처럼 조합된다**.
+
+```java
+// 조건 자체를 변수로
+ProductPredicate inStock = p -> p.getStock() > 0;
+ProductPredicate onSale  = p -> p.isOnSale();
+
+// 조합
+List<Product> result = service.filter(inStock.and(onSale));
+```
+
+`Predicate`, `Function`, `Consumer`, `Supplier` — 네 가지 built-in 인터페이스는 각각 "판단", "변환", "소비", "공급"이라는 역할로 분리되어 있다. 어떤 로직이든 이 네 범주 중 하나에 속한다. 분류가 먼저 되면, 코드는 의도부터 말할 수 있다.
+
+`@FunctionalInterface`의 single abstract method(SAM) 제약은 이 철학의 구현체다. 추상 메서드가 하나여야만 Lambda가 "어떤 메서드를 구현하는가"를 모호함 없이 알 수 있다.
+
+## Stream Pipeline: 중간 상태를 파이프 안에 가두기
+
+Stream은 두 번째 문제를 공략한다. 중간 리스트들을 파이프라인 안으로 숨긴다.
+
+```java
+List<String> names = orders.stream()
+    .filter(o -> o.getStatus() == COMPLETED)
+    .filter(o -> o.getTotal().compareTo(new BigDecimal("50000")) >= 0)
+    .map(Order::getCustomerName)
+    .collect(Collectors.toList());
+```
+
+중간 연산(`filter`, `map`, `sorted`)은 **lazy**다. 최종 연산(`collect`, `reduce`, `count`)이 호출되기 전까지 실제로 실행되지 않는다. 이는 성능 최적화이기도 하지만, 더 중요한 의미는 **파이프라인이 "실행 계획"을 기술하는 것이지 "실행 순서"를 명령하지 않는다**는 점이다.
+
+`flatMap`은 이 구조에서 가장 강력한 연산이다. 중첩된 컬렉션을 평탄화함으로써, "주문 안의 아이템들 전부"처럼 계층 구조를 선형으로 처리할 수 있다.
+
+`Collectors.groupingBy`와 `partitioningBy`는 Stream이 단순 필터링을 넘어 **집계와 분류**까지 파이프라인 안에서 처리함을 보여준다. 카테고리별 평균 가격, 상태별 주문 수 — 이전이라면 `Map`을 수동으로 관리해야 했던 작업들이 선언적으로 표현된다.
+
+## Optional: null을 타입 시스템으로 끌어올리기
+
+세 번째 문제는 Optional이 담당한다. `null`은 Java 타입 시스템 바깥에 있다. 어떤 참조형이든 null이 될 수 있고, 컴파일러는 이를 감지하지 못한다.
+
+`Optional<T>`는 "값이 있거나 없다"는 사실을 타입 시그니처에 명시한다. `Optional<User>`를 반환하는 메서드는 호출자에게 "이 결과를 null 체크 없이 사용하면 안 된다"고 컴파일 타임에 알린다.
+
+체이닝이 핵심이다:
+
+```java
+// 중첩 null 체크 대신
+return userRepository.findById(userId)
+    .flatMap(User::getAddress)
+    .flatMap(Address::getCity)
+    .map(City::getName)
+    .orElse("Unknown");
+```
+
+`map`과 `flatMap`의 차이에 주의해야 한다. `map`은 결과를 자동으로 `Optional`로 감싼다. `flatMap`은 이미 `Optional`을 반환하는 메서드를 체이닝할 때 중첩을 막는다. `Optional<Optional<City>>`가 되지 않으려면 `flatMap`을 써야 한다.
+
+`orElse`와 `orElseGet`의 차이도 실용적으로 중요하다. `orElse("default")`는 값이 있어도 항상 `"default"`를 평가한다. `orElseGet(() -> expensiveDefault())`는 값이 없을 때만 실행된다. 기본값 생성 비용이 있다면 항상 `orElseGet`을 써야 한다.
+
+## Sealed Classes: 타입 계층을 설계 언어로
+
+Java 17의 Sealed Classes는 세 번째 문제의 다른 측면을 공략한다. Optional이 "값의 존재"를 타입으로 표현했다면, Sealed는 **"허용된 타입의 집합"을 컴파일러가 알게 한다**.
+
+```java
+public sealed interface PaymentMethod
+    permits CreditCard, DebitCard, BankTransfer, PayPal {}
+```
+
+이 선언 하나로 두 가지가 보장된다. 첫째, `PaymentMethod`를 구현할 수 있는 타입은 저 네 개뿐이다. 둘째, `switch`에서 모든 케이스를 처리하지 않으면 컴파일 에러가 난다.
+
+```java
+String fee = switch (method) {
+    case CreditCard c -> "3%";
+    case DebitCard d  -> "2%";
+    case BankTransfer b -> "₩1,000";
+    case PayPal p    -> "4%";
+    // default 불필요 — 컴파일러가 완전성을 보장
+};
+```
+
+`default` 없이 모든 케이스가 보장된다는 것은, **새로운 결제 수단이 추가될 때 이 `switch`를 수정하지 않으면 컴파일이 실패한다**는 뜻이다. 누락이 런타임이 아닌 컴파일 타임에 잡힌다.
+
+`record`와의 조합은 이 패턴을 더 강력하게 만든다. `record Confirmed(LocalDateTime confirmedAt) implements OrderState {}`처럼 쓰면, 상태별로 다른 데이터를 타입 안전하게 담을 수 있다. Enum이 할 수 없었던 것이다.
+
+<Callout type="note" title="트레이드오프">
+이 패턴들은 모두 **확장성과 제어 사이의 균형**을 다르게 설정한다. Functional Interface는 로직 교체를 쉽게 하지만, Lambda가 길어지면 디버깅이 어렵다 — 스택 트레이스에서 익명 함수는 추적이 힘들다. Stream은 선언적이지만 `peek()`으로 중간값을 찍어야 할 때 불편하다. Optional은 NPE를 컴파일 타임으로 끌어올리지만, 필드나 파라미터로 쓰면 오히려 오버헤드와 혼란을 만든다. Sealed Classes는 타입 완전성을 보장하지만, Java 17 이상에서만 쓸 수 있고 서드파티 확장이 불가능하다. 각 패턴이 해결하는 문제와 포기하는 유연성을 함께 이해해야 한다.
+</Callout>
+
+<Aside label="공통 철학">
+이 네 패턴을 관통하는 질문은 하나다 — "이 의도를, 런타임이 아닌 컴파일 타임에 표현할 수 있는가?" Functional Interface는 로직의 역할을, Optional은 값의 존재를, Sealed Classes는 타입의 범위를 타입 시스템 안으로 가져온다. Stream은 실행 순서 대신 데이터 변환 의도를 코드에 담는다. 방향은 모두 같다 — **의도를 더 이른 시점에 더 명확하게 표현하라**.
+</Aside>
+
+## 정리
+
+- Functional Interface는 "로직을 값으로" 만든다. SAM 제약이 Lambda와의 연결을 가능하게 한다.
+- Stream Pipeline은 중간 상태를 파이프 안에 숨기고, lazy 평가로 "실행 계획"과 "실행"을 분리한다.
+- Optional은 null을 타입 시스템으로 끌어올려, 값의 부재를 시그니처에서 명시한다.
+- Sealed Classes는 허용된 타입 집합을 컴파일러가 알게 해, switch 완전성을 보장한다.
+
+다음 글에서는 이 패턴들이 실제로 맞닥뜨리는 경계 — Builder, Factory, Command 패턴이 Lambda와 만날 때 어떻게 변형되는지 추적한다.

@@ -1,0 +1,113 @@
+---
+title: "구조 패턴의 공통 문법 — 상속 대신 관계로 설계하라"
+description: "Adapter부터 Flyweight까지, Java 구조 패턴 7개가 공유하는 하나의 철학 — 상속 계층을 포기하고 객체 간 관계로 복잡성을 제어하는 방법을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, design-patterns, structural-patterns, oop]
+difficulty: intermediate
+series:
+  slug: java-design-patterns
+  title: Java Design Patterns
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Adapter, Decorator, Proxy, Composite, Facade, Bridge, Flyweight. 이 7개 패턴은 GoF가 "구조 패턴"으로 묶었다. 묶인 이유가 있다. 이들은 모두 같은 문제를 다른 각도에서 공격한다 — **상속으로 해결하려 할 때 터지는 폭발을 관계(조합)로 봉합**하는 것. 그 공통 문법이 어디서 왔는지 추적해보자.
+
+## 상속이 터지는 순간
+
+상속은 강력하다. 그런데 두 가지 독립적인 축이 생기는 순간 상속은 폭발한다.
+
+Bridge 패턴이 보여주는 예가 가장 선명하다. 도형(Circle, Rectangle, Triangle)과 색상(Red, Blue, Green)을 상속으로 표현하면 `RedCircle`, `BlueCircle`, `GreenCircle`, `RedRectangle`... 3×3=9개 클래스가 필요하다. 색상 하나를 추가할 때마다 도형 수만큼 클래스가 늘어난다.
+
+Decorator도 마찬가지다. 커피에 우유, 설탕, 휘핑크림, 바닐라 시럽을 선택적으로 추가하려면 모든 조합마다 서브클래스가 필요하다. 4개 옵션이면 $2^4 = 16$개다.
+
+상속의 문제는 "부모가 하나뿐"이라는 제약이 아니다. 진짜 문제는 **컴파일 타임에 계층을 고정시킨다**는 것이다. 런타임에 "이 객체에 로깅 기능 추가"는 불가능하다. 상속은 소스 코드를 수정하는 행위다.
+
+## 7개 패턴이 쓰는 공통 문법
+
+구조 패턴 7개를 관통하는 문법은 단순하다.
+
+```
+같은 인터페이스를 구현하되, 내부에 다른 객체를 참조한다.
+그 참조를 통해 실제 작업을 위임하거나 가로챈다.
+```
+
+코드로 보면 패턴마다 거의 동일한 골격이 나온다.
+
+```java
+// Decorator, Proxy, Adapter 모두 이 형태다
+public class SomeWrapper implements Target {
+    private final Target delegate;   // 핵심: 같은 타입 또는 Adaptee
+
+    public SomeWrapper(Target delegate) {
+        this.delegate = delegate;
+    }
+
+    @Override
+    public void operation() {
+        // 전처리
+        delegate.operation();        // 위임
+        // 후처리
+    }
+}
+```
+
+Decorator는 이 위임 앞뒤에 기능을 덧붙인다. Proxy는 위임 자체를 제어한다(지연, 권한 체크, 캐싱). Adapter는 `delegate`의 타입이 다를 때 인터페이스를 번역한다. 세 패턴의 코드 구조는 거의 같다. 의도가 다를 뿐이다.
+
+## 의도가 구분한다 — Proxy vs Decorator
+
+같은 골격을 쓰는데 왜 다른 이름인가? **의도**가 다르기 때문이다.
+
+Decorator의 의도는 "기능 추가"다. 클라이언트가 직접 데코레이터를 조립한다. `new WhipDecorator(new MilkDecorator(new SimpleCoffee()))`. 레이어가 쌓이는 걸 클라이언트가 인지한다.
+
+Proxy의 의도는 "접근 제어"다. 클라이언트는 프록시가 있는지 모른다. Virtual Proxy는 무거운 객체를 처음 사용할 때까지 생성을 미룬다. Protection Proxy는 권한 없는 접근을 막는다. Caching Proxy는 결과를 저장해 두 번째 호출에서 DB를 건너뛴다.
+
+<Callout type="note" title="트레이드오프: 투명성">
+Proxy는 클라이언트에게 투명하게 동작해야 한다. 클라이언트 코드를 바꾸지 않고 삽입할 수 있다는 게 강점이다. 반대로 Decorator는 클라이언트가 명시적으로 조립한다는 점에서 더 유연하지만, 호출 지점을 알아야 한다. Spring의 `@Transactional`이 프록시 기반인 이유가 여기 있다 — 개발자가 트랜잭션 래핑 코드를 작성하지 않아도 된다.
+</Callout>
+
+## 계층 구조를 다루는 두 패턴
+
+Composite와 Facade는 방향이 다르다. Composite는 **안쪽 계층**을 균일하게 다루고, Facade는 **바깥쪽 인터페이스**를 단순하게 만든다.
+
+Composite의 핵심은 `Leaf`와 `Composite`가 같은 인터페이스를 구현한다는 것이다. 파일 시스템에서 파일과 폴더를 같은 `FileSystemItem`으로 다루면, `getSize()`를 호출할 때 타입을 물어볼 필요가 없다. 폴더는 자신의 자식들에게 위임하고, 파일은 자신의 크기를 돌려준다. 재귀가 자연스럽게 흐른다.
+
+```java
+// 타입 체크 없이 전체 크기 계산
+public int getSize() {
+    return children.stream()
+        .mapToInt(FileSystemItem::getSize)  // Leaf든 Composite든 동일 호출
+        .sum();
+}
+```
+
+Facade는 반대 방향이다. 서브시스템이 이미 복잡하게 존재한다. 홈시어터 예제에서 앰프, DVD, 프로젝터, 조명, 스크린은 각자 잘 동작한다. Facade는 이들을 조율하는 `watchMovie()` 한 줄을 제공한다. 서브시스템 내부는 건드리지 않는다.
+
+<Aside label="주의">
+Facade가 너무 많은 기능을 흡수하면 God Object가 된다. 주문 처리 Facade가 재고, 결제, 배송, 알림을 전부 담당한다면 결합도가 Facade 하나에 집중된다. 도메인 경계에 따라 Facade를 분리하는 것이 안전하다.
+</Aside>
+
+## 공유로 해결하는 Flyweight
+
+Flyweight는 나머지 6개 패턴과 동기가 다르다. 복잡성 관리보다 **메모리 효율**이 목적이다. 그러나 구조는 같다 — 공유 가능한 부분(intrinsic state)을 하나의 객체로 만들고, 개별적인 부분(extrinsic state)은 외부에 둔다.
+
+게임 포레스트 예제에서 100만 그루 나무를 만들 때 나무 종류, 색상, 텍스처는 하나의 `TreeType` 객체로 공유한다. 각 나무는 좌표만 개별로 들고, `TreeType` 참조를 공유한다.
+
+클래스 수 비교: 상속이라면 `OakTree`, `PineTree`, `BirchTree`에 각각 위치 정보를 담아야 했다. Flyweight는 타입 3개 + 가벼운 Tree 100만 개로 끝낸다.
+
+## 정리
+
+- 구조 패턴 7개는 공통적으로 상속 계층 대신 **객체 간 조합(has-a)**으로 복잡성을 다룬다.
+- Adapter·Decorator·Proxy는 같은 골격(Wrapper)을 쓰되, 의도(번역·추가·제어)가 다르다.
+- Composite는 재귀적 계층을 균일하게, Facade는 복잡한 서브시스템을 단순하게 포장한다.
+- Bridge는 두 독립적 축이 곱으로 폭발하는 것을 합으로 막는다.
+- Flyweight는 불변 상태를 공유해 메모리를 선형에서 상수로 줄인다.
+
+패턴의 이름을 외우는 것보다 중요한 건 이 공통 질문을 습관처럼 묻는 것이다 — "이 클래스가 늘어나는 이유가 상속 때문인가? 관계로 표현할 수 없는가?"
+
+다음 글에서는 행동 패턴으로 넘어간다. 구조가 객체 간 관계를 다뤘다면, 행동 패턴은 그 관계를 통해 **책임이 어떻게 흐르는가**를 다룬다.

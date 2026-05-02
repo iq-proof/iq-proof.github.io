@@ -1,0 +1,147 @@
+---
+title: "Java 생성 패턴, 무엇을 왜 선택하는가"
+description: "Singleton의 Thread-safety부터 Object Pool의 재사용 철학까지, Java 생성 패턴 6개를 관통하는 하나의 질문을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, design-patterns, creational-patterns, oop]
+difficulty: intermediate
+series:
+  slug: java-design-patterns
+  title: Java Design Patterns
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Singleton, Factory Method, Builder, Prototype, Abstract Factory, Object Pool — Java의 생성 패턴 6개는 모두 다른 문제를 해결하는 것처럼 보인다. 그런데 이 패턴들을 가로지르는 공통 질문이 하나 있다. **"객체 생성의 제어권을 누가 가져야 하는가?"**
+
+## 제어권의 첫 번째 형태: 인스턴스 개수 통제
+
+Singleton은 가장 단순한 주장을 한다 — 어떤 객체는 전 생애주기에서 딱 하나만 존재해야 한다. 설정 파일을 세 곳에서 각각 읽으면 메모리가 낭비되고 상태가 불일치한다. 커넥션 풀이 서비스마다 따로 생기면 DB 연결이 폭발한다.
+
+구현 선택지는 여러 가지이지만 결론은 명확하다.
+
+```java
+// Bill Pugh: JVM 클래스 로딩을 동기화 메커니즘으로 활용
+public class BillPughSingleton {
+    private static class SingletonHolder {
+        private static final BillPughSingleton INSTANCE = new BillPughSingleton();
+    }
+    public static BillPughSingleton getInstance() {
+        return SingletonHolder.INSTANCE;
+    }
+}
+
+// Enum: Serialization·Reflection 공격까지 막는 가장 안전한 방법
+public enum EnumSingleton {
+    INSTANCE;
+}
+```
+
+Lazy Initialization이 필요 없고 공격 방어가 중요하다면 Enum, 복잡한 초기화가 필요하다면 Bill Pugh. DCL(Double-Checked Locking)은 `volatile` 없이 쓰면 명령어 재배치로 깨진다 — 레거시 코드에서 조용히 버그가 나는 이유가 여기에 있다.
+
+<Callout type="warning" title="전역 상태의 대가">
+Singleton은 암묵적 의존성을 만든다. 테스트에서 상태를 격리하기 어렵고, 단일 책임 원칙을 어기기 쉽다. Spring 같은 DI 컨테이너가 있다면, 직접 Singleton을 구현하는 대신 빈 스코프로 위임하는 것이 더 나은 선택이다.
+</Callout>
+
+## 제어권의 두 번째 형태: 생성 로직 캡슐화
+
+클라이언트가 구체 클래스를 직접 `new`로 생성하면, 새로운 타입이 추가될 때마다 클라이언트 코드도 수정해야 한다. Factory Method는 이 문제를 상속으로 푼다 — 어떤 클래스를 만들지는 서브클래스가 결정한다.
+
+```java
+// Creator: 팩토리 메서드 선언
+public abstract class Logistics {
+    protected abstract Transport createTransport();  // 서브클래스가 결정
+
+    public void planDelivery(String origin, String dest, int distance) {
+        Transport transport = createTransport();     // 구체 타입 몰라도 됨
+        transport.deliver(dest);
+    }
+}
+
+// ConcreteCreator: 실제 타입 결정
+public class RoadLogistics extends Logistics {
+    @Override
+    protected Transport createTransport() { return new Truck(); }
+}
+```
+
+드론을 추가하려면 `DroneLogistics`를 하나 더 만들면 된다. 기존 `Logistics`나 `Truck`은 건드리지 않는다. OCP(개방-폐쇄 원칙)가 이 구조로 지켜진다.
+
+Abstract Factory는 한 단계 더 나아간다. 단일 객체가 아니라 **관련 객체들의 집합(제품군)** 을 일관성 있게 생성해야 할 때 쓴다. `WindowsButton`과 `MacCheckbox`를 섞을 수 없도록 팩토리가 제품군 전체를 책임진다.
+
+```java
+public interface GUIFactory {
+    Button createButton();
+    Checkbox createCheckbox();
+    TextField createTextField();
+}
+
+// 클라이언트는 GUIFactory만 알면 된다
+public class Application {
+    public Application(GUIFactory factory) {
+        this.button = factory.createButton();     // Windows면 WindowsButton
+        this.checkbox = factory.createCheckbox(); // 섞일 수 없음
+    }
+}
+```
+
+## 제어권의 세 번째 형태: 복잡한 초기화의 단계 분리
+
+생성자 매개변수가 7개를 넘어가면 코드를 읽기 어렵다. 어떤 `null`이 어떤 필드인지 알 수 없고, 매개변수 순서를 틀려도 컴파일 에러가 나지 않는다. Builder는 이 문제를 Fluent API로 푼다.
+
+```java
+User user = new User.Builder("john", "john@email.com")  // 필수만 생성자로
+    .age(25)
+    .phone("010-1234-5678")
+    .newsletter(true)
+    .build();  // build()에서 유효성 검증
+```
+
+핵심은 세 가지다. **필수 매개변수는 Builder 생성자에**, **선택 매개변수는 메서드로**, **`build()`에서 유효성 검증**. 모든 필드를 `final`로 선언하면 불변 객체가 된다 — Setter를 노출하지 않아도 된다.
+
+Prototype은 다른 각도에서 초기화 비용을 공격한다. 객체 생성 자체가 무거울 때, 처음 한 번만 만들고 이후엔 복제한다. 게임 캐릭터를 클래스별로 한 번씩만 초기화해두고, 플레이어가 선택할 때마다 `clone()`으로 찍어내는 방식이다.
+
+<Callout type="note" title="얕은 복사와 깊은 복사">
+`super.clone()`은 얕은 복사다. `List`, `Map` 같은 참조 타입 필드는 복제본이 원본과 같은 객체를 가리킨다. 복제 후 한쪽을 수정하면 다른 쪽도 바뀐다. `clone()` 안에서 참조 타입은 반드시 새로 생성해야 한다.
+</Callout>
+
+## 제어권의 네 번째 형태: 생명주기 관리
+
+Object Pool은 생성 패턴 중 유일하게 **소멸까지 관리**한다. 생성 비용이 크고 재사용 가능한 객체 — DB 커넥션, 스레드, 게임 총알 — 는 만들고 버리는 것보다 대여하고 돌려받는 것이 훨씬 효율적이다.
+
+```
+acquire() → 작업 → release() → reset() → 다시 acquire() ...
+```
+
+`reset()`이 핵심이다. 반납할 때 이전 상태를 완전히 지워야 다음 사용자가 오염된 객체를 받지 않는다. 이 책임을 `Reusable` 인터페이스로 강제하는 구조가 안전하다.
+
+실무에서 직접 구현하는 경우는 드물다. `ExecutorService`(스레드), HikariCP(커넥션), Apache Commons Pool2(범용)가 이미 검증된 구현을 제공한다.
+
+## 트레이드오프
+
+<Callout type="note" title="패턴 선택 기준">
+
+| 상황 | 패턴 | 이유 |
+|:---|:---|:---|
+| 전역 유일 인스턴스 | Singleton (Enum) | 직렬화·Reflection 안전 |
+| 단일 타입 생성 분리 | Factory Method | 서브클래스가 타입 결정 |
+| 제품군 일관성 | Abstract Factory | 섞임 방지 |
+| 복잡한 초기화, 불변 객체 | Builder | Fluent API + 유효성 검증 |
+| 무거운 초기화 한 번만 | Prototype | 복제가 생성보다 빠를 때 |
+| 생성 비용이 크고 재사용 가능 | Object Pool | 대여·반납으로 GC 절감 |
+
+</Callout>
+
+패턴은 도구다. Factory Method는 클래스 수를 늘리고, Abstract Factory는 새 제품 추가가 어렵고, Builder는 보일러플레이트가 많다(Lombok으로 줄일 수 있다). Singleton의 전역 상태는 테스트를 어렵게 만든다. 비용을 알고 선택하는 것이 패턴을 아는 것보다 더 중요하다.
+
+## 정리
+
+- 생성 패턴 6개는 모두 "객체 생성의 제어권"을 클라이언트에서 분리하는 방법이다.
+- Singleton·Prototype·Object Pool은 인스턴스 수명을 통제하고, Factory Method·Abstract Factory·Builder는 생성 로직을 캡슐화한다.
+- 각 패턴의 트레이드오프를 모르면 패턴이 오히려 복잡도를 키운다.
+
+다음 글에서는 구조 패턴으로 넘어간다 — 이미 만들어진 객체들을 어떻게 조합하고 감싸는가.
