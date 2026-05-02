@@ -1,0 +1,123 @@
+---
+title: "DDD와 JPA는 왜 긴장 관계인가"
+description: "Persistence Ignorance 원칙부터 Repository 패턴, AbstractAggregateRoot, 테스트 전략까지 — 도메인 설계가 JPA의 제약을 어떻게 극복하는지 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [ddd, jpa, persistence-ignorance, aggregate, repository]
+difficulty: intermediate
+series:
+  slug: ddd-deep-dive
+  title: Ddd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+JPA를 쓰는 Spring 프로젝트에서 `@Entity`가 붙은 클래스가 곧 도메인 클래스다. 빠르고 단순해 보이지만, 시간이 지나면 도메인 불변식은 무너지고, 테스트는 `@SpringBootTest` 없이 돌지 않으며, `KEYS *` 하나가 서비스를 멈추듯 `KEYS *` 하나가 이벤트 루프를 점유하듯 — `LazyInitializationException` 하나가 도메인 메서드를 터뜨린다. 왜 이렇게 되는가? 그리고 어떻게 빠져나오는가?
+
+## 도메인이 JPA를 알면 생기는 일
+
+JPA가 도메인 설계를 지배하는 패턴은 세 가지 증상으로 나타난다.
+
+첫째, **불변식 보호 불가**. JPA는 기본 생성자를 요구한다. `protected Order() {}`가 생기는 순간, 외부에서 빈 `Order`를 만들 수 있다. `order.setStatus("ANYTHING")`이 가능해지면 상태 전이 규칙은 의미를 잃는다.
+
+둘째, **도메인 메서드가 트랜잭션에 의존**. `@OneToMany(fetch = FetchType.LAZY)`로 선언된 `lines`를 `calculateTotal()` 안에서 순회하면, 트랜잭션이 없는 컨텍스트에서 `LazyInitializationException`이 터진다. 도메인 로직이 영속성 컨텍스트를 알게 된다.
+
+셋째, **테스트가 Spring을 필요로 함**. `new Order()`로 유효하지 않은 주문을 생성할 수 있으면, 팩토리 메서드 패턴이 무력화된다. 도메인 로직 하나를 테스트하는 데 `@SpringBootTest`가 필요해진다.
+
+Persistence Ignorance(PI)는 이 문제에 이름을 붙인 원칙이다. "도메인 모델은 저장 방식을 몰라야 한다." 완전한 PI는 비용이 크므로, 현실은 **허용 범위를 정하는 것**이다.
+
+<Callout type="note" title="실용적 PI 허용 범위">
+허용: `@Entity`, `@Id`, `@Embedded`, `@Enumerated`, `@Transient`, `protected` 기본 생성자
+
+방지: `public` setter, `public` 기본 생성자, 지연 로딩에 의존하는 도메인 메서드
+</Callout>
+
+`protected Order() {}`는 JPA를 위한 것이고, `Order.place(customerId, lines, discount, shippingFee)`가 외부에서 사용하는 유일한 생성 경로다. 이 구분만 지켜도 불변식 보호의 절반은 해결된다.
+
+## Aggregate 경계와 JPA 연관 관계
+
+`@OneToMany(cascade = CascadeType.ALL)`은 강력하지만 방향이 틀리면 위험하다. Aggregate 내부 엔티티(`OrderLine`)에는 맞는 설정이지만, 다른 Aggregate(`Customer`, `Coupon`)를 향하면 의도치 않은 영속성 전파가 생긴다.
+
+```java
+// 잘못된 설정 — Aggregate 경계를 넘는 Cascade
+@ManyToOne(cascade = CascadeType.ALL)
+private Customer customer;  // Order 저장 시 Customer도 수정됨
+```
+
+올바른 원칙은 단순하다: **Aggregate 내부는 객체 참조 + `CascadeType.ALL` + `orphanRemoval = true`, 다른 Aggregate는 ID만 참조**.
+
+```java
+// 올바른 설정
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+@JoinColumn(name = "order_id")
+private List<OrderLine> lines = new ArrayList<>();
+
+@Embedded
+private CustomerId customerId;  // Customer 객체 참조 없음, ID만
+```
+
+`orphanRemoval = true`는 컬렉션에서 제거된 내부 엔티티를 DB에서도 삭제한다. `order.lines().remove(line)` 후 `save()`하면 `DELETE` 쿼리가 나간다. 이것이 Aggregate 안에서 일관성을 유지하는 방식이다.
+
+Fetch 전략은 항상 `LAZY`로 선언하되, Repository에서 `JOIN FETCH`로 명시적으로 로드한다. `EAGER`는 페이지네이션과 함께 쓰면 메모리에서 전체 데이터를 자르는 사고가 발생한다.
+
+## Repository — 의존성 역전의 실체
+
+대부분의 Spring 프로젝트는 `interface OrderRepository extends JpaRepository<Order, Long>`으로 시작한다. 빠르지만, 도메인 레이어에 `JpaRepository`, `Pageable`, `Sort` 같은 Spring Data 타입이 침투한다.
+
+올바른 구조는 의존성 방향을 뒤집는다.
+
+```
+Before: Domain → Spring Data JPA (인프라)
+After:  Infrastructure → Domain
+```
+
+도메인 레이어에는 순수 인터페이스만:
+
+```java
+public interface OrderRepository {
+    void save(Order order);
+    Optional<Order> findById(OrderId id);
+    List<Order> findByCustomerId(CustomerId customerId);
+}
+```
+
+인프라 레이어에서 이 인터페이스를 구현한다. `JpaOrderRepository implements OrderRepository`, 내부에서 `SpringDataOrderRepository extends JpaRepository`를 사용한다.
+
+이 구조의 진짜 가치는 테스트에서 드러난다. `InMemoryOrderRepository`를 만들면 Spring, JPA, DB 없이 Application Service 전체를 테스트할 수 있다. `Map<OrderId, Order>` 하나로 충분하다.
+
+<Aside label="설계 철학">
+Repository 분리는 코드량이 늘어나는 대신 "도메인 테스트에서 Spring이 사라진다"는 구체적인 이익을 준다. 테스트 3분이 30초가 되는 것이 이 구조가 정당화되는 순간이다.
+</Aside>
+
+## Domain Event와 AbstractAggregateRoot
+
+이벤트를 수집하고 발행하는 보일러플레이트 — `order.pullDomainEvents().forEach(publisher::publishEvent)` — 를 모든 Application Service 메서드에 반복하다 보면 실수로 빠뜨리는 순간이 온다. Spring Data의 `AbstractAggregateRoot`는 이것을 자동화한다.
+
+`save()` 한 번으로 DB 저장과 이벤트 발행이 함께 일어난다. 내부적으로 `@DomainEvents` 어노테이션이 붙은 메서드가 이벤트 목록을 반환하고, `SimpleJpaRepository`가 `persist()` 또는 `merge()` 후 `ApplicationEventPublisher`로 발행한다.
+
+주의해야 할 함정이 있다. JPA 더티 체킹만으로는 이벤트가 발행되지 않는다. `AbstractAggregateRoot`는 `save()`가 호출될 때만 `@DomainEvents`를 실행한다. 항상 명시적 `save()`가 필요하다.
+
+`AbstractAggregateRoot`가 Spring Data를 상속한다는 점이 PI를 일부 훼손하는 것은 사실이다. Kafka + Outbox 패턴이 필요하다면 커스텀 `AggregateRoot`와 수동 발행이 더 적합하다. 선택 기준은 명확하다: 단일 서비스 내 이벤트라면 `AbstractAggregateRoot`, 분산 트랜잭션이 필요하다면 Outbox.
+
+## 트레이드오프
+
+<Callout type="note" title="분리 수준별 비용과 이익">
+**실용적 PI** (JPA 어노테이션 허용, 불변식 보호): 대부분의 팀에 적합. 추가 클래스 없음.
+
+**완전 분리** (Domain + JPA Entity + Mapper): 클래스 수 3배, Mapper 유지 비용. 대규모 팀, 기술 교체 가능성이 있을 때 정당화된다. 핵심 Aggregate만 분리하는 절충도 현실적이다.
+</Callout>
+
+Value Object 매핑에서도 선택이 필요하다. 여러 필드를 가진 VO(`Money`, `Address`)는 `@Embeddable`로 소유자 테이블에 직접 포함하고, 단일 값으로 표현되는 VO(`Email`, `OrderId`)는 `AttributeConverter`로 단일 컬럼에 저장한다. `@Embeddable` 타입을 같은 Entity에서 두 번 사용하면 `@AttributeOverride`로 컬럼명을 명시해야 한다. 빠뜨리면 Hibernate가 컬럼명 충돌을 보고한다.
+
+## 정리
+
+- 도메인이 JPA를 알면 불변식이 무너지고 테스트가 Spring에 의존하게 된다. `protected` 기본 생성자 + 팩토리 메서드가 출발점이다.
+- Aggregate 내부 엔티티에만 `CascadeType.ALL + orphanRemoval`, 다른 Aggregate는 ID만 참조한다. 이 규칙 하나가 "주문을 저장하면 고객이 바뀌는" 버그를 막는다.
+- Repository는 도메인 인터페이스를 인프라가 구현하는 구조로 뒤집는다. `InMemoryRepository`가 생기는 순간 도메인 테스트에서 Spring이 사라진다.
+- 테스트 피라미드는 도메인 단위(40%) → Application Service InMemory(30%) → JPA 통합(20%) → E2E(10%) 순으로 배분한다. 모든 테스트가 `@SpringBootTest`라면 이 비율을 뒤집어야 한다.
+
+다음 글에서는 이 구조 위에서 Bounded Context 경계를 어떻게 코드로 강제하는지, 그리고 Anti-Corruption Layer가 실제로 어떤 형태를 띠는지 추적한다.

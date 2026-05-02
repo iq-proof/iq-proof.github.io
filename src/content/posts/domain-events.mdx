@@ -1,0 +1,159 @@
+---
+title: "Domain Event는 어떻게 결합도를 끊는가"
+description: "발행자가 구독자를 모르는 설계부터 Outbox Pattern의 원자성 보장, Saga의 보상 트랜잭션, ACL의 번역 계층까지 — DDD 이벤트 기반 설계의 핵심을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [ddd, domain-event, outbox-pattern, saga, anti-corruption-layer]
+difficulty: intermediate
+series:
+  slug: ddd-deep-dive
+  title: Ddd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`OrderService`가 `EmailService`, `PointService`, `InventoryService`, `MarketingService`를 직접 호출한다. 새 기능이 추가될 때마다 `OrderService` 코드에 한 줄이 늘어난다. 이것은 버그가 아니라 설계의 귀결이다. 그렇다면 이 연결을 어떻게 끊는가? 그리고 연결을 끊은 이후에 발생하는 신뢰성 문제는 어떻게 해결하는가?
+
+## 이벤트 기반 설계의 핵심 원리
+
+Domain Event가 결합도를 낮추는 메커니즘은 단순하다. 발행자는 `OrderPlaced`라는 이벤트 타입만 알면 된다. 누가 이 이벤트를 받아 무엇을 하는지는 모른다. 각 관심사(이메일, 포인트, 재고)는 독립적인 핸들러로 구독한다.
+
+```java
+// Before: 기능이 추가될 때마다 OrderService가 커짐
+public void placeOrder(PlaceOrderRequest request) {
+    orderRepository.save(order);
+    emailService.sendConfirmation(order);   // v1
+    pointService.earn(order.customerId());  // v2
+    inventoryService.decrease(order.lines()); // v3
+    // "리뷰 유도 메시지" → 또 한 줄
+}
+
+// After: 이벤트만 발행, 기능 추가 시 핸들러만 추가
+public OrderId placeOrder(PlaceOrderCommand command) {
+    Order order = Order.place(...);
+    orderRepository.save(order);
+    order.pullEvents().forEach(eventPublisher::publishEvent);
+    return order.id();
+    // 이 코드는 변하지 않는다
+}
+```
+
+이것이 Open/Closed Principle의 직접적인 구현이다. 확장에는 열려 있고(새 핸들러 추가), 변경에는 닫혀 있다(기존 발행자 코드 수정 없음).
+
+<Callout type="note" title="이벤트가 적합한 경우 vs 직접 호출이 나은 경우">
+"이 작업의 성공/실패가 이 유스케이스의 성공/실패를 결정하는가?"라는 질문이 판단 기준이다. 재고 확인과 결제 승인은 YES → 동기 호출. 이메일 발송과 포인트 적립은 NO → 이벤트.
+</Callout>
+
+## 발행 시점과 위치 — Aggregate는 수집, Application Service는 발행
+
+이벤트를 **어디서**, **언제** 발행하느냐가 신뢰성을 결정한다. Aggregate가 `Kafka`를 직접 호출하면 도메인 레이어가 인프라를 알게 된다. Application Service가 저장 전에 이벤트를 발행하면 저장이 실패해도 이벤트는 이미 나갔다.
+
+올바른 분리는 명확하다. Aggregate는 "무슨 이벤트를 발행할지" 결정하고 내부 컬렉션에 수집한다. Application Service는 저장이 성공한 후에 이벤트를 꺼내 발행한다.
+
+```java
+// Aggregate: 인프라 없이 내부 수집만
+public void cancel(String reason) {
+    validateCancellable();
+    this.status = OrderStatus.CANCELLED;
+    registerEvent(new OrderCancelled(this.id, reason, LocalDateTime.now()));
+    // Kafka, EventPublisher를 전혀 모름
+}
+
+// Application Service: 저장 → 발행 순서 보장
+@Transactional
+public OrderId placeOrder(PlaceOrderCommand command) {
+    Order order = orderFactory.create(command);
+    orderRepository.save(order);
+    order.pullDomainEvents().forEach(eventPublisher::publishEvent);
+    return order.id();
+}
+```
+
+`@EventListener`는 `publishEvent()` 즉시 실행되어 발행자와 같은 트랜잭션을 공유한다. `@TransactionalEventListener(AFTER_COMMIT)`은 트랜잭션 커밋 후 실행되어 "핸들러가 실행될 때 DB에 Order가 반드시 존재한다"를 보장한다. 대부분의 경우 후자가 올바른 선택이다.
+
+## Outbox Pattern — DB 트랜잭션과 이벤트 원자성
+
+비동기 이벤트 아키텍처에서 가장 흔히 간과되는 문제가 있다. DB 저장은 성공했지만 서버가 다운되어 Kafka 발행이 일어나지 않는 시나리오, 또는 Kafka에 발행했지만 DB 저장이 롤백되는 시나리오 — 이것이 Dual Write 문제다.
+
+Outbox Pattern은 이 두 쓰기를 하나의 DB 트랜잭션으로 묶어 원자성을 보장한다.
+
+```
+┌────────────────────────────────────────┐
+│  DB Transaction                        │
+│  INSERT INTO orders ...                │
+│  INSERT INTO outbox_messages ...       │  ← 이벤트를 DB에 저장
+└────────────────────────────────────────┘
+      ↓ 커밋 완료
+
+Relay Process (별도 스케줄러):
+SELECT * FROM outbox_messages WHERE status = 'PENDING'
+      ↓
+kafkaTemplate.send(...)
+      ↓
+UPDATE outbox_messages SET status = 'PUBLISHED'
+```
+
+Order와 OutboxMessage는 같은 트랜잭션으로 저장된다. 트랜잭션이 롤백되면 둘 다 없어진다. Relay 프로세스는 독립적으로 실패한 메시지를 재시도한다. `at-least-once` 전송이므로 소비자는 멱등하게 설계해야 한다.
+
+<Callout type="note" title="트레이드오프">
+Polling Publisher는 구현이 단순하지만 폴링 주기만큼 지연이 생긴다. CDC(Debezium)는 WAL에서 실시간으로 읽어 밀리초 수준 지연을 달성하지만 추가 인프라가 필요하다. 소규모 팀은 Polling으로 시작하고 트래픽이 증가하면 CDC로 전환하는 것이 현실적이다.
+</Callout>
+
+## Saga — 분산 트랜잭션 없는 프로세스 조율
+
+"주문 → 결제 → 재고 차감 → 배송 예약"이 여러 서비스에 걸쳐 있을 때 2PC는 현실적으로 작동하지 않는다. PG사는 XA를 지원하지 않고, 하나의 서비스 장애가 전체를 블로킹한다.
+
+Saga는 긴 트랜잭션을 일련의 짧은 로컬 트랜잭션으로 분해하고, 실패 시 이미 완료된 단계를 보상 트랜잭션으로 되돌린다.
+
+```
+성공 흐름:
+OrderPlaced → PaymentApproved → InventoryDecreased → ShippingReserved
+
+실패 흐름 (재고 부족):
+OrderPlaced → PaymentApproved → InventoryDecreaseFailed
+    → PaymentRefunded (보상) → OrderCancelled (보상)
+```
+
+Choreography Saga는 각 서비스가 이벤트에 반응해 다음 단계를 처리한다. 중앙 조율자가 없어 결합도가 낮지만 전체 흐름이 코드에 명시적으로 드러나지 않는다. Orchestration Saga는 중앙 Orchestrator가 각 서비스에 Command를 보내고 응답을 받는다. 복잡한 보상 로직과 가시성이 필요할 때 적합하다.
+
+보상 트랜잭션은 기술적 롤백이 아니라 비즈니스적 되돌리기다. 이미 배송 출발한 패키지는 코드로 롤백할 수 없다. 회수 요청이라는 비즈니스 프로세스가 필요하다. 이 설계 결정은 도메인 전문가와 함께 이루어져야 한다.
+
+## Context 간 데이터 동기화와 ACL
+
+여러 Bounded Context의 데이터를 화면에 합쳐 보여줄 때, 매번 두 서비스를 동기 호출하면 하나가 다운되면 화면 전체가 실패한다. 이벤트로 읽기 모델을 동기화하면 단일 쿼리로 빠른 응답이 가능하고 배송 서비스 장애와 무관하게 주문 목록을 보여줄 수 있다.
+
+Anti-Corruption Layer는 외부 API의 변화를 도메인 모델에서 차단하는 계층이다. CJ대한통운 API가 상태 코드를 변경하거나 배송사를 교체해도, Translator 한 클래스만 수정하면 된다.
+
+```java
+// Port: 도메인 언어로 정의 (외부와 무관)
+public interface ShipmentTrackingPort {
+    Optional<ShipmentTracking> findTracking(TrackingNumber trackingNumber);
+}
+
+// Translator: 번역만 전담
+private ShipmentTrackingStatus translateStatus(String cjCode) {
+    return switch (cjCode) {
+        case "80" -> ShipmentTrackingStatus.DELIVERED;
+        case "91" -> ShipmentTrackingStatus.DELIVERY_FAILED;
+        default   -> throw new UnknownCjStatusException(cjCode);
+    };
+}
+```
+
+각 클래스의 책임이 명확히 분리된다. Client는 HTTP 통신만, Translator는 번역만, Adapter는 둘을 조합해 Port를 구현한다. 이 분리는 Translator를 Mock 없이 순수 Java로 단위 테스트할 수 있게 한다.
+
+## 정리
+
+- Domain Event는 발행자-구독자 간 직접 의존을 끊는다. OCP의 구현이며, 새 기능은 새 핸들러 추가로 완성된다.
+- Aggregate는 이벤트를 수집하고, Application Service는 저장 후 발행한다. 발행 순서가 신뢰성을 결정한다.
+- Dual Write 문제는 Outbox Pattern으로 해결한다. DB 저장과 이벤트 저장을 하나의 트랜잭션으로 묶는다.
+- Saga는 보상 트랜잭션으로 결과적 일관성을 달성한다. 보상 설계는 코드가 아닌 비즈니스 결정이다.
+- ACL은 외부 API 변화를 Translator 한 클래스에 가둔다. 도메인은 외부 시스템을 알 필요가 없다.
+
+<Aside label="설계 철학">
+이 챕터들은 하나의 질문을 다른 각도에서 답한다 — "변경이 전파되지 않으려면 어디서 끊어야 하는가?" 이벤트는 발행자와 구독자 사이를, Outbox는 저장과 발행 사이를, Saga는 서비스 간 트랜잭션 경계를, ACL은 외부 시스템과 도메인 사이를 끊는다. 절단면이 다를 뿐 동기는 같다.
+</Aside>

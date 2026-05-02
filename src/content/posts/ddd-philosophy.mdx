@@ -1,0 +1,131 @@
+---
+title: "DDD는 복잡도를 어떻게 다루는가"
+description: "Anemic Domain Model이 Service 비대화로 이어지는 원인부터 Strategic/Tactical Design의 역할 분담, 레이어 의존성 역전까지 — DDD의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [ddd, domain-model, bounded-context, layered-architecture, software-design]
+difficulty: intermediate
+series:
+  slug: ddd-deep-dive
+  title: Ddd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`OrderService`가 1,500줄이 됐다. `cancelOrder()`는 80줄이고, 비슷한 규칙이 `PaymentService`와 `InventoryService`에도 흩어져 있다. 새 요구사항이 들어올 때마다 "어디를 수정해야 하는가"를 찾는 데 반나절이 걸린다. 이것은 비즈니스가 복잡한 것인가, 아니면 설계가 만들어낸 복잡도인가?
+
+## 두 가지 복잡도
+
+소프트웨어 복잡도에는 두 종류가 있다. **본질적 복잡도(Essential Complexity)**는 비즈니스 자체에서 오는 것으로 피할 수 없다. 전자상거래의 쿠폰+포인트+현금 혼합 결제 계산, 상태에 따른 취소/환불 가능 여부 — 이것은 소프트웨어가 해결해야 할 문제의 복잡도다.
+
+반면 **우발적 복잡도(Accidental Complexity)**는 잘못된 설계가 만들어낸 것으로 제거 가능하다. 상태 전이 규칙이 `if ("SHIPPED".equals(order.getStatus()))` 같은 문자열 비교로 여러 Service에 흩어지는 것, `Order` 엔티티가 getter/setter만 가진 데이터 컨테이너가 되는 것이 그 예다.
+
+DDD의 목표는 단순하다 — 본질적 복잡도는 도메인 모델 안에 명확히 표현하고, 우발적 복잡도는 경계와 캡슐화로 제거한다.
+
+## Anemic Domain Model의 함정
+
+"Anemic Domain Model"은 Entity가 데이터 컨테이너에 불과하고 비즈니스 로직이 Service에 쏟아지는 구조다. 처음 3개월은 단순하고 명확해 보인다. 그런데 요구사항이 쌓이면서 Service는 필연적으로 비대해진다.
+
+문제의 본질은 `Order`에게 "이 주문이 취소 가능한가?"를 물을 수 없다는 것이다. 그 판단을 `OrderService`가 해야 하고, 비슷한 판단이 `RefundService`, `AdminService`에도 복사된다. 규칙이 바뀌면 모든 Service를 찾아 수정해야 한다.
+
+Rich Domain Model은 이 구조를 뒤집는다.
+
+```java
+// Order가 자신의 불변식을 보호한다
+public void cancel() {
+    if (!this.status.isCancellable()) {
+        throw new OrderNotCancellableException(
+            String.format("'%s' 상태의 주문은 취소할 수 없습니다", this.status.displayName())
+        );
+    }
+    this.status = OrderStatus.CANCELLED;
+    this.events.add(new OrderCancelled(this.id));
+}
+
+// 상태 전이 규칙이 한 곳에 집중된다
+public enum OrderStatus {
+    PENDING, PAID, PREPARING, SHIPPED, DELIVERED, CANCELLED;
+
+    public boolean isCancellable() {
+        return this == PENDING || this == PAID;
+    }
+}
+```
+
+이제 `order.isCancellable()`이 도메인 질문에 직접 답한다. 새 상태 `PREPARING`을 추가할 때 `OrderStatus` 열거형과 `isCancellable()` 하나만 수정하면 된다. Service에 if문을 추가할 필요가 없고, 누락도 불가능하다.
+
+## 언어가 코드 구조를 결정한다
+
+Ubiquitous Language — 개발자, 도메인 전문가, 기획자가 하나의 공유된 언어로 소통하는 것 — 는 DDD의 핵심 도구다. 언어 불일치는 단순히 커뮤니케이션 문제가 아니라 실제 버그로 이어진다.
+
+헬스케어 예약 시스템에서 개발자가 `confirm()`, `checkIn()`이라고 부르는 것을 간호사는 "접수", "내원"이라고 부른다면, 같은 개념을 두 번 구현하거나 한쪽이 빠지는 버그가 생긴다. 코드가 `Appointment.accept()`, `Appointment.arrive()`를 갖고 상태 열거형이 `ACCEPTED`, `ARRIVED`를 갖는다면, 코드 자체가 비즈니스 명세가 된다.
+
+<Callout type="note" title="언어 불일치의 비용">
+도메인 전문가가 코드를 읽었을 때 의미를 이해할 수 없다면, 그것은 주석의 문제가 아니라 이름의 문제다. 주석이 코드를 번역해야 하는 순간이 Ubiquitous Language가 무너졌다는 신호다.
+</Callout>
+
+같은 "주문(Order)"이라도 주문 컨텍스트에서는 "고객이 상품을 구매하기로 한 계약"이고, 배송 컨텍스트에서는 "배송해야 할 패키지 묶음"이다. Bounded Context 경계가 곧 언어의 경계다.
+
+## Strategic Design이 먼저인 이유
+
+DDD를 공부하면 보통 Aggregate, Entity, Value Object부터 배운다. 코드로 바로 이어지기 때문에 더 직관적으로 느껴진다. 그런데 Context Map 없이 Aggregate를 설계하면 3개월 후 "이 Aggregate 경계가 잘못됐다"를 깨닫고 전면 재설계하는 상황을 맞는다.
+
+Strategic Design은 "무엇을 만들 것인가"를 결정한다. Subdomain 식별(Core / Supporting / Generic), Bounded Context 경계, Context Map 패턴(ACL, Customer-Supplier, Shared Kernel). Tactical Design은 각 Context 내부에서 "어떻게 구현할 것인가"를 결정한다.
+
+```
+Strategic 없이 시작한 결과:
+  Order가 Delivery, Payment, Warehouse를 직접 포함
+  → "결제 서비스 분리" 요구사항 → Order 전면 재설계
+  → 3개 팀이 하나의 클래스를 공유하는 "분산 모놀리스"
+
+Strategic 먼저 시작한 결과:
+  Order Context ≠ Payment Context (Context Map으로 확인)
+  → Order는 PaymentId만 참조
+  → Payment Context 분리 시 Order 무관
+```
+
+Aggregate 경계는 Bounded Context 경계 안에 있다. Context를 모르면 Aggregate 경계를 잘못 설계한다.
+
+## 복잡도에 맞는 도구 선택
+
+DDD를 공부하고 나면 "모든 프로젝트에 DDD를 적용해야겠다"는 생각이 들기 쉽다. 그런데 사내 공지사항 게시판에 Aggregate Root를 설계하고 Domain Event를 발행하면, 3개 파일로 끝날 기능이 15개 파일이 된다.
+
+Martin Fowler의 세 가지 패턴이 복잡도 선택의 기준이다: Transaction Script(단순 CRUD), Table Module(중간 복잡도), Domain Model(DDD). 판단 기준은 불변식 수, 상태 전이 복잡도, 도메인 전문가 협업 필요성이다.
+
+<Callout type="note" title="트레이드오프">
+DDD의 진짜 비용은 초기 설계 투자와 팀 역량 의존성이다. 반면 Anemic Model의 진짜 비용은 복잡도가 증가할수록 기하급수적으로 커지는 유지보수 비용이다. 단순 CRUD에는 Transaction Script, Core Domain에는 Domain Model — 혼합 전략이 가장 현실적이다.
+</Callout>
+
+현실적 신호: Service 메서드가 200줄을 넘고, "이 규칙이 어디에 있지?"를 찾는 데 시간이 걸리고, 문자열 상태 비교가 여러 곳에 중복된다면 — Domain Model 전환을 고려할 시점이다.
+
+## 레이어 의존성을 역전하라
+
+Spring Boot로 프로젝트를 시작하면 자연스럽게 Controller → Service → Repository 3-tier가 만들어진다. 이 구조에서 Service는 필연적으로 여러 Repository와 다른 Service를 주입받고 비대해진다. 비즈니스 로직이 Service 안에 있으면 `OrderService` 테스트에 8개의 Mock이 필요하다.
+
+DDD의 레이어 구조는 의존성 방향을 바꾼다. **Domain Layer가 중심이 되고, 다른 레이어가 Domain을 의존한다. Domain은 인프라를 모른다.**
+
+```
+Presentation  → Application → Domain ← Infrastructure
+                               ↑
+                          (인터페이스)
+```
+
+Domain Layer는 순수 Java다. JPA, Kafka, 외부 API를 모른다. `OrderRepository`는 Domain Layer의 인터페이스이고, `JpaOrderRepository`는 Infrastructure Layer의 구현체다. 이 분리가 되면 `Order.cancel()` 테스트에 Spring Context도, JPA도, Mock도 필요 없다. 순수 Java 객체 생성 후 메서드 호출로 1ms 안에 비즈니스 규칙을 검증한다.
+
+<Aside label="Hexagonal Architecture">
+Ports and Adapters 패턴은 이 의존성 방향을 구조화한다. Port는 Domain이 정의하는 인터페이스, Adapter는 외부 세계와 Port를 연결하는 구현체다. DDD Domain Layer를 Hexagon 중심에 배치하는 것이 자연스러운 조합이다.
+</Aside>
+
+## 정리
+
+- 소프트웨어 복잡도 = 본질적 복잡도 + 우발적 복잡도. DDD는 우발적 복잡도를 제거하고 본질적 복잡도를 도메인 모델에 명확히 담는다.
+- Anemic Domain Model은 비즈니스 규칙을 Service로 흘려보내고, Service는 필연적으로 비대해진다. Rich Domain Model은 Entity가 자신의 불변식을 보호한다.
+- Ubiquitous Language가 무너지면 언어 불일치가 버그가 된다. 코드 이름이 도메인 언어와 일치할 때, 코드가 비즈니스 명세가 된다.
+- Strategic Design(Bounded Context, Context Map)이 없으면 Tactical Design(Aggregate, Entity)의 경계를 잘못 설정한다.
+- Domain Layer를 인프라에서 분리하면 테스트가 빠르고 인프라 교체가 자유로워진다. 의존성은 항상 도메인을 향해야 한다.
+
+DDD는 복잡한 도메인에 대한 도구다. 모든 곳에 쓰는 것이 아니라, Core Domain에 집중하는 것이 핵심이다.

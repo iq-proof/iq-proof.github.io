@@ -1,0 +1,106 @@
+---
+title: "DDD의 모든 실수는 하나의 질문으로 수렴한다"
+description: "Anemic Model부터 과잉 Context 분리, DDD 과잉 적용까지 — 도메인 로직이 어디에 있어야 하는가라는 질문 하나가 모든 설계 실수를 관통한다."
+pubDate: 2026-05-02
+category: dev
+tags: [ddd, domain-driven-design, aggregate, bounded-context, clean-architecture]
+difficulty: intermediate
+series:
+  slug: ddd-deep-dive
+  title: Ddd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+DDD를 도입한 팀이 가장 먼저 하는 실수는 Entity에 `@Entity`를 붙이고 getter/setter를 가득 채운 다음 "우리 DDD 한다"고 선언하는 것이다. 그 다음은 모든 개념을 별도 Context로 분리하는 열정이 찾아오고, 그 다음은 공지사항 CRUD에도 Aggregate와 Outbox Pattern을 끼워 넣는 과잉이 온다. 이 실수들은 서로 달라 보이지만 사실 하나의 질문을 제대로 묻지 않아서 생긴다 — **"이 로직은 어디에 있어야 하는가?"**
+
+## Anemic Model — Entity가 데이터 컨테이너가 될 때
+
+Martin Fowler가 2003년에 명명한 Anemic Domain Model은 2024년에도 여전히 가장 흔한 패턴이다. 증상은 단순하다. Entity에 public getter/setter만 있고, 모든 로직이 `xxxService`에 있다.
+
+```java
+// Anemic: Service가 상태 확인 로직을 소유
+if ("SHIPPED".equals(order.getStatus()) || "DELIVERED".equals(order.getStatus())) {
+    throw new CannotCancelException();
+}
+order.setStatus("CANCELLED");
+
+// Rich: Entity가 자신의 불변식을 보호
+order.cancel("사유"); // 내부에서 상태 검증 + 이벤트 등록
+```
+
+Anemic Model이 자연스럽게 발생하는 이유가 있다. JPA를 처음 배우면 Entity는 DB 매핑 객체로 학습되고, 로직은 당연히 Service에 넣는다. 절차적 프로그래밍 습관이 남아 있으면 함수(Service)가 데이터(Entity)를 처리하는 Transaction Script 방식이 기본값이 된다. 팀 컨벤션 없이 "Service에 로직 넣는다"는 암묵적 규칙이 생기면 새 팀원도 그 패턴을 따른다.
+
+<Callout type="warning" title="Anemic Model이 DDD를 무효화하는 방식">
+`order.setStatus("CANCELLED")`는 불변식을 우회한다. "취소 가능 조건"이 어디 있는지 알려면 `OrderService`, `AdminOrderService`, `ReturnService`를 모두 뒤져야 한다. Rich Model에서는 `order.isCancellable()`이 한 곳에서 답한다.
+</Callout>
+
+도메인 로직 위치를 판단하는 기준은 세 질문으로 압축된다. "이 로직이 해당 객체의 데이터만으로 결정되는가?" → Entity 메서드. "여러 Aggregate에 걸친 계산인가?" → Domain Service. "외부 시스템(DB, 이메일, API)에 의존하는가?" → Application Service 또는 Infrastructure.
+
+## Aggregate 경계 — 너무 크거나 너무 작거나
+
+Entity에 로직을 돌려놓았다고 끝이 아니다. 다음 실수는 Aggregate 경계에서 기다린다.
+
+```java
+// 너무 큰 Aggregate: Customer에 주문 수천 개 + 포인트 이력 수천 개
+@OneToMany(cascade = CascadeType.ALL, fetch = FetchType.EAGER)
+private List<Order> orders; // 3,000개 로딩
+private List<PointTransaction> pointHistory; // 5,000개 로딩
+```
+
+고객 이름 하나 바꾸려고 수백 MB 메모리를 쓰게 된다. 동시 주문 시도가 생기면 Customer 전체에 락이 걸려 `OptimisticLockException`이 폭발한다. `CascadeType.ALL`에 다른 Aggregate 참조가 결합되면 Customer 삭제가 Seller도 삭제하는 재앙이 된다.
+
+Aggregate 크기를 판단하는 체크리스트는 명확하다. "이 두 객체의 불변식이 항상 함께 보장돼야 하는가?" → 같은 Aggregate. "한쪽이 수천 개로 늘어날 수 있는가?" → 다른 Aggregate. "서로 다른 사람이 동시에 수정할 수 있는가?" → 다른 Aggregate.
+
+다른 Aggregate를 참조할 때는 객체가 아닌 ID만 사용한다. `order.getCustomer().setEmail(newEmail)`이 가능하면 Order를 통해 Customer의 불변식을 우회할 수 있다. `order.customerId()`로만 접근하면 Customer는 오직 `CustomerRepository`를 통해서만 수정된다.
+
+<Aside label="트랜잭션 경계 신호">
+하나의 `@Transactional` 안에서 `orderRepository.save()`, `customerRepository.save()`, `inventoryRepository.save()`가 모두 호출된다면 Aggregate 설계를 재검토해야 한다. 트랜잭션 하나는 Aggregate 하나다. 나머지는 Domain Event로 분리한다.
+</Aside>
+
+## Bounded Context — 분산 모놀리스와 언어 오염 사이
+
+Aggregate를 잘 설계했다면 이제 Context 경계 실수가 찾아온다.
+
+DDD를 배운 직후 흔한 충동은 모든 개념을 별도 Context로 만드는 것이다. 장바구니, 장바구니 항목, 위시리스트, 주문, 주문 항목, 결제, 쿠폰, 포인트... 결과는 단순 주문 목록 조회에 5개 서비스를 호출하는 분산 모놀리스다. 하나 다운되면 목록 페이지 전체가 실패한다.
+
+반대 극단은 하나의 거대한 CommerceContext다. 여기서는 "상품"이라는 단어가 마케팅팀(카탈로그 항목), 창고팀(SKU), 주문팀(스냅샷), 배송팀(패키지)에서 각자 다른 의미를 갖는다. `Product` 클래스가 모든 의미를 담으려다 `@Transient` 필드가 폭발하고, 어떤 상황에서 어떤 필드가 채워지는지 아무도 모르게 된다.
+
+<Callout type="note" title="트레이드오프">
+Context 경계 재조정의 신호는 두 방향이다. "두 서비스가 항상 함께 배포된다" → 통합 신호. "같은 용어가 다른 의미로 쓰인다" → 분리 신호. 불확실할 때는 크게 시작(모놀리스)하고, 도메인 지식이 쌓이면 패키지 경계를 코드에 먼저 반영한 후 서비스로 분리한다.
+</Callout>
+
+"마이크로서비스 = 마이크로 Context"라는 오해도 여기서 나온다. Bounded Context가 배포 단위(마이크로서비스)가 될 수 있지만, 비율이 반드시 1:1일 필요는 없다. 물류 Context 하나가 재고, 배송, 반품을 통합한 하나의 서비스가 될 수 있다. 판단 기준은 "두 명의 피자 팀이 독립적으로 개발하고 배포할 수 있는가"다.
+
+## DDD 과잉 — 단순한 도메인을 복잡하게 만들기
+
+DDD는 강력한 도구지만 모든 곳에 쓰는 도구가 아니다. 공지사항 CRUD에 Aggregate, Domain Event, Outbox Pattern을 전부 적용하면 5줄로 끝날 것이 100줄이 된다. 신규 개발자는 "이 Title Value Object가 왜 있어요?"라고 묻는다.
+
+Martin Fowler의 세 가지 아키텍처 패턴이 명확한 기준을 제공한다. Transaction Script는 비즈니스 규칙이 거의 없는 단순 CRUD(공지사항, FAQ, 관리자 설정)에 최선의 선택이다. Domain Model은 복잡한 불변식과 도메인 로직이 비즈니스 차별화 요소가 되는 Core Domain(주문, 결제, 재고)에만 완전 적용한다.
+
+과잉 적용 신호는 확인하기 쉽다. Domain Event를 발행하는데 핸들러가 없다면 이벤트가 불필요하다. Value Object에 검증 로직도 없다면 일반 String으로 충분하다. Aggregate에 Entity가 하나뿐이라면 Aggregate 패턴이 불필요하다. Application Service가 `find → method call → save → event publish` 외에 아무것도 안 한다면 레이어가 과잉이다.
+
+## 실무의 타협 — 의식적으로 결정하기
+
+완벽한 DDD는 없다. 모든 팀이 처음부터 Outbox Pattern, 완전한 Persistence Ignorance, Saga Pattern을 적용할 수 없다. 중요한 것은 어디서 타협할 것인지를 의식적으로 결정하는 것이다.
+
+절대 포기하면 안 되는 것이 있다. Entity의 public setter 금지, 코드에 비즈니스 언어 사용(Ubiquitous Language), Aggregate 경계의 명시적 존재, 비즈니스 로직의 도메인 레이어 집중 — 이 네 가지가 없으면 DDD가 아니다.
+
+타협 가능한 것도 있다. Persistence Ignorance 수준(JPA 어노테이션을 Domain 클래스에 허용), 이벤트 신뢰성(@TransactionalEventListener로 시작), CQRS 적용 범위, Context 분리 수준(모놀리스 패키지부터) — 이것들은 팀 역량과 상황에 따라 조정할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+타협이 습관이 되지 않으려면 타협 내용을 반드시 문서화해야 한다. ADR(Architecture Decision Record)이나 코드 주석에 "왜 이 타협을 했는가"와 "언제 재검토할 것인가"를 명시한다. 팀 전체가 타협 내용을 공유하지 않으면, 타협은 기술 부채가 된다.
+</Callout>
+
+팀 역량별 단계도 명확하다. Level 1에서는 Entity 불변식(setter 금지)과 기본 Repository 패턴만 적용한다. Level 2에서는 Value Object 추출, Aggregate 경계 명시, 내부 Domain Event를 추가한다. Level 3에서야 Outbox, Saga, CQRS, 완전한 Persistence Ignorance를 고려한다.
+
+## 정리
+
+- DDD의 모든 실수는 "도메인 로직이 어디에 있어야 하는가"라는 질문을 제대로 묻지 않아서 생긴다.
+- Anemic Model, 너무 큰 Aggregate, 분산 모놀리스, DDD 과잉은 각각 Entity/Aggregate/Context/설계 패턴 수준에서 같은 실수를 반복한다.
+- 절대 타협하면 안 되는 것(불변식 보호, Ubiquitous Language)과 상황에 따라 조정 가능한 것(PI 수준, 이벤트 신뢰성)을 구분한다.
+- 완벽한 DDD를 기다리다 아무것도 못 하는 것보다, 불완전하지만 의식적인 DDD가 낫다.

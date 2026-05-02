@@ -1,0 +1,106 @@
+---
+title: "DDD의 모든 패턴은 하나의 질문에서 나온다"
+description: "Entity/Value Object 구분부터 Aggregate 경계, Repository 설계, Domain Event까지 — DDD 전술 패턴들이 공유하는 하나의 원칙을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [ddd, domain-driven-design, aggregate, value-object, domain-event]
+difficulty: intermediate
+series:
+  slug: ddd-deep-dive
+  title: Ddd Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`Long orderId`, `String email`, `BigDecimal amount`. 대부분의 코드베이스는 이런 원시 타입으로 가득하다. 동작은 한다. 그런데 도메인의 의도는 드러나지 않는다. DDD의 전술 패턴들 — Entity, Value Object, Aggregate, Repository, Domain Service, Factory, Domain Event — 은 왜 존재하는가? 그 뿌리에는 단 하나의 질문이 있다: **"불변식을 누가, 언제, 어디서 보장하는가?"**
+
+## 식별자냐, 값이냐 — 첫 번째 구분
+
+모든 것의 출발점은 Entity와 Value Object의 구분이다. 기준은 하나다. "이것을 복사하면 원본과 동일한가?" — YES면 Value Object, NO면 Entity다.
+
+`Money(10000, KRW)`를 복사하면 원본과 동일하다. 별도 ID가 필요 없다. 반면 고객 Kim은 복사본이 "또 다른 고객"이다. 식별자로 추적해야 한다.
+
+이 구분이 중요한 이유는 `equals()` 구현 방식이 달라지기 때문만이 아니다. **불변식이 다른 곳에 위치하기 때문이다.** Value Object는 생성 시점에 스스로를 검증한다. `Money` 인스턴스가 존재하면 항상 유효하다 — 음수가 불가능하고, 통화가 명확하며, 소수점 자릿수가 정규화돼 있다. 검증 로직이 여러 Service에 흩어지지 않는다.
+
+```java
+public Money add(Money other) {
+    if (!this.currency.equals(other.currency)) {
+        throw new CurrencyMismatchException(currency + " ≠ " + other.currency);
+    }
+    return new Money(this.amount.add(other.amount), this.currency);
+}
+```
+
+원화와 달러를 합산하는 버그가 컴파일 직후 테스트에서 잡힌다. 타입 시스템이 도메인 규칙을 강제한다.
+
+## Aggregate — 불변식의 경계를 긋다
+
+Value Object가 단일 값의 불변식을 보장한다면, Aggregate는 **여러 객체에 걸친 불변식의 경계**다.
+
+`Order`와 `OrderLine`을 생각해보자. "총 금액 = 모든 항목의 소계 합"은 두 객체에 걸친 불변식이다. 이 불변식이 `Order`와 `OrderLine`을 같은 Aggregate로 묶는 근거다. 외부에서 `order.getLines().add(new OrderLine(...))`처럼 직접 컬렉션을 수정할 수 있다면, 총 금액 재계산이 누락되고 불변식이 깨진다.
+
+<Callout type="warning" title="Aggregate 경계 위반의 증상">
+외부에서 내부 컬렉션을 직접 수정하거나, 하나의 트랜잭션에서 두 개 이상의 Aggregate를 수정하고 있다면 경계 설계를 재검토해야 한다.
+</Callout>
+
+Aggregate 크기는 **작을수록 좋다**. 큰 Aggregate는 더 많은 행을 잠그고, 더 긴 트랜잭션을 만들며, 동시 요청이 증가할수록 충돌이 기하급수적으로 늘어난다. `Customer`에 `List<Order>`를 포함시키면 고객 이름 변경 한 건이 그 고객의 모든 주문 처리를 블로킹한다. Aggregate 간 참조는 ID로만 한다. 객체 참조는 경계를 무너뜨린다.
+
+## 어디에 둘 것인가 — Service의 두 얼굴
+
+Aggregate 설계가 자리를 잡으면, 다음 질문이 온다: 이 로직은 어디에 있어야 하는가?
+
+**Domain Service**는 하나의 Aggregate에 자연스럽게 속하기 어려운 도메인 로직을 담는다. "고객 등급 + 쿠폰 → 최종 할인"은 `Customer`와 `Coupon` 두 Aggregate에 걸쳐 있다. 어느 한쪽에 넣으면 어색하다. `PricingDomainService`로 추출하면 인프라 의존이 없고, Mock 없이 단위 테스트가 가능하다.
+
+**Application Service**는 다르다. 도메인 로직을 직접 표현하지 않는다. Repository에서 Aggregate를 꺼내고, Domain Service나 Aggregate 메서드에 위임하고, 저장하고, 이벤트를 발행한다. "어떤 순서로 누구에게 시킬 것인가"가 역할이다.
+
+```
+비즈니스 규칙인가? → YES + 단일 Aggregate → Entity 메서드
+                   → YES + 여러 Aggregate → Domain Service
+                   → NO (흐름 제어)       → Application Service
+```
+
+Application Service에 할인율 계산 `if/else`가 있다면, 그것은 Domain Service로 가야 할 코드가 잘못된 자리에 앉아 있는 것이다.
+
+## Repository — 컬렉션처럼 동작해야 한다
+
+Repository를 "DB 접근 객체"로 보면 테이블마다 Repository가 생긴다. `OrderLineRepository.save(line)`이 생기면 Order의 불변식 검증을 우회하게 된다. 총 금액이 실제 항목 합계와 달라진다.
+
+DDD에서 Repository는 메모리 컬렉션처럼 행동해야 한다. `List<Order>`에서 꺼내 수정하고 넣는 것처럼, Repository에서 꺼내 수정하고 저장하면 영속화된다. **Aggregate Root 당 하나의 Repository**. OrderLine의 별도 Repository는 없다.
+
+도메인 레이어가 Repository 인터페이스를 소유하고, 인프라가 구현한다. 의존성이 역전된다. `InMemoryOrderRepository`로 도메인 테스트를 DB 없이 돌릴 수 있게 된다.
+
+## Domain Event — 발행자는 구독자를 모른다
+
+`OrderService.placeOrder()` 끝에 `emailService.send()`를 직접 호출하면, 새 요구사항이 올 때마다 OrderService를 고쳐야 한다. SMS가 추가되면, 포인트 적립이 추가되면, 마케팅 데이터 전송이 추가되면 — 전부 OrderService에 줄줄이 달린다.
+
+Domain Event는 이 결합을 끊는다. `OrderPlaced` 이벤트를 발행하면 이메일 핸들러, 포인트 핸들러, 카카오 알림톡 핸들러가 각자 구독한다. **발행자는 구독자를 모른다.** 새 기능은 새 핸들러를 추가하는 것으로 끝난다.
+
+이벤트 이름은 과거형이다 — `OrderPlaced`, `PaymentCompleted`. 명령(`PlaceOrder`)이 아니라 이미 일어난 사실이기 때문이다. 과거형은 "핸들러는 이미 일어난 일에 반응하며, 그것을 거부할 수 없다"는 의미를 담는다.
+
+<Aside label="원자성 문제">
+DB 저장과 이벤트 발행 사이에 장애가 나면 이벤트가 유실된다. Outbox Pattern은 이벤트를 같은 트랜잭션으로 DB에 저장한 뒤 별도 릴레이어가 메시지 브로커로 전달해 원자성을 보장한다.
+</Aside>
+
+## 트레이드오프
+
+이 모든 패턴은 비용을 수반한다.
+
+Value Object는 클래스 수를 늘린다. Aggregate 경계를 작게 유지하면 Eventually Consistent 처리 복잡도가 올라간다. Domain Event는 "주문 완료 직후 포인트 즉시 표시"처럼 강한 일관성을 요구하는 요건과 충돌할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+작은 Aggregate + 이벤트 기반 Eventually Consistent는 처리량을 높이지만 Saga, Outbox, 멱등성 처리가 따라온다. 큰 Aggregate + 강한 일관성은 구현이 단순하지만 락 경합이 처리량을 누른다. 어느 쪽을 선택할지는 도메인 전문가와 비즈니스 요건을 확인한 후 결정해야 한다.
+</Callout>
+
+## 정리
+
+- Entity는 ID로, Value Object는 값으로 동등성을 정의한다. 이 구분이 `equals()` 구현과 불변식의 위치를 결정한다.
+- Aggregate는 불변식의 경계다. 작게 유지하고, 경계 바깥과는 ID로만 참조한다.
+- Domain Service는 여러 Aggregate에 걸친 도메인 로직을, Application Service는 유스케이스 흐름 제어를 담당한다.
+- Repository는 컬렉션처럼 동작해야 한다. Aggregate Root 당 하나만.
+- Domain Event는 발행자와 구독자를 분리해 새 요구사항을 핸들러 추가로 수용하게 한다.
+
+패턴을 기억하는 것보다 중요한 것은 질문을 기억하는 것이다 — "불변식을 누가, 언제, 어디서 보장하는가?"
