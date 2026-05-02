@@ -1,0 +1,109 @@
+---
+title: "Spring Boot 앱은 어떻게 실행되는가"
+description: "Fat JAR의 중첩 ClassLoader 구조부터 Native Image의 Closed World 가정, Kubernetes 운영 설정까지 — 배포 파이프라인 전체를 관통하는 설계 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-boot, fat-jar, graalvm, buildpacks, kubernetes]
+difficulty: intermediate
+series:
+  slug: spring-boot-internals
+  title: Spring Boot Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`java -jar app.jar` 한 줄로 Spring Boot 앱이 뜬다. 그런데 그 뒤에서 무슨 일이 벌어지는가? JVM은 `MANIFEST.MF`의 `Main-Class`만 읽는다. 수백 MB의 의존성 JAR가 JAR 안에 중첩되어 있는데도 어떻게 클래스를 찾는가? 그리고 왜 어떤 명령어 하나가 전체 기동을 망가뜨리는가?
+
+## JAR 안의 JAR — 표준 JVM이 할 수 없는 것
+
+표준 Java JAR 스펙은 중첩 JAR를 지원하지 않는다. `java.util.jar.JarFile`은 `jar:file:/path/app.jar!/com/example/Foo.class` 형태의 URL은 처리하지만, `jar:file:/path/app.jar!/BOOT-INF/lib/spring-core.jar!/org/springframework/Foo.class` 같은 이중 중첩은 처리하지 못한다.
+
+대안은 두 가지였다. 모든 클래스를 하나로 압축하는 Shade JAR는 `META-INF/spring.factories` 같은 동일 경로 리소스가 충돌하고 JAR 서명이 깨진다. 의존성을 외부 `lib/` 폴더로 빼면 단일 파일 배포가 불가능하다.
+
+Spring Boot는 세 번째 길을 택했다. 의존성 JAR를 원본 형태로 `BOOT-INF/lib/` 안에 중첩하고, 이를 읽을 수 있는 커스텀 ClassLoader를 JAR 안에 직접 포함시켰다.
+
+```
+app.jar
+├── META-INF/MANIFEST.MF
+│     Main-Class:  org.springframework.boot.loader.launch.JarLauncher
+│     Start-Class: com.example.Application
+├── BOOT-INF/
+│   ├── classes/          ← 앱 코드
+│   ├── lib/              ← 의존성 JAR (중첩)
+│   └── classpath.idx     ← 결정론적 로딩 순서
+└── org/springframework/boot/loader/
+    ├── launch/JarLauncher.class
+    └── jar/NestedJarFile.class
+```
+
+`MANIFEST.MF`에 `Main-Class`와 `Start-Class`가 분리된 이유가 여기 있다. JVM은 `JarLauncher`를 호출하고, `JarLauncher`가 `jar:nested:` 프로토콜 핸들러를 등록한 뒤 `LaunchedURLClassLoader`를 생성해 `Start-Class`를 로딩한다. `Start-Class`를 `Main-Class`로 직접 지정하면 ClassLoader 준비 없이 실행되어 `ClassNotFoundException`이 발생한다.
+
+## WAR 배포와 lib-provided
+
+`WarLauncher`는 같은 원리를 WAR 구조에 적용한다. `WEB-INF/lib/`에는 런타임 의존성이, `WEB-INF/lib-provided/`에는 내장 서버처럼 "컨테이너가 제공할 수 있는" 의존성이 들어간다.
+
+`java -jar app.war`로 실행하면 `WarLauncher`가 `lib-provided`까지 포함해 ClassLoader를 구성한다 — 내장 Tomcat이 동작한다. 외부 Tomcat의 `webapps/`에 배포하면 컨테이너가 `lib-provided`를 무시하고 자신의 Tomcat을 사용한다. 하나의 WAR가 두 가지 실행 방식을 지원하는 구조다.
+
+<Callout type="note" title="트레이드오프">
+임베디드 서버(Fat JAR)는 단일 파일 배포와 서버 설정 코드화가 장점이다. 외부 컨테이너(WAR)는 기존 WAS 인프라 활용이 가능하지만 배포가 복잡하고 `server.port` 같은 Spring Boot 설정이 무시된다. 컨테이너(Docker/K8s) 환경이라면 Fat JAR가 압도적으로 유리하다.
+</Callout>
+
+## Docker 레이어 캐시 — 변하는 것과 변하지 않는 것을 분리하라
+
+200MB Fat JAR를 그대로 Docker 이미지로 만들면, 코드 한 줄 바꿀 때마다 200MB 전체를 재업로드해야 한다. Layered JAR는 이 문제를 의존성과 앱 코드의 변경 주기 차이로 푼다.
+
+```dockerfile
+FROM eclipse-temurin:21-jre AS builder
+WORKDIR /application
+COPY app.jar .
+RUN java -Djarmode=layertools -jar app.jar extract
+
+FROM eclipse-temurin:21-jre
+WORKDIR /application
+COPY --from=builder /application/dependencies/ ./
+COPY --from=builder /application/snapshot-dependencies/ ./
+COPY --from=builder /application/resources/ ./
+COPY --from=builder /application/application/ ./
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+`layers.idx`가 어떤 파일이 어느 레이어에 속하는지 정의한다. `dependencies`(release JAR, 수개월에 한 번)를 먼저 COPY하고 `application`(앱 코드, 수시로)을 마지막에 두면, 코드 변경 시 1MB 안팎의 레이어만 재빌드된다. CI/CD 속도가 10~20배 빨라진다.
+
+Cloud Native Buildpacks는 이 Dockerfile을 쓸 필요조차 없애준다. `./gradlew bootBuildImage`가 detect → build → export 단계를 자동으로 처리하고, Spring Boot Buildpack이 Layered JAR 분리를 대신 수행한다. JRE 보안 패치도 Buildpack 업데이트 후 재빌드만으로 일괄 적용된다.
+
+## Native Image — Closed World의 비용
+
+GraalVM `native-image`는 빌드 타임에 전체 앱을 네이티브 바이너리로 컴파일한다. 기동 시간이 수 초에서 수십 ms로 줄고, 메모리 사용량이 JVM 런타임이 없는 만큼 감소한다.
+
+대가는 **Closed World Assumption**이다. 빌드 시점에 실행될 모든 코드를 알아야 한다. Spring은 리플렉션으로 Bean을 생성하고, CGLIB으로 동적 프록시를 만들고, `Class.forName()`으로 드라이버를 로딩한다 — 전부 이 가정을 위반한다.
+
+Spring Boot 3.x의 AOT 엔진(`processAot`)이 이 간극을 메운다. `ApplicationContext`를 빌드 타임에 "시뮬레이션" 실행해 리플렉션 없는 Bean 등록 소스 코드를 생성하고, `reflect-config.json` 같은 힌트 파일을 만든다. AOT 엔진이 놓친 동적 리플렉션은 `RuntimeHintsRegistrar`로 수동 등록하거나 `native-image-agent`로 런타임 수집할 수 있다.
+
+<Callout type="warning" title="트레이드오프">
+Native Image는 기동 시간과 메모리에서 JVM을 압도하지만, 빌드에 수십 분이 걸리고 JIT 최적화가 없어 장기 실행 고처리량 서비스에서는 최대 처리량이 낮다. 서버리스, 빠른 스케일아웃, 메모리 민감 환경에 적합하다.
+</Callout>
+
+## 운영 환경에서 기본값을 믿지 마라
+
+Spring Boot의 기본값은 개발 편의를 위해 설계되어 있다. 운영에서 그대로 쓰면 구멍이 생긴다.
+
+Actuator는 `management.server.port: 8081`로 서비스 포트와 분리하고, `health,info,metrics,prometheus`만 노출한다. `shutdown` 엔드포인트는 절대 활성화하지 않는다. `server.shutdown: graceful`을 설정해야 K8s SIGTERM 수신 시 처리 중인 요청이 완료될 때까지 대기한다 — 미설정 시 트랜잭션이 진행 중인 요청도 즉시 끊긴다.
+
+Kubernetes Probe 설계에는 한 가지 원칙이 있다. **재시작해도 해결되지 않는 문제는 절대 Liveness 실패로 만들지 말 것.** DB가 다운됐을 때 Liveness가 실패하면 재시작 루프(CrashLoopBackOff)가 발생한다. 외부 의존성 장애는 Readiness에만 반영해야 트래픽을 차단하되 컨테이너는 살아있는 상태를 유지한다.
+
+<Aside label="JVM 메모리">
+컨테이너 환경에서 `-Xmx` 고정값은 위험하다. 컨테이너 메모리 제한이 바뀌면 OOM Kill이 발생한다. `-XX:MaxRAMPercentage=75.0`으로 컨테이너 제한의 75%를 힙으로 자동 산정하는 것이 안전하다. `-XX:+ExitOnOutOfMemoryError`를 함께 설정하면 OOM 발생 시 K8s가 컨테이너를 재시작한다.
+</Aside>
+
+## 정리
+
+- `java -jar app.jar`의 진짜 진입점은 `JarLauncher`다. `Start-Class`는 `LaunchedURLClassLoader`가 준비된 후에야 실행된다.
+- Layered JAR는 변경 빈도가 다른 의존성과 앱 코드를 Docker 레이어로 분리해 캐시 효율을 극대화한다.
+- Native Image는 기동 속도와 메모리를 얻는 대신 Closed World 가정을 만족시키는 AOT 준비 작업이 필요하다.
+- 운영 배포 전 Actuator 노출 범위, Graceful Shutdown, Liveness/Readiness 분리는 필수다 — 기본값이 틀렸다고 가정하고 검토하라.
+
+다음 글에서는 이 시리즈의 각 주제를 더 깊이 파고든다. JarLauncher와 WarLauncher의 ClassLoader 전략 차이, Layered JAR 커스텀 레이어 정의, Native Image 힌트 누락 패턴을 차례로 다룬다.

@@ -1,0 +1,150 @@
+---
+title: "Spring Boot Auto-configuration은 어떻게 스스로를 조립하는가"
+description: "클래스 로딩 없는 조건 평가부터 위상 정렬 기반 순서 결정, DataSource·JPA·MVC 자동 구성, 커스텀 Auto-configuration 작성까지 — Spring Boot가 빈을 조립하는 전 과정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-boot, auto-configuration, conditional, bean-factory, internals]
+difficulty: advanced
+series:
+  slug: spring-boot-internals
+  title: Spring Boot Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Collapse from '@/components/mdx/Collapse.astro';
+
+Spring Boot를 쓰면 `spring.datasource.url` 한 줄로 HikariCP 연결 풀이 생기고, `spring-data-jpa`를 추가하면 `EntityManagerFactory`가 자동으로 올라온다. 이것이 "마법"처럼 보이는 이유는 내부의 조건 평가 체인, 위상 정렬 알고리즘, 컴파일 타임 메타데이터가 한꺼번에 작동하기 때문이다. 도대체 Spring Boot는 어떻게 클래스패스를 읽고, 조건을 검사하고, 150개 가까운 Auto-configuration 클래스를 올바른 순서로 처리하는가?
+
+## 두 단계로 나뉘는 클래스 존재 확인
+
+`@ConditionalOnClass`의 핵심 질문은 "이 클래스가 클래스패스에 있는가?"다. 그런데 클래스 존재를 확인하려고 클래스를 로딩하면, 로딩 과정에서 `NoClassDefFoundError`가 발생할 수 있다. Spring Boot는 이 딜레마를 두 단계로 해결한다.
+
+**1단계: 컴파일 타임 메타데이터 기반 사전 필터링.** `spring-boot-autoconfigure-processor`가 빌드 시 `META-INF/spring-autoconfigure-metadata.properties`를 생성한다. 이 파일에는 `DataSourceAutoConfiguration.ConditionalOnClass=javax.sql.DataSource,...` 같은 텍스트 항목이 들어 있다. 런타임에 `OnClassCondition`은 이 문자열을 읽고 `ClassLoader.getResource()`로 `.class` 파일 존재만 확인한다. 클래스 로딩이 없다. 150개 후보 중 대부분이 이 단계에서 탈락한다.
+
+**2단계: 통과한 것들만 `Class.forName(name, false, loader)`.** `initialize=false`이므로 static initializer는 실행되지 않는다. 클래스 파일을 JVM에 등록하지만 코드는 실행하지 않는 최소 로딩이다.
+
+```java
+// ClassNameFilter.isPresent() — 클래스 로딩 최소화 핵심
+static boolean isPresent(String className, ClassLoader classLoader) {
+    try {
+        Class.forName(className, false, classLoader); // initialize=false
+        return true;
+    } catch (ClassNotFoundException | NoClassDefFoundError ex) {
+        return false;
+    }
+}
+```
+
+`@ConditionalOnClass`를 외부 타입을 반환하는 `@Bean` 메서드와 같은 `@Configuration` 클래스에 두면 위험하다. 클래스 자체가 로딩될 때 반환 타입이 참조되기 때문이다. Spring Boot가 내부 static `@Configuration` 클래스로 분리하는 이유가 여기에 있다.
+
+## Bean 탐색 시점의 함정 — @ConditionalOnMissingBean
+
+`@ConditionalOnMissingBean`은 **Bean 인스턴스**가 아니라 **BeanDefinition**을 탐색한다. 평가 시점은 `REGISTER_BEAN` Phase, 즉 사용자 `@Configuration` 처리가 완료된 후다.
+
+```java
+// OnBeanCondition — BeanDefinitionRegistry 직접 탐색
+private MatchResult getMatchingBeans(ConditionContext context, Spec<?> spec) {
+    // BeanTypeRegistry.getNamesForType() → isAssignableFrom() 서브타입 포함
+    // HikariDataSource도 DataSource로 감지됨
+}
+```
+
+타입을 명시하지 않으면 `@Bean` 메서드의 반환 타입을 자동으로 추론한다. `HikariDataSource`를 반환하는 사용자 Bean이 있으면, `@ConditionalOnMissingBean(DataSource.class)`는 이를 감지해 Auto-configuration Bean 등록을 건너뛴다.
+
+<Callout type="warning" title="@ConditionalOnBean을 사용자 @Configuration에서 쓰면 안 된다">
+`@Configuration` 처리 순서가 보장되지 않는다. `ConfigA`가 먼저 처리되면 `ServiceB`가 아직 없어서 조건이 `false`가 되고, `ConfigB`가 먼저면 `true`가 된다. 순서에 따라 결과가 달라지는 비결정적 동작이다. `@ConditionalOnBean`은 `@AutoConfigureAfter`와 함께 Auto-configuration 내부에서만 사용해야 한다.
+</Callout>
+
+## 위상 정렬로 결정되는 Auto-configuration 순서
+
+`HibernateJpaAutoConfiguration`은 `DataSourceAutoConfiguration` 이후에 처리되어야 `DataSource` BeanDefinition이 존재한다는 것을 보장할 수 있다. 이 관계를 `@AutoConfigureAfter`로 선언하면 `AutoConfigurationSorter`가 두 단계로 정렬한다.
+
+1단계: `@AutoConfigureOrder` 기준 상대 순서.  
+2단계: `@AutoConfigureAfter`/`@AutoConfigureBefore` 관계를 DFS로 위상 정렬 — 2단계가 1단계를 덮어쓴다.
+
+```
+처리 순서:
+DataSourceAutoConfiguration
+  ↓ (after)
+HibernateJpaAutoConfiguration
+  ↓ (after)
+JpaRepositoriesAutoConfiguration
+```
+
+정렬 데이터도 1차 필터링과 마찬가지로 `spring-autoconfigure-metadata.properties`에서 문자열로 읽는다. `@AutoConfigureAfter`에 지정한 클래스가 Auto-configuration 후보 목록에 없으면 해당 관계는 조용히 무시된다.
+
+## DataSource에서 JPA까지 — 자동 구성 체인
+
+`spring.datasource.url`을 설정하면 `DataSourceProperties.determineDriverClassName()`이 URL 패턴으로 드라이버 클래스를 자동 추론한다. `jdbc:mysql://`이면 `com.mysql.cj.jdbc.Driver`, `jdbc:h2:`이면 `org.h2.Driver`다. `driver-class-name`을 명시할 필요가 없다.
+
+연결 풀 우선순위는 HikariCP → Tomcat DBCP2 → Oracle UCP → DBCP2다. URL을 설정하지 않고 H2가 클래스패스에 있으면 `EmbeddedDatabaseConfiguration` 경로로 인메모리 DB가 자동 생성된다.
+
+JPA는 `@ConditionalOnSingleCandidate(DataSource.class)` 조건이 붙어 있어, DataSource가 단 하나이거나 `@Primary`가 하나일 때만 `HibernateJpaAutoConfiguration`이 동작한다. 멀티 DataSource 환경에서는 전체 JPA 자동 구성이 스킵되고 수동 설정이 필요하다.
+
+Entity 스캔 범위는 `@SpringBootApplication`이 위치한 패키지다. `AutoConfigurationPackages`가 이 패키지를 등록하고, `JpaBaseConfiguration.getPackagesToScan()`이 이를 조회해 `LocalContainerEntityManagerFactoryBean`에 전달한다.
+
+<Aside label="ddl-auto 기본값 정책">
+Embedded DB(H2 인메모리)면 `create-drop`, 외부 DB면 `none`이다. 운영 환경에서는 `validate`를 명시하고, Flyway나 Liquibase로 마이그레이션을 관리해야 한다.
+</Aside>
+
+## Auto-configuration을 확장하는 올바른 방법
+
+`@EnableWebMvc`를 붙이면 `WebMvcConfigurationSupport` Bean이 등록되고, `WebMvcAutoConfiguration`은 `@ConditionalOnMissingBean(WebMvcConfigurationSupport.class)` 조건으로 전체 스킵된다. Jackson MessageConverter, 정적 리소스 경로, ViewResolver 기본값이 모두 사라진다. Spring Boot에서 `@EnableWebMvc`는 쓰지 않는다.
+
+올바른 확장 방법은 `WebMvcConfigurer` 구현이다. `DelegatingWebMvcConfiguration`이 `@Autowired List<WebMvcConfigurer>`로 모든 구현체를 자동 수집하고 각 설정 메서드 호출 시 위임한다. Auto-configuration은 그대로 유지된 채 부분적 커스터마이징만 추가된다.
+
+커스텀 라이브러리에 Auto-configuration을 추가하는 절차는 네 단계다.
+
+```java
+// 1. @ConfigurationProperties
+@ConfigurationProperties(prefix = "my.lib")
+public class MyLibProperties { ... }
+
+// 2. @AutoConfiguration
+@AutoConfiguration
+@ConditionalOnClass(AuditLogger.class)
+@EnableConfigurationProperties(MyLibProperties.class)
+public class MyLibAutoConfiguration {
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "my.lib", name = "enabled",
+                           havingValue = "true", matchIfMissing = true)
+    public AuditLogger auditLogger(MyLibProperties props) { ... }
+}
+```
+
+```
+# 3. META-INF/spring/
+# org.springframework.boot.autoconfigure.AutoConfiguration.imports
+com.example.lib.autoconfigure.MyLibAutoConfiguration
+```
+
+```java
+// 4. ApplicationContextRunner 테스트
+private final ApplicationContextRunner contextRunner =
+    new ApplicationContextRunner()
+        .withConfiguration(AutoConfigurations.of(MyLibAutoConfiguration.class));
+
+@Test
+void backsOffWhenUserDefinesOwn() {
+    contextRunner.withUserConfiguration(UserConfig.class)
+        .run(ctx -> assertThat(ctx.getBean(AuditLogger.class))
+            .isInstanceOf(CustomAuditLogger.class));
+}
+```
+
+`withUserConfiguration`이 먼저 처리되고 `AutoConfigurations`가 나중에 처리된다. 실제 `DeferredImportSelector` 동작을 재현하므로 `@ConditionalOnMissingBean`이 테스트에서도 정확히 작동한다.
+
+## 정리
+
+- `@ConditionalOnClass`는 컴파일 타임 메타데이터(`autoconfigure-metadata.properties`) → `getResource()` 체크 → `Class.forName(false)` 순서로, 클래스 로딩을 최대한 뒤로 미룬다.
+- `@ConditionalOnMissingBean`은 Bean 인스턴스가 아니라 BeanDefinition을 탐색하며, 사용자 `@Configuration` 처리 완료 후 평가된다.
+- Auto-configuration 처리 순서는 `@AutoConfigureAfter`/`@AutoConfigureBefore`로 선언된 의존 관계를 DFS 위상 정렬로 해결한다.
+- `@EnableWebMvc`는 Spring Boot Auto-configuration 전체를 무력화한다. 확장은 `WebMvcConfigurer`로 한다.
+- 커스텀 Auto-configuration은 `.imports` 파일 등록, `@ConditionalOnMissingBean` 조합, `ApplicationContextRunner` 테스트 세 가지가 필수다.
+
+다음 글에서는 `application.properties`와 `application.yml`이 어떻게 로딩되고, `@ConfigurationProperties` 바인딩이 어느 시점에 일어나는지 추적한다.

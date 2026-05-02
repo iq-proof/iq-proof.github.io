@@ -1,0 +1,138 @@
+---
+title: "Spring Boot 설정은 어떻게 주입되는가"
+description: "application.yml 로딩 시점부터 Relaxed Binding, record 기반 불변 설정, PropertySource 우선순위 17단계까지, Spring Boot 설정 주입 메커니즘 전체를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-boot, configuration, property-source, binding]
+difficulty: intermediate
+series:
+  slug: spring-boot-internals
+  title: Spring Boot Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Boot 애플리케이션이 시작될 때, `application.yml` 한 줄이 Java 객체의 필드로 변환되기까지 얼마나 많은 단계가 개입하는지 아는가? 파일 탐색, 포맷 파싱, 키 정규화, 타입 변환, 검증까지 — 설정 주입은 생각보다 훨씬 깊은 파이프라인이다. 이 파이프라인을 이해하지 못하면 "왜 내 환경변수가 적용 안 되지?"나 "왜 YAML이 properties보다 이기지?"라는 질문에 영원히 답할 수 없다.
+
+## 파일 로딩의 출발점
+
+Spring Boot는 `SpringApplication.run()`이 호출되면 `prepareEnvironment()` 단계에서 `ConfigDataEnvironmentPostProcessor`를 실행한다. 이것이 `application.yml`과 `application.properties`를 읽는 진입점이다.
+
+두 포맷은 각각 다른 `PropertySourceLoader`가 처리한다. `.properties`는 `PropertiesPropertySourceLoader`가 단일 `PropertySource` 하나를 반환한다. `.yml`은 `YamlPropertySourceLoader`가 SnakeYAML로 파싱하며, `---` 구분자를 만날 때마다 **별도의 `PropertySource`를 생성**한다. 멀티 문서 YAML이 가능한 이유가 여기 있다.
+
+```yaml
+# 하나의 application.yml에서 세 개의 PropertySource가 나온다
+spring:
+  application:
+    name: my-app
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+server:
+  port: 443
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+spring:
+  datasource:
+    url: jdbc:h2:mem:devdb
+```
+
+같은 위치에 두 포맷이 모두 있으면 `.properties`가 먼저 로딩되고 `.yml`이 나중에 로딩된다. 나중에 로딩된 것이 이기므로 **yml이 properties를 덮어쓴다**. 이 동작에 의존하는 설계는 위험하다 — Spring Boot 버전이나 경로 설정에 따라 순서가 달라질 수 있기 때문이다.
+
+## Binder — 키에서 객체까지
+
+파일이 로딩되면 `ConfigurationPropertiesBindingPostProcessor`가 `BeanPostProcessor`로서 Bean 생성 직후, `@PostConstruct` 실행 전에 바인딩을 수행한다. 핵심 엔진은 `Binder`다.
+
+`Binder`는 세 가지 경우를 순서대로 시도한다. 첫째, 스칼라 타입이면 `findProperty()`로 직접 값을 조회하고 `BindConverter`로 변환한다. 둘째, 중첩 객체면 `JavaBeanBinder`가 setter를 탐색해 재귀적으로 바인딩한다. 셋째, `List`나 `Map`이면 `CollectionBinder`나 `MapBinder`가 처리한다.
+
+`BindConverter`가 지원하는 타입 변환은 생각보다 풍부하다.
+
+```yaml
+my:
+  timeout: 30s        # → Duration.ofSeconds(30)
+  buffer-size: 512MB  # → DataSize.ofMegabytes(512)
+  retention: 30d      # → Period.ofDays(30)
+```
+
+`@Value`로는 이런 변환이 불가능하다. `@Value`는 `AutowiredAnnotationBeanPostProcessor`가 처리하며 `SpEL`과 플레이스홀더(`${...}`)만 지원한다. `Duration`이나 `DataSize`로의 자동 변환이 없고, Relaxed Binding도 적용되지 않는다.
+
+## Relaxed Binding — 표기법 통일
+
+`@ConfigurationProperties`의 핵심 강점 중 하나는 표기법에 무관하게 같은 키로 인식한다는 것이다. `ConfigurationPropertyName`이 모든 키를 정규화하는 알고리즘을 담당한다.
+
+```
+my.max-pool-size        (kebab-case)
+my.maxPoolSize          (camelCase)
+my.max_pool_size        (underscore)
+MY_MAX_POOL_SIZE        (SCREAMING_SNAKE, 환경변수)
+```
+
+네 가지가 모두 같은 프로퍼티로 매핑된다. camelCase는 대소문자 경계에서 하이픈을 삽입하고, SCREAMING_SNAKE는 언더스코어를 하이픈/점으로 변환한다.
+
+단, Relaxed Binding이 **적용되지 않는 곳**이 있다. `@Value`는 정확한 키만 인식한다. `Map`의 키는 정규화 없이 그대로 저장된다 — `feature-a`와 `featureA`는 다른 키다. `@ConfigurationProperties`의 `prefix`는 kebab-case로 작성해야 한다.
+
+<Callout type="warning" title="@Value의 Relaxed Binding 함정">
+`application.yml`에 `my.max-pool-size=10`이 있고 환경변수 `MY_MAX_POOL_SIZE=20`이 있을 때, `@ConfigurationProperties`의 `maxPoolSize` 필드는 `20`을 읽지만 `@Value("${my.maxPoolSize}")` 는 `null`이다. 같은 애플리케이션에서 두 값이 달라지는 원인이 된다.
+</Callout>
+
+## record + @ConfigurationProperties — 불변 설정
+
+setter 기반 바인딩의 문제는 런타임에 설정 객체가 변경될 수 있다는 것이다. Spring Boot 2.6+에서는 `record`와 `@ConfigurationProperties`를 조합해 불변 설정 객체를 만들 수 있다.
+
+```java
+@ConfigurationProperties(prefix = "app")
+@Validated
+public record AppProperties(
+    @NotBlank String name,
+    @DefaultValue("localhost") String host,
+    @DefaultValue("8080") int port,
+    @NotNull @Valid Database database
+) {
+    public record Database(
+        @NotBlank String url,
+        @DefaultValue("10") int poolSize
+    ) {}
+}
+```
+
+`ValueObjectBinder`가 이 record의 canonical constructor를 탐색해 파라미터별로 바인딩을 수행한다. `@DefaultValue`가 있으면 설정 값이 없을 때 어노테이션의 `value()`를 대상 타입으로 변환해 사용한다. `@Validated`는 바인딩 완료 후 즉시 JSR-303 검증을 트리거하고, 실패 시 **애플리케이션 시작이 실패**하며 정확한 프로퍼티 경로와 파일 위치가 오류 메시지에 포함된다.
+
+모든 필드가 `final`이므로 어떤 Bean이 주입받아도 값을 변경할 수 없다. 공유 설정 객체의 안전성이 컴파일 타임에 보장된다.
+
+## PropertySource 우선순위 — 충돌의 해법
+
+설정이 여러 소스에서 충돌할 때 `MutablePropertySources`의 순서가 승자를 결정한다. 앞에 있는 것이 이긴다. 실무에서 자주 충돌하는 계층은 다음과 같다.
+
+```
+1위   커맨드라인 --key=value
+6위   시스템 프로퍼티 -Dkey=value
+7위   OS 환경변수 KEY=VALUE
+9-10위  외부 application.yml (file:./config/)
+12-13위 내부 application.yml (classpath:)
+```
+
+환경변수(7위)가 `application.yml`(13위)보다 높다. Kubernetes나 Docker에서 환경변수로 설정을 오버라이드하는 패턴이 가능한 이유다. JAR 외부에 `config/application.yml`을 두면(9-10위) JAR 내부 설정 전체를 재배포 없이 교체할 수 있다.
+
+`@PropertySource`로 추가한 파일은 11위로 `application.yml`보다 높지만, YAML을 지원하지 않는다. YAML 파일을 추가로 읽으려면 `spring.config.import`를 사용해야 한다.
+
+<Aside label="디버깅">
+어느 소스에서 값이 왔는지 확인하려면 `/actuator/env/{key}` 엔드포인트를 사용하라. `{"property": {"source": "systemEnvironment", "value": "9090"}}` 처럼 출처까지 정확히 알려준다.
+</Aside>
+
+## 정리
+
+- `application.yml`은 `ConfigDataEnvironmentPostProcessor` → `YamlPropertySourceLoader` 경로로 로딩된다. `---`마다 별도 `PropertySource`가 생성된다.
+- `@ConfigurationProperties`는 `BeanPostProcessor`가 Bean 생성 직후 `Binder`를 통해 처리한다. `Duration`, `DataSize` 등 풍부한 타입 변환과 Relaxed Binding이 포함된다.
+- `@Value`는 Relaxed Binding이 없고, `static` 필드나 `BeanFactoryPostProcessor`에서는 작동하지 않는다. 관련 프로퍼티가 3개 이상이거나 검증이 필요하면 `@ConfigurationProperties`를 택하라.
+- PropertySource 우선순위에서 **환경변수 > application.yml**이다. 커맨드라인 인수는 항상 모든 것을 이긴다.
+
+다음 글에서는 `@ConfigurationProperties`가 Bean으로 등록되는 과정과 Auto-configuration이 이 설정을 어떻게 소비하는지 추적한다.

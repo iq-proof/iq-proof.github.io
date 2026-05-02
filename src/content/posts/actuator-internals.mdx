@@ -1,0 +1,131 @@
+---
+title: "Spring Boot Actuator는 어떻게 작동하는가"
+description: "Endpoint 탐색부터 HTTP 경로 등록, 헬스 집계 알고리즘, Micrometer 연동, 운영 환경 보안 설정까지 Actuator 내부 처리 흐름을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-boot, actuator, micrometer, health-indicator, security]
+difficulty: intermediate
+series:
+  slug: spring-boot-internals
+  title: Spring Boot Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Boot Actuator는 `/actuator/health` 하나로 시작하지만, 그 뒤에는 Endpoint 탐색 → 경로 등록 → 헬스 집계 → 메트릭 수집 → 보안 필터라는 긴 파이프라인이 숨어 있다. 이 파이프라인을 모르면 `@Transactional`이 왜 안 되는지처럼 "왜 내 Endpoint는 안 보이지?"라는 막연한 혼란에 빠진다. Actuator의 설계는 하나의 철학을 따른다 — **하나의 정의, 여러 기술로 노출**. 그 철학이 내부 구조 곳곳에 어떻게 구현되어 있는가?
+
+## Endpoint 탐색과 HTTP 경로 등록
+
+Actuator의 시작점은 `EndpointDiscoverer`다. 애플리케이션 컨텍스트에서 `@Endpoint`, `@WebEndpoint`, `@JmxEndpoint` 어노테이션이 붙은 Bean을 탐색하고, 각 메서드의 `@ReadOperation` / `@WriteOperation` / `@DeleteOperation`을 HTTP 메서드로 변환한다.
+
+```
+@ReadOperation   → GET
+@WriteOperation  → POST
+@DeleteOperation → DELETE
+@Selector        → PathVariable ({name} 세그먼트)
+```
+
+이 매핑 규칙은 단순하지만 반환 타입에도 의미가 있다. 값을 반환하면 200 OK, `null`을 반환하면 404, `void`면 204 No Content다. HTTP 상태 코드를 직접 제어하고 싶으면 `WebEndpointResponse<T>`를 반환하면 된다.
+
+탐색이 끝나면 `WebMvcEndpointHandlerMapping`이 모든 `ExposableWebEndpoint`를 Spring MVC의 `HandlerMapping`에 등록한다. 이 시점부터 Actuator 경로는 일반 `@RequestMapping`과 동일하게 `DispatcherServlet`을 통해 처리된다.
+
+`@Endpoint`는 HTTP와 JMX 양쪽에 노출되는 기술 독립적 어노테이션이고, `@WebEndpoint`는 HTTP 전용, `@JmxEndpoint`는 JMX 전용이다. 같은 `id`에 `@EndpointWebExtension`을 붙이면 HTTP 동작만 오버라이드할 수 있다 — JMX에서는 원래 `@Endpoint` 메서드가 그대로 사용된다.
+
+## 헬스 집계 알고리즘
+
+`/actuator/health`의 전체 상태는 `SimpleStatusAggregator`가 계산한다. 규칙은 명확하다.
+
+```
+DOWN > OUT_OF_SERVICE > UNKNOWN > UP
+```
+
+컴포넌트 중 하나라도 `DOWN`이면 전체가 `DOWN`이 되고, HTTP 응답 코드는 503이 된다. 이 집계는 `CompositeHealthContributor`로 계층화할 수 있다 — 예를 들어 `primary` DB와 `secondary` DB를 `databases` 그룹으로 묶으면, `secondary`가 DOWN일 때 `databases.secondary → databases → 전체` 순서로 상태가 전파된다.
+
+커스텀 `HealthIndicator`를 작성할 때 중요한 규칙이 하나 있다.
+
+<Callout type="warning" title="예외를 절대 전파하지 마라">
+`HealthIndicator.health()`에서 예외가 전파되면 `/actuator/health` 전체가 500 오류로 응답한다. 항상 `try-catch`로 감싸고 `Health.down(ex)`를 반환해야 한다. Spring Boot는 uncaught 예외를 자동으로 `DOWN`으로 변환하지만, 다른 Indicator의 실행은 영향받지 않는다.
+</Callout>
+
+Bean 이름 규칙도 알아두면 편하다. `ExternalApiHealthIndicator`라는 Bean은 자동으로 `"HealthIndicator"` 접미사가 제거되어 `components.externalApi`로 집계된다.
+
+커스텀 `Status`도 가능하다. `Status DEGRADED = new Status("DEGRADED")`를 정의하고 `management.endpoint.health.status.http-mapping.DEGRADED=207`로 매핑하면, 부분 장애를 503 대신 207 Multi-Status로 표현할 수 있다.
+
+## Micrometer와 메트릭 수집
+
+Micrometer는 메트릭 라이브러리의 SLF4J다. 코드는 항상 `MeterRegistry`에 기록하고, 등록된 백엔드(Prometheus, Datadog, CloudWatch)가 자동으로 수신한다. `CompositeMeterRegistry`가 이 팬아웃을 담당한다.
+
+Meter 타입은 네 가지다.
+
+```
+Counter          — 단조 증가 (요청 수, 오류 수)
+Gauge            — 현재 상태 스냅샷 (큐 크기, 연결 수)
+Timer            — 시간 측정 + 히스토그램 (p50/p95/p99)
+DistributionSummary — 값 분포 (응답 크기)
+```
+
+`@Timed`는 `TimedAspect` Bean이 등록되어 있을 때만 동작하는 AOP 어드바이스다. Bean이 없으면 어노테이션을 붙여도 아무 일도 일어나지 않는다.
+
+Prometheus 연동 흐름은 단순하다. 코드가 `MeterRegistry`에 기록한 값은 인메모리에 유지되고, `GET /actuator/prometheus` 요청이 오면 `PrometheusMeterRegistry.scrape()`이 그 값을 Prometheus 텍스트 포맷으로 직렬화해 응답한다. Prometheus 서버는 이 경로를 주기적으로 스크레이핑한다.
+
+태그 카디널리티에는 주의가 필요하다. `tag("userId", request.getUserId())`처럼 고유값을 태그로 쓰면 사용자 수만큼 Meter 인스턴스가 생성되어 메모리가 고갈된다. 태그는 HTTP 메서드, 엔드포인트 경로, 상태 코드처럼 수십 가지 이내의 값으로 제한해야 한다.
+
+## JMX vs HTTP, 그리고 포트 분리
+
+HTTP와 JMX는 처리 경로가 완전히 다르다. HTTP는 `WebEndpointDiscoverer → WebMvcEndpointHandlerMapping → DispatcherServlet`, JMX는 `JmxEndpointDiscoverer → EndpointMBeanRegistrar → MBeanServer`다. 노출 기본값도 다르다 — HTTP는 `health`와 `info`만, JMX는 전체(`*`)다. 운영 환경에서는 `spring.jmx.enabled=false`로 JMX를 끄는 것이 권장된다.
+
+`management.server.port`를 별도로 설정하면 Spring Boot는 독립된 `WebServerApplicationContext`를 생성한다. 앱 포트(8080)는 외부 트래픽, Actuator 포트(8081)는 내부 트래픽만 받게 되며, `management.server.address=127.0.0.1`로 외부 접근을 완전히 차단할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+포트를 분리하면 Actuator가 앱 성능에 미치는 영향을 격리할 수 있다. 대신 앱의 Spring Security 설정이 Management 컨텍스트에 자동으로 적용되지 않는다 — Actuator 포트용 `SecurityFilterChain`을 별도로 작성하거나, 내부망에서만 접근 가능하다면 방화벽으로 대신할 수 있다.
+</Callout>
+
+## Actuator 보안 설정
+
+`EndpointRequest`는 Actuator 경로를 타입 안전하게 참조하는 `RequestMatcher`다. `management.endpoints.web.base-path`가 변경되어도 코드 수정 없이 동작한다는 점이 경로 문자열 하드코딩과의 결정적 차이다.
+
+운영 환경 Security 패턴은 세 레벨로 나뉜다.
+
+```java
+// 레벨 1: 공개 — 로드밸런서, Kubernetes probe
+.requestMatchers(EndpointRequest.to(HealthEndpoint.class, InfoEndpoint.class))
+    .permitAll()
+
+// 레벨 2: 모니터링 시스템 (Prometheus, Grafana)
+.requestMatchers(EndpointRequest.to(MetricsEndpoint.class, "prometheus"))
+    .hasRole("MONITORING")
+
+// 레벨 3: 운영 관리
+.requestMatchers(EndpointRequest.toAnyEndpoint())
+    .hasRole("ACTUATOR_ADMIN")
+```
+
+노출 범위도 명시적으로 제한해야 한다.
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+        exclude: env, beans, heapdump, threaddump
+```
+
+`env`는 DB 비밀번호와 API 키를 평문으로 노출하고, `beans`는 애플리케이션 구조를 드러낸다. `heapdump`는 힙 덤프 파일 전체를 다운로드할 수 있게 한다. 이 세 가지는 운영 환경에서 반드시 제외해야 한다.
+
+<Aside label="설계 철학">
+Actuator의 모든 추상화 — `@Endpoint`의 기술 독립성, `EndpointRequest`의 타입 안전 매칭, `SimpleStatusAggregator`의 명확한 우선순위 — 는 같은 방향을 가리킨다. 관찰 가능성(observability)을 코드에서 선언하고, 인프라와의 통합은 설정으로 결정한다. 무엇을 노출할지, 누구에게 보여줄지, 어떤 포트로 분리할지는 전부 설정의 영역이다.
+</Aside>
+
+## 정리
+
+- Actuator Endpoint는 `EndpointDiscoverer`가 탐색하고, `WebMvcEndpointHandlerMapping`이 Spring MVC에 등록한다. `@ReadOperation → GET`, `@WriteOperation → POST`, `@Selector → PathVariable` 변환 규칙은 고정이다.
+- 헬스 집계는 `DOWN > OUT_OF_SERVICE > UNKNOWN > UP` 우선순위로 동작한다. `HealthIndicator`에서 예외를 전파하지 마라.
+- Micrometer는 코드와 백엔드를 분리한다. 태그 카디널리티를 낮게 유지하지 않으면 메모리가 고갈된다.
+- 운영 환경에서는 `include: health, info, prometheus`로 제한하고, `env / beans / heapdump`는 반드시 제외하며, `management.server.port` 분리로 Actuator 트래픽을 격리한다.
+
+다음 글에서는 Spring Boot의 내장 서버 — Tomcat, Jetty, Undertow — 가 어떻게 초기화되고, `EmbeddedWebServerFactory`가 서버 교체를 어떻게 추상화하는지 추적한다.

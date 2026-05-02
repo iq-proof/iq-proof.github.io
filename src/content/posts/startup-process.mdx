@@ -1,0 +1,102 @@
+---
+title: "SpringApplication.run()은 한 줄인데 내부에서 무슨 일이 벌어지는가"
+description: "웹 타입 감지부터 내장 서버 포트 바인딩까지, Spring Boot 시작 과정의 설계 철학과 각 단계의 역할을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-boot, application-context, auto-configuration, conditional, event-loop]
+difficulty: intermediate
+series:
+  slug: spring-boot-internals
+  title: Spring Boot Internals
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`SpringApplication.run(App.class, args)` 한 줄이 실행되면 Spring Boot는 15단계 이상의 과정을 밟는다. 대부분의 개발자는 이 과정을 블랙박스로 다루지만, 내부를 모르면 커스터마이징 지점을 찾지 못하고, `@ConditionalOnMissingBean`이 왜 때로는 기대와 다르게 동작하는지 설명할 수 없다. 이 설계가 어떤 문제를 풀기 위해 만들어졌는가?
+
+## 두 단계로 나뉘는 시작 과정
+
+`SpringApplication.run()`은 사실 두 단계다. 첫 번째는 `SpringApplication` 객체 생성, 두 번째는 `run()` 메서드 실행이다.
+
+객체 생성 시점에 세 가지 핵심 결정이 이루어진다. **웹 애플리케이션 타입 감지**, `spring.factories`(또는 Boot 3.x의 `.imports` 파일)에서 `ApplicationContextInitializer`와 `ApplicationListener` 로딩, 그리고 스택 트레이스를 분석해 `main` 클래스 추정이다.
+
+웹 타입 감지는 클래스패스 기반이다. `DispatcherHandler`가 있고 `DispatcherServlet`이 없으면 `REACTIVE`, 서블릿 관련 클래스가 존재하면 `SERVLET`, 그 외는 `NONE`이다. 이 결과가 이후 `ApplicationContext` 타입을 결정한다.
+
+```
+SERVLET   → AnnotationConfigServletWebServerApplicationContext
+REACTIVE  → AnnotationConfigReactiveWebServerApplicationContext
+NONE      → AnnotationConfigApplicationContext
+```
+
+객체 생성 단계에서 이 결정이 끝나기 때문에, `app.setWebApplicationType(WebApplicationType.NONE)`으로 오버라이드하면 내장 서버 없이 순수 Bean 컨테이너만 시작할 수 있다. 배치 처리나 CLI 도구에서 유용한 패턴이다.
+
+## `@SpringBootApplication`은 세 어노테이션의 합성이다
+
+`run()` 단계로 넘어오면 가장 먼저 `Environment`를 구성하고, 배너를 출력한 뒤, `ApplicationContext`를 생성한다. 이 Context가 준비되는 과정에서 `@SpringBootApplication`이 처음 해석된다.
+
+`@SpringBootApplication`은 세 어노테이션의 합성 메타 어노테이션이다.
+
+- `@SpringBootConfiguration`: `@Configuration`과 기능은 동일하지만 `@SpringBootTest`가 시작점을 탐색할 때 이 어노테이션을 마커로 사용한다.
+- `@EnableAutoConfiguration`: `@Import(AutoConfigurationImportSelector.class)`를 통해 Auto-configuration 후보 목록을 로딩하는 핵심 스위치다.
+- `@ComponentScan`: 어노테이션이 붙은 클래스의 패키지를 기준으로 하위 패키지 전체를 스캔한다. `com.example.config.App`에 배치하면 `com.example.service`는 스캔 대상에서 빠진다.
+
+<Callout type="note" title="트레이드오프">
+`exclude`로 Auto-configuration을 끄는 방법은 세 가지다. 어노테이션 속성(`exclude = DataSourceAutoConfiguration.class`)은 컴파일 타임에 클래스 존재를 검사한다. `excludeName` 속성은 클래스가 클래스패스에 없어도 오류 없이 동작한다. `spring.autoconfigure.exclude` 프로퍼티는 코드 변경 없이 환경별로 제어할 수 있다. 각각 다른 시점에 다른 방식으로 동작한다.
+</Callout>
+
+## Auto-configuration이 사용자 Bean에 밀리는 이유
+
+`@EnableAutoConfiguration`의 핵심은 `AutoConfigurationImportSelector`가 `DeferredImportSelector`를 구현한다는 점이다. 일반 `@Import`와 달리, `DeferredImportSelector`는 모든 `@Configuration` 클래스 파싱이 끝난 후에 실행된다.
+
+처리 순서는 다음과 같다.
+
+1. 사용자 `@Configuration` 클래스 파싱 완료 → 사용자 `DataSource` Bean 등록
+2. `DeferredImportSelector` 실행 → Auto-configuration 후보 처리
+3. `DataSourceAutoConfiguration`의 `@ConditionalOnMissingBean(DataSource.class)` 평가
+4. 이미 `DataSource`가 등록되어 있으므로 조건 `false` → 스킵
+
+이 순서가 보장되기 때문에 사용자 Bean이 항상 Auto-configuration보다 우선한다. `DeferredImportSelector`가 없었다면 처리 순서가 섞여 `@ConditionalOnMissingBean`이 부정확하게 동작했을 것이다.
+
+Auto-configuration 후보는 수백 개지만 대부분은 1차 필터링에서 탈락한다. `spring-boot-autoconfigure-processor`가 컴파일 타임에 `@ConditionalOnClass` 조건을 메타데이터 파일로 추출해두고, 런타임에는 클래스를 로딩하지 않고 클래스명 문자열 비교만으로 즉시 제외한다. 실제로 클래스 로딩과 `@Conditional` 평가가 발생하는 것은 1차 필터링을 통과한 소수다.
+
+Boot 3.x에서는 Auto-configuration 후보 목록 파일도 분리됐다. `spring.factories`의 `EnableAutoConfiguration` 키 대신 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 파일을 사용한다. 한 줄에 하나의 클래스명을 담는 구조라 Git diff가 명확하고 GraalVM Native Image 분석에도 유리하다.
+
+## `refresh()`에서 내장 서버가 두 번 등장하는 이유
+
+`ApplicationContext`가 생성되고 나면 `prepareContext()` → `refreshContext()` 순서로 진행된다. `refresh()`는 12단계로 구성되는데, 내장 서버와 관련해 두 단계가 중요하다.
+
+`onRefresh()` 단계에서 내장 Tomcat 객체가 생성되고 `DispatcherServlet`이 등록된다. 그러나 아직 포트 바인딩은 일어나지 않는다. `finishBeanFactoryInitialization()` 단계에서 모든 싱글턴 Bean이 생성되고, 그 후 `finishRefresh()`에서 비로소 포트 바인딩이 완료된다.
+
+```
+onRefresh()       → Tomcat 객체 생성, DispatcherServlet 등록 (포트 닫힘)
+finishBeanFactoryInitialization() → 모든 Bean 생성 완료
+finishRefresh()   → 포트 바인딩 (HTTP 요청 수신 시작)
+```
+
+이 순서가 보장하는 것은 "포트가 열리는 시점에 모든 Bean이 준비 완료 상태"다. `DispatcherServlet`, `@Controller`, `@Service` 전부 초기화된 이후에 트래픽을 받는다.
+
+<Aside label="설계 철학">
+`SpringApplication`의 자동화는 "편의"가 아니라 "일관성"을 위한 선택이다. 환경마다 다른 컨텍스트 타입, `PropertySource` 우선순위 체인, `FailureAnalyzer`를 통한 친절한 오류 메시지 — 이 모두가 매번 직접 구현해야 했던 것들이다. 대신 내부를 모르면 커스터마이징 지점을 찾기 어렵다는 비용이 따른다.
+</Aside>
+
+## `@Conditional` 평가는 Bean 생성이 아니라 등록 시점에 일어난다
+
+흔한 오해 중 하나는 `@Conditional`이 `getBean()` 호출 시 평가된다는 것이다. 실제로는 `BeanDefinition` **등록** 시점에 평가된다. 조건이 `false`이면 `BeanDefinition` 자체가 등록되지 않는다.
+
+평가 시점은 두 단계로 나뉜다. `PARSE_CONFIGURATION` Phase는 `@Configuration` 클래스 파싱 중 클래스 레벨 조건을 평가한다. 조건이 `false`이면 해당 클래스 전체가 스킵된다. `REGISTER_BEAN` Phase는 `@Bean` 메서드 등록 중 메서드 레벨 조건을 평가한다.
+
+`@ConditionalOnClass`는 `PARSE_CONFIGURATION` Phase에서 가장 높은 우선순위로 실행된다. 클래스가 없으면 나머지 조건 평가가 생략된다. `@ConditionalOnMissingBean`은 `REGISTER_BEAN` Phase에서 낮은 우선순위로 실행되어 사용자 Bean이 모두 등록된 후에 평가된다. 이 두 Phase의 분리와 순서가 Auto-configuration의 신뢰성을 만든다.
+
+## 정리
+
+- `SpringApplication` 생성 시점에 웹 타입이 감지되고, 이것이 `ApplicationContext` 타입을 결정한다.
+- `@SpringBootApplication`은 세 어노테이션의 합성이다. `@ComponentScan` 기본 범위는 클래스 위치 기준이므로 루트 패키지에 배치해야 한다.
+- Auto-configuration이 사용자 Bean에 밀리는 것은 `DeferredImportSelector`와 `@ConditionalOnMissingBean`의 `REGISTER_BEAN` Phase 덕분이다.
+- 내장 서버는 `onRefresh()`에서 생성되고 `finishRefresh()`에서 포트를 열어 "준비 완료 후 트래픽 수신"을 보장한다.
+- Boot 3.x에서 `spring.factories`의 Auto-configuration 목록은 `.imports` 파일로 분리됐다. `ApplicationContextInitializer`, `ApplicationListener` 등은 여전히 `spring.factories`를 사용한다.
+
+다음 글에서는 `@ConditionalOnClass`의 1차 필터링이 클래스 로딩 없이 어떻게 동작하는지, `spring-boot-autoconfigure-processor`가 컴파일 타임에 무엇을 생성하는지 추적한다.
