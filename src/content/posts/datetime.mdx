@@ -1,0 +1,137 @@
+---
+title: "Java 8 Time API는 왜 기존 Date를 버렸는가"
+description: "가변 객체와 스레드 불안전이라는 레거시 API의 근본 결함부터 불변성·타입 안정성·시간대 분리라는 java.time의 설계 철학까지, 날짜/시간 처리의 전환점을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, datetime, java-time, immutability, timezone]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+
+`new Date(2024, 12, 25)`를 입력하면 2024년 12월 25일이 생성될 것 같다. 실제로 실행하면 3924년 1월 25일이 나온다. 연도는 1900 기준, 월은 0부터 시작하기 때문이다. Java 8의 `java.time` 패키지는 이런 레거시의 실수를 전부 부수고 새로 지은 집이다. 왜 그렇게까지 해야 했을까?
+
+## 레거시 API가 실패한 이유
+
+`Date`와 `Calendar`의 핵심 결함은 세 가지다.
+
+**첫째, 가변(Mutable) 객체다.** `date.setTime(0)`처럼 내부 상태를 마음대로 바꿀 수 있다. 메서드에 `Date`를 넘기면 호출 대상이 그 값을 변경할 수 있다는 뜻이다. 방어적 복사를 빠뜨리는 순간 버그가 된다. 멀티스레드 환경에서는 락 없이 공유하는 것 자체가 위험하다.
+
+**둘째, `SimpleDateFormat`이 스레드 안전하지 않다.** 내부에 파싱 상태를 필드로 들고 있어서, 여러 스레드가 같은 인스턴스를 공유하면 레이스 컨디션이 발생한다. 실무에서 `SimpleDateFormat`을 `static`으로 선언한 코드가 간헐적으로 날짜를 잘못 반환하는 이유다. 문제가 재현되지 않아 원인 파악도 어렵다.
+
+**셋째, API가 직관에 반한다.** 월이 0부터 시작하고, `Calendar.DAY_OF_WEEK`는 일요일이 1이다. 매번 상수를 확인해야 하고, 잘못 넣어도 컴파일 에러가 없다.
+
+```java
+// 전부 컴파일 통과, 전부 예상 밖 결과
+Date d = new Date(2024, 12, 25);      // 3924-01-25
+cal.set(Calendar.MONTH, 11);          // 12월 (0 기반)
+cal.set(Calendar.MONTH, 15);          // 15월? 컴파일 에러 없음
+```
+
+## java.time의 설계 원칙
+
+`java.time`은 Joda-Time에서 이어받은 세 가지 원칙 위에 지어졌다.
+
+**불변성(Immutability).** 모든 핵심 클래스(`LocalDate`, `LocalTime`, `LocalDateTime`, `ZonedDateTime`, `Instant`)는 불변이다. "수정" 메서드는 전부 새 객체를 반환한다. 원본은 절대 바뀌지 않는다. 스레드 안전성은 덤으로 따라온다.
+
+```java
+LocalDate date = LocalDate.of(2024, 12, 25);
+LocalDate tomorrow = date.plusDays(1);   // 새 객체 반환
+System.out.println(date);     // 2024-12-25 (원본 불변)
+System.out.println(tomorrow); // 2024-12-26
+```
+
+**타입 안정성.** 월은 `Month` enum, 요일은 `DayOfWeek` enum이다. 잘못된 값을 넣으면 컴파일 시점에 막힌다. `LocalDate.of(2024, 13, 1)`처럼 범위를 벗어난 값은 런타임에 `DateTimeException`을 던진다. 정수 상수로 모든 것을 표현하던 레거시와 근본적으로 다른 접근이다.
+
+**관심사 분리.** `LocalDate`는 날짜만, `LocalTime`은 시간만, `ZonedDateTime`은 시간대까지 포함한다. 시간대가 필요 없으면 `LocalDateTime`을 쓰면 되고, 전 세계 동일 시점이 필요하면 `Instant`를 쓴다. 각 클래스가 맡는 역할이 명확해서, 어느 타입을 쓸지 선택하는 것 자체가 의도를 표현하는 문서가 된다.
+
+```
+LocalDate          날짜만           2024-12-25
+LocalTime          시간만           14:30:00
+LocalDateTime      날짜+시간        시간대 없음
+ZonedDateTime      날짜+시간+시간대  Asia/Seoul 포함
+Instant            UTC 타임스탬프   에포크 기준 초
+Period             날짜 기반 기간   1년 6개월 15일
+Duration           시간 기반 기간   2시간 30분
+```
+
+## 시간대 처리: Instant와 ZonedDateTime
+
+레거시 API에서 가장 다루기 까다로운 부분이 시간대다. `java.time`은 이를 두 개념으로 깔끔하게 분리한다.
+
+`Instant`는 시간대 없이 에포크(1970-01-01T00:00:00Z)부터 경과한 초를 나타낸다. 데이터베이스에 저장하거나 로그 타임스탬프로 찍을 때 쓴다. `ZonedDateTime`은 그 `Instant`에 특정 시간대(`ZoneId`)를 붙인 것이다. 같은 순간을 서울 시간으로도, 뉴욕 시간으로도 표현할 수 있다.
+
+```java
+Instant instant = Instant.now();
+ZonedDateTime seoul   = instant.atZone(ZoneId.of("Asia/Seoul"));
+ZonedDateTime newYork = instant.atZone(ZoneId.of("America/New_York"));
+
+// 같은 Instant, 다른 표현
+System.out.println(seoul);    // 2024-12-25T14:30:00+09:00[Asia/Seoul]
+System.out.println(newYork);  // 2024-12-25T00:30:00-05:00[America/New_York]
+
+// 시간대 변환 — 같은 순간을 도쿄 시간으로
+ZonedDateTime toTokyo = seoul.withZoneSameInstant(ZoneId.of("Asia/Tokyo"));
+```
+
+서머타임이 있는 지역(`America/New_York`)도 자동으로 처리된다. `ZoneId`는 DST 전환 규칙을 포함하고 있어서, 날짜 연산 중 오프셋이 바뀌어도 올바른 값을 돌려준다. 레거시에서 서머타임을 직접 계산하던 코드와 비교하면 차이가 극명하다.
+
+## Period와 Duration: 기간의 두 얼굴
+
+"1개월 후"와 "720시간 후"는 같지 않다. 31일짜리 달과 28일짜리 달이 있기 때문이다. `java.time`은 이 차이를 타입으로 표현한다.
+
+`Period`는 사람의 달력 관점이다. 1월 31일에 `Period.ofMonths(1)`을 더하면 윤년 여부에 따라 2월 28일 또는 29일이 된다. 나이 계산, 만기일, 월정기 납부에 쓴다. `Duration`은 정확한 초 단위 기간이다. 근무 시간 계산, 타이머, 성능 측정에 쓴다.
+
+```java
+// Period: 사람의 달력 관점
+Period age = Period.between(LocalDate.of(1990, 5, 15), LocalDate.now());
+System.out.println(age.getYears() + "세 " + age.getMonths() + "개월");
+
+// Duration: 정확한 시간
+Duration work = Duration.between(LocalTime.of(9, 0), LocalTime.of(18, 0));
+System.out.println(work.toHours() + "시간");  // 9
+
+// ❌ 혼용은 컴파일 에러
+LocalDate.now().plus(Duration.ofHours(24));  // 컴파일 에러
+LocalTime.now().plus(Period.ofDays(1));      // 컴파일 에러
+```
+
+타입이 다르기 때문에 잘못된 조합은 컴파일 시점에 걸린다. 레거시에서는 `Calendar.add(Calendar.DATE, 1)`로 날짜와 시간을 구분 없이 다뤘고, 실수가 런타임까지 숨어 있었다.
+
+## 레거시와의 공존: 마이그레이션 전략
+
+현실에서는 JDBC, 외부 라이브러리, 레거시 코드베이스가 여전히 `Date`를 요구한다. `java.time`은 변환 경로를 명시적으로 제공한다.
+
+```java
+// Date → LocalDateTime
+LocalDateTime ldt = date.toInstant()
+                        .atZone(ZoneId.systemDefault())
+                        .toLocalDateTime();
+
+// LocalDateTime → Date
+Date legacy = Date.from(ldt.atZone(ZoneId.systemDefault()).toInstant());
+```
+
+변환 코드가 장황해 보이지만, 이것이 의도적 설계다. "시간대를 어떻게 처리할 것인가"를 호출자가 명시적으로 결정하게 만든다. 레거시 API에서 시간대를 암묵적으로 처리하다 발생하던 버그를 코드 리뷰 단계에서 발견할 수 있다.
+
+실용적인 전략은 경계에서만 변환하는 것이다. 내부 로직은 전부 `java.time`으로 작성하고, 외부 API와 맞닿는 지점에만 어댑터를 둔다. 점진적으로 레거시 메서드에 `@Deprecated`를 붙이고 새 시그니처를 추가하면 대규모 코드베이스도 안전하게 마이그레이션할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+`java.time`의 불변성과 타입 분리는 **안전성**을 얻는 대신 **변환 보일러플레이트**를 치른다. 레거시와의 경계마다 `Date.from(...)` / `date.toInstant()` 변환이 필요하다. 그러나 이 비용은 레거시 API의 가변성·스레드 불안전이 야기하는 디버깅 비용에 비하면 훨씬 작다.
+</Callout>
+
+## 정리
+
+- `Date`/`Calendar`의 실패 원인은 **가변 객체**, **스레드 불안전 포맷터**, **직관에 반하는 정수 기반 API** 세 가지다.
+- `java.time`은 **불변성**, **타입 안정성**, **관심사 분리**로 이를 해결한다.
+- 시간대가 없으면 `LocalDate`/`LocalTime`/`LocalDateTime`, 시간대가 필요하면 `ZonedDateTime`, 전역 타임스탬프는 `Instant`를 쓴다.
+- 기간은 달력 관점의 `Period`와 정확한 초 기준 `Duration`으로 구분하며, 혼용은 컴파일 에러로 막힌다.
+- 레거시와의 통합은 경계에서만 변환하고, 내부 로직은 `java.time`으로 일관되게 유지하는 것이 실용적인 전략이다.
+
+`plusDays(1)`이 새 객체를 반환하고, `Month.DECEMBER`가 상수 11 대신 이름을 쓰는 것 — 작아 보이지만 오랜 버그의 뿌리를 잘라낸 선택이다.

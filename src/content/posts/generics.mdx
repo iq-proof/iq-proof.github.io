@@ -1,0 +1,122 @@
+---
+title: "Java Generics는 왜 타입을 지운가"
+description: "컴파일 타임 타입 안전성의 근본 원리부터 Type Erasure의 설계 결정, PECS 원칙까지 — Java Generics의 통일된 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, generics, type-erasure, wildcard, pecs]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java Generics의 모든 설계 결정은 하나의 긴장 관계에서 나온다 — **컴파일 타임 안전성**과 **런타임 하위 호환성**. `List<String>`은 `List<Object>`의 하위 타입이 아니고, `T`로 객체를 생성할 수 없으며, 런타임에는 타입 정보 자체가 사라진다. 왜 이런 선택을 했는가?
+
+## 제네릭 이전의 세계
+
+Java 5 이전에는 컬렉션이 `Object`를 담았다. `List`에 `String`을 넣고 꺼낼 때 `(String)`으로 캐스팅했다. 문제는 컴파일러가 이 캐스팅의 올바름을 검증하지 못한다는 점이다. `list.get(1)`이 실제로 `Integer`인데 `String`으로 캐스팅하면, 런타임에서야 `ClassCastException`이 터진다.
+
+Generics는 이 캐스팅 검증을 **컴파일 타임으로 당긴다**. `List<String>`에는 `Integer`를 추가할 수 없다 — 컴파일러가 거부한다. 오류 발생 시점이 런타임에서 컴파일 타임으로 이동한다는 것은 단순한 편의가 아니라 신뢰성 수준의 차이다.
+
+## Type Erasure — 하위 호환의 대가
+
+그런데 컴파일된 `.class` 파일 안에서 `List<String>`과 `List<Integer>`는 동일한 `List`다. 이것이 **Type Erasure**다. JVM은 제네릭 타입 정보를 알지 못한다.
+
+```java
+List<String> list1 = new ArrayList<>();
+List<Integer> list2 = new ArrayList<>();
+
+// 런타임에 같은 클래스
+System.out.println(list1.getClass() == list2.getClass()); // true
+```
+
+컴파일러는 `T`를 상한 제약이 없으면 `Object`로, `T extends Number`이면 `Number`로 치환하고, 필요한 곳에 캐스팅 코드를 삽입한다. 개발자가 쓰던 타입 안전한 코드는 컴파일 후에 Java 5 이전과 동일한 바이트코드로 변환된다.
+
+이 선택의 동기는 하위 호환성이다. Java 5에서 컬렉션 API 전체를 제네릭으로 바꾸면서도, 이미 배포된 수억 줄의 Java 4 코드가 그대로 동작해야 했다. JVM을 바꾸지 않고 컴파일러만 바꿔 해결한 것이 Type Erasure다.
+
+<Callout type="warning" title="Type Erasure의 제약">
+런타임에 타입 정보가 없으므로 `new T()`, `instanceof T`, `T.class`, `T[]` 배열 직접 생성이 모두 불가능하다. 이 제약들은 버그가 아니라 Type Erasure 설계의 직접적인 귀결이다.
+</Callout>
+
+## 공변성 문제와 와일드카드
+
+Type Erasure와 맞물리는 또 하나의 설계 결정이 있다. `List<String>`은 `List<Object>`의 하위 타입이 아니다. 직관에 반하는 이 규칙은 타입 안전성을 위한 것이다.
+
+만약 `List<String>`이 `List<Object>`로 치환 가능했다면 다음 코드가 컴파일된다.
+
+```java
+List<String> strings = new ArrayList<>();
+List<Object> objects = strings; // 만약 허용된다면
+objects.add(42); // Integer를 String 리스트에 추가!
+String s = strings.get(0); // ClassCastException
+```
+
+제네릭 타입은 기본적으로 **불변(invariant)**이다. 이 불변성이 타입 안전성의 보루다.
+
+하지만 실무에서는 유연성이 필요하다. `Integer` 리스트와 `Double` 리스트를 모두 처리하는 합산 함수를 쓰고 싶다. 여기서 **와일드카드**가 등장한다.
+
+```java
+// extends: 읽기 전용 (Producer)
+public static double sum(List<? extends Number> list) {
+    double total = 0;
+    for (Number num : list) {
+        total += num.doubleValue();
+    }
+    return total;
+}
+
+// super: 쓰기 전용 (Consumer)
+public static void addIntegers(List<? super Integer> list) {
+    list.add(1);
+    list.add(2);
+}
+```
+
+`? extends Number`는 "Number의 어떤 하위 타입인지 모르지만 읽으면 Number다"라는 의미다. 쓰기가 금지되는 이유는 실제 타입이 `Integer`인지 `Double`인지 모르기 때문이다. `? super Integer`는 반대다 — 실제 타입이 `Integer`보다 넓은 무언가이므로 `Integer` 추가는 안전하지만, 꺼낼 때는 `Object`로만 받을 수 있다.
+
+## PECS — 트레이드오프의 명명
+
+이 패턴을 **PECS**라고 부른다: Producer Extends, Consumer Super.
+
+```java
+// 교과서적 PECS 적용
+public static <T> void copy(
+    List<? extends T> source,  // Producer: 읽어서 제공
+    List<? super T> dest       // Consumer: 받아서 저장
+) {
+    for (T element : source) {
+        dest.add(element);
+    }
+}
+```
+
+`Collections.copy`가 정확히 이 시그니처다. 이 메서드 덕분에 `List<Integer>`를 `List<Number>`로 복사하는 것이 가능해진다. 타입 매개변수 `T`가 `Integer`로 추론되고, `source`는 `List<? extends Integer>`(Integer 리스트가 충족), `dest`는 `List<? super Integer>`(Number 리스트가 충족)다.
+
+<Callout type="note" title="트레이드오프">
+와일드카드는 유연성을 얻는 대신 쓰기 또는 읽기 중 하나를 포기한다. `extends`는 쓰기를 막고, `super`는 구체적 읽기를 막는다. 둘 다 필요하면 정확한 타입 매개변수 `<T>`를 써야 하고, 그러면 유연성을 잃는다. 이 트레이드오프가 PECS 원칙이 존재하는 이유다.
+</Callout>
+
+## Raw Type — 하위 호환의 탈출구
+
+Type Erasure가 하위 호환을 위한 컴파일러 수준의 결정이라면, **Raw Type**은 그 하위 호환을 코드 수준에서 직접 노출한 것이다. `List list = new ArrayList()`처럼 타입 매개변수 없이 쓰는 Raw Type은 Java 4 스타일 코드와의 브리지 역할만 한다.
+
+현대 코드에서 Raw Type은 명시적으로 금지 대상이다. 컴파일러는 `unchecked` 경고를 발행하고, 런타임 `ClassCastException`의 원천이 된다. `@SuppressWarnings("rawtypes")`는 경고를 숨길 뿐 문제를 해결하지 않는다.
+
+<Aside label="설계 철학">
+Generics의 모든 제약 — 불변 타입, Type Erasure, 와일드카드 읽기/쓰기 분리 — 은 하나의 원칙으로 수렴한다: **컴파일러가 보장할 수 없는 것은 허용하지 않는다**. 런타임에서 타입 정보가 없으니 `new T()`를 막고, 실제 타입을 모르니 `extends` 와일드카드에 쓰기를 막는다. 제약이 많아 보이지만, 각 제약은 허용했을 때 발생하는 정확히 하나의 타입 안전성 결함을 막는다.
+</Aside>
+
+## 정리
+
+- Java Generics는 컴파일 타임 타입 체크를 JVM 변경 없이 달성하기 위해 Type Erasure를 선택했다.
+- `List<String>`이 `List<Object>`의 하위 타입이 아닌 것은 버그가 아니라, 쓰기 안전성을 지키는 불변성 설계다.
+- 와일드카드는 이 불변성을 희생하지 않으면서 유연성을 얻는 도구다 — 읽기 전용(`extends`)이거나 쓰기 전용(`super`)임을 명시하는 조건으로.
+- PECS는 이 트레이드오프에 붙인 이름이고, `Collections.copy`는 그 가장 단적인 구현이다.
+
+다음 글에서는 Generics가 실제 API 설계에서 어떻게 쓰이는지, `Comparable<? super T>`처럼 재귀적으로 보이는 타입 경계가 왜 필요한지 추적한다.

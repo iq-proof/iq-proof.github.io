@@ -1,0 +1,172 @@
+---
+title: "Java 함수형 인터페이스는 왜 이렇게 설계됐을까"
+description: "Supplier부터 커스텀 함수형 인터페이스까지, Java 람다 생태계의 공통 철학인 '타입으로 표현된 함수'를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, lambda, functional-interface, method-reference]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 8이 람다를 도입했을 때, 언어 설계자들은 기존 타입 시스템을 건드리지 않는 방향을 선택했다. 람다는 새로운 원시 타입이 아니라 **함수형 인터페이스의 구현체**다. 이 선택이 `Supplier`, `Consumer`, `Function`, `Predicate`라는 네 가지 근본 타입을 낳았고, 메서드 참조와 커스텀 함수형 인터페이스로 이어지는 일관된 생태계를 만들었다. 왜 Java는 함수를 "타입으로 표현"하는 길을 택했는가?
+
+## 네 가지 근본 타입
+
+Java 함수형 인터페이스 전체는 입력과 출력의 유무로 정확히 네 가지로 분류된다.
+
+```java
+Supplier<T>     () -> T              // 입력 없음, 출력 있음
+Consumer<T>     T -> void            // 입력 있음, 출력 없음
+Function<T, R>  T -> R               // 입력 있음, 출력 있음
+Predicate<T>    T -> boolean         // 입력 있음, 출력은 참/거짓
+```
+
+이 네 가지를 완전히 이해하면 나머지는 전부 파생이다. `BiFunction<T, U, R>`은 입력이 두 개인 `Function`이고, `UnaryOperator<T>`는 입력과 출력 타입이 같은 `Function<T, T>`다. `BinaryOperator<T>`는 `BiFunction<T, T, T>`의 특수 케이스다. 두 입력으로 같은 타입의 결과를 낸다는 의미가 명확하므로 별도 타입으로 분리했다.
+
+각 인터페이스에는 **조합을 위한 default 메서드**가 내장되어 있다. `Function`의 `andThen`과 `compose`는 실행 순서만 다르다.
+
+```java
+Function<Integer, Integer> multiply2 = x -> x * 2;
+Function<Integer, Integer> add10 = x -> x + 10;
+
+// compose: add10 먼저 → multiply2
+// (5 + 10) * 2 = 30
+Function<Integer, Integer> composed = multiply2.compose(add10);
+
+// andThen: multiply2 먼저 → add10
+// (5 * 2) + 10 = 20
+Function<Integer, Integer> chained = multiply2.andThen(add10);
+```
+
+`Predicate`는 `and`, `or`, `negate`로 불리언 대수를 그대로 표현한다. 이 조합 메서드들이 없다면 람다를 여러 단계로 연결하려 할 때마다 임시 변수나 중첩 호출로 가독성이 무너진다. `Consumer`의 `andThen`은 여러 소비 동작을 순차 실행하는 파이프라인을 표현한다.
+
+`Supplier`는 인자 없이 값을 생산한다는 점에서 **지연 평가(lazy evaluation)**와 궁합이 좋다. `getValueOrDefault(null, () -> expensiveComputation())`처럼 실제 값이 필요할 때만 람다를 실행하게 만들 수 있다. `Optional.orElseGet(Supplier)`도 같은 이유로 `orElse`보다 선호된다 — `orElse`는 인자를 항상 평가하지만, `orElseGet`은 `Optional`이 비어 있을 때만 `Supplier`를 호출한다.
+
+## 메서드 참조 — 람다의 축약형
+
+메서드 참조(`::`)는 새로운 개념이 아니다. 람다가 "기존 메서드를 그대로 호출"하는 경우에 한해 더 짧게 쓸 수 있는 문법이다. 네 가지 형태가 있다.
+
+```java
+// 1. 정적 메서드: Class::staticMethod
+Function<String, Integer> parse = Integer::parseInt;
+// s -> Integer.parseInt(s) 와 동일
+
+// 2. 인스턴스 메서드 (클래스): Class::instanceMethod
+// 첫 번째 인자가 메서드의 수신자(receiver)가 된다
+Function<String, String> upper = String::toUpperCase;
+// s -> s.toUpperCase() 와 동일
+
+BiPredicate<String, String> starts = String::startsWith;
+// (s, prefix) -> s.startsWith(prefix) 와 동일
+
+// 3. 인스턴스 메서드 (특정 객체): object::instanceMethod
+Consumer<String> print = System.out::println;
+// s -> System.out.println(s) 와 동일
+
+// 4. 생성자: Class::new
+Function<String, User> factory = User::new;
+// name -> new User(name) 와 동일
+```
+
+사용 가능한 조건은 단순하다. 람다 본문이 메서드 호출 **하나뿐**이고, 매개변수를 그대로 전달할 때만 쓸 수 있다. `s -> s.length() * 2`처럼 추가 연산이 있으면 람다로 써야 한다.
+
+실전에서 가장 많이 쓰이는 패턴은 Stream과의 조합이다.
+
+```java
+List<Person> people = Arrays.asList(
+    new Person("Charlie", 30),
+    new Person("Alice", 25),
+    new Person("Bob", 20)
+);
+
+// 이름 추출 + 정렬
+List<String> names = people.stream()
+    .map(Person::getName)
+    .sorted(String::compareTo)
+    .collect(Collectors.toList());
+
+// null 제거
+List<String> items = Arrays.asList("A", null, "B", null, "C");
+long nonNullCount = items.stream()
+    .filter(Objects::nonNull)
+    .count();
+
+// 배열로 변환
+String[] array = names.stream()
+    .toArray(String[]::new);
+```
+
+`Comparator.comparing(Person::getAge).thenComparing(Person::getName)`처럼 메서드 참조를 Comparator 빌더와 결합하면 정렬 로직이 선언형으로 표현된다. 람다로 쓰면 `(a, b) -> Integer.compare(a.getAge(), b.getAge())`가 되어 비교라는 의도가 코드 안에 묻힌다.
+
+<Aside label="배열 생성자 참조">
+`String[]::new`는 Stream의 `toArray`에서 자주 등장한다. `toArray(String[]::new)`는 `toArray(size -> new String[size])`와 완전히 동일하다. 제네릭 타입 소거(type erasure) 때문에 런타임에 배열 타입 정보를 JVM에 전달하려면 이 방식이 필요하다.
+</Aside>
+
+## 커스텀 함수형 인터페이스가 필요한 순간
+
+표준 인터페이스로 부족할 때 `@FunctionalInterface`를 직접 정의한다. 세 가지 상황에서 정당화된다.
+
+**첫째**, 세 개 이상의 인자가 필요할 때. `BiFunction`은 두 개가 최대다. `TriFunction<T, U, V, R>`은 표준 라이브러리에 없으므로 직접 정의해야 한다.
+
+**둘째**, 도메인 언어를 코드에 반영하고 싶을 때. `Predicate<Product>` 대신 `Specification<Product>`을 쓰면 이것이 비즈니스 규칙임이 코드에서 바로 드러난다. 타입 이름 자체가 문서가 된다.
+
+**셋째**, 체크 예외를 다루어야 할 때. 표준 `Function`은 체크 예외를 던질 수 없다. 파일 I/O나 네트워크 호출을 람다로 표현하려면 예외를 허용하는 별도 인터페이스가 필요하다.
+
+```java
+@FunctionalInterface
+interface ThrowingFunction<T, R, E extends Exception> {
+    R apply(T input) throws E;
+}
+
+// 사용 예
+ThrowingFunction<String, String, IOException> reader =
+    path -> Files.readString(Path.of(path));
+```
+
+커스텀 인터페이스를 정의할 때 `default` 메서드로 조합 능력을 추가하면 훨씬 유연해진다.
+
+```java
+@FunctionalInterface
+interface Specification<T> {
+    boolean isSatisfiedBy(T item);
+
+    default Specification<T> and(Specification<T> other) {
+        return item -> this.isSatisfiedBy(item) && other.isSatisfiedBy(item);
+    }
+
+    default Specification<T> or(Specification<T> other) {
+        return item -> this.isSatisfiedBy(item) || other.isSatisfiedBy(item);
+    }
+
+    default Specification<T> not() {
+        return item -> !this.isSatisfiedBy(item);
+    }
+}
+```
+
+이 패턴은 Repository, Strategy, Pipeline 등 여러 디자인 패턴에서 반복된다. 핵심은 동일하다 — **조합 가능한 작은 단위를 만들고, default 메서드로 결합 방식을 제공한다**. `static` 메서드로 팩토리를 추가하면 `DiscountStrategy.percentageDiscount(10)` 같은 유창한(fluent) API도 만들 수 있다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**기본형 특화 인터페이스**(`IntSupplier`, `IntFunction`, `IntUnaryOperator` 등)는 박싱/언박싱 비용을 없앤다. `Function<Integer, Integer>` 대신 `IntUnaryOperator`를 사용하면 루프 1억 회 기준 수 배의 성능 차이가 발생한다. JVM이 `Integer` 객체를 생성하고 GC로 수거하는 비용이 누적되기 때문이다. Stream에서 `mapToInt`, `mapToLong` 같은 특화 스트림이 존재하는 이유가 동일하다.
+
+반면 **커스텀 함수형 인터페이스를 남발**하면 표준 라이브러리와 호환성이 떨어진다. `java.util.function` 패키지의 인터페이스들은 서로 조합 가능하지만, 자체 정의한 인터페이스는 그렇지 않다. 먼저 표준 인터페이스로 충분한지 검토하고, 도메인 의미가 명확히 다를 때만 커스텀을 정의하라.
+</Callout>
+
+## 정리
+
+- Java 람다는 새 타입이 아니라 함수형 인터페이스의 구현체다. `Supplier`, `Consumer`, `Function`, `Predicate` 네 가지가 전체 생태계의 뿌리이고, 나머지는 전부 파생이다.
+- 메서드 참조(`::`)는 람다 본문이 메서드 호출 하나뿐일 때만 쓸 수 있는 축약형이다. 네 가지 형태(정적, 인스턴스-클래스, 인스턴스-객체, 생성자)를 구분해서 쓰면 Stream과 Comparator 코드가 선언적으로 읽힌다.
+- 커스텀 함수형 인터페이스는 도메인 언어 표현, 3개 이상 인자, 체크 예외 세 경우에 정당화된다. `default` 메서드로 조합 능력을 함께 제공하라.
+- 성능이 중요한 루프에서는 기본형 특화 인터페이스(`IntUnaryOperator` 등)를 우선 고려하라. 박싱 비용은 생각보다 크다.
+
+다음 글에서는 이 함수형 인터페이스들이 Stream API의 중간 연산과 최종 연산에서 어떻게 연결되는지, 그리고 지연 평가(lazy evaluation)가 어떤 조건에서 활성화되는지 추적한다.

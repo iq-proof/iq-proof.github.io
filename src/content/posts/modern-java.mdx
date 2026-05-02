@@ -1,0 +1,177 @@
+---
+title: "Modern Java의 불변 설계 — Record, Switch, Sealed Class"
+description: "50줄 보일러플레이트를 1줄로 줄이는 Record부터, 완전성을 컴파일 타임에 강제하는 Sealed Class까지, Modern Java가 공유하는 하나의 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, record, sealed-class, switch-expression, pattern-matching]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 16의 Record, Java 14의 Switch Expression, Java 17의 Sealed Class — 세 기능은 별개의 릴리스에서 등장했지만 같은 방향을 가리킨다. 컴파일러가 더 많은 것을 알수록, 런타임 버그가 줄어든다. 단순히 문법적 편의가 아니라, 잘못된 코드를 실행 전에 거부하는 능력의 확장이다. 이 세 가지가 함께 작동할 때 어떤 설계가 가능한가?
+
+## 보일러플레이트의 종말 — Record
+
+불변 데이터 클래스를 만들려면 Java 15 이전엔 50줄이 필요했다. `private final` 필드, 생성자, getter, `equals`, `hashCode`, `toString`을 전부 손으로 써야 했고, 필드 하나를 추가할 때마다 이 모든 메서드를 다시 수정해야 했다. Record는 이 모든 것을 선언 한 줄로 압축한다.
+
+```java
+record Person(String name, int age) {}
+```
+
+컴파일러는 이 선언에서 전체 구현을 자동으로 생성한다. getter는 `person.name()`, `person.age()` 형태로 접근한다. `equals`와 `hashCode`는 컴포넌트 값 기반으로 동작한다. `toString`은 `Person[name=Alice, age=25]` 형태로 출력된다.
+
+유효성 검증이 필요하면 **Compact Constructor**를 사용한다.
+
+```java
+record Person(String name, int age) {
+    public Person {
+        if (name == null || name.isBlank())
+            throw new IllegalArgumentException("이름은 필수다");
+        if (age < 0 || age > 150)
+            throw new IllegalArgumentException("나이가 유효하지 않다");
+        name = name.trim();  // 정규화
+    }
+}
+```
+
+Compact Constructor는 파라미터 목록을 반복하지 않는다. 검증과 정규화 로직만 담는다. 필드 할당은 컴파일러가 처리하므로, `this.name = name` 같은 코드를 쓸 필요가 없다. 이 구조 덕분에 Record는 단순 데이터 담개를 넘어 **불변 Value Object**로 쓰기에 충분한 능력을 갖는다.
+
+인스턴스 메서드와 정적 팩토리 메서드도 추가할 수 있다. `record Money(double amount, String currency)`에 `add(Money other)`, `multiply(double factor)`, `format()` 같은 도메인 로직을 담으면 완전한 Value Object가 된다.
+
+<Callout type="note" title="Record의 제약">
+Record는 `final class`다. 다른 클래스를 상속할 수 없고, 인스턴스 필드를 컴포넌트 외에 추가할 수 없다. 가변 상태나 상속이 필요하면 일반 클래스를 써야 한다. 이 제약이 불변성을 보장하는 구조적 근거다.
+</Callout>
+
+## 분기 표현식의 진화 — Switch Expression
+
+기존 switch 문의 문제는 두 가지다. `break` 누락으로 인한 fall-through 버그, 그리고 값을 반환하려면 외부 변수를 먼저 선언해야 하는 어색함. Java 14의 Switch Expression은 두 문제를 동시에 해결한다.
+
+```java
+// 기존: 결과를 담을 변수를 먼저 선언해야 함
+String result;
+switch (day) {
+    case MONDAY: case TUESDAY: result = "평일"; break;
+    default: result = "주말";
+}
+
+// Switch Expression: 표현식 자체가 값을 반환
+String result = switch (day) {
+    case MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY -> "평일";
+    case SATURDAY, SUNDAY -> "주말";
+};
+```
+
+화살표 구문(`->`)은 fall-through를 원천 차단한다. 각 케이스는 독립적으로 동작하며, 여러 케이스를 콤마로 묶을 수 있다. 블록이 필요할 때는 `yield`로 값을 반환한다.
+
+```java
+String grade = switch (score / 10) {
+    case 10, 9 -> "A";
+    case 8 -> "B";
+    default -> {
+        if (score < 0) yield "오류";
+        yield "F";
+    }
+};
+```
+
+Java 17부터는 **Type Pattern**이 가능하다. `instanceof` 체크와 캐스팅을 한 번에 처리한다. 기존에는 `if (obj instanceof Integer) { int i = (Integer) obj; ... }` 형태로 두 번 써야 했던 코드가 한 줄로 줄어든다.
+
+```java
+String desc = switch (obj) {
+    case Integer i -> "정수: " + i;
+    case String s when s.length() > 5 -> "긴 문자열";
+    case String s -> "짧은 문자열";
+    case null -> "null";
+    default -> "기타";
+};
+```
+
+`when` 키워드(Guarded Pattern)는 타입 매칭에 조건을 더한다. 타입 분기와 값 분기를 중첩하던 `if-else` 체인이 평탄한 switch 케이스로 바뀐다. null 처리도 케이스 하나로 명시할 수 있어, 별도의 null 체크 코드가 사라진다.
+
+## 타입 계층의 봉인 — Sealed Class
+
+상속을 열어두면 어떤 코드가 어떤 하위 타입을 만들지 컴파일러가 알 수 없다. 그 결과 switch 나 `if-instanceof` 체인에서 "모든 케이스를 다 다뤘는가"를 컴파일러가 판단할 수 없고, 새 하위 타입이 추가돼도 기존 분기 로직은 아무 경고 없이 통과한다. Sealed Class는 이 정보 공백을 채운다.
+
+```java
+sealed interface Shape permits Circle, Rectangle, Triangle {}
+
+record Circle(double radius) implements Shape {}
+record Rectangle(double width, double height) implements Shape {}
+record Triangle(double base, double height) implements Shape {}
+```
+
+`permits` 목록이 곧 계약이다. 이 계약이 있으면 switch에서 `default`가 필요 없다.
+
+```java
+double area = switch (shape) {
+    case Circle c -> Math.PI * c.radius() * c.radius();
+    case Rectangle r -> r.width() * r.height();
+    case Triangle t -> t.base() * t.height() / 2;
+};  // default 없어도 컴파일된다
+```
+
+`Triangle`을 나중에 `permits` 목록에서 제거하거나 새 타입을 추가하면, 이 switch를 사용하는 모든 코드에서 **컴파일 에러**가 발생한다. 누락된 분기가 런타임에 발견되지 않고, 빌드 시점에 드러난다.
+
+하위 클래스는 세 가지 키워드 중 하나를 선택해야 한다.
+
+```java
+final class Circle implements Shape {}        // 더 이상 상속 불가
+sealed class Cat implements Animal permits Persian, Siamese {}  // 제한된 상속
+non-sealed class Dog implements Animal {}     // 자유 상속 허용
+```
+
+`final`은 계층을 완전히 닫는다. `sealed`는 계층을 한 단계 더 내려보낸다. `non-sealed`는 해당 가지에서 봉인을 열어주되, 상위 계층의 완전성 보장에는 영향을 주지 않는다.
+
+## 세 기능이 교차하는 지점
+
+Record, Switch Expression, Sealed Class의 교차점에서 함수형 스타일의 타입 안전한 패턴이 나온다.
+
+```java
+sealed interface Result<T> permits Success, Failure {}
+record Success<T>(T value) implements Result<T> {}
+record Failure<T>(String error) implements Result<T> {}
+```
+
+이 `Result` 타입은 예외 없이 성공/실패를 표현한다. 호출 쪽에서는 switch가 두 케이스를 모두 처리하도록 컴파일러가 강제한다.
+
+```java
+String message = switch (divide(10, b)) {
+    case Success<Integer> s -> "결과: " + s.value();
+    case Failure<Integer> f -> "오류: " + f.error();
+};
+```
+
+`Failure` 케이스를 빠뜨리면 컴파일이 실패한다. 오류 처리를 잊는 것이 구조적으로 불가능해진다. 같은 원리가 AST 인터프리터, 이벤트 소싱의 이벤트 타입, HTTP 메서드 분기, 커맨드 패턴 등 닫힌 타입 계층이 필요한 모든 곳에 적용된다.
+
+Record Pattern(Java 19+)을 더하면 구조 분해까지 한 번에 처리할 수 있다.
+
+```java
+String desc = switch (shape) {
+    case Circle(double r) -> "원 반지름: " + r;
+    case Rectangle(double w, double h) -> "사각형: " + w + "×" + h;
+    case Triangle(double b, double h) -> "삼각형: 밑변 " + b;
+};
+```
+
+`case Circle c -> c.radius()`처럼 객체에 접근하지 않고, `case Circle(double r)`로 컴포넌트를 직접 꺼낸다. 중첩된 데이터 구조도 한 케이스 안에서 깊이 분해할 수 있다.
+
+<Aside label="설계 철학">
+세 기능의 공통 동기는 하나다 — **컴파일러에게 더 많은 정보를 주어, 런타임에 발견될 버그를 빌드 타임에 잡는다**. 불변성(Record), 완전성(Sealed), 표현식 기반 분기(Switch)는 그 철학의 서로 다른 표현이다.
+</Aside>
+
+## 정리
+
+- Record는 불변 데이터 클래스의 보일러플레이트를 제거하고, Compact Constructor로 검증과 정규화를 선언적으로 담는다. DTO, Value Object, 이벤트 모델링에 바로 쓸 수 있다.
+- Switch Expression은 fall-through를 차단하고 Type Pattern, Guarded Pattern으로 타입 분기를 평탄하게 만든다. 표현식이므로 변수 초기화와 반환에 직접 사용할 수 있다.
+- Sealed Class는 `permits`로 타입 계층을 봉인하여, switch의 완전성을 컴파일 타임에 보장한다. 새 하위 타입 추가 시 분기 누락이 빌드 에러로 드러난다.
+- 세 기능을 조합하면 `Result`, `Option`, ADT 같은 함수형 패턴을 Java에서 타입 안전하게 구현할 수 있으며, 런타임 예외보다 컴파일 에러를 선호하는 코드베이스를 만들 수 있다.
+
+다음 글에서는 Modern Java의 또 다른 축인 `var` 타입 추론과 텍스트 블록, 그리고 이들이 가독성에 미치는 실질적인 영향을 살펴본다.

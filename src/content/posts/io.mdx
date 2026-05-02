@@ -1,0 +1,111 @@
+---
+title: "Java IO는 왜 이렇게 복잡한가"
+description: "File 클래스의 경로 표현부터 바이트/문자 스트림 분리, 객체 직렬화까지 — Java IO 계층의 설계 결정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, io, file, stream, serialization]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java IO는 왜 이렇게 클래스가 많은가? `FileReader`, `BufferedReader`, `InputStreamReader`, `FileInputStream`... 같은 작업을 하는 것처럼 보이는 클래스들이 레이어를 이루며 쌓여 있다. 이 복잡함은 우연이 아니라 **"관심사를 층위별로 분리한다"는 설계 철학의 결과**다. 각 층위가 무엇을 책임지는지 이해하면, IO 코드의 선택이 명확해진다.
+
+## File — 경로는 객체가 아닌 참조다
+
+`java.io.File`은 파일 자체가 아니라 **경로에 대한 참조**다. `new File("test.txt")`를 만든다고 디스크에 파일이 생기지 않는다. 이 구분이 중요한 이유는, 존재하지 않는 경로도 객체로 표현할 수 있어야 디렉토리 생성 같은 작업을 선언적으로 표현할 수 있기 때문이다.
+
+```java
+File dir = new File("data/backup");
+
+if (!dir.exists()) {
+    dir.mkdirs();  // 중첩 디렉토리까지 한 번에 생성
+}
+```
+
+`mkdir()`과 `mkdirs()`의 차이가 여기서 드러난다. `mkdir()`은 부모 디렉토리가 없으면 실패한다. `mkdirs()`는 경로 전체를 만든다. 실전에서는 거의 항상 `mkdirs()`를 써야 한다.
+
+NIO의 `Path`와 `Files`는 이 설계를 더 명확하게 분리한다. `Path`는 순수하게 경로를 표현하고, 파일 시스템 작업은 전부 `Files` 유틸리티 클래스에 위임한다. `Files.copy()`, `Files.move()`, `Files.createDirectories()` — 부작용 있는 작업과 경로 표현을 분리한 구조다.
+
+## 바이트와 문자 — 왜 두 계층인가
+
+Java IO가 `InputStream`/`OutputStream`(바이트)과 `Reader`/`Writer`(문자)를 분리한 이유는 인코딩이다. 바이트는 인코딩을 모른다. 문자는 인코딩을 알아야 한다.
+
+```java
+// 인코딩을 명시하지 않으면 플랫폼 기본값이 적용된다 (위험)
+FileReader reader = new FileReader("test.txt");
+
+// 인코딩을 명시하는 올바른 방법
+BufferedReader br = new BufferedReader(
+    new InputStreamReader(
+        new FileInputStream("test.txt"),
+        StandardCharsets.UTF_8));
+```
+
+`FileReader`는 편리하지만 인코딩을 플랫폼 기본값에 맡긴다. Windows의 기본 인코딩은 `MS949`, Linux는 `UTF-8` — 같은 코드가 다른 환경에서 깨진다. `InputStreamReader`로 감싸면서 인코딩을 명시하는 게 올바른 선택이다.
+
+`BufferedReader.readLine()`은 줄 단위 처리를 편하게 해주지만, 여기서도 함정이 있다. `readLine()`은 줄바꿈 문자(`\n`, `\r\n`, `\r`)를 소비하고 반환하지 않는다. 줄바꿈을 보존해야 한다면 `BufferedWriter.newLine()`을 쓰면 플랫폼 독립적인 줄바꿈을 얻는다.
+
+## 버퍼링 — 시스템 콜 횟수가 성능을 결정한다
+
+`FileReader`로 한 글자씩 읽으면 매 `read()` 호출이 시스템 콜이 된다. 100,000줄 파일을 처리하면 수백만 번의 시스템 콜이 발생한다. `BufferedReader`는 이 호출을 묶어서 한 번에 8KB씩 OS에서 가져오고, 애플리케이션은 메모리에서 읽는다.
+
+```java
+// 버퍼 없이: 모든 read()가 시스템 콜
+FileReader fr = new FileReader("large.txt");
+
+// 버퍼 사용: 8KB 단위로 시스템 콜, 나머지는 메모리에서
+BufferedReader br = new BufferedReader(new FileReader("large.txt"));
+```
+
+실측 차이는 수십 배에 달한다. 버퍼 크기 기본값은 8192바이트(8KB)다. 대용량 파일을 처리할 때 `new BufferedReader(reader, 65536)`처럼 명시적으로 키울 수 있지만, 대부분의 경우 기본값으로 충분하다.
+
+## 데이터 스트림과 직렬화 — 타입을 바이트에 싣는 방법
+
+`DataOutputStream`은 기본 타입을 바이트로 변환하는 규약을 제공한다. `writeInt(100)`은 정확히 4바이트를 big-endian으로 쓴다. 읽는 쪽은 반드시 쓴 순서와 같은 순서로 읽어야 한다.
+
+```java
+// 쓰기 순서와 읽기 순서가 반드시 일치해야 한다
+dos.writeUTF("Alice");
+dos.writeInt(20);
+dos.writeDouble(3.8);
+
+// 동일한 순서
+String name = dis.readUTF();
+int age = dis.readInt();
+double gpa = dis.readDouble();
+```
+
+객체 직렬화(`ObjectOutputStream`)는 이 규약을 클래스 단위로 확장한다. `implements Serializable`만 추가하면 객체 전체를 바이트로 직렬화할 수 있다. 단, `serialVersionUID`를 명시하지 않으면 클래스 변경 시 역직렬화가 깨진다.
+
+<Callout type="warning" title="직렬화의 취약점">
+`serialVersionUID`를 명시하지 않으면 컴파일러가 클래스 구조에서 자동으로 계산한다. 필드 하나를 추가하면 `serialVersionUID`가 바뀌어, 이전에 저장한 데이터를 읽을 때 `InvalidClassException`이 발생한다. 직렬화를 쓴다면 `private static final long serialVersionUID = 1L;`을 항상 명시하라.
+</Callout>
+
+직렬화는 Java 전용 형식이라 다른 언어와 호환되지 않는다. 장기 저장이나 외부 시스템 연동에는 JSON, Protocol Buffers 같은 언어 중립 형식이 더 적합하다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**편의성 vs 제어권**: `Files.readString(path)`은 한 줄이지만 파일 전체를 메모리에 올린다. 수 GB짜리 파일에는 OOM이 발생한다. `BufferedReader`로 줄 단위로 읽으면 메모리 사용량이 고정된다.
+
+**레거시 API vs NIO**: `File` 클래스는 오류 발생 시 `false`를 반환하고 이유를 알 수 없다. `Files` API는 `IOException`을 던지며 실패 원인을 명시한다. 신규 코드에서는 NIO API를 사용하는 것이 진단 가능성(observability) 면에서 낫다.
+
+**직렬화 vs 텍스트 형식**: Java 직렬화는 빠르지만 Java 전용이고 버전 관리가 어렵다. JSON/XML은 느리지만 언어 중립적이고 사람이 읽을 수 있다. 캐시나 임시 저장소에는 직렬화, 외부 API나 설정 파일에는 텍스트 형식이 더 자연스럽다.
+</Callout>
+
+## 정리
+
+- `File`/`Path`는 경로 참조다. 파일 작업은 `Files` 유틸리티에 위임한다.
+- 바이트 스트림(`InputStream`)과 문자 스트림(`Reader`)의 분리는 인코딩 때문이다. 인코딩은 항상 명시하라.
+- 버퍼링은 선택이 아니라 기본이다. `BufferedReader`/`BufferedWriter`를 래핑하지 않으면 시스템 콜이 폭발한다.
+- 직렬화는 `serialVersionUID`를 명시하고, 장기 저장에는 언어 중립 형식을 고려하라.
+
+다음 글에서는 Java Collections의 각 자료구조가 내부적으로 어떤 구조를 사용하는지, 그리고 `HashMap`의 버킷 충돌이 어떻게 처리되는지 추적한다.

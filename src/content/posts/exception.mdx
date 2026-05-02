@@ -1,0 +1,112 @@
+---
+title: "Java 예외는 어떻게 설계해야 하는가"
+description: "예외 계층 구조의 출발점부터 커스텀 예외 설계, Exception 체인, 그리고 실무 안티패턴까지, Java 예외 처리의 전체 그림을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, exception, error-handling, best-practices]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 예외 처리는 `try-catch` 문법을 아는 것과 **잘 설계하는 것** 사이에 상당한 거리가 있다. 빈 catch 블록, `Exception`을 통째로 잡는 코드, 스택 트레이스를 삼켜버리는 래핑 — 이 패턴들은 Java 코드베이스 어디서나 발견된다. 왜 이런 코드가 나쁜지, 그리고 무엇이 좋은 예외 설계인지를 어떻게 구별하는가?
+
+## Throwable 계층과 설계의 출발점
+
+Java 예외의 뿌리는 `Throwable`이다. 그 아래 두 갈래가 있다.
+
+```
+Throwable
+├── Error          — 시스템 레벨 오류 (OOM, StackOverflow). 잡지 않는다.
+└── Exception
+    ├── RuntimeException  — Unchecked. 컴파일러가 강제하지 않는다.
+    └── IOException 등    — Checked. 반드시 처리하거나 선언해야 한다.
+```
+
+이 구분은 단순한 분류가 아니라 **설계 의도**다. Checked Exception은 "호출자가 이 오류를 예상하고 처리할 책임이 있다"는 신호다. 파일이 없거나 네트워크가 끊기는 것은 외부 조건이므로 `IOException`은 Checked다. 반면 `null`을 역참조하거나 배열 범위를 벗어나는 것은 프로그래밍 버그이므로 `NullPointerException`은 Unchecked다.
+
+실무 선택 기준은 하나다. **복구 가능한 외부 조건 오류 → Checked, 프로그래밍 오류 → Unchecked.** 이 원칙을 무시하고 모든 예외를 `RuntimeException`으로 던지거나, 반대로 모든 것을 Checked로 만들면 API 사용자를 혼란에 빠뜨린다.
+
+## 커스텀 예외 — 도메인 언어로 오류를 표현하라
+
+표준 예외만으로는 도메인 오류를 표현하기 어렵다. `throw new Exception("잔액 부족")`은 메시지를 읽기 전까지 무슨 오류인지 알 수 없다. 커스텀 예외는 타입 자체가 의미를 전달한다.
+
+```java
+class InsufficientBalanceException extends Exception {
+    private final long accountId;
+    private final double balance;
+    private final double requested;
+
+    public InsufficientBalanceException(long accountId, double balance, double requested) {
+        super(String.format(
+            "잔액 부족 [계좌:%d] 잔액:%.2f원, 요청:%.2f원",
+            accountId, balance, requested));
+        this.accountId = accountId;
+        this.balance = balance;
+        this.requested = requested;
+    }
+
+    public double getShortfall() { return requested - balance; }
+}
+```
+
+좋은 커스텀 예외의 조건은 세 가지다. 첫째, **4가지 생성자** — 기본, 메시지, 메시지+원인, 원인. 모두 구현해야 유연하게 사용할 수 있다. 둘째, **도메인 필드** — 단순 메시지가 아니라 `accountId`, `balance` 같은 구조화된 정보를 담는다. 셋째, **계층 구조** — `BusinessException → ValidationException → InvalidEmailException` 처럼 상위 타입으로 한번에 잡을 수도, 구체 타입으로 구분할 수도 있어야 한다.
+
+## Exception 체인 — 정보를 잃지 마라
+
+계층 경계를 넘을 때는 예외를 변환해야 한다. 데이터 접근 계층의 `SQLException`을 서비스 계층에 그대로 노출하면 추상화가 무너진다. 그렇다고 원인을 버리면 디버깅이 불가능해진다.
+
+```java
+class UserRepository {
+    public void save(String userId) {
+        try {
+            // JDBC 코드
+        } catch (SQLException e) {
+            // 원인 예외를 반드시 체인으로 연결한다
+            throw new DataAccessException("사용자 저장 실패: " + userId, e);
+        }
+    }
+}
+```
+
+`super(message, cause)` 생성자로 원인을 연결하면 `getCause()`와 스택 트레이스 양쪽에서 추적이 가능하다. **원인 없이 메시지만 바꾸는 래핑은 정보 손실이다.** 로그에 `DataAccessException: 사용자 저장 실패`만 남고 원래 `SQLException`이 사라지면, 프로덕션 장애에서 근본 원인을 찾는 데 몇 배의 시간이 걸린다.
+
+## 안티패턴 — 흔하지만 치명적인 실수
+
+<Callout type="warning" title="절대 하지 말아야 할 것들">
+**빈 catch 블록**: 오류를 삼키고 시스템이 오작동한다. 최소한 로깅은 해야 한다.
+
+**`catch (Exception e)` 남용**: `NullPointerException`, `ClassCastException` 같은 의도치 않은 예외까지 삼킨다. 구체 타입으로 잡아라.
+
+**예외로 흐름 제어**: `NumberFormatException`을 잡아서 `null`을 반환하는 패턴. 예외 생성 비용이 정규식 검사보다 수십 배 높고, 의도도 불명확하다.
+</Callout>
+
+예외로 흐름을 제어하는 패턴의 성능 차이는 실측으로 확인된다. 10,000회 반복 기준으로 `NumberFormatException` 잡기는 정규식 사전 검사보다 수십 ms 느리다. 빈번히 발생하는 경로라면 무시할 수 없는 차이다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**Checked Exception**은 호출자에게 처리를 강제하므로 API 계약이 명확하다. 대신 `throws` 선언이 전파되면서 코드가 장황해지고, 람다/스트림에서 쓰기 불편하다.
+
+**Unchecked Exception**은 코드가 간결하다. 대신 어디서 어떤 예외가 나올지 컴파일러가 알려주지 않아, 문서화와 팀 규약에 의존해야 한다.
+
+현대 Java 생태계(Spring, JPA 등)는 대부분 Unchecked로 전환했다. 라이브러리 경계에서만 Checked를 쓰고 내부는 Unchecked로 유지하는 것이 현실적인 균형점이다.
+</Callout>
+
+`try-with-resources`는 자원 관리 트레이드오프를 해결하는 문법이다. `finally` 블록에서 `close()`를 직접 호출하면 close 중 발생한 예외가 원래 예외를 덮어쓰는 **억제된 예외(suppressed exception)** 문제가 생긴다. `try-with-resources`는 `AutoCloseable`을 구현한 자원을 자동으로, 역순으로 닫으면서 이 문제를 해결한다.
+
+## 정리
+
+- 예외 계층은 분류가 아니라 설계 의도다. Checked는 "호출자가 처리하라", Unchecked는 "프로그래밍 버그"를 의미한다.
+- 커스텀 예외는 타입 자체가 도메인 언어가 되어야 한다. 메시지보다 구조화된 필드와 계층이 중요하다.
+- 계층 경계를 넘을 때는 반드시 원인 예외를 체인으로 연결하라. 정보 손실 없는 변환이 원칙이다.
+- 빈 catch, `Exception` 남용, 예외로 흐름 제어 — 세 가지 안티패턴이 Java 예외 버그의 대부분을 만든다.
+
+다음 글에서는 커스텀 예외에서 자주 등장하는 `ErrorCode` Enum 패턴과 Spring의 `@ExceptionHandler`가 이 계층 구조를 어떻게 API 응답으로 매핑하는지 추적한다.

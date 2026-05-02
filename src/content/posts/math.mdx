@@ -1,0 +1,135 @@
+---
+title: "Java 수 타입의 설계 철학 — 왜 세 가지가 필요한가"
+description: "int와 double의 한계부터 Wrapper 클래스의 박싱 함정, BigDecimal의 정확성 보장까지, Java 수 타입 계층이 만들어진 이유를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, math, wrapper, bigdecimal, numeric-types]
+difficulty: intermediate
+series:
+  slug: java-api-reference
+  title: Java Api Reference
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+
+Java에는 숫자를 다루는 타입이 세 겹으로 나뉜다. 기본 타입(`int`, `double`), Wrapper 클래스(`Integer`, `Double`), 그리고 임의 정밀도 클래스(`BigInteger`, `BigDecimal`). 왜 `0.1 + 0.2 == 0.3`이 Java에서 `false`인지 이해하면, 이 세 계층이 어떤 트레이드오프를 해결하기 위해 존재하는지 보이기 시작한다.
+
+## 기본 타입 — 빠른 연산을 위한 단순함
+
+`java.lang.Math`는 생성자가 `private`인 유틸리티 클래스다. 인스턴스를 만들 수 없고, 모든 메서드는 `static`이다. 이 설계 자체가 Java 기본 타입 철학의 표현이다 — **객체 오버헤드 없이 연산에만 집중한다**.
+
+`Math`가 제공하는 반올림 계열 메서드는 이름이 비슷하지만 동작이 다르다.
+
+```java
+Math.round(2.5)   // 3 (long, 양의 방향 올림)
+Math.rint(2.5)    // 2.0 (double, 짝수 방향 — Banker's rounding)
+Math.floor(2.9)   // 2.0 (내림)
+Math.ceil(2.1)    // 3.0 (올림)
+```
+
+`round`와 `rint`의 차이는 사소해 보이지만 실전에서 자주 혼동을 부른다. `Math.round(-3.5)`는 `-3`을 반환한다. 음수 방향이 아니라 0 방향으로 올라가기 때문이다. 또 하나의 함정은 `Math.abs(Integer.MIN_VALUE)`다. `Integer.MIN_VALUE`는 `-2147483648`인데, 이 값의 절댓값인 `2147483648`은 `int` 범위를 벗어난다. 결과로 음수가 그대로 돌아온다. 안전하게 처리하려면 `Math.abs((long) Integer.MIN_VALUE)`로 먼저 `long`으로 변환해야 한다.
+
+두 점 사이 거리를 계산할 때도 미묘한 선택이 있다. `Math.sqrt(dx*dx + dy*dy)` 대신 `Math.hypot(dx, dy)`를 쓰면 `dx`나 `dy`가 `1e200` 같은 큰 값일 때 발생하는 중간 계산 오버플로우를 피할 수 있다. 기본 타입은 빠른 대신, 이런 경계 조건의 책임을 사용자에게 떠넘긴다.
+
+## Wrapper 클래스 — 컬렉션과의 타협
+
+기본 타입은 `List<int>`에 들어갈 수 없다. 제네릭은 참조 타입만 받는다. 그래서 Wrapper가 태어났다. `Integer`, `Double`, `Boolean`, `Character` — 기본 타입 8개 각각에 대응하는 클래스가 있다.
+
+```java
+List<Integer> list = new ArrayList<>();
+list.add(10);           // auto-boxing: Integer.valueOf(10)
+int value = list.get(0);  // auto-unboxing: .intValue()
+```
+
+오토박싱은 편리하지만 비용이 숨어 있다.
+
+```java
+Integer sum = 0;
+for (int i = 0; i < 1_000_000; i++) {
+    sum += i;  // 매 반복마다 unbox → 연산 → box, 객체 백만 개 생성
+}
+```
+
+루프 안에서 `Integer`로 누적하면 백만 번의 객체 생성과 GC 압박이 따른다. 같은 코드를 `int sum`으로 바꾸면 수십 배 빠르다. 성능이 중요한 경로에서 Wrapper를 변수로 쓰는 것은 피해야 한다.
+
+<Callout type="warning" title="== 비교 함정">
+`Integer.valueOf(100) == Integer.valueOf(100)`은 `true`지만, `Integer.valueOf(200) == Integer.valueOf(200)`은 `false`다. JVM은 -128~127 범위의 `Integer`를 캐싱한다. 범위 밖에서 `==`로 비교하면 참조 동일성을 비교하게 된다. Wrapper 타입 비교는 항상 `equals`를 써야 한다.
+</Callout>
+
+`null` 역시 Wrapper만이 가진 능력이다. `int`는 "값 없음"을 표현할 수 없지만 `Integer`는 `null`을 담을 수 있다. 그 대신 auto-unboxing 시 `NullPointerException`이 발생할 수 있다. `null`인지 먼저 확인하지 않으면 런타임에서 예상치 못한 크래시가 생긴다.
+
+`Integer` 클래스는 비트 유틸리티도 제공한다. `Integer.bitCount(n)`은 이진 표현에서 1의 개수를 반환하고, `Integer.numberOfLeadingZeros(n)`, `Integer.highestOneBit(n)` 같은 메서드는 비트 플래그 권한 관리나 해시 알고리즘에서 직접 활용할 수 있다.
+
+## BigDecimal — 정확성을 위해 속도를 포기하다
+
+`0.1 + 0.2`가 `0.30000000000000004`가 되는 이유는 IEEE 754 부동소수점 표현에서 `0.1`을 이진수로 정확하게 표현할 수 없기 때문이다. `double`은 근사값이다. 금융 계산에서 이 근사 오차가 쌓이면 실제 돈이 어긋난다.
+
+```java
+// 틀린 방법
+double price = 0.1;
+double quantity = 3;
+System.out.println(price * quantity);  // 0.30000000000000004
+
+// 올바른 방법
+BigDecimal price = new BigDecimal("0.1");   // 반드시 문자열로 생성
+BigDecimal quantity = new BigDecimal("3");
+System.out.println(price.multiply(quantity));  // 0.3
+```
+
+`new BigDecimal(0.1)`이 아니라 `new BigDecimal("0.1")`이어야 한다. `double` 리터럴을 생성자에 넘기면 이미 부정확한 부동소수점 값이 그대로 `BigDecimal` 안으로 들어온다.
+
+나눗셈에는 반드시 반올림 모드를 지정해야 한다.
+
+```java
+// 무한소수 → ArithmeticException!
+new BigDecimal("1").divide(new BigDecimal("3"));
+
+// 올바른 방법: 소수점 자리 + 반올림 모드 명시
+new BigDecimal("1").divide(new BigDecimal("3"), 10, RoundingMode.HALF_UP);
+// 0.3333333333
+```
+
+금융 계산에서 `HALF_EVEN`(은행가 반올림)을 쓰는 이유는 `HALF_UP`이 통계적으로 편향을 만들기 때문이다. 정확히 중간값인 `x.5`를 항상 올리면, 대량의 거래에서 체계적 오차가 누적된다.
+
+`BigDecimal`을 비교할 때도 함정이 있다. `new BigDecimal("10.5").equals(new BigDecimal("10.50"))`은 `false`다. `equals`는 값뿐 아니라 스케일(소수점 자릿수)까지 비교하기 때문이다. 값만 비교하려면 `compareTo`를 써야 한다.
+
+## BigInteger — 오버플로우 없는 정수 세계
+
+`long`의 최대값은 약 `9.2 × 10^18`다. 암호화, 팩토리얼, 큰 수 피보나치 수열에서는 이 한계를 금방 넘는다.
+
+```java
+BigInteger factorial100 = BigInteger.ONE;
+for (int i = 2; i <= 100; i++) {
+    factorial100 = factorial100.multiply(BigInteger.valueOf(i));
+}
+// 158자리 숫자 — long으로는 절대 담을 수 없다
+```
+
+`BigInteger`는 내부적으로 `int` 배열로 숫자를 저장하고, 필요한 만큼 동적으로 확장한다. 오버플로우가 없는 대신 힙 할당과 GC 비용이 따른다.
+
+RSA 암호화의 핵심 연산인 `base.modPow(exponent, modulus)`는 `BigInteger` 없이는 구현하기 어렵다. `BigInteger.isProbablePrime(certainty)`로 확률적 소수 판별도 가능하다. `certainty` 값이 클수록 판별 정확도가 높아지는 대신 시간이 더 걸린다.
+
+## 트레이드오프
+
+세 계층의 선택 기준은 명확하다.
+
+<Callout type="note" title="타입 선택 가이드">
+- **기본 타입 + Math**: 일반 연산, 반복문, 성능이 중요한 경우. 경계 조건은 직접 챙겨야 한다.
+- **Wrapper 클래스**: 컬렉션, 제네릭, `null` 표현이 필요한 경우. 오토박싱 루프와 `==` 비교를 조심한다.
+- **BigDecimal**: 금융, 회계, 정확성이 필수인 실수 연산. 생성은 문자열로, 나눗셈엔 `RoundingMode` 필수, 비교는 `compareTo`로.
+- **BigInteger**: 오버플로우 가능성이 있는 큰 정수, 암호화 연산. 속도보다 정확성과 무한 범위가 중요한 곳에서 쓴다.
+</Callout>
+
+성능 차이는 극적이다. 백만 번 덧셈 기준으로 기본 `int`가 `BigDecimal`보다 수십 배 이상 빠르다. 정확성과 속도는 항상 반대 방향을 당긴다. Java의 수 타입 계층은 그 긴장을 명시적인 선택지로 나눠 놓은 설계다 — 어떤 타입을 쓰는지가 곧 어떤 트레이드오프를 선택했는지를 드러낸다.
+
+## 정리
+
+- `Math`는 빠르고 단순하다. `round` vs `rint`, `abs(MIN_VALUE)` 오버플로우, `hypot` vs 직접 계산 — 경계 조건은 사용자 책임이다.
+- Wrapper는 컬렉션과 제네릭을 위한 타협이다. `==` 비교 캐싱 함정과 오토박싱 루프 성능 비용이 가장 흔한 실수다.
+- `BigDecimal`은 생성을 문자열로, 나눗셈은 `RoundingMode`와 함께, 비교는 `compareTo`로. `equals`는 스케일까지 비교한다는 점을 잊지 말아야 한다.
+- `BigInteger`는 오버플로우 없는 정수 세계다. 암호화와 큰 수 연산에서 `long`의 한계를 넘어선다.
+
+다음 글에서는 Java의 문자열 타입이 왜 불변(immutable)인지, 그리고 `String`, `StringBuilder`, `StringBuffer`가 각각 어떤 트레이드오프를 위해 존재하는지 추적한다.
