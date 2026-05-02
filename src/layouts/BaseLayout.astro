@@ -104,6 +104,9 @@ const resolvedOgImage = new URL(ogImage, Astro.site).toString();
     flex: 1 1 auto;
     width: 100%;
     align-items: stretch;
+    /* main이 짧은 페이지(archive, 404 등)에서도 sidebar sticky 영역이
+       viewport 풀 높이로 유지되도록 min-height 보장 */
+    min-height: calc(100vh - 4rem);
   }
 </style>
 <SearchModal />
