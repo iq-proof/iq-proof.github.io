@@ -1,0 +1,171 @@
+---
+title: "Spring MVC 예외는 어떻게 응답이 되는가"
+description: "HandlerExceptionResolver 체인의 구조부터 @ExceptionHandler 매칭 알고리즘, @ControllerAdvice 우선순위, RFC 7807 ProblemDetail까지, Spring MVC 예외 처리의 전체 경로를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, spring-mvc, exception-handling, controller-advice, problem-detail]
+difficulty: intermediate
+series:
+  slug: spring-mvc-deep-dive
+  title: Spring Mvc Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Controller에서 예외가 발생하면 Spring MVC는 그것을 그냥 서블릿 컨테이너로 내보내지 않는다. `DispatcherServlet`이 예외를 가로채고, 등록된 `HandlerExceptionResolver` 체인을 순회하며 응답을 만든다. 이 체인의 구조를 모르면 정성껏 작성한 `@ExceptionHandler`가 조용히 무시되거나, `@ResponseStatus`가 붙은 예외가 왜 동작하는지 설명할 수 없다. Spring MVC의 예외는 어떤 경로로 응답이 되는가?
+
+## 예외가 응답이 되기까지의 경로
+
+`doDispatch()`가 핸들러 실행 중 예외를 잡으면 `processDispatchResult()`로 전달하고, 그 안에서 `processHandlerException()`이 호출된다.
+
+```java
+// doDispatch() 내부 흐름
+try {
+    mv = ha.handle(request, response, handler);
+} catch (Exception ex) {
+    dispatchException = ex;
+}
+processDispatchResult(request, response, mappedHandler, mv, dispatchException);
+
+// processHandlerException() 내부
+for (HandlerExceptionResolver resolver : handlerExceptionResolvers) {
+    ModelAndView exMv = resolver.resolveException(request, response, handler, ex);
+    if (exMv != null) {
+        if (exMv.isEmpty()) return null;  // 응답 완료, 뷰 렌더링 스킵
+        return exMv;                      // 뷰 렌더링용 ModelAndView 반환
+    }
+}
+throw ex;  // 모두 null → 서블릿 컨테이너로 전파
+```
+
+`resolveException()`의 반환값이 이 흐름을 결정한다. `null`은 "나는 처리 못한다"는 신호고, 빈 `ModelAndView`는 "응답을 직접 썼다"는 신호다. 이 규약 위에서 세 개의 기본 Resolver가 순서대로 동작한다.
+
+## 세 Resolver의 책임 분담
+
+Spring MVC는 애플리케이션 시작 시 세 개의 Resolver를 순서대로 등록한다.
+
+**`ExceptionHandlerExceptionResolver` (order=0)** 가 가장 먼저 실행된다. `@ExceptionHandler`로 선언된 메서드를 찾아 실행하는 역할이다. 로컬 Controller를 먼저 뒤지고, 없으면 `@ControllerAdvice` 빈을 `@Order` 순서로 탐색한다.
+
+**`ResponseStatusExceptionResolver` (order=1)** 는 `@ResponseStatus` 어노테이션이 붙은 예외 클래스와 `ResponseStatusException`을 처리한다. `response.sendError(statusCode)`를 호출한 뒤 빈 `ModelAndView`를 반환한다.
+
+**`DefaultHandlerExceptionResolver` (order=2)** 는 Spring MVC가 내부적으로 던지는 표준 예외 15종을 처리한다.
+
+```java
+// DefaultHandlerExceptionResolver가 처리하는 주요 표준 예외
+// NoHandlerFoundException                    → 404 Not Found
+// HttpRequestMethodNotSupportedException     → 405 Method Not Allowed
+// HttpMediaTypeNotSupportedException         → 415 Unsupported Media Type
+// HttpMediaTypeNotAcceptableException        → 406 Not Acceptable
+// MethodArgumentNotValidException            → 400 Bad Request
+// HttpMessageNotReadableException            → 400 Bad Request
+// MissingServletRequestParameterException    → 400 Bad Request
+// TypeMismatchException                      → 400 Bad Request
+```
+
+`@ExceptionHandler`가 없어도 이 예외들이 적절한 상태 코드로 처리되는 이유가 여기에 있다.
+
+<Callout type="warning" title="트레이드오프">
+`DefaultHandlerExceptionResolver`는 `response.sendError()`만 호출하므로 응답 본문이 없다. REST API에서 필드별 검증 오류 메시지를 내려보내려면 `ResponseEntityExceptionHandler`를 상속해 `handleExceptionInternal()`을 오버라이드해야 한다.
+</Callout>
+
+## @ExceptionHandler 매칭 알고리즘
+
+`ExceptionHandlerExceptionResolver`가 핸들러를 찾는 과정은 단순한 타입 비교가 아니다. `ExceptionHandlerMethodResolver`는 Controller 클래스의 `@ExceptionHandler` 메서드를 스캔해 `mappedMethods: Map<ExceptionType, Method>` 캐시를 구성한다. 예외가 발생하면 다음 알고리즘으로 핸들러를 선택한다.
+
+1. 완전 일치(`exceptionType == declaredException`) 먼저 확인한다.
+2. 없으면 `isAssignableFrom()`으로 부모 클래스를 탐색한다.
+3. 여러 후보가 나오면 `ExceptionDepthComparator`로 상속 계층 깊이를 비교한다.
+4. 가장 낮은 depth, 즉 가장 구체적인 핸들러를 선택한다.
+
+```java
+// depth 계산 예시: 발생 예외 = InvalidUserIdException
+//   extends IllegalArgumentException extends RuntimeException
+
+// @ExceptionHandler(InvalidUserIdException.class)  → depth = 0  ← 선택
+// @ExceptionHandler(IllegalArgumentException.class) → depth = 1
+// @ExceptionHandler(RuntimeException.class)         → depth = 2
+```
+
+탐색 결과는 `exceptionLookupCache: ConcurrentHashMap`에 저장된다. 동일 예외 타입은 두 번째 발생부터 `O(1)`로 처리된다.
+
+`resolveMethodByThrowable()`은 발생 예외뿐 아니라 `cause` 예외까지 탐색한다. JPA나 트랜잭션 처리에서 예외가 래핑되는 경우, `cause`에 선언된 `@ExceptionHandler`가 동작하는 이유다. `TransactionSystemException(cause=ConstraintViolationException)`이 발생해도 `@ExceptionHandler(ConstraintViolationException.class)`가 선택된다.
+
+`@ExceptionHandler`의 처리 예외 타입은 `value` 속성과 파라미터 타입 두 가지 방식으로 선언할 수 있다. `value`가 명시되어 있으면 `value`가 우선이고, 비어 있으면 메서드 파라미터 타입에서 추출한다. 두 가지를 함께 쓸 때 파라미터 타입이 `value`에 선언된 예외와 호환되지 않으면 런타임에 타입 불일치가 발생하므로 주의해야 한다.
+
+## @ControllerAdvice 우선순위와 함정
+
+`@ControllerAdvice`는 네 가지 필터(`basePackages`, `basePackageClasses`, `annotations`, `assignableTypes`)로 적용 대상을 좁힐 수 있다. `ExceptionHandlerExceptionResolver`는 시작 시 `afterPropertiesSet()`에서 `@ControllerAdvice` 빈을 `@Order` 순으로 정렬해 `LinkedHashMap`에 캐시한다.
+
+실제 탐색 순서는 다음과 같다.
+
+```java
+// getExceptionHandlerMethod() 탐색 흐름
+
+// ① 로컬 탐색: Controller 자체의 @ExceptionHandler
+ExceptionHandlerMethodResolver localResolver = exceptionHandlerCache.get(handlerType);
+Method method = localResolver.resolveMethodByThrowable(exception);
+if (method != null) {
+    return new ServletInvocableHandlerMethod(handlerMethod.getBean(), method, ...);
+    // 로컬에서 찾으면 즉시 반환, 전역 탐색 없음
+}
+
+// ② 전역 탐색: @ControllerAdvice (Order 낮은 값 우선)
+for (Map.Entry<ControllerAdviceBean, ExceptionHandlerMethodResolver> entry
+        : exceptionHandlerAdviceCache.entrySet()) {
+    ControllerAdviceBean advice = entry.getKey();
+    if (advice.isApplicableToBeanType(handlerType)) {   // 필터 체크
+        Method m = entry.getValue().resolveMethodByThrowable(exception);
+        if (m != null) return new ServletInvocableHandlerMethod(advice.resolveBean(), m, ...);
+    }
+}
+```
+
+여기서 중요한 함정이 있다.
+
+<Aside label="Order vs 구체성">
+`@ControllerAdvice(Order=1)`에 `@ExceptionHandler(RuntimeException.class)`가 있고, `@ControllerAdvice(Order=2)`에 `@ExceptionHandler(UserNotFoundException.class)`가 있으면, `UserNotFoundException` 발생 시 더 구체적인 Order=2 핸들러가 아니라 **Order=1의 범용 핸들러가 선택된다**. 전역 탐색에서는 Advice 내부의 depth 비교보다 Advice 간의 Order가 먼저 적용된다. 구체적인 예외를 먼저 처리하려면 그 핸들러를 낮은 Order의 Advice에 배치해야 한다.
+</Aside>
+
+로컬 `@ExceptionHandler`는 항상 전역보다 우선한다. 구체성과 무관하게, 로컬에 `@ExceptionHandler(Exception.class)`가 있으면 전역의 어떤 핸들러도 실행되지 않는다. "내 Controller 안의 예외는 내가 처리한다"는 캡슐화 원칙이 구체성 우선보다 강하다.
+
+`@RestControllerAdvice`는 `@ControllerAdvice + @ResponseBody`의 합성이다. 차이는 단 하나, 모든 `@ExceptionHandler` 메서드에 `@ResponseBody`가 자동으로 적용된다는 것이다. REST API 전용 예외 처리에는 `@RestControllerAdvice`를 쓰는 것이 명시적이다.
+
+## ResponseEntityExceptionHandler와 RFC 7807
+
+`DefaultHandlerExceptionResolver`가 응답 본문 없이 `sendError()`만 호출한다는 한계를 극복하는 것이 `ResponseEntityExceptionHandler`다. 이 추상 클래스를 상속하면 동일한 표준 예외들을 `ResponseEntity` 기반으로 처리할 수 있고, 응답 본문을 완전히 제어할 수 있다.
+
+확장 포인트는 계층적으로 설계되어 있다. 특정 예외만 다르게 처리하려면 `handleMethodArgumentNotValid()` 같은 개별 메서드를 오버라이드한다. 모든 표준 예외에 동일한 응답 형식을 적용하려면 최종 공통 처리 지점인 `handleExceptionInternal()`을 오버라이드한다.
+
+Spring 6.x부터는 오류 응답 형식도 표준화됐다. RFC 7807 Problem Details 스펙을 구현한 `ProblemDetail` 클래스가 추가됐고, Spring MVC 표준 예외들이 `ErrorResponse` 인터페이스를 구현하게 됐다. `getBody()`로 `ProblemDetail`에 직접 접근할 수 있다.
+
+```json
+{
+  "type": "https://api.example.com/errors/user-not-found",
+  "title": "User Not Found",
+  "status": 404,
+  "detail": "ID 42인 사용자를 찾을 수 없다.",
+  "instance": "/api/users/42",
+  "traceId": "abc123"
+}
+```
+
+`spring.mvc.problemdetails.enabled=true` 설정 하나로 이 체계가 활성화된다. `handleExceptionInternal()`이 `body == null`일 때 자동으로 `ex.getBody()`를 사용하며, Content-Type도 `application/problem+json`으로 설정된다. 커스텀 예외에 ProblemDetail을 적용할 때는 `setProperty()`로 확장 필드를 추가한다.
+
+```java
+ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+pd.setType(URI.create("https://api.example.com/errors/user-not-found"));
+pd.setProperty("userId", ex.getUserId());
+pd.setProperty("traceId", MDC.get("traceId"));
+// @ExceptionHandler에서 ProblemDetail을 반환하면
+// Content-Type: application/problem+json 자동 설정
+```
+
+`type` 필드에 `about:blank`를 쓰면 "추가 정보 없음, HTTP 상태 코드 자체가 설명"을 의미한다. 클라이언트가 오류 종류를 프로그래밍적으로 구분해야 한다면 팀 내 오류 카탈로그 URL을 `type`에 할당하는 것이 좋다.
+
+## 정리
+
+- 예외는 `processHandlerException()`에서 Resolver 체인을

@@ -1,0 +1,104 @@
+---
+title: "Spring MVC는 파라미터를 어떻게 바인딩하는가"
+description: "ArgumentResolver 체인과 HttpMessageConverter 선택부터 @Valid 검증, Custom Resolver 작성까지 — Spring MVC 파라미터 바인딩의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-mvc, argument-resolver, data-binding, validation]
+difficulty: intermediate
+series:
+  slug: spring-mvc-deep-dive
+  title: Spring Mvc Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring MVC 컨트롤러 메서드는 `@RequestParam`, `@RequestBody`, `@PathVariable`, `HttpSession`, `@Valid`를 파라미터로 선언할 수 있다. 이 모든 것이 "그냥 동작"한다. 어떤 설계 원칙이 이 다양성을 하나의 파이프라인으로 통합하는가?
+
+## 파라미터 바인딩의 설계 원칙 — Chain of Responsibility
+
+파라미터 타입과 어노테이션 조합은 30가지가 넘는다. 이것을 단일 `if-else`로 처리하면 `InvocableHandlerMethod`가 모든 변환 로직을 알아야 하고, 새 파라미터 타입이 생길 때마다 핵심 클래스를 수정해야 한다.
+
+Spring은 **Chain of Responsibility** 패턴으로 이 문제를 푼다. 각 `HandlerMethodArgumentResolver`가 "내가 이 파라미터를 처리할 수 있는가?"(`supportsParameter`)를 판단하고, 처리 가능한 첫 번째 Resolver가 값을 생성한다. 새 파라미터 타입 지원 = 새 Resolver 추가.
+
+`HandlerMethodArgumentResolverComposite`는 이 체인의 오케스트레이터다. 매 요청마다 30개 Resolver를 순회하는 비용을 피하기 위해 `ConcurrentHashMap<MethodParameter, HandlerMethodArgumentResolver>` 캐시를 유지한다. 같은 컨트롤러 메서드의 같은 파라미터는 첫 요청 이후 O(1)로 Resolver를 찾는다.
+
+<Callout type="note" title="등록 순서 = 우선순위">
+기본 Resolver 목록은 **어노테이션 기반(구체적) → 타입 기반 → 커스텀 → 폴백** 순으로 등록된다. `addArgumentResolvers()`로 추가한 커스텀 Resolver는 기본 목록 **뒤**에 위치한다. 기본 Resolver보다 먼저 실행해야 한다면 `setArgumentResolvers()`로 전체 목록을 직접 지정해야 한다.
+</Callout>
+
+## 값의 출처 — @RequestParam과 @PathVariable이 다른 이유
+
+같아 보이지만 두 어노테이션은 값을 꺼내는 위치가 근본적으로 다르다.
+
+```java
+// @RequestParam: 서블릿 API 통해 쿼리스트링 + 폼 본문 통합 조회
+Object arg = request.getParameterValues(name);
+
+// @PathVariable: HandlerMapping이 미리 저장해 둔 URI 변수 Map에서 조회
+Map<String, String> uriVars = (Map<String, String>)
+    request.getAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE);
+return uriVars.get(name);
+```
+
+두 Resolver 모두 `AbstractNamedValueMethodArgumentResolver`를 상속한다. 공통 흐름은 동일하다 — 값 추출 → `null`이면 `defaultValue` 적용(`${property}`, SpEL 표현식 지원) → `required` 체크 → `ConversionService`로 타입 변환. `String → Long`, `String → LocalDate`, `String → enum`은 전부 이 파이프라인을 거친다.
+
+`required=true`에서 값이 없을 때 발생하는 예외도 다르다. `@RequestParam`은 URL 매칭 후에 확인되므로 `MissingServletRequestParameterException(400)`이, `@PathVariable`은 URL 매칭 자체가 실패하므로 `404` 또는 `MissingPathVariableException(500)`이 발생한다.
+
+## JSON이 객체가 되는 과정 — Content-Type과 HttpMessageConverter
+
+`@RequestBody`는 `RequestResponseBodyMethodProcessor`가 처리한다. 이 Processor는 `HandlerMethodArgumentResolver`와 `HandlerMethodReturnValueHandler`를 동시에 구현한다 — 역직렬화와 직렬화를 한 클래스가 담당한다.
+
+Converter 선택 알고리즘은 단순하다. `Content-Type` 헤더를 파싱한 뒤 등록된 `HttpMessageConverter` 목록을 순서대로 순회하며 `canRead(타입, contentType) == true`인 첫 번째를 선택한다. `application/json`이면 `MappingJackson2HttpMessageConverter`가 선택되어 `objectMapper.readValue(inputStream, targetType)`을 호출한다. 적합한 Converter가 없으면 `415 Unsupported Media Type`.
+
+```java
+// @RequestBody와 @ModelAttribute의 결정적 차이
+// @RequestBody:    HttpMessageConverter 기반 → JSON/XML 본문
+// @ModelAttribute: request.getParameterMap() 기반 → 쿼리파라미터 + 폼 본문
+```
+
+`@ModelAttribute`는 `ServletModelAttributeMethodProcessor`가 처리한다. 기본 생성자로 객체를 만든 뒤 `WebDataBinder.bind()`가 `request.getParameterMap()`으로 얻은 `PropertyValues`를 `BeanWrapper`를 통해 각 필드에 설정한다. JSON 요청에 `@ModelAttribute`를 쓰면 필드가 전부 `null`이 되는 이유가 여기 있다.
+
+<Callout type="warning" title="Mass Assignment 주의">
+`@ModelAttribute`는 요청 파라미터 이름과 객체 필드명을 자동 매핑하므로, 클라이언트가 `role=ADMIN` 같은 파라미터를 추가하면 의도치 않게 바인딩될 수 있다. `@InitBinder`에서 `setAllowedFields()` 또는 `setDisallowedFields()`로 바인딩 대상을 명시적으로 제한해야 한다.
+</Callout>
+
+## 검증의 위치 — @Valid와 BindingResult
+
+`@Valid` 또는 `@Validated` 어노테이션이 파라미터에 있으면, `RequestResponseBodyMethodProcessor`와 `ModelAttributeMethodProcessor` 모두 `validateIfApplicable()`을 호출한다. `SmartValidator`가 `javax.validation.Validator`로 Bean Validation 어노테이션을 평가하고 결과를 `BindingResult`에 저장한다.
+
+검증 실패 후 어떤 일이 일어나는지는 **BindingResult 파라미터의 존재 여부**로 결정된다. `isBindExceptionRequired()`는 현재 파라미터 **바로 다음** 파라미터가 `Errors` 타입인지 확인한다.
+
+```java
+// BindingResult가 있으면: 예외 없이 컨트롤러 실행, result에 오류 저장
+public String create(@Valid @RequestBody UserDto dto, BindingResult result) { ... }
+
+// BindingResult가 없으면: 예외 throw → 400
+// @RequestBody → MethodArgumentNotValidException
+// @ModelAttribute → BindException
+public String create(@Valid @RequestBody UserDto dto) { ... }
+```
+
+`BindingResult`의 위치가 검증 대상 파라미터 **바로 뒤**여야 하는 이유다. 사이에 다른 파라미터가 끼면 `isBindExceptionRequired()`가 연결을 인식하지 못한다.
+
+<Aside label="@Valid vs @Validated">
+`@Valid`는 `Default` 그룹만 검증하는 javax.validation 표준이다. `@Validated(CreateGroup.class)`는 Spring 전용으로 그룹을 지정할 수 있다. `groups` 속성 없는 어노테이션(`@NotBlank String name`)은 `Default` 그룹에 속하므로, `@Validated(CreateGroup.class)`만 지정하면 이 필드는 검증되지 않는다. 의도치 않은 검증 누락의 흔한 원인이다.
+</Aside>
+
+## 트레이드오프
+
+Chain of Responsibility 패턴의 대가는 디버깅 복잡도다. 어느 Resolver가 이 파라미터를 처리했는지 즉시 알기 어렵다. `TRACE` 로그(`org.springframework.web.method.support`) 또는 `RequestMappingHandlerAdapter`의 `argumentResolvers` 필드를 리플렉션으로 조회하면 추적할 수 있다.
+
+커스텀 Resolver(`@CurrentUser User user` 패턴)는 인증 로직을 컨트롤러에서 완전히 분리하는 강력한 도구다. 핵심 구현 포인트 두 가지: (1) `supportsParameter()`는 **어노테이션 + 타입** 모두 체크해야 한다. 타입 체크를 생략하면 `@CurrentUser String name`처럼 잘못 선언한 파라미터에서 `ClassCastException`이 발생한다. (2) `resolveArgument()`는 매 요청마다 호출되므로, DB 조회 결과를 `request.setAttribute()`로 캐시해 같은 요청 내 중복 조회를 방지해야 한다.
+
+## 정리
+
+- Spring MVC 파라미터 바인딩의 핵심은 **Chain of Responsibility + 캐시**다. Resolver 선택 결과는 캐시되고, 값 생성(`resolveArgument`)만 매 요청마다 실행된다.
+- `@RequestParam`/`@PathVariable`은 같은 부모 클래스를 공유하지만 값 추출 위치가 다르다. `@RequestBody`/`@ModelAttribute`는 변환 메커니즘이 근본적으로 다르다 — Converter vs DataBinder.
+- `@Valid` 검증 결과는 `BindingResult`의 위치로 제어된다. 바로 뒤에 없으면 예외가 된다.
+- 커스텀 Resolver는 `addArgumentResolvers()`로 기본 목록 뒤에, 우선순위가 필요하면 `setArgumentResolvers()`로 앞에 삽입한다.
+
+다음 글에서는 컨트롤러가 값을 **반환**할 때 어떤 파이프라인이 작동하는지 — `HandlerMethodReturnValueHandler` 체인과 View 렌더링의 분기 — 를 추적한다.

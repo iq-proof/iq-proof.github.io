@@ -1,0 +1,149 @@
+---
+title: "DispatcherServlet은 어떻게 HTTP 요청을 응답으로 만드는가"
+description: "Front Controller 패턴부터 doDispatch() 9단계, HandlerMapping 체인, HandlerAdapter, ViewResolver까지 Spring MVC 요청 처리의 전체 여정을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring-mvc, dispatcher-servlet, handler-mapping, handler-adapter, view-resolver]
+difficulty: intermediate
+series:
+  slug: spring-mvc-deep-dive
+  title: Spring Mvc Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@GetMapping("/users/{id}")` 한 줄을 작성하면 HTTP 요청이 알아서 그 메서드로 흘러든다. 그런데 그 "알아서"가 정확히 어떻게 동작하는지 설명할 수 있는가? Tomcat이 소켓을 열고, `DispatcherServlet`이 요청을 받고, 수십 개의 컴포넌트가 연쇄적으로 협력해 JSON 응답 한 줄을 만들어내는 그 여정 — Spring MVC는 이 복잡한 조율을 어떻게 단일 진입점 뒤에 숨겨두는가?
+
+## Front Controller — 단일 진입점의 탄생
+
+Java 서블릿 스펙의 원래 모델은 URL마다 별도의 Servlet 클래스를 등록하는 방식이었다. API가 100개면 Servlet도 100개, 그리고 인증 로직도 100번, 예외 처리도 100번 반복된다. 공통 처리 로직이 분산되고, `web.xml`이 수백 줄로 비대해진다.
+
+**Front Controller 패턴**은 이 문제를 단번에 해결한다. 모든 HTTP 요청을 단 하나의 진입점(`DispatcherServlet`)이 받아서, 내부적으로 올바른 핸들러에게 위임한다. `DispatcherServlet`은 `javax.servlet.http.HttpServlet`의 서브클래스다 — Servlet 스펙을 대체하는 게 아니라 그 위에 올라탄다. Tomcat이 `DispatcherServlet`을 생성하고, `service()`를 호출하고, `DispatcherServlet`은 그 위에서 Spring MVC의 추가 기능을 제공한다.
+
+상속 계층이 이 책임 분리를 드러낸다.
+
+```
+HttpServlet
+  ↑ service() → doGet()/doPost() 분기
+HttpServletBean
+  ↑ init() → ServletConfig의 init-param을 Bean 프로퍼티에 바인딩
+FrameworkServlet
+  ↑ initServletBean() → WebApplicationContext 초기화
+  ↑ processRequest() → LocaleContextHolder, RequestContextHolder ThreadLocal 설정
+DispatcherServlet
+  ↑ onRefresh() → Spring MVC 9가지 컴포넌트 초기화
+  ↑ doDispatch() → 요청 처리 핵심 로직
+```
+
+Spring Boot 환경에서는 `web.xml` 없이도 `DispatcherServletAutoConfiguration`이 `DispatcherServlet` Bean을 생성하고 `DispatcherServletRegistrationBean`으로 Tomcat에 등록한다. 기본 URL 패턴은 `"/"`다.
+
+<Callout type="note" title="/ vs /*">
+`/`는 Tomcat의 DefaultServlet을 오버라이드하지만 JSP 처리는 `JspServlet`에 남긴다. `/*`는 JSP를 포함한 모든 요청을 `DispatcherServlet`이 가로채 정적 리소스와 JSP가 404로 떨어진다. 두 글자 차이가 서비스 장애를 만든다.
+</Callout>
+
+## onRefresh() — 컴포넌트가 깨어나는 순간
+
+`DispatcherServlet`이 생성된다고 바로 요청을 처리할 수 있는 게 아니다. `WebApplicationContext.refresh()` 완료 → `ContextRefreshedEvent` → `onRefresh()` → `initStrategies()` 순서를 거쳐야 한다. Bean 등록이 완료된 뒤에야 MVC 컴포넌트를 수집할 수 있기 때문이다.
+
+`initStrategies()`는 9가지 컴포넌트를 순서대로 초기화한다.
+
+```
+initMultipartResolver()        파일 업로드
+initLocaleResolver()           국제화
+initThemeResolver()            테마
+initHandlerMappings()          URL → 핸들러 매핑  ← 핵심
+initHandlerAdapters()          핸들러 실행        ← 핵심
+initHandlerExceptionResolvers() 예외 처리         ← 핵심
+initRequestToViewNameTranslator()
+initViewResolvers()            View 선택          ← 핵심
+initFlashMapManager()
+```
+
+각 초기화는 `detectAllHandlerMappings=true`(기본값)일 때 `ApplicationContext`에서 해당 타입의 Bean을 전부 수집해 `Order` 순으로 정렬한다. Bean이 하나도 없으면 `DispatcherServlet.properties` 파일의 기본 전략으로 폴백한다. Spring Boot 환경에서는 `WebMvcAutoConfiguration`이 이미 필요한 Bean을 모두 등록해두므로 폴백이 동작할 일이 없다.
+
+## doDispatch() — 9단계 조율
+
+요청이 들어오면 모든 처리는 `doDispatch()` 한 메서드 안에서 조율된다.
+
+```
+① checkMultipart()         multipart/form-data → MultipartHttpServletRequest 래핑
+② getHandler()             HandlerMapping 체인 탐색 → HandlerExecutionChain
+③ getHandlerAdapter()      supports() 체크 → 적합한 HandlerAdapter 선택
+④ Last-Modified 체크       GET/HEAD 요청 304 조기 반환
+⑤ applyPreHandle()         Interceptor 순서대로, false 반환 시 즉시 return
+⑥ ha.handle()              Controller 메서드 실행 → ModelAndView (또는 null)
+⑦ applyDefaultViewName()   View 이름 없으면 URL 기반 자동 생성
+⑧ applyPostHandle()        Interceptor 역순 (Controller 예외 시 스킵)
+⑨ processDispatchResult()  예외→ExceptionResolver / 정상→View렌더링 / afterCompletion 보장
+```
+
+`postHandle`은 Controller가 정상 완료된 경우에만 실행된다. Controller에서 예외가 발생하면 `postHandle`은 건너뛰고 `afterCompletion`만 보장된다. 반드시 실행되어야 하는 정리 로직은 `afterCompletion`에 두어야 한다.
+
+`@ResponseBody`가 붙은 Controller는 `ha.handle()` 내부에서 이미 응답 본문을 `response`에 쓰고 `mv = null`을 반환한다. `processDispatchResult()`에서 `mv == null` 조건으로 View 렌더링이 완전히 건너뛰어진다. ViewResolver는 아예 호출되지 않는다.
+
+## HandlerMapping → HandlerAdapter 체인
+
+`getHandler()`는 등록된 `HandlerMapping`을 순서대로 순회해 첫 번째 non-null `HandlerExecutionChain`을 반환한다.
+
+```
+order=-1  RouterFunctionMapping     → RouterFunction Bean
+order=0   RequestMappingHandlerMapping → @RequestMapping 계열  ← 대부분의 요청
+order=2   BeanNameUrlHandlerMapping  → Bean 이름이 "/" 시작
+order=MAX WelcomePageHandlerMapping, WelcomePageNotFoundHandlerMapping
+```
+
+`RequestMappingHandlerMapping`은 애플리케이션 시작 시 `afterPropertiesSet()` → `initHandlerMethods()`에서 모든 `@Controller` Bean을 스캔해 `RequestMappingInfo`와 `HandlerMethod`를 `MappingRegistry`에 등록한다. 요청이 오면 정확한 URL은 `directPathMappings`에서 O(1)로 조회하고, 패턴 URL은 전체 registry를 순회해 가장 구체적인 매핑을 선택한다. `/users/admin`과 `/users/{id}`가 공존할 때 `/users/admin`이 선택되는 이유가 여기 있다.
+
+`HandlerAdapter`는 Adapter 패턴의 교과서적 적용이다. `DispatcherServlet`은 핸들러 타입을 알 필요 없이 `adapter.supports(handler)` → `adapter.handle()` 두 단계로 실행한다.
+
+```
+RequestMappingHandlerAdapter  → HandlerMethod (@RequestMapping 계열)
+HandlerFunctionAdapter         → HandlerFunction (RouterFunction)
+HttpRequestHandlerAdapter      → HttpRequestHandler (정적 리소스)
+SimpleControllerHandlerAdapter → Controller 인터페이스 (레거시)
+```
+
+`RequestMappingHandlerAdapter.handle()`의 실제 실행 체인은 다음과 같다.
+
+```
+invokeHandlerMethod()
+  → ServletInvocableHandlerMethod.invokeAndHandle()
+    → InvocableHandlerMethod.invokeForRequest()
+      → getMethodArgumentValues()  ← ArgumentResolver 30개+ 순차 탐색
+      → Method.invoke(bean, args)  ← 리플렉션 호출
+    → returnValueHandlers.handleReturnValue()  ← ReturnValueHandler
+```
+
+`@PathVariable`, `@RequestBody`, `@RequestParam` 각각이 별도의 `ArgumentResolver`에 의해 처리되고, 결과 파라미터가 리플렉션 호출에 전달된다.
+
+## ViewResolver와 두 컨텍스트 계층
+
+View 이름이 반환되면 `DispatcherServlet.render()` → `resolveViewName()` → ViewResolver 체인 탐색이 일어난다.
+
+```
+order=-MAX  ContentNegotiatingViewResolver  Accept 헤더 기반 협상
+order=-1    BeanNameViewResolver
+order=1     ThymeleafViewResolver           templates/*.html
+order=MAX   InternalResourceViewResolver    항상 non-null 반환 (마지막 필수)
+```
+
+`InternalResourceViewResolver`는 파일 존재 여부를 확인하지 않고 항상 View를 반환한다. 이것이 마지막 순서에 있어야 하는 이유다 — 앞에 오면 그 뒤의 ViewResolver는 영원히 실행되지 않는다.
+
+컨텍스트 계층도 이 구조에 영향을 준다. 전통적인 Spring MVC는 `RootApplicationContext`(Service, Repository)와 `WebApplicationContext`(Controller)를 분리한다. 자식은 부모 Bean을 찾을 수 있지만 부모는 자식을 모른다. 이 단방향 탐색이 레이어 위반을 구조적으로 막는다. Spring Boot는 단일 `AnnotationConfigServletWebServerApplicationContext`로 양쪽 역할을 겸한다. `getParent() == null`이고 Root와 Web 컨텍스트가 같다.
+
+<Callout type="warning" title="트레이드오프">
+Front Controller 패턴은 공통 처리 로직을 중앙에 모아주는 대신, `DispatcherServlet` 초기화 실패 시 전체 웹 요청이 불가능해지는 단일 장애점이 된다. `HandlerMapping` 체인 탐색은 해시맵 최적화로 실제 오버헤드는 무시할 수준이지만, `detectAllHandlerMappings=false`로 단일 Bean만 사용하면 RouterFunction 등 라이브러리의 HandlerMapping이 무시된다. View 캐싱은 운영 환경 성능을 높이지만 개발 환경에서는 `cache=false`로 끄지 않으면 템플릿 수정이 반영되지 않는다.
+</Callout>
+
+## 정리
+
+- `DispatcherServlet`은 Servlet 스펙의 서브클래스다. Tomcat이 관리하고, `onRefresh()` → `initStrategies()`로 Spring MVC 9가지 컴포넌트를 ApplicationContext에서 수집해 세팅한다.
+- `doDispatch()`는 9단계 조율자다. `afterCompletion`은 항상 실행되고, `postHandle`은 Controller 정상 완료 시에만 실행된다.
+- `@ResponseBody`는 ViewResolver를 우회한다 — `mv == null`이므로 `render()` 자체가 호출되지 않는다.
+- `HandlerMapping`과 `HandlerAdapter`는 모두 체인 구조다. 순서가 동작을 결정한다.
+
+다음 글에서는 `RequestMappingHandlerMapping`이 `@RequestMapping` 정보를 수집하고 `MappingRegistry`에 등록하는 내부 자료구조를, 그리고 `ArgumentResolver`가 파라미터를 준비하는 과정을 더 깊이 추적한다.
