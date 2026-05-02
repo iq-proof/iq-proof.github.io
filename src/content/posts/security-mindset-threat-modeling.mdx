@@ -1,0 +1,102 @@
+---
+title: "보안 설정을 켰다고 안전한 게 아니다"
+description: "공격자가 빠진 것을 찾는 방식부터 STRIDE 위협 분류, DFD 신뢰 경계, Defense in Depth, SDL 통합까지 — 공격자 관점 설계의 전체 구조를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [security, stride, defense-in-depth, threat-modeling, sdl]
+difficulty: intermediate
+series:
+  slug: security-engineering-deep-dive
+  title: Security Engineering Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+2023년 한 핀테크 팀은 Spring Security가 정상 동작 중인 상태에서 침해를 당했다. JWT 인증도 살아 있었다. 취약점은 `/api/admin/users/{id}` 엔드포인트에서 `@PreAuthorize`가 한 줄 빠진 것이었다. 방어자는 "설정했으니 안전하다"고 생각했고, 공격자는 "설정했더라도 빠진 곳이 있다"고 알고 있었다. 이 비대칭이 보안 공학의 출발점이다. 그렇다면 공격자처럼 생각한다는 것은 구체적으로 무엇을 의미하는가?
+
+## 공격자는 빠진 것을 찾는다
+
+방어자는 자신이 만든 것을 기준으로 생각한다. 공격자는 만들지 않은 것, 누락된 것, 가정이 깨지는 경우를 기준으로 생각한다.
+
+같은 API 엔드포인트를 두 시각으로 보면 전혀 다른 질문이 나온다. 방어자: "JWT 검증 필터를 붙였다." 공격자: "인증된 사용자가 다른 사용자의 데이터를 조회할 수 있는가? 토큰의 role 클레임을 서버에서 재검증하는가? 에러 응답이 내부 구조를 노출하는가? 요청 빈도 제한이 있는가?" 방어자의 체크리스트는 구현한 것을 확인하고, 공격자의 체크리스트는 구현하지 않은 것을 탐색한다.
+
+이 사고 전환을 체계화한 도구가 STRIDE다.
+
+## STRIDE — 위협의 6가지 언어
+
+STRIDE는 Microsoft가 정리한 위협 분류 체계로, 소프트웨어 시스템의 위협을 여섯 범주로 묶는다. 범주 자체보다 각 범주가 던지는 **방어 질문**이 핵심이다.
+
+- **Spoofing (신원 위장)**: 이 시스템은 요청자가 실제로 주장하는 당사자임을 어떻게 검증하는가? — JWT alg:none 공격, 세션 탈취, OAuth2 state 미검증이 여기 해당한다.
+- **Tampering (데이터 변조)**: 전송 중 또는 처리 중 데이터가 변조된다면 어떻게 감지하는가? — SQL Injection, HTTP 파라미터 변조, JWT 페이로드 변조.
+- **Repudiation (부인)**: 민감한 행위에 대해 "내가 하지 않았다"는 주장을 반박할 증거가 있는가? — 감사 로그 부재, 변조 가능한 로그 저장소.
+- **Information Disclosure (정보 노출)**: 권한 없는 사용자가 접근할 수 있는 정보는 무엇인가? — 스택 트레이스 응답, Actuator 프로덕션 노출, IDOR.
+- **Denial of Service (서비스 거부)**: 공격자가 정상 사용자의 서비스 이용을 막을 수 있는 방법은? — Rate Limiting 없는 API, ReDoS, 대용량 업로드.
+- **Elevation of Privilege (권한 상승)**: 일반 사용자가 관리자 기능을 실행할 수 있는 경로가 있는가? — Mass Assignment, @PreAuthorize 누락, JWT claims 미검증.
+
+STRIDE는 완벽한 체크리스트가 아니라 "어떤 종류의 위협이 있을 수 있는가?"를 생각하게 만드는 프레임이다.
+
+## DFD와 신뢰 경계 — 어디서 위협이 발생하는가
+
+STRIDE가 위협을 분류한다면, DFD(Data Flow Diagram)는 위협이 발생하는 **위치**를 찾아내는 도구다. DFD에서 가장 중요한 개념은 신뢰 경계(Trust Boundary)다. 서로 다른 신뢰 수준을 가진 두 컴포넌트 사이의 경계를 점선으로 표시하고, **그 경계를 넘는 모든 데이터 흐름이 위협 분석의 대상**이다.
+
+전형적인 Spring 마이크로서비스라면 인터넷 ↔ API Gateway, API Gateway ↔ 내부 서비스, 내부 서비스 ↔ DB, 내부 서비스 ↔ 외부 결제 API 사이에 각각 신뢰 경계가 존재한다.
+
+체크리스트 방식의 보안 검토가 놓치는 것이 바로 이 경계 문제다. "HTTPS 사용? ✓, 인증 있음? ✓, SQL Injection 방어? ✓"를 통과해도 내부 마이크로서비스 간 통신이 인증 없이 HTTP로 동작하거나, 배치 서비스가 운영 DB에 읽기/쓰기 모두 가능한 계정을 쓰는 구조적 취약점은 잡히지 않는다.
+
+PASTA(Process for Attack Simulation and Threat Analysis)는 DFD에서 한 걸음 더 나아가 공격자의 실제 시나리오를 시뮬레이션하고 비즈니스 영향까지 연결한다. 비즈니스 목표 정의 → 기술 범위 → DFD 작성 → 위협 분석 → 취약점 분석 → 공격 시나리오 시뮬레이션 → 위험 우선순위 결정의 7단계로 구성된다. 어디서 시작할지는 DREAD 모델로 정량화한다 — Damage, Reproducibility, Exploitability, Affected Users, Discoverability 각각 1~10점을 합산해 우선순위를 결정한다.
+
+## OWASP Top 10 — 실제로 가장 많이 뚫리는 곳
+
+위협 모델의 추상적 프레임을 실제 발생 빈도로 검증하는 데이터가 OWASP Top 10이다. 500,000개 이상 애플리케이션을 분석한 결과로, 2023년 기준 1위는 **A01: Broken Access Control**이다. 2회 연속 1위다.
+
+이유는 단순하다. 인증은 "누구인가?"를 확인하고, 인가는 "무엇을 할 수 있는가?"를 확인한다. 대부분의 팀은 인증에 집중하고 인가의 세부 구현 — 특히 개별 리소스의 소유권 검증 — 을 놓친다. `GET /api/orders/99999`를 다른 사람이 호출할 수 있는지 확인하는 코드는 Spring Security가 대신 써주지 않는다.
+
+<Callout type="warning" title="Spring Security가 방어해주지 않는 것">
+Spring Security는 HTTP 레이어 인증과 역할 기반 접근 제어를 처리한다. 그러나 `PathVariable`의 리소스 소유권 검증, JPQL 문자열 연결로 인한 인젝션, 외부 URL 요청의 화이트리스트 검증은 개발자가 직접 구현해야 한다. 프레임워크 설정 완료 ≠ 비즈니스 로직 수준의 보안 완료.
+</Callout>
+
+취약점들은 독립적으로 존재하지 않는다. SSRF(A10)로 내부 서비스에 접근하고, 내부 서비스의 SQL Injection(A03)을 원격으로 악용하고, 탈취한 관리자 계정으로 권한 상승(A01)하는 연쇄 공격이 실제 침해 사고의 전형적인 패턴이다.
+
+## Defense in Depth — 레이어마다 다른 방어
+
+단일 방어선은 반드시 뚫린다. WAF도, Spring Security도, DB 암호화도 단독으로는 충분하지 않다. Defense in Depth의 핵심은 **한 레이어가 뚫렸을 때 다음 레이어가 피해를 제한하는 구조**다.
+
+같은 SQL Injection 공격을 레이어별로 방어하면 다음과 같다.
+
+```
+레이어 1 (네트워크): DB를 VPC 내부에 배치 → 외부 직접 접근 차단
+레이어 2 (애플리케이션): PreparedStatement 파라미터 바인딩 → 공격 자체 차단
+레이어 3 (DB 권한): orders 테이블 SELECT/INSERT만 허용 → 피해 범위 최소화
+레이어 4 (암호화): 카드번호 애플리케이션 레벨 암호화 → 데이터 탈취해도 무용지물
+레이어 5 (감사 로그): 비정상 쿼리 패턴 탐지 → 뚫려도 즉시 탐지
+```
+
+이 구조에서 "Security by Default" 원칙이 작동한다. 기본적으로 모든 것을 차단하고 필요한 것만 열어라. `.csrf().disable()`을 쓸 때 왜 안전한지 설명할 수 있어야 한다.
+
+<Aside label="설계 철학">
+Defense in Depth는 완벽한 방어가 불가능하다는 전제에서 출발한다. 목표는 공격을 0으로 만드는 것이 아니라, 뚫렸을 때 피해를 제한하고 탐지 시간을 줄이는 것이다. IBM 2022 보고서 기준 평균 침해 탐지 시간은 197일이다. 감사 로그와 이상 탐지를 갖추면 이를 수 시간으로 단축할 수 있다.
+</Aside>
+
+## SDL — 보안을 개발 과정에 내재화하기
+
+"보안 스프린트를 별도로 잡는" 접근 방식의 문제는 발견 시점이 너무 늦다는 것이다. NIST 연구 기준, 출시 후 발견된 취약점의 수정 비용은 설계 단계 수정 비용의 평균 30배다.
+
+SDL(Security Development Lifecycle)은 각 단계에 보안 활동을 분산시킨다.
+
+- **설계 단계**: 기능 요구사항에 보안 요구사항을 함께 작성. 새 기능의 DFD를 그리고 STRIDE를 적용해 위협 목록 도출.
+- **개발 단계**: 개발자 보안 체크리스트 — @PreAuthorize 적용 여부, @Query에 문자열 연결(+) 없음, 에러 응답에 스택 트레이스 미포함, 로그에 PII 없음.
+- **코드 리뷰 단계**: PR 템플릿에 보안 체크리스트를 포함. 리뷰어는 findById 결과의 소유자 검증, @Query 어노테이션의 파라미터 바인딩, 에러 응답의 정보 노출을 중점 확인한다.
+- **CI/CD 단계**: Gitleaks로 하드코딩된 비밀번호 스캔, OWASP Dependency-Check로 HIGH/CRITICAL CVE 탐지, SpotBugs로 보안 패턴 정적 분석. HIGH/CRITICAL CVE는 빌드 실패로 PR 머지를 차단한다.
+- **운영 단계**: 인증 실패, 권한 오류, 비업무 시간 관리자 접근에 대한 이상 탐지 알림.
+
+<Callout type="note" title="트레이드오프">
+모든 레이어와 SDL 활동을 동시에 도입하는 것은 불가능하다. 5인 스타트업이라면 PR 보안 체크리스트와 Gitleaks CI 통합(설정 30분, 비용 0)부터 시작하고, 시스템 복잡도가 증가할수록 위협 모델링과 SIEM을 추가하는 점진적 접근이 현실적이다. 완벽한 SDL보다 지속 가능한 SDL이 먼저다.
+</Callout>
+
+## 정리
+
+- 공격

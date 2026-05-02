@@ -1,0 +1,127 @@
+---
+title: "API 보안의 근본은 하나다 — '신뢰하지 말고 검증하라'"
+description: "IDOR, 권한 상승, Mass Assignment, Rate Limiting, JWT 클레임 검증, 최소 권한 원칙까지. Spring 기반 API 보안 취약점의 공통 원인과 방어 패턴을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [security, spring, authorization, jwt, api-security]
+difficulty: intermediate
+series:
+  slug: security-engineering-deep-dive
+  title: Security Engineering Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`@PreAuthorize("isAuthenticated()")`를 붙였는데도 다른 사용자의 주문이 조회된다. JWT 서명은 유효한데 퇴사자가 관리자 API를 호출한다. 프론트엔드에서 숨긴 필드가 API 요청으로 변조된다. 이 버그들은 서로 다른 취약점처럼 보이지만 뿌리는 하나다. **인증(Authentication)과 인가(Authorization)를 혼동하거나, "이미 검증했다"고 가정하는 순간 구멍이 생긴다.** 왜 이 패턴이 반복되는가?
+
+## 인증 ≠ 인가 — IDOR가 드러내는 혼동
+
+IDOR(Insecure Direct Object Reference)는 API 보안 취약점 중 가장 단순하면서도 가장 자주 발생한다. 공격자는 로그인 상태에서 URL의 숫자 하나를 바꾼다.
+
+```java
+// 취약한 코드: 로그인 여부만 확인
+@PreAuthorize("isAuthenticated()")
+@GetMapping("/{orderId}")
+public ResponseEntity<OrderDto> getOrder(@PathVariable Long orderId) {
+    return ResponseEntity.ok(new OrderDto(orderService.findById(orderId)));
+}
+```
+
+`isAuthenticated()`는 "이 사람이 로그인했는가"만 묻는다. "이 사람이 이 주문의 소유자인가"는 묻지 않는다. 인증을 통과했다고 인가까지 통과한 게 아니다.
+
+방어는 DB 쿼리 한 줄의 차이다.
+
+```java
+// WHERE id = ? → WHERE id = ? AND user_id = ?
+Optional<Order> findByIdAndUserId(Long id, Long userId);
+```
+
+`findByIdAndUserId`가 빈 Optional을 반환하면 403을 던진다. 소유권 검증은 애플리케이션 계층이 아니라 DB 계층에서 필터링하는 것이 가장 효과적이다.
+
+## 수평·수직 권한 상승 — "숨김"은 보안이 아니다
+
+수평적 권한 상승은 같은 권한 레벨의 다른 사용자 데이터에 접근하는 것이고, 수직적 권한 상승은 낮은 권한으로 높은 권한 기능을 사용하는 것이다. 둘 다 프론트엔드에서 메뉴를 숨기는 것으로는 막을 수 없다.
+
+`/api/admin/discounts/apply` 엔드포인트가 프론트엔드에 없더라도, Postman으로 직접 호출하면 그만이다. 백엔드 API에 `@PreAuthorize("hasRole('ADMIN')")` 없이 노출된 엔드포인트는 숨겨진 게 아니라 그냥 열려 있는 것이다.
+
+JWT 클레임 변조도 같은 선상에 있다. 토큰에 `"role": "ROLE_USER"`가 있을 때, 클라이언트가 이를 `"ROLE_ADMIN"`으로 바꿔 보내면 서버가 DB를 재검증하지 않는 한 그대로 통과한다.
+
+```java
+// 취약: 토큰의 role 클레임을 그대로 신뢰
+String role = claims.get("role").toString();
+authorities.add(new SimpleGrantedAuthority(role));
+
+// 방어: DB에서 현재 권한을 매번 조회
+User user = userRepository.findById(userId).orElseThrow();
+List<GrantedAuthority> authorities = user.getRoles().stream()
+    .map(r -> new SimpleGrantedAuthority(r.getRoleName()))
+    .collect(Collectors.toList());
+```
+
+<Callout type="warning" title="JWT는 불변이 아니다">
+JWT 서명은 위변조를 탐지하지만, 권한 정보가 발급 이후 DB에서 변경되는 것을 막지 못한다. 퇴사자의 역할 박탈, 계정 정지 — 이 변경이 즉시 반영되려면 토큰에 role을 담지 말고, 매 요청마다 DB에서 재조회해야 한다.
+</Callout>
+
+## Mass Assignment — 보내지 않았으면 받아서도 안 된다
+
+Mass Assignment는 API가 JSON 필드를 엔티티에 전부 매핑할 때 발생한다. 프론트엔드가 `username`과 `email`만 노출해도, 공격자는 `role: "ADMIN"`이나 `accountBalance: 9999999`를 요청 본문에 추가한다.
+
+방어의 핵심은 Request DTO와 Entity를 분리하는 것이다. DTO에는 사용자가 변경할 수 있는 필드만 선언한다.
+
+```java
+// Request DTO: username, email, phone만 — role, balance는 없다
+public class UserUpdateRequest {
+    private String username;
+    private String email;
+    private String phone;
+    // role 없음, accountBalance 없음
+}
+```
+
+서비스 계층에서도 명시적인 필드만 복사한다. `BeanUtils.copyProperties(request, entity)`는 DTO에 없는 필드까지 null로 덮어쓸 수 있어 위험하다. MapStruct의 `@Mapping` 명시적 선언이나, 수동 setter 호출이 더 안전하다.
+
+민감한 필드(역할 변경, 잔액 조정)는 별도의 관리자 API 엔드포인트에서만 처리하고, 해당 엔드포인트에 `@PreAuthorize("hasRole('ADMIN')")`를 선언한다.
+
+## Rate Limiting — 엔드포인트마다 다른 이유
+
+Rate Limiting은 단순히 "초당 요청 수 제한"이 아니다. 로그인 API와 게시물 조회 API에 같은 한도를 적용하면 둘 다 망친다. 로그인은 분당 5회로 제한해야 무차별 대입 공격을 막을 수 있고, 조회 API는 분당 수백~수천 회를 허용해야 정상 사용성이 보장된다.
+
+Redis 기반 슬라이딩 윈도우가 실무에서 가장 많이 쓰인다. 키 설계가 핵심이다.
+
+```
+rate-limit:{userId}:{method}:{path}
+```
+
+IP 기반 키만 사용하면 같은 NAT 뒤의 정상 사용자 전체가 공격자 한 명 때문에 차단된다. 인증된 요청은 사용자 ID 기반, 미인증은 IP 기반으로 분리한다. 제한 초과 시 응답은 `HTTP 429`와 `Retry-After` 헤더가 함께 가야 클라이언트가 올바르게 처리할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+Redis 의존성이 추가되면 네트워크 지연이 생긴다. 로컬 메모리 카운터로 1차 필터링하고, Redis로 정확한 카운트를 동기화하는 하이브리드 방식이 성능과 정확성의 균형점이다. 캐시 미스 비용을 감수하더라도 분산 환경에서는 Redis가 필수적이다.
+</Callout>
+
+## 최소 권한 원칙 — 묵시적 신뢰를 끊어라
+
+이 챕터들이 공유하는 철학의 이름은 **최소 권한 원칙(Principle of Least Privilege)**이다. 각 컴포넌트는 자신의 업무에 필요한 최소 권한만 가져야 한다.
+
+DB 계정에 root를 쓰면, 개발 서버가 침투됐을 때 프로덕션 전체가 노출된다. 애플리케이션 계정에는 `SELECT, INSERT, UPDATE`만, 특정 DB 호스트에서만 접속 가능하도록 제한한다. `DROP`과 `ALTER`는 마이그레이션 전용 계정이 필요할 때만, 일회성으로 부여한다.
+
+AWS IAM 와일드카드(`"Action": "*", "Resource": "*"`)는 자격증명 탈취 한 번으로 전체 계정이 무너진다는 뜻이다. 개발자는 개발 버킷의 `s3:GetObject, s3:PutObject`만, 특정 리전에서만.
+
+Spring에서는 HTTP 보안 설정과 메서드 보안 어노테이션을 함께 써야 한다. URL 패턴 매칭만으로는 `/api/v2/admin/users` 같은 우회 경로를 막을 수 없다. `@PreAuthorize("hasRole('ADMIN')")`는 메서드에 직접 붙어야 버전이 바뀌어도 보호된다.
+
+<Aside label="자동화가 열쇠다">
+권한 관리의 가장 큰 위험은 "퇴사자 권한 회수 누락"이다. 계약 만료일을 DB에 저장하고, 스케줄러가 매일 만료된 계정을 자동으로 비활성화하도록 구성하면 인적 실수를 제거할 수 있다.
+</Aside>
+
+## 정리
+
+- **IDOR**: 인증과 인가를 혼동하지 말라. `WHERE id = ? AND user_id = ?` 한 줄이 방어선이다.
+- **권한 상승**: 프론트엔드 숨김은 보안이 아니다. JWT 클레임은 신뢰하지 말고 DB에서 매번 재검증하라.
+- **Mass Assignment**: Request DTO와 Entity를 분리하고, DTO에는 허용된 필드만 선언하라.
+- **Rate Limiting**: 엔드포인트 특성에 맞게 차등 적용하고, 사용자 ID 기반으로 식별하라.
+- **최소 권한**: DB 계정, IAM 정책, Kubernetes RBAC, Spring 메서드 보안 — 모든 계층에서 묵시적 신뢰를 끊어라.
+
+모든 취약점은 "이미 검증됐을 것"이라는 가정에서 시작된다. API 보안은 그 가정을 코드로 명시적으로 깨는 작업이다.
