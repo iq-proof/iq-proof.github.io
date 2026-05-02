@@ -1,0 +1,149 @@
+---
+title: "Java CAS의 설계 철학 — 원자성, 경쟁, 그리고 트레이드오프"
+description: "CPU 레벨 LOCK CMPXCHG부터 LongAdder의 Cell 분산, ConcurrentLinkedQueue의 Lock-Free 설계, VarHandle 메모리 오더링까지 Java CAS 생태계의 통일된 원리를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, concurrency, cas, lock-free, varhandle]
+difficulty: advanced
+series:
+  slug: java-concurrency-deep-dive
+  title: Java Concurrency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java의 `AtomicInteger`, `ConcurrentHashMap`, `LongAdder`는 서로 다른 문제를 푸는 것처럼 보인다. 하지만 이 클래스들을 관통하는 단 하나의 질문이 있다 — **"어떻게 락 없이 원자성을 보장하는가?"** 그리고 그 답이 낳은 필연적 트레이드오프는 무엇인가?
+
+## CAS — 원자성의 최소 단위
+
+CAS(Compare-And-Swap)는 CPU 명령어 하나다. x86에서는 `LOCK CMPXCHG`로 구현된다.
+
+```bash
+# 의미론: 원자적으로
+# if (메모리[addr] == expected) { 메모리[addr] = newValue; return true; }
+# else { return false; }
+LOCK CMPXCHG [addr], newValue
+```
+
+`LOCK` 접두사는 메모리 버스 전체가 아닌 해당 캐시 라인(64바이트)을 독점한다. MESI 프로토콜이 그 캐시 라인을 Modified 상태로 만들고, 다른 코어의 접근을 차단한다. 비용은 캐시 히트 무경쟁 시 약 20~40 사이클 — 일반 `load`(~4 사이클)의 5~10배다.
+
+CAS는 실패를 허용한다. 그래서 실제 사용은 항상 루프다.
+
+```java
+int expected, next;
+do {
+    expected = var.get();      // 현재 값 읽기
+    next = expected + 1;       // 새 값 계산
+} while (!var.compareAndSet(expected, next));  // CAS 시도, 실패 시 재시도
+```
+
+이 패턴이 **Optimistic Locking**이다. 충돌이 드물다고 가정하고 먼저 작업하고, 실패 시 재시도한다.
+
+## ABA — CAS가 보지 못하는 것
+
+CAS는 값이 같으면 성공한다. 그런데 값이 A → B → A로 변했어도 CAS는 성공한다. 이것이 ABA 문제다.
+
+<Theorem kind="proposition" number="1" title="ABA 문제의 위험 조건">
+단순 값 카운터에서 ABA는 대개 무해하다. 위험해지는 조건은 두 가지다: 참조 타입 포인터를 CAS할 때, 그리고 같은 객체가 다른 논리적 상태로 재삽입될 수 있을 때.
+</Theorem>
+
+<Proof>
+Lock-Free 스택에서 top → A → B → null 상태를 가정하자. Thread 1이 A를 pop하려고 `expected = A`를 기억하고 일시 정지한다. 이때 Thread 2가 A를 pop하고, B를 pop하고, A를 다시 push한다(같은 객체 재사용). Thread 1이 재개해서 `CAS(top, A, B)`를 실행하면 — 성공한다. 그러나 B는 이미 Thread 2에 의해 제거된 상태다. top이 해제된 노드를 가리키는 논리적 버그가 발생한다.
+
+Java의 GC는 참조가 살아있는 동안 메모리를 해제하지 않으므로 C/C++의 use-after-free는 없지만, 논리적 데이터 손상은 여전히 발생한다.
+</Proof>
+
+해결책은 버전 스탬프다. `AtomicStampedReference`는 `(참조, stamp)` 쌍을 단일 volatile 참조로 묶어 관리한다. A(stamp=0) → B(stamp=1) → A(stamp=2) 변화에서 stamp 불일치로 ABA를 탐지한다. 대가는 쓰기마다 새 `Pair` 객체 생성 — GC 압박이다.
+
+## 고경쟁의 벽 — CAS가 느려질 때
+
+CAS 루프의 근본적 한계는 경쟁이다.
+
+```
+스레드 수    | AtomicLong  | LongAdder   | 비율
+───────────┼─────────────┼─────────────┼──────
+1          | 500,000/ms  | 450,000/ms  | 0.9x
+8          | 100,000/ms  | 530,000/ms  | 5.3x
+32         |  25,000/ms  | 545,000/ms  | 21.8x
+```
+
+32개 스레드가 하나의 캐시 라인에서 `LOCK XADD`를 경합하면 직렬화된다. 처리량이 스레드 수에 반비례한다.
+
+`LongAdder`는 이 문제를 구조적으로 해결한다. `Striped64` 기반의 `Cell[]` 배열로 경합을 분산시킨다.
+
+```
+Thread T1 ──→ Cell[0] (독립 캐시 라인)
+Thread T2 ──→ Cell[1] (독립 캐시 라인)
+Thread T3 ──→ Cell[2] (독립 캐시 라인)
+
+sum() = base + Cell[0] + Cell[1] + Cell[2] + ...
+```
+
+`@Contended` 어노테이션이 각 Cell에 128바이트 패딩을 주어 False Sharing을 차단한다. 결과적으로 각 스레드는 자신의 Cell에서 거의 무경쟁으로 CAS를 실행한다.
+
+<Callout type="warning" title="LongAdder의 트레이드오프">
+`sum()`은 일관성을 보장하지 않는다. 순회하는 동안 다른 스레드가 Cell을 수정할 수 있다. "특정 값에 도달했는지" 감지하거나, 정확한 시퀀스 번호가 필요하다면 `AtomicLong`을 써야 한다. `LongAdder`는 빠른 집계 카운터고, `AtomicLong`은 정확한 상태 관리다.
+</Callout>
+
+## Lock-Free 자료구조 — CAS의 구조적 확장
+
+`ConcurrentLinkedQueue`는 Michael-Scott 알고리즘(1996)을 구현한다. CAS만으로 FIFO를 구현하는 전형적 패턴이다.
+
+핵심은 두 가지다. 첫째, **Helping 메커니즘** — 다른 스레드의 미완성 작업을 완성시켜준다. `tail`이 뒤처진 것을 발견한 스레드가 `tail`을 전진시킨 후 자신의 작업을 시작한다. "항상 적어도 하나의 스레드가 진행한다"는 Lock-Free 보장의 구현이다.
+
+둘째, **논리적 삭제** — `poll()` 시 노드를 즉시 제거하지 않고 `item = null`로 마킹한다. 물리적 제거는 별도 CAS로 분리된다. 이 두 단계 분리가 ABA를 방지한다.
+
+```
+head → [dummy] → [node1] → [node2] → [tail]
+                    ↑ item=null (논리 삭제됨)
+```
+
+단, `ConcurrentLinkedQueue`는 생산자-소비자 패턴의 만능 해결책이 아니다. 큐가 비었을 때 소비자가 `null`을 받고 루프를 돌면 busy-wait가 된다. 소비자가 블로킹을 필요로 한다면 `LinkedBlockingQueue`가 더 적합하다.
+
+## VarHandle — CAS 아래의 정밀 도구
+
+Java 9부터 `VarHandle`이 `sun.misc.Unsafe`를 대체한다. 같은 `LOCK CMPXCHG` 성능을 공식 API로 제공하면서, 메모리 오더링을 세밀하게 제어할 수 있다.
+
+4단계 오더(강한 것 → 약한 것):
+
+| 모드 | 보장 | x86 비용 |
+|:---|:---|:---|
+| `volatile` | 완전한 순차 일관성 | StoreLoad 펜스 (~100ns 쓰기) |
+| `acquire/release` | 절반 펜스 (게시 패턴) | TSO로 거의 무료 |
+| `opaque` | 컴파일러 재정렬만 방지 | 거의 없음 |
+| `plain` | 보장 없음 | 없음 |
+
+게시(publication) 패턴에서 `setRelease`/`getAcquire` 쌍은 `volatile`과 동등한 happens-before를 보장하면서 StoreLoad 펜스 비용을 절약한다.
+
+```java
+// 쓰기 측 (Producer)
+DATA.set(this, value);           // plain: 데이터 쓰기
+READY.setRelease(this, true);   // release: 데이터가 먼저 보임 보장
+
+// 읽기 측 (Consumer)
+if ((boolean) READY.getAcquire(this)) {  // acquire: LoadLoad 펜스
+    return (int) DATA.get(this);          // plain: acquire 이후이므로 안전
+}
+```
+
+x86에서는 TSO(Total Store Order) 덕분에 `acquire`/`release` 비용이 거의 없다. ARM(AWS Graviton, Apple M)에서는 40% 이상의 차이가 난다. 크로스 플랫폼 라이브러리라면 이 구분이 의미 있다.
+
+<Aside label="설계 철학">
+CAS에서 VarHandle까지, Java 동시성 API의 모든 계층은 같은 질문에 답한다 — "얼마나 강한 보장이 필요한가?" 강한 보장일수록 비싸다. `LongAdder`가 `AtomicLong`보다 빠른 이유도, `setRelease`가 `setVolatile`보다 빠른 이유도 같다: 필요 이상의 보장을 하지 않는다.
+</Aside>
+
+## 정리
+
+- CAS(`LOCK CMPXCHG`)는 캐시 라인 독점으로 원자성을 보장한다. 경쟁 없을 때 ~20~40 사이클, 고경쟁 시 CAS 실패가 폭증한다.
+- ABA 문제는 단순 카운터에서는 무해하지만, 참조 타입과 Lock-Free 자료구조에서 논리적 버그로 이어진다. `AtomicStampedReference`가 해결책이지만 GC 압박이 대가다.
+- `LongAdder`는 `Cell[]` 분산으로 고경쟁 문제를 구조적으로 해결한다. 대신 `sum()`의 일관성을 포기한다.
+- Lock-Free 자료구조(Michael-Scott Queue)는 Helping과 논리적 삭제로 ABA를 방지하되, `size()` O(N), busy-wait 등 새로운 제약을 낳는다.
+- VarHandle의 4단계 메모리 오더는 "필요한 만큼만 보장하고 나머지는 포기"하는 같은 철학의 정밀 도구다.
+
+다음 글에서는 이 원칙들이 `ConcurrentHashMap`의 세그먼트 분리와 `compute()` 원자성 구현에서 어떻게 결합되는지 추적한다.

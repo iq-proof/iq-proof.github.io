@@ -1,0 +1,157 @@
+---
+title: "Virtual Thread는 왜 OS 스레드의 한계를 넘는가"
+description: "Thread-per-Request 모델의 처리량 상한선부터 Pinning·ThreadLocal 함정까지, Java 21 Virtual Thread의 설계 원리와 실전 함의를 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, virtual-thread, concurrency, project-loom, jvm]
+difficulty: intermediate
+series:
+  slug: java-concurrency-deep-dive
+  title: Java Concurrency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 21의 Virtual Thread는 "스레드 풀 크기를 얼마로 설정해야 하는가"라는 수십 년간의 질문에 "스레드를 수백만 개 만들면 된다"는 새로운 답을 제시한다. OS 스레드 1개당 ~1MB 메모리를 소비하던 모델에서, JVM 힙 위의 수 KB짜리 Continuation으로 전환하는 것이 어떻게 가능한가? 그리고 이 전환에는 어떤 새로운 함정이 따라오는가?
+
+## OS 스레드가 I/O 바운드에 취약한 이유
+
+전형적인 웹 서버 요청을 분해하면 구조가 드러난다.
+
+```
+요청 수신
+  ├── DB 쿼리    10ms  ← 스레드 WAITING
+  ├── 외부 API   50ms  ← 스레드 WAITING
+  ├── 파일 읽기   5ms  ← 스레드 WAITING
+  └── 응답 생성   1ms  ← 실제 CPU 사용
+
+총 66ms, CPU 사용 1ms (1.5%)
+```
+
+OS 스레드는 I/O 대기 중에도 스택 메모리(기본 ~1MB)를 점유하고 스케줄러 부담을 유지한다. 10,000 req/s를 달성하려면 `100ms/요청 × 1000개 스레드`가 필요하고, 그건 ~1GB RAM이다. 이것이 C10K 문제의 본질이다.
+
+기존 해결책은 두 방향이었다. Reactive(WebFlux)는 처리량 문제를 해결하지만 코드를 `Mono/Flux` API로 전면 재작성해야 한다. 스레드 풀 확장은 처리량 상한선을 풀 크기에 고정시킨다. Virtual Thread는 세 번째 방향을 제안한다 — **기존 동기 코드 그대로, I/O 대기 비용만 제거**.
+
+## Continuation이 문제를 해결하는 방식
+
+Virtual Thread의 핵심 구조는 M:N 매핑이다.
+
+```
+수백만 개 Virtual Thread
+        ↕  JVM 스케줄러 (ForkJoinPool)
+수십 개 캐리어 스레드 (OS 스레드, CPU 코어 수)
+```
+
+VT가 `Socket.read()` 같은 블로킹 I/O를 만나면 다음 흐름이 작동한다.
+
+1. JDK 내부에서 NIO non-blocking read를 시도한다.
+2. 데이터가 없으면(EAGAIN) Poller에 fd를 등록하고 `LockSupport.park()`를 호출한다.
+3. park → **VT Unmount**: 현재 스택 프레임이 힙의 `StackChunk`로 복사된다.
+4. 캐리어 스레드는 즉시 다른 VT를 실행한다.
+5. 데이터 도착 → Poller가 `unpark` → VT Mount → 힙에서 스택 복원 → 실행 재개.
+
+`Thread.sleep()`도 동일하다. 내부적으로 `LockSupport.parkNanos()`를 호출하므로 캐리어를 블로킹하지 않는다. VT 100만 개가 sleep 중이어도 캐리어 스레드는 자유롭다.
+
+```java
+// 코드는 동기 스타일 그대로
+ExecutorService vExecutor = Executors.newVirtualThreadPerTaskExecutor();
+vExecutor.submit(() -> {
+    String data = httpClient.get("https://api.example.com");  // Unmount → Mount
+    return processData(data);
+});
+```
+
+## Pinning — synchronized가 숨긴 함정
+
+Unmount가 발생하지 않는 조건이 있다. **synchronized 블록 내 블로킹**이다.
+
+JVM 모니터(`synchronized`)는 내부적으로 `ObjectMonitor._owner`에 **OS 스레드 포인터**를 저장한다. VT가 Unmount되면 캐리어(OS 스레드)가 바뀔 수 있는데, 모니터 소유자가 이전 캐리어를 가리키므로 해제가 불가능해진다. 결국 VT는 캐리어에 고착(Pinned)된다.
+
+<Callout type="warning" title="Pinning = 캐리어 고착">
+`synchronized` 블록 내에서 `Thread.sleep()`, I/O, `ReentrantLock.lock()` 대기 등 어떤 블로킹도 Pinning을 유발한다. Pinning된 VT는 캐리어를 독점하며, VT로 전환해도 OS 스레드 방식과 처리량이 같아진다.
+</Callout>
+
+해결책은 명확하다. `synchronized → ReentrantLock`으로 교체한다. AQS(AbstractQueuedSynchronizer)는 VT 자체(Thread 객체)를 소유자로 추적하므로 Unmount 후 캐리어가 바뀌어도 정상 동작한다.
+
+```java
+// Before (Pinning)
+synchronized (lock) {
+    result = db.query("SELECT ...");  // 캐리어 고착
+}
+
+// After (Unmount 가능)
+lock.lock();
+try {
+    result = db.query("SELECT ...");  // VT Unmount → 캐리어 해방
+} finally { lock.unlock(); }
+```
+
+진단은 JVM 플래그로 시작한다.
+
+```bash
+# 개발 환경: Pinning 발생 즉시 스택 출력
+java -Djdk.tracePinnedThreads=full MyApp
+
+# 운영 환경: JFR 이벤트
+jcmd <pid> JFR.start duration=30s filename=pinning.jfr
+jfr print --events jdk.VirtualThreadPinned pinning.jfr
+```
+
+## ThreadLocal과 ScopedValue
+
+`synchronized` 외에 또 다른 함정이 있다. Spring Security의 `SecurityContextHolder`, SLF4J MDC, DB 트랜잭션 컨텍스트는 모두 `ThreadLocal`을 사용한다. OS 스레드 환경에서는 스레드 수가 수백 개 수준이지만, VT 환경에서는 각 요청마다 새 VT가 생성되고 각각 독립적인 `ThreadLocalMap`을 갖는다. VT 100만 개 = `ThreadLocalMap` 100만 개 = 메모리 압박.
+
+VT를 풀링하는 것은 안티패턴이다. `ThreadLocal` 값이 다음 요청으로 누출되기 때문이다. 항상 `Executors.newVirtualThreadPerTaskExecutor()`로 태스크마다 새 VT를 생성해야 한다.
+
+Java 21의 `ScopedValue`는 이 문제의 근본 해결책이다.
+
+```java
+static final ScopedValue<String> USER_ID = ScopedValue.newInstance();
+
+ScopedValue.where(USER_ID, "user-123")
+           .run(() -> {
+               // 이 스코프 내에서 어디서든 읽기 가능
+               processRequest();  // USER_ID.get() == "user-123"
+           });
+// 스코프 종료 시 자동 정리 — remove() 불필요
+```
+
+`ScopedValue`는 불변이고, `run()` 블록 종료 시 자동으로 정리되며, `StructuredTaskScope`의 자식 VT에 복사 없이 참조로 상속된다. 요청 컨텍스트(userId, traceId) 전달은 `ThreadLocal`에서 `ScopedValue`로 이전하는 것이 VT 환경에서의 올바른 방향이다.
+
+## Spring Boot 통합과 트레이드오프
+
+Spring Boot 3.2부터는 설정 한 줄로 Tomcat 요청 처리 스레드 전체를 VT로 전환할 수 있다.
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+이 설정은 Tomcat 요청 처리 스레드와 `@Async` 기본 executor를 VT로 전환한다. HikariCP 커넥션 풀은 흥미로운 변화를 보인다. VT가 커넥션 대기 중 Unmount되므로, 커넥션 풀 크기를 줄여도 처리량을 유지할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+**이점**: I/O 바운드 API 처리량 향상, 기존 동기 코드 유지, 메모리 효율.  
+**제약**: `synchronized` 내 I/O는 Pinning 유발(JEP 491에서 개선 예정), 대량 VT 환경에서 `ThreadLocal` 남용은 메모리 압박, CPU 바운드 작업은 이점 없음.  
+**마이그레이션 순서**: VT 활성화 → `-Djdk.tracePinnedThreads=full`로 Pinning 스캔 → 수정 → 부하 테스트 → 운영 배포.
+</Callout>
+
+`StructuredTaskScope`는 여러 VT 작업을 구조화된 방식으로 조율한다. `ShutdownOnFailure`는 하나가 실패하면 나머지를 취소하고, `ShutdownOnSuccess`는 가장 빠른 하나가 성공하면 나머지를 취소한다. 순차 실행이 80ms인 API가 병렬 VT로 50ms가 되는 것은 이 패턴으로 구현한다.
+
+<Aside label="설계 철학">
+Virtual Thread의 핵심 가치는 "비동기의 이점을 동기 코드 스타일로"다. Reactive가 강요하는 인지 부담 없이, 기존 Java 생태계(JDBC, Spring, JUnit)를 그대로 쓰면서 Non-Blocking 효율을 얻는다. 대신 사용자에게 "Pinning 주의"와 "ThreadLocal 절제"라는 새로운 책임을 요구한다.
+</Aside>
+
+## 정리
+
+- OS 스레드 모델의 처리량 상한은 I/O 대기 중 스레드를 낭비하는 구조에서 온다.
+- Virtual Thread는 Continuation을 힙에 저장해 I/O 대기 비용을 제거한다. 캐리어는 항상 실제 작업에만 쓰인다.
+- `synchronized` 내 블로킹은 Pinning을 유발한다. `ReentrantLock`으로 교체하거나, I/O를 synchronized 밖으로 이동해 해결한다.
+- 대량 VT 환경에서 `ThreadLocal`은 메모리 압박의 원인이 된다. 요청 컨텍스트는 `ScopedValue`로 전환하는 것이 올바른 방향이다.
+
+다음 글에서는 VT 환경에서 데드락이 어떻게 발생하고 진단하는지, `ReentrantLock`과 `synchronized`의 차이가 실제 데드락 패턴에 어떤 영향을 주는지 추적한다.

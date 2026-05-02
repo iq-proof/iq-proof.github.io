@@ -1,0 +1,130 @@
+---
+title: "Java 동시성 자료구조는 어떻게 락을 줄이는가"
+description: "ConcurrentHashMap의 CAS 전환부터 CopyOnWriteArrayList의 스냅샷 보장, BlockingQueue의 분리 락, ConcurrentSkipListMap의 Lock-Free 삭제까지, Java 동시성 컬렉션의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, concurrency, cas, lock-free, blocking-queue]
+difficulty: advanced
+series:
+  slug: java-concurrency-deep-dive
+  title: Java Concurrency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Collapse from '@/components/mdx/Collapse.astro';
+
+Java 동시성 컬렉션들은 저마다 다른 방식으로 같은 질문에 답한다 — "어떻게 하면 락을 덜 잡고도 스레드 안전성을 보장할 수 있는가?" `ConcurrentHashMap`은 버킷 단위 CAS로, `CopyOnWriteArrayList`는 불변 스냅샷으로, `LinkedBlockingQueue`는 락을 둘로 쪼개서 각자의 방식으로 이 문제를 푼다. 이 설계들이 공유하는 철학은 무엇인가?
+
+## 전역 락에서 국소 락으로
+
+Java 7의 `ConcurrentHashMap`은 16개 `Segment`를 두었다. 각 세그먼트가 독립적인 `ReentrantLock`을 가지므로, 서로 다른 세그먼트에 접근하는 스레드들은 병렬로 실행된다. 하지만 동시성 수준이 세그먼트 수에 묶여 있고, 균일하게 분산되지 않으면 특정 세그먼트에 경합이 몰린다.
+
+Java 8은 세그먼트를 버렸다. 대신 **버킷 레벨 `synchronized`와 CAS를 조합**했다.
+
+```java
+// 빈 버킷 삽입: CAS (락 없음)
+if (CAS(table[hash], null, new Node(k, v))) {
+    // 성공, 완료
+}
+
+// 기존 버킷 수정: 버킷 head에만 synchronized
+synchronized (head) {
+    // 연결 리스트 또는 TreeBin 조작
+}
+```
+
+빈 버킷에 첫 노드를 삽입할 때는 락이 전혀 없다. 충돌이 없는 버킷들은 완전히 병렬로 동작한다. 동시성 수준의 상한이 세그먼트 수(16)에서 버킷 수(수천~수만)로 뛰어오른다.
+
+## volatile과 happens-before — 락 없는 읽기의 근거
+
+`ConcurrentHashMap.get()`은 락을 잡지 않는다. 이게 어떻게 안전한가?
+
+`Node`의 `val`과 `next`가 `volatile`로 선언되어 있다. 새 노드를 버킷에 연결하는 순간은 volatile 쓰기이고, `get()`이 버킷을 읽는 순간은 volatile 읽기다. Java 메모리 모델에서 volatile 쓰기는 이후의 모든 volatile 읽기와 happens-before 관계를 형성한다. 부분 초기화된 노드를 읽을 수 없는 이유가 여기 있다.
+
+단, 삽입이 진행 중이라면 그 새 값은 아직 연결 전이므로 `get()`이 보지 못할 수 있다. 이것이 "weakly consistent"의 의미다 — 일관성은 보장하되, 최신성은 보장하지 않는다.
+
+<Theorem kind="proposition" number="1" title="ConcurrentHashMap의 읽기 안전성">
+락 없이 동시에 put()이 발생하더라도, get()은 부분 초기화된 노드를 절대 읽지 않는다.
+</Theorem>
+
+<Proof>
+새 Node 생성자가 완료된 이후 volatile CAS(또는 synchronized 블록 내 volatile 쓰기)로 버킷에 연결된다. volatile 쓰기 이전의 모든 쓰기는 이후 volatile 읽기에서 가시적이다(happens-before). 따라서 get()이 volatile 읽기로 노드를 발견하는 순간, 그 노드의 생성자가 이미 완료된 상태임이 보장된다.
+</Proof>
+
+`CopyOnWriteArrayList`는 같은 원리를 다른 방식으로 구현한다. 쓰기 시 배열 전체를 복사해 새 참조를 `volatile`로 교체한다. 읽기 스레드가 volatile로 배열 참조를 읽는 순간, 그 배열 객체는 이미 완성된 상태다. 진행 중인 쓰기는 새 배열을 아직 교체하지 않았을 뿐, 기존 배열을 건드리지 않는다.
+
+```java
+// COWAL.add() 핵심
+lock.lock();
+try {
+    Object[] newElements = Arrays.copyOf(elements, len + 1);
+    newElements[len] = e;
+    setArray(newElements);  // volatile 쓰기 — 원자적 참조 교체
+} finally { lock.unlock(); }
+
+// 읽기 스레드: 락 없음
+Object[] snapshot = getArray();  // volatile 읽기
+return (E) snapshot[index];
+```
+
+`iterator()`가 생성 시점의 배열 참조를 저장한다. 이후 `add()`가 새 배열을 만들어도, 이전 배열 객체 자체는 변경되지 않는다. `iterator`가 들고 있는 스냅샷은 불변이다.
+
+## 락을 쪼개는 두 번째 방법 — 분리 락
+
+`ArrayBlockingQueue`는 put과 take가 하나의 `ReentrantLock`을 공유한다. 생산자와 소비자가 교대로 락을 잡는다. 고처리량 시나리오에서 병목이 된다.
+
+`LinkedBlockingQueue`는 락을 둘로 쪼갠다.
+
+```java
+final ReentrantLock putLock  = new ReentrantLock();
+final ReentrantLock takeLock = new ReentrantLock();
+private final AtomicInteger count = new AtomicInteger();
+```
+
+생산자들은 `putLock`으로, 소비자들은 `takeLock`으로 각자 직렬화된다. put과 take는 동시에 실행될 수 있다. 두 락에서 동시에 접근하는 `count`는 `AtomicInteger`로 처리한다.
+
+<Callout type="note" title="트레이드오프">
+`ArrayBlockingQueue`는 단일 락으로 단순하지만 처리량이 낮다. `LinkedBlockingQueue`는 분리 락으로 더 높은 처리량을 내지만, 노드 생성에 따른 GC 압박이 있고 메모리 사용이 예측하기 어렵다. 메모리 예측 가능성이 중요하면 `ArrayBlockingQueue`, 처리량이 중요하면 `LinkedBlockingQueue`가 기본 선택이다.
+
+`SynchronousQueue`는 버퍼 자체가 없다. put은 take가 올 때까지, take는 put이 올 때까지 블로킹한다. `Executors.newCachedThreadPool()`이 이 큐를 사용해 "직접 전달 또는 새 스레드 생성" 분기를 구현한다.
+</Callout>
+
+## Lock-Free 삭제 — 마커 노드
+
+`ConcurrentSkipListMap`은 Red-Black Tree 대신 스킵 리스트를 선택했다. 이유는 구조적이다. 트리 삽입/삭제는 회전을 수반하고, 회전은 여러 포인터를 동시에 수정한다. CAS 한두 번으로 원자적으로 처리하기 어렵다. 스킵 리스트의 삽입/삭제는 연결 리스트 수준의 포인터 조작으로 귀결된다.
+
+삭제에는 마커 노드 기법을 쓴다.
+
+```
+삭제 1단계 (논리적 삭제):
+  ... → [node] → [successor] → ...
+  CAS(node.next, successor, new MarkerNode(successor))
+  ... → [node] → [MARKER] → [successor] → ...
+
+삭제 2단계 (물리적 제거):
+  CAS(predecessor.next, node, successor)
+  ... → [predecessor] → [successor] → ...
+```
+
+마커 노드가 삽입된 이후에는 다른 스레드의 `node.next` CAS가 모두 실패한다. "이 노드는 삭제 중"이라는 신호가 마커 자체로 표현된다. 2단계가 실패해도 다른 스레드가 탐색 중 마커를 만나면 자동으로 물리 제거를 돕는다(Helping).
+
+단일 스레드 환경에서는 `TreeMap`이 `ConcurrentSkipListMap`보다 약 20% 빠르다. 레이어 관리 오버헤드와 더 많은 메모리 때문이다. 그러나 8스레드 환경에서는 `Collections.synchronizedMap(new TreeMap<>())`이 단일 스레드 대비 처리량이 78% 감소하는 반면, `ConcurrentSkipListMap`은 거의 선형으로 확장된다.
+
+<Aside label="설계 철학">
+이 네 자료구조는 모두 같은 방향을 향한다 — 경합의 범위를 줄이거나, 경합 자체를 없앤다. 전역 락 → 세그먼트 락 → 버킷 락 → CAS의 진화는 "얼마나 작은 단위를 원자적으로 처리할 수 있는가"를 탐구하는 과정이다. volatile + happens-before는 그 탐구를 뒷받침하는 언어 수준의 보장이다.
+</Aside>
+
+## 정리
+
+- `ConcurrentHashMap` Java 8은 빈 버킷 삽입에 CAS, 기존 버킷 수정에 버킷 단위 `synchronized`를 써서 동시성 수준을 버킷 수까지 끌어올렸다.
+- 락 없는 읽기의 안전성은 `volatile` + happens-before가 보장한다. weakly consistent는 일관성을 포기하지 않되 최신성을 보장하지 않겠다는 선택이다.
+- `LinkedBlockingQueue`는 putLock과 takeLock을 분리해 생산자-소비자를 동시에 실행한다. `count`는 `AtomicInteger`로 두 락 경계를 넘나든다.
+- `ConcurrentSkipListMap`은 마커 노드로 Lock-Free 삭제를 구현한다. Red-Black Tree가 아닌 스킵 리스트를 선택한 이유는 CAS 친화적인 구조 때문이다.
+
+다음 글에서는 Java 21의 Virtual Thread가 이 전통적인 동시성 모델과 어떻게 공존하는지, 그리고 `BlockingQueue` 기반 코드가 Virtual Thread 위에서 어떻게 동작하는지 추적한다.

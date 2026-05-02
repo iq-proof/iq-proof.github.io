@@ -1,0 +1,133 @@
+---
+title: "Java 스레드는 OS와 어떻게 연결되는가"
+description: "1:1 커널 스레드 매핑의 비용부터 컨텍스트 스위칭, ThreadPoolExecutor 내부, 상태 머신, Graceful Shutdown까지 — Java 동시성의 물리적 기반을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, concurrency, thread-pool, jvm, linux]
+difficulty: intermediate
+series:
+  slug: java-concurrency-deep-dive
+  title: Java Concurrency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java에서 `new Thread().start()`를 호출하면 JVM 내부에서 `pthread_create()`가 호출되고, 커널이 `clone()` 시스템콜로 새 OS 스레드를 생성한다. 스레드 하나에 512KB~1MB 스택이 Native 메모리에 잡히고, OS 스케줄러의 관리 대상이 된다. "스레드를 늘리면 처리량이 늘어난다"는 직관이 어디서 무너지는가?
+
+## 1:1 매핑의 비용
+
+Java 스레드는 OS 커널 스레드와 1:1로 매핑된다. 이 선택은 "진정한 병렬 실행"과 "OS 스케줄러 위임"이라는 두 가지 이점을 가져온다. 하나의 스레드가 블로킹되어도 다른 스레드는 계속 실행되고, 멀티코어를 직접 활용할 수 있다.
+
+대가는 명확하다. 스레드 하나를 만들 때마다 `clone()` 시스템콜이 발생하고, 이 비용은 약 수십 μs다. 객체 생성(~수백 ns)과 비교하면 100배 이상 비싸다. 스레드 1,000개를 만들면 스택 메모리만 1GB가 Native 영역에 잡힌다 — `-Xmx` 설정과 무관하게.
+
+```bash
+# strace로 clone() 시스템콜 확인
+strace -e trace=clone -f java ThreadTest 2>&1 | grep clone
+# 스레드마다 clone() 한 번씩 발생
+```
+
+Go의 goroutine이나 Java 21 Virtual Thread는 M:N 모델로 이 문제를 우회한다. 수백만 개의 사용자 스레드를 소수의 OS 스레드(캐리어 스레드)에 스케줄링해, OS 스레드 생성 비용 없이 대규모 동시성을 처리한다. 1:1 모델의 한계가 Virtual Thread 탄생의 직접적 이유다.
+
+## 컨텍스트 스위칭의 실제 비용
+
+스레드 간 전환 시 OS가 저장하고 복원하는 것들 — x86-64 범용 레지스터 16개, 스택 포인터, 명령어 포인터, xmm 레지스터 512바이트 — 은 순수 오버헤드로 약 1~10μs다. 하지만 이것이 전부가 아니다.
+
+진짜 비용은 **CPU 캐시 오염**이다. Thread A가 실행 중일 때 L1/L2 캐시는 Thread A의 데이터로 가득 차 있다. 스위치 후 Thread B가 자신의 데이터에 접근하면 캐시 미스가 폭발한다. RAM 접근은 L1 캐시 대비 300배 느리다. 이 "워밍업" 기간이 수 ms 동안 처리량을 40~60%로 떨어뜨린다.
+
+8코어 서버에서 스레드 수를 늘릴수록 어떤 일이 일어나는지 보면 패턴이 명확하다.
+
+```
+스레드 수    초당 CS 횟수    상대 처리량
+8            ~100           100%
+32           ~24,000         88%
+100          ~80,000         70%
+500          ~400,000        45%
+```
+
+스레드가 코어 수를 넘는 순간, 각 스레드의 타임슬라이스가 줄고 캐시 워밍업 효율이 떨어진다. CPU 사용률은 높아 보이지만 실제 작업이 아닌 스케줄링에 소비된다.
+
+<Callout type="warning" title="비자발적 컨텍스트 스위칭">
+`pidstat -w -p <pid>`로 `nvcswch/s`(비자발적 스위칭)가 `cswch/s`(자발적 스위칭)보다 높으면, 스레드들이 CPU를 두고 경합 중이라는 신호다. 스레드 수를 줄여야 한다.
+</Callout>
+
+## ThreadPoolExecutor의 의사결정 흐름
+
+`Executors.newFixedThreadPool(10)`으로 풀을 만들면 내부는 `LinkedBlockingQueue`의 용량이 `Integer.MAX_VALUE`인 무한 큐다. 큐가 차지 않으면 `maximumPoolSize`까지 스레드가 늘어나지 않는다. 큐에 작업이 수백만 개 쌓여도 아무 경고 없이 OOM에 도달한다.
+
+`ThreadPoolExecutor`가 새 작업을 받을 때 판단하는 순서는 직관과 다르다.
+
+```
+1순위: 현재 스레드 수 < corePoolSize → 즉시 새 스레드 생성 (큐 먼저가 아님)
+2순위: corePoolSize 이상 → 큐에 적재
+3순위: 큐 포화 → maximumPoolSize까지 스레드 추가
+4순위: 모두 포화 → RejectedExecutionHandler
+```
+
+올바른 설정은 `ArrayBlockingQueue`에 명시적 용량을 주고, 거절 정책을 직접 선택하는 것이다.
+
+```java
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    10,                             // corePoolSize
+    50,                             // maximumPoolSize
+    60L, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(200),  // 유한 큐
+    r -> {
+        Thread t = new Thread(r, "worker-" + counter.incrementAndGet());
+        t.setDaemon(false);
+        return t;
+    },
+    new ThreadPoolExecutor.CallerRunsPolicy()  // 백프레셔
+);
+```
+
+`CallerRunsPolicy`는 풀이 포화됐을 때 제출한 스레드가 직접 작업을 실행한다. 생산 속도를 자연스럽게 억제하는 백프레셔 메커니즘이다. 다만 Tomcat 요청 스레드가 제출 스레드라면 해당 요청이 묶이므로 주의해야 한다.
+
+## 스레드 상태와 Thread Dump 해석
+
+Java 스레드는 6가지 상태를 가진다. 장애 대응 시 가장 중요한 구분은 `BLOCKED`와 `WAITING`이다.
+
+- **BLOCKED**: `synchronized` 락을 다른 스레드가 보유 중이어서 대기. Thread Dump에서 `waiting to lock <0x...>` 로 확인.
+- **WAITING**: `Object.wait()`, `LockSupport.park()`, `Thread.join()`으로 조건 대기. `ReentrantLock.lock()` 대기도 WAITING (BLOCKED가 아님).
+- **RUNNABLE이지만 CPU 없음**: I/O 대기 중인 스레드도 RUNNABLE로 표시된다. CPU 사용률이 낮은데 스레드가 전부 RUNNABLE이면 I/O가 병목이다.
+
+`Thread.sleep()`과 `Object.wait()`의 결정적 차이는 락 반납 여부다. `sleep()`은 락을 쥔 채 대기하고, `wait()`은 락을 반납한다. `synchronized` 블록 안에서 `sleep()`을 쓰면 락을 쥔 채로 잠들어 다른 스레드가 진입하지 못한다.
+
+<Aside label="Spurious Wakeup">
+`Object.wait()`는 `notify()` 없이도 깨어날 수 있다. 조건 확인은 항상 `while`로 감싸야 한다 — `if`가 아니라.
+</Aside>
+
+## 데몬 스레드와 Graceful Shutdown
+
+JVM은 non-daemon 스레드가 모두 종료될 때 종료 시퀀스를 시작한다. 데몬 스레드는 JVM 종료 시 강제로 끊기며, `finally` 블록조차 보장되지 않는다. DB 트랜잭션, 파일 쓰기, 결제 처리를 데몬 스레드에 두면 데이터가 손상된다.
+
+SIGTERM 수신 시 JVM은 `Runtime.addShutdownHook()`으로 등록된 스레드들을 병렬로 실행한다. 모든 Hook이 완료될 때까지 JVM이 대기하므로, Hook 내에서 데드락이 발생하면 JVM이 종료되지 않는다.
+
+```java
+Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+    running = false;
+    workerPool.shutdown();
+    try {
+        if (!workerPool.awaitTermination(25, TimeUnit.SECONDS)) {
+            workerPool.shutdownNow();
+        }
+    } catch (InterruptedException e) {
+        workerPool.shutdownNow();
+    }
+}, "shutdown-hook"));
+```
+
+Kubernetes 환경에서는 `terminationGracePeriodSeconds`(기본 30초) 내에 Hook이 완료되지 않으면 SIGKILL이 온다. SIGKILL은 어떤 Hook도 실행하지 않는다. Hook의 타임아웃을 grace period보다 5초 짧게 설정하고, 나머지는 `shutdownNow()`로 강제 취소하는 것이 안전하다.
+
+## 정리
+
+- Java 스레드는 OS 커널 스레드에 1:1 매핑된다. `start()` 한 번에 `clone()` 시스템콜이 발생하고, Native 메모리에 최대 1MB 스택이 잡힌다.
+- 컨텍스트 스위칭의 실질적 비용은 레지스터 저장이 아니라 CPU 캐시 오염이다. 스레드 수가 코어 수를 크게 초과하면 처리량이 역전된다.
+- `Executors` 팩토리 메서드의 무한 큐는 OOM 위험이 있다. `ArrayBlockingQueue`에 명시적 용량을 쓰고 거절 정책을 직접 선택하라.
+- `BLOCKED`는 synchronized 경합, `WAITING`은 조건 대기다. RUNNABLE이어도 I/O 대기 중일 수 있다.
+- 중요 리소스 정리는 데몬 스레드가 아닌 ShutdownHook에서. Hook은 SIGTERM에만 실행되고 SIGKILL에는 실행되지 않는다.
+
+다음 글에서는 Java Memory Model의 하드웨어 기반 — CPU 캐시 계층과 메모리 배리어가 어떻게 `volatile`과 `synchronized`의 가시성을 보장하는지 추적한다.

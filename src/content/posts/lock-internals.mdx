@@ -1,0 +1,144 @@
+---
+title: "Java 락은 어떻게 스스로를 최적화하는가"
+description: "Object Header의 Mark Word 비트 레이아웃부터 AQS 대기 큐, StampedLock 낙관적 읽기, JIT Lock Elision까지 — Java 동시성 락 계층의 설계 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [java, concurrency, synchronized, locks, jvm]
+difficulty: advanced
+series:
+  slug: java-concurrency-deep-dive
+  title: Java Concurrency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java의 `synchronized`는 하나의 키워드지만, JVM 내부에서는 세 가지 서로 다른 락으로 작동한다. 어떤 상황에서 어느 락이 작동하는지 모르면, 특정 명령어 하나가 전체 서비스를 수 초간 멈추는 이유를 영원히 이해할 수 없다. Java 동시성 락의 모든 계층은 하나의 질문으로 수렴한다 — "락 비용을 어디까지 줄일 수 있는가?"
+
+## 모든 것은 Object Header에서 시작한다
+
+Java의 모든 객체는 힙에서 Object Header를 가진다. 그 중 8바이트짜리 **Mark Word**는 해시코드, GC 나이, 그리고 락 상태를 한 필드에 압축해 저장한다.
+
+```
+Normal (락 없음):  [해시코드(56비트) | GC나이(4비트) | 0 | 01]
+Biased Lock:       [ThreadID(54비트) | epoch        | 1 | 01]
+Thin Lock:         [LockRecord 포인터(62비트)        |   00]
+Fat Lock:          [Monitor 포인터(62비트)           |   10]
+```
+
+하위 2~3비트만 보면 현재 객체의 락 상태를 즉시 알 수 있다. `monitorenter` 바이트코드가 실행될 때 JVM은 이 비트를 읽고 세 가지 경로 중 하나를 선택한다.
+
+<Aside label="Java 21 변화">
+Java 15에서 Deprecated된 Biased Lock은 Java 21(JEP 374)에서 완전히 제거됐다. 현대 JDK는 ConcurrentHashMap 같은 다중 스레드 컬렉션이 일반화된 환경에서 바이어스 취소 비용이 이득보다 크다고 판단했다. Java 21 이후 단일 스레드 `synchronized`는 Thin Lock(CAS)과 JIT Lock Elision으로 처리된다.
+</Aside>
+
+## Thin Lock에서 Fat Lock으로 — 경쟁이 만드는 전환
+
+경쟁이 없을 때 `synchronized`는 **CAS 한 번**으로 끝난다.
+
+```
+Thin Lock 획득:
+  ① 스택에 Lock Record 생성 (원본 Mark Word 저장)
+  ② CAS(Mark Word, 원본값, LockRecord주소) → 성공: 락 획득
+  
+Thin Lock 해제:
+  ① CAS(Mark Word, LockRecord주소, 원본값) → 복원
+```
+
+다른 스레드가 이미 보유 중인 Thin Lock을 획득하려 하면 CAS가 실패한다. JVM은 적응적 스핀(Adaptive Spinning)으로 잠시 재시도한다. 스핀 한계를 초과하면 **Fat Lock**으로 확장된다.
+
+```
+Fat Lock (ObjectMonitor):
+  _owner:     현재 락 소유 스레드
+  _EntryList: 락 대기 스레드 목록 (park 상태)
+  _WaitSet:   Object.wait() 대기 스레드 목록
+  _recursions: 재진입 카운터
+```
+
+Fat Lock이 되면 OS의 `futex_wait` / `futex_wake` 시스템 콜이 개입한다. 컨텍스트 스위칭 비용이 수 μs로 뛰는 이유다. 그래서 "synchronized가 느리다"는 말은 정확히는 "Fat Lock 상태의 synchronized가 느리다"는 뜻이다.
+
+<Callout type="warning" title="트레이드오프">
+Fat Lock은 경쟁이 심한 구조의 **결과**이지 원인이 아니다. 임계 구역을 줄이거나(Fine-grained locking), Lock-Free 자료구조로 경쟁 자체를 없애는 것이 Fat Lock 방지의 올바른 방향이다. 락 종류를 바꾸는 것은 차선책이다.
+</Callout>
+
+## AQS — ReentrantLock의 골격
+
+`ReentrantLock`은 `AbstractQueuedSynchronizer` 위에 올라앉아 있다. AQS의 핵심은 두 가지다: volatile `state` 필드 하나와 CLH 변형 대기 큐.
+
+```
+AQS 대기 큐:
+[head(dummy)] ↔ [Node(T1, SIGNAL)] ↔ [Node(T2, SIGNAL)] ↔ [tail=Node(T3, 0)]
+
+lock() 흐름:
+  CAS(state, 0, 1) 성공 → 즉시 획득
+  실패 → Node 생성 → 큐 삽입 → LockSupport.park()
+
+unlock() 흐름:
+  state-- (재진입이면 반복)
+  state == 0 → LockSupport.unpark(head.next.thread)
+```
+
+`LockSupport.park()` / `unpark()`는 `Object.wait()` / `notify()`와 달리 **특정 스레드를 직접 지정**해 깨울 수 있다. 이 덕분에 AQS는 큐 순서를 완전히 제어한다.
+
+Non-Fair Lock은 새 스레드가 큐를 무시하고 즉시 CAS를 시도하는 **Barging**을 허용한다. `unpark`된 스레드가 OS 스케줄러에 의해 깨어나는 수 μs 동안 CPU가 놀지 않아도 되므로 처리량이 높다. Fair Lock은 이 이점을 포기하고 FIFO를 보장한다 — 처리량이 Non-Fair 대비 약 5배 낮아지는 대가를 치르면서.
+
+`ReadWriteLock`은 AQS의 32비트 `state`를 상위 16비트(읽기 카운트)와 하위 16비트(쓰기 재진입)로 쪼개 읽기/쓰기를 분리한다. 그러나 Non-Fair 모드에서 읽기 스레드가 계속 유입되면 쓰기 스레드가 영원히 밀리는 **Write Starvation**이 발생한다.
+
+## StampedLock — 락 없이 읽기
+
+`StampedLock`은 Write Starvation과 읽기 락 오버헤드를 동시에 해결한다. 핵심 아이디어는 **낙관적 읽기(Optimistic Read)** — 락을 잡지 않고 읽되, 읽는 동안 쓰기가 없었는지를 사후에 검증한다.
+
+```java
+// 항상 이 구조를 지켜야 한다
+long stamp = sl.tryOptimisticRead();
+double curX = x, curY = y;         // 로컬 변수로 복사
+
+if (!sl.validate(stamp)) {          // 쓰기 발생 여부 검증
+    stamp = sl.readLock();
+    try { curX = x; curY = y; }     // 비관적 읽기로 재시도
+    finally { sl.unlockRead(stamp); }
+}
+return Math.sqrt(curX * curX + curY * curY);
+```
+
+`validate()` 내부에는 `loadFence()`가 삽입된다. 이는 데이터 읽기(`curX = x`)가 검증 이후로 CPU에 의해 재정렬되는 것을 막는다. 이 펜스가 없으면 검증 자체가 무의미해진다.
+
+단, `StampedLock`은 **재진입이 불가**하다. 쓰기 락을 보유한 채로 다시 쓰기 락을 시도하면 데드락이 발생한다. 스레드 소유권을 추적하지 않기 때문에 JVM도 자동으로 감지하지 못한다. `jstack`의 데드락 자동 탐지도 동작하지 않는다.
+
+## JIT가 락을 지운다
+
+JIT 컴파일러는 두 가지 방식으로 락 비용을 0에 가깝게 만들 수 있다.
+
+**Lock Elision**: 탈출 분석(Escape Analysis)으로 락 객체가 메서드 스택을 벗어나지 않는다고 판단되면, 해당 `synchronized` 블록을 어셈블리에서 완전히 제거한다. `StringBuffer`를 로컬 변수로 사용하면 내부의 모든 `synchronized`가 사라진다.
+
+**Lock Coarsening**: 루프 내 연속된 `synchronized` 블록을 하나로 합친다. 100회 락 획득/해제가 1회로 줄어든다.
+
+```java
+// JIT 이전: 100회 락 획득/해제
+for (int i = 0; i < 100; i++) {
+    synchronized (sb) { sb.append(i); }
+}
+
+// JIT 후 (Lock Coarsening 적용):
+synchronized (sb) {
+    for (int i = 0; i < 100; i++) { sb.append(i); }
+}
+```
+
+두 최적화 모두 런타임에 JIT C2 컴파일 임계값(약 10,000회 호출)을 넘은 후 적용된다. JMH 벤치마크에서 충분한 워밍업이 필요한 이유다.
+
+<Callout type="note" title="경쟁 수준별 락 선택">
+단순 카운터 고경합 → `LongAdder`. 읽기 집약 → `StampedLock` 낙관적 읽기. 타임아웃/인터럽트 필요 → `ReentrantLock`. Virtual Thread 환경의 I/O 임계 구역 → `synchronized` 대신 `ReentrantLock`(Pinning 방지). 그 외 → `synchronized`. 추측하지 말고 JMH로 측정하라.
+</Callout>
+
+## 정리
+
+- `synchronized`의 성능은 Mark Word의 락 상태(Thin / Fat)에 따라 수십 배 달라진다. 병목은 Fat Lock이고, 원인은 경쟁이다.
+- `ReentrantLock`은 AQS CLH 큐 위에서 동작한다. Non-Fair가 Fair보다 처리량이 ~5배 높지만, 특정 스레드가 계속 밀릴 수 있다.
+- `StampedLock` 낙관적 읽기는 쓰기가 드문 환경에서 읽기 락 비용을 거의 0으로 만든다. 재진입 불가라는 제약을 반드시 인식해야 한다.
+- JIT의 Lock Elision과 Lock Coarsening은 코드가 단순할수록 더 공격적으로 적용된다. 직접 최적화하기 전에 JMH로 JIT가 이미 처리했는지 확인하라.
+
+락 계층의 모든 설계 결정 뒤에는 단 하나의 원칙이 있다 — 경쟁이 없을 때 락 비용을 0으로 만들고, 경쟁이 생겼을 때 OS 개입을 최대한 늦춰라.
