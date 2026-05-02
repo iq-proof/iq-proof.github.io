@@ -1,0 +1,112 @@
+---
+title: "Kafka 처리량은 어디서 결정되는가"
+description: "Producer 배치 전략부터 Consumer Fetch 튜닝, 파티션 핫스팟 진단, 운영 장애 대응까지 — Kafka 처리량을 지배하는 설계 결정들을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kafka, producer, consumer, partitioning, monitoring]
+difficulty: intermediate
+series:
+  slug: kafka-deep-dive
+  title: Kafka Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kafka는 기본 설정만으로도 "잘 돌아간다". 그게 문제다. 기본값이 낮은 지연을 위해 최적화되어 있기 때문에, 고처리량이 필요한 순간 병목이 어디서 오는지 알지 못하면 서버만 늘리게 된다. Producer의 배치 크기, Consumer의 Fetch 단위, 파티션 키 분포, 브로커 메트릭 — 이 네 가지가 처리량을 공동으로 지배한다. 어느 하나라도 잘못 설정되면 나머지가 아무리 좋아도 전체가 그 한계에 묶인다.
+
+## 배치가 처리량을 만드는 방식
+
+Producer의 기본값 `linger.ms=0`은 메시지가 들어오는 즉시 전송한다. 초당 100,000개 메시지를 발행하면 브로커에 그에 비례하는 수십만 번의 요청이 쏟아진다. 브로커 CPU는 요청 처리 오버헤드에 잠식된다.
+
+`linger.ms`와 `batch.size`는 이 구조를 뒤집는다.
+
+```
+linger.ms=20, batch.size=64KB, 메시지당 1KB 기준:
+
+  t=0ms:   메시지 1개 → 배치 시작
+  t=1~19ms: 메시지 19개 추가
+  t=20ms:  linger.ms 만료 → 20개 한 번에 전송
+  초당 500번 요청 (vs linger.ms=0의 10,000번)
+```
+
+`linger.ms`는 배치를 채울 **최대 대기 시간**이고, `batch.size`는 대기 없이 **즉시 전송을 트리거하는 크기**다. 둘을 함께 늘릴수록 배치가 커지고 요청 수가 줄어든다. 처리량이 충분히 높으면 `linger.ms`가 만료되기 전에 `batch.size`에 도달해서 실제 지연이 거의 추가되지 않는다. 트래픽이 낮을 때 비로소 `linger.ms`가 실제 대기 시간으로 작동한다.
+
+압축은 이 효과를 네트워크 비용으로 확장한다. `lz4`는 CPU 비용이 낮으면서 약 25% 대역폭을 줄이고, `zstd`는 중간 CPU로 60% 수준의 절감을 달성한다. `gzip`은 압축률이 가장 높지만 CPU 비용이 `lz4` 대비 3~5배로, 고처리량 환경에서 오히려 Producer가 압축 병목에 걸린다.
+
+## Consumer가 병목이 되는 지점
+
+Consumer 처리량은 두 단계에서 결정된다. Kafka 브로커에서 얼마나 효율적으로 가져오는가(Fetch 효율), 그리고 가져온 메시지를 얼마나 빠르게 처리하는가(처리 로직 효율).
+
+`fetch.min.bytes=1`(기본값)은 브로커에 1바이트만 있어도 즉시 응답을 반환한다. 메시지가 지속적으로 들어오는 환경에서는 초당 수백~수천 번의 소량 Fetch가 발생한다. `fetch.min.bytes=65536`으로 설정하면 브로커는 64KB가 쌓일 때까지 응답을 보류한다(Long Polling). Fetch 요청 횟수가 절반 이하로 줄고 배치 처리 효율이 높아진다.
+
+처리 로직이 I/O 바운드(DB 쿼리, 외부 API 호출)라면 Consumer 인스턴스를 늘리는 것보다 스레드 풀이 더 효과적일 수 있다. 파티션이 3개라도 Worker 스레드 10개로 병렬 처리하면 처리량이 대폭 오른다. 단, 이 경우 offset 커밋 타이밍이 복잡해진다.
+
+<Callout type="warning" title="offset 커밋 함정">
+스레드 풀 방식에서 비동기 처리를 시작하자마자 `commitSync()`를 호출하면 처리 완료 전에 offset이 커밋된다. 크래시 시 해당 레코드가 유실된다. Worker가 완료 신호를 보낸 후에만 커밋해야 한다.
+</Callout>
+
+## 파티션 핫스팟 — Consumer를 늘려도 안 되는 이유
+
+파티션 핫스팟은 Kafka 처리량 문제 중 가장 오진하기 쉬운 유형이다. 특정 파티션에 메시지가 집중되면 해당 파티션을 담당하는 Consumer 하나만 과부하 상태가 된다. Consumer를 12개로 늘려도 핫스팟 파티션에는 여전히 Consumer 1개만 배정된다.
+
+진단은 두 곳을 봐야 한다.
+
+```bash
+# 파티션별 Lag 불균형
+kafka-consumer-groups --describe --group order-group
+
+# 파티션별 크기 불균형
+kafka-log-dirs --topic-list orders --describe
+```
+
+특정 파티션의 Lag 또는 크기가 다른 파티션 대비 수배 이상이면 핫스팟이다. 원인은 대부분 키 분포 편향이다. `hash(key) % 파티션수`가 특정 파티션에 집중되는 것.
+
+해결 방향은 두 가지다. Custom Partitioner로 핫스팟 키를 여러 파티션에 강제 분산하거나, 키에 샤드 번호를 붙여서(`shop-9999-0`, `shop-9999-1`, `shop-9999-2`) 기본 해시 파티셔닝의 분산 효과를 이용한다. 후자는 Consumer에서 시간순 정렬이 필요하지만 순서 보장을 어느 정도 유지할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+키 해시 파티셔닝은 동일 키가 항상 동일 파티션으로 가므로 완전한 순서 보장이 된다. 핫스팟 분산을 적용하는 순간 같은 키의 메시지가 여러 파티션에 흩어지고, 타임스탬프 기반 정렬이 필요해진다. 엄격한 순서가 필요한 비즈니스 로직이라면 분산보다 파티션 수 증가가 더 안전한 선택이다.
+</Callout>
+
+## 브로커 메트릭이 말하는 것
+
+모니터링 없이 운영하면 브로커가 죽어가는 줄도 모른다. 실무에서 즉각 알람이 필요한 지표 세 가지는 명확하다.
+
+`OfflinePartitionsCount > 0` — ISR이 없어 Leader 선출 자체가 불가한 파티션이 존재한다는 의미다. 해당 파티션은 쓰기/읽기 모두 불가하므로 서비스 중단 상태다.
+
+`UnderReplicatedPartitions > 0` (5분 이상 지속) — ISR이 `replication.factor`에 미달한다. 브로커가 살아있어도 복제 지연(디스크 I/O 포화, 네트워크 지연, GC 스탑)으로 발생할 수 있다. 즉각 재시작하면 재동기화가 처음부터 다시 시작되어 복구 시간이 늘어난다. 원인 파악 → 자연 복귀 대기 → 최후 수단으로 재시작 순서를 지켜야 한다.
+
+`RequestHandlerAvgIdlePercent < 0.3` — 요청 처리 스레드가 70% 이상 점유 상태다. Consumer를 늘려도 브로커가 못 따라가는 상황. `num.io.threads` 증가 또는 브로커 추가가 해결책이다.
+
+Consumer Lag은 결과 지표다. Lag이 급증할 때 Consumer 문제인지, 브로커 병목인지, 파티션 핫스팟인지 구분하려면 브로커 메트릭을 함께 봐야 한다.
+
+## 운영 중 흔히 만나는 장애 패턴
+
+Consumer Group이 무한 리밸런싱을 반복할 때 원인은 두 가지로 갈린다. `session.timeout.ms` 초과는 heartbeat 자체가 실패하는 경우고, `max.poll.interval.ms` 초과는 처리 로직이 너무 오래 걸려서 poll() 간격이 벌어지는 경우다. 전자는 GC 튜닝이나 타임아웃 증가로, 후자는 `max.poll.records` 감소 또는 처리 로직 최적화로 접근한다.
+
+Offset 리셋은 가장 조심해야 할 운영 작업이다. 두 가지 원칙이 있다.
+
+```bash
+# 1. Consumer Group이 완전히 멈춘 것을 확인 (State=Empty)
+kafka-consumer-groups --describe --group order-group
+
+# 2. Dry-run 먼저
+kafka-consumer-groups --group order-group --topic orders \
+  --reset-offsets --to-datetime 2026-05-01T09:00:00.000
+
+# 3. 결과 확인 후 --execute 추가
+```
+
+`--to-earliest`(전체 재처리)는 처리 로직의 멱등성이 보장되어야 한다. DB UPSERT가 아닌 INSERT를 쓰거나 이메일 발송 같은 부수 효과가 있다면 중복이 발생한다. `--to-datetime`이 가장 실용적인 선택인 이유는 특정 장애 시점 이후만 정밀하게 재처리할 수 있기 때문이다.
+
+## 정리
+
+- 처리량 병목은 항상 하나의 레이어에만 있지 않다 — Producer 배치, Consumer Fetch, 파티션 분산, 브로커 용량을 모두 확인해야 한다.
+- `linger.ms` + `batch.size` + `lz4` 압축 조합은 기본값 대비 처리량을 3배 이상 끌어올릴 수 있는 가장 단순한 튜닝이다.
+- 파티션 핫스팟은 Consumer를 늘려도 해결되지 않는다. 파티션별 Lag과 크기를 함께 봐야 진단이 된다.
+- Offset 리셋은 Consumer Group이 완전히 멈춘 후, Dry-run 확인 후, 멱등성 검토 후 실행한다. 이 순서를 생략하면 중복 처리나 데이터 유실로 이어진다.
+
+Kafka의 처리량 문제는 대부분 "왜 느려졌는가"가 아니라 "어느 레이어에서 느려졌는가"를 묻는 질문이다.

@@ -1,0 +1,117 @@
+---
+title: "Kafka는 어떻게 메시지를 잃지 않는가"
+description: "파티션 복제의 Leader/Follower 구조부터 ISR, acks, min.insync.replicas, Leader Election, Log Compaction까지 — Kafka 내구성 설계의 일관된 철학을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kafka, replication, isr, acks, log-compaction]
+difficulty: intermediate
+series:
+  slug: kafka-deep-dive
+  title: Kafka Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kafka는 "메시지를 잃지 않는 시스템"으로 알려져 있다. 그런데 그 보장은 어디서 오는가? 복제 팩터 3이면 항상 안전하다는 믿음이 왜 틀릴 수 있는가? 그리고 `acks=all`을 설정했는데도 데이터가 유실되는 조건이 존재하는가?
+
+## 복제의 구조 — Leader가 모든 것을 처리한다
+
+Kafka의 내구성은 복제에서 나온다. 각 파티션은 하나의 Leader와 하나 이상의 Follower로 구성된다. Producer 쓰기와 Consumer 읽기는 모두 Leader에서만 처리된다. Follower는 오직 하나의 역할만 한다 — Leader를 복제하는 것.
+
+복제 방식은 Push가 아닌 Pull이다. Follower가 Consumer처럼 Leader에게 FetchRequest를 보내 데이터를 가져간다. 이 선택은 중요한 함의를 가진다. 느린 Follower가 Leader의 쓰기 성능에 영향을 주지 않는다. Follower가 자신의 속도로 요청을 보내기 때문에, Leader는 각 Follower의 상태를 관리하는 복잡도에서 해방된다. Follower가 Leader에서 가져온 데이터는 `sendfile()`로 PageCache에서 직접 네트워크로 전달된다 — Zero-Copy다.
+
+## ISR — "충분히 따라오고 있는" 복제본 집합
+
+**ISR(In-Sync Replicas)**은 현재 Leader의 LEO(Log End Offset)에 충분히 가까운 Follower의 집합이다. 기준은 `replica.lag.time.max.ms`(기본 30초) — 이 시간 안에 Fetch 요청을 보내고 LEO를 따라잡고 있으면 ISR 멤버다.
+
+ISR 이탈은 브로커 다운만으로 발생하지 않는다. GC STW, 네트워크 혼잡, 디스크 I/O 병목 모두 이탈 원인이 된다. 이것이 ISR 모니터링이 브로커 생존 모니터링과 별개로 필요한 이유다.
+
+```bash
+# ISR 이탈 파티션 즉시 확인
+kafka-topics --bootstrap-server localhost:9092 \
+  --describe --under-replicated-partitions
+```
+
+JMX 지표 `kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions`가 0이 아니면 ISR 이탈이 진행 중이라는 신호다.
+
+## acks와 min.insync.replicas — 보장의 정확한 범위
+
+`acks=all`은 "모든 복제본에 기록"이 아니다. "**현재 ISR의 모든 멤버**에 기록"이다. ISR이 1개로 줄어있으면 `acks=all`이어도 브로커 1대에만 기록하면 성공 응답이 나온다.
+
+이 간극을 채우는 것이 `min.insync.replicas`다.
+
+<Callout type="warning" title="acks=all의 맹점">
+`ISR=[1]` 상태에서 `acks=all`로 쓰기를 하면 성공 응답이 반환된다. Broker 1이 장애나면 데이터는 유실된다. `min.insync.replicas=2`가 없으면 `acks=all`은 완전한 보장이 아니다.
+</Callout>
+
+세 설정의 조합이 만드는 보장을 정리하면:
+
+```
+replication.factor=3, min.insync.replicas=2, acks=all
+
+브로커 1대 장애:  ISR=2 >= 2 → 쓰기 계속, 2개에 데이터 보존
+브로커 2대 장애:  ISR=1 < 2  → NotEnoughReplicasException (쓰기 거부)
+                              → 서비스 중단이지만 데이터 유실 없음
+```
+
+이것이 황금 조합이라 불리는 이유다. 브로커 1대까지는 투명하게 처리하고, 2대 동시 장애(드문 케이스)에서는 데이터를 지키기 위해 가용성을 포기한다.
+
+<Aside label="설계 철학">
+`min.insync.replicas`는 "내구성을 위해 가용성을 일부 포기"하는 명시적 선택이다. "가용하지만 데이터 유실 중"인 최악의 상태를 막는 안전장치다.
+</Aside>
+
+## Leader Election — ISR 없이는 선출 없다
+
+Leader 브로커가 장애나면 Controller 브로커가 ISR에서 새 Leader를 선출한다. 기본 설정(`unclean.leader.election.enable=false`)에서는 ISR 멤버만 후보다.
+
+`unclean.leader.election.enable=true`는 ISR이 비었을 때 ISR 밖의 Follower도 후보로 허용한다. 서비스는 빠르게 재개되지만 대가가 있다.
+
+```
+ISR=[1,2], Leader=1, offset 0~100 기록
+Broker 2는 offset 0~80까지만 복제 완료
+모든 ISR 소멸 → unclean=true → Broker 3 (offset 0~70)이 새 Leader
+→ offset 71~100 영구 유실
+→ 나중에 Broker 1 복구 시 Leader Epoch에 의해 offset 71~100이 Truncation됨
+```
+
+**데이터 유실이 있는 빠른 복구보다 데이터를 보존하는 서비스 중단이 낫다.** 비즈니스 중요 데이터에서 `unclean.leader.election.enable`은 기본값 `false`를 유지해야 한다.
+
+롤링 재시작 후 Leader가 특정 브로커로 쏠리는 현상은 `auto.leader.rebalance.enable=true`(기본값)로 자동 완화된다. 수동 재균형이 필요하면 `kafka-preferred-replica-election`을 사용한다.
+
+## Log Compaction — 최신 상태만 필요할 때
+
+일반 `retention.ms`는 시간 기반으로 메시지를 삭제한다. Log Compaction은 다른 질문을 던진다 — "이전 이력이 아니라 현재 상태만 필요한 데이터라면?"
+
+`cleanup.policy=compact` 토픽은 키별 최신값만 보존하고 이전 값을 삭제한다. 사용자 프로필 업데이트가 1년 동안 100번 발생했다면 100개의 이력 대신 최신 상태 1개만 남는다.
+
+Tombstone(`value=null`)은 해당 키 삭제 마커다. `delete.retention.ms` 이후 키 자체가 토픽에서 제거된다. Consumer에서 `null` 값을 받으면 버그가 아니라 삭제 이벤트다.
+
+```java
+records.forEach(record -> {
+    if (record.value() == null) {
+        stateStore.delete(record.key()); // Tombstone: 키 삭제
+    } else {
+        stateStore.put(record.key(), record.value());
+    }
+});
+```
+
+`__consumer_offsets`가 Compaction을 사용하는 이유도 여기에 있다. Consumer Group의 커밋 offset은 최신값만 필요하다. 이전 offset은 재시작 후 불필요하다.
+
+<Callout type="note" title="트레이드오프">
+Compaction은 변경 이력을 지운다. 감사 로그나 이벤트 소싱처럼 이력 자체가 데이터인 경우에는 `cleanup.policy=delete`가 맞다. 최신 상태가 중요하고 이력이 불필요한 경우에만 `compact`를 선택한다. `cleanup.policy=compact,delete` 조합으로 두 정책을 함께 적용할 수도 있다.
+</Callout>
+
+## 정리
+
+- 복제는 Follower가 Leader를 Pull하는 구조다. 느린 Follower는 Leader 성능에 영향을 주지 않는다.
+- ISR은 "지금 따라오고 있는" Follower 집합이다. `acks=all`의 보장 범위는 ISR 크기에 따라 달라진다.
+- 황금 조합은 `replication.factor=3, min.insync.replicas=2, acks=all`이다. 브로커 1대 장애까지 투명하게 처리한다.
+- `unclean.leader.election.enable=false`는 기본값이고 유지해야 한다. ISR 소멸 시 서비스 중단을 선택하는 것이 데이터 유실보다 낫다.
+- Log Compaction은 최신 상태만 필요한 데이터를 위한 도구다. Tombstone을 통해 키 삭제도 처리한다.
+
+Kafka의 내구성 설계는 하나의 원칙에서 나온다 — "불완전한 성공보다 명시적 실패가 낫다." ISR 이탈, `NotEnoughReplicasException`, Offline 파티션 모두 이 원칙의 표현이다.

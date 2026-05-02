@@ -1,0 +1,132 @@
+---
+title: "Spring Kafka는 왜 그렇게 설계되었는가"
+description: "KafkaTemplate 비동기 전송의 함정부터 Outbox Pattern까지, Spring Kafka 5개 레이어를 관통하는 하나의 질문 — '정확히 한 번'은 가능한가."
+pubDate: 2026-05-02
+category: dev
+tags: [kafka, spring-kafka, exactly-once, transaction, error-handling]
+difficulty: intermediate
+series:
+  slug: kafka-deep-dive
+  title: Kafka Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Spring Kafka는 Kafka 클라이언트를 Spring 방식으로 감싸는 추상화 레이어다. `@KafkaListener` 한 줄로 Consumer를 만들고, `KafkaTemplate.send()` 한 줄로 메시지를 보낸다. 그런데 이 "한 줄"들이 내부에서 어떻게 동작하는지 모르면, 왜 메시지가 유실되고, 왜 중복 처리가 발생하고, 왜 DB와 Kafka 사이에 불일치가 생기는지 영원히 알 수 없다. Spring Kafka의 다섯 가지 레이어를 관통하는 질문은 하나다 — **"정확히 한 번" 처리는 실제로 달성 가능한가?**
+
+## 전송은 비동기다 — 착각의 출발점
+
+`KafkaTemplate.send()`는 `CompletableFuture<SendResult<K,V>>`를 반환한다. 반환값을 버리면 메시지가 브로커에 도달했는지 알 방법이 없다.
+
+```java
+// 위험: 전송 결과를 확인하지 않는다
+kafkaTemplate.send("orders", key, value);
+
+// 안전: 비동기 콜백으로 결과 처리
+kafkaTemplate.send("orders", key, value)
+             .whenComplete((result, ex) -> {
+                 if (ex != null) handleError(ex);
+                 else log.info("offset: {}", result.getRecordMetadata().offset());
+             });
+```
+
+내부 경로는 `KafkaTemplate` → `DefaultKafkaProducerFactory` → `KafkaProducer.send()`다. `ProducerFactory`는 기본 설정에서 단일 `KafkaProducer` 인스턴스를 캐시해 스레드 간 공유한다. `KafkaProducer`는 스레드 안전하므로 이 공유는 안전하지만, 결과 확인은 호출자의 책임이다.
+
+`@KafkaListener` 쪽에서는 `ConcurrentKafkaListenerContainerFactory`가 `concurrency` 값만큼 `KafkaMessageListenerContainer`를 생성하고, 각 컨테이너는 별도 스레드에서 `poll()` 루프를 돈다. `concurrency=6`인데 파티션이 3개라면 스레드 3개는 IDLE이다 — 자원 낭비다. **concurrency는 파티션 수에 맞게 설정하라.**
+
+## AckMode — 언제 커밋할 것인가
+
+`poll()`로 받은 메시지를 처리한 뒤 offset을 언제 커밋하느냐가 `AckMode`의 핵심이다.
+
+| AckMode | 커밋 시점 | 처리량 | 특징 |
+|:---|:---|:---|:---|
+| `BATCH` | 배치 전체 처리 후 1회 | 최고 | 기본값, 간단 |
+| `RECORD` | 레코드마다 | 낮음 | 세밀한 격리 |
+| `MANUAL_IMMEDIATE` | `ack.acknowledge()` 즉시 | 중간 | 정확한 제어 |
+| `MANUAL` | `ack.acknowledge()` 후 다음 `poll()` | 중간 | 왕복 감소 |
+
+`MANUAL_IMMEDIATE`를 쓸 때 `ack.acknowledge()`를 호출하는 위치가 전부다. 예외가 발생했는데 `acknowledge()`를 호출하면 처리 실패한 메시지가 커밋되어 재처리 기회가 사라진다. 예외 시에는 `acknowledge()`를 호출하지 말고 에러 핸들러에게 위임하라.
+
+## 에러 처리 — 재시도와 DLT의 균형
+
+에러 핸들러가 없으면 두 극단 중 하나다. 재시도 없이 skip하면 데이터 유실, 무한 재시도하면 파티션 전체가 멈춘다.
+
+`DefaultErrorHandler`는 `BackOff` 정책으로 재시도 횟수를 제한하고, 소진 시 `DeadLetterPublishingRecoverer`가 DLT로 메시지를 격리한다.
+
+```java
+var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+    (record, ex) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+
+var backOff = new ExponentialBackOff(1000L, 2.0);
+backOff.setMaxAttempts(3);
+
+var handler = new DefaultErrorHandler(recoverer, backOff);
+// 재시도가 의미 없는 예외는 즉시 DLT로
+handler.addNotRetryableExceptions(JsonParseException.class, DeserializationException.class);
+```
+
+DLT 메시지에는 원본 토픽, 파티션, offset, 예외 정보가 헤더에 담긴다. 원인 파악과 재처리 모두 가능하다.
+
+<Callout type="note" title="@RetryableTopic vs DefaultErrorHandler">
+`DefaultErrorHandler`는 재시도 중 해당 파티션이 일시 중단된다. `@RetryableTopic`은 실패한 메시지를 별도 재시도 토픽으로 보내 원본 토픽을 계속 처리할 수 있다. 대신 토픽 수가 재시도 횟수만큼 늘어나고, 메시지 순서가 역전될 수 있다.
+</Callout>
+
+## 트랜잭션 — Best Effort의 한계
+
+"DB 저장 + Kafka 발행을 `@Transactional` 하나로 묶으면 원자적이지 않나?"는 가장 흔한 착각이다.
+
+```java
+@Transactional  // JpaTransactionManager 관리
+public void placeOrder(Order order) {
+    orderRepository.save(order);
+    kafkaTemplate.send("orders", order);  // DB 트랜잭션 외부!
+    if (failed) throw new RuntimeException();  // DB rollback
+    // Kafka 메시지는 이미 전송됨 → 불일치
+}
+```
+
+`kafkaTemplate.send()`는 기본 설정에서 Kafka 트랜잭션 없이 즉시 전송된다. DB 롤백이 일어나도 Kafka 메시지는 취소할 수 없다.
+
+`ChainedKafkaTransactionManager`로 DB와 Kafka를 묶을 수 있지만, 이것은 **Best Effort 1PC**다. Kafka 커밋 성공 후 DB 커밋이 실패하면 불일치는 여전히 발생한다. XA 트랜잭션이 아닌 이상 두 이종 시스템 간의 완전한 원자성은 없다.
+
+<Callout type="warning" title="트레이드오프">
+**KafkaTransactionManager 단독**: Kafka 토픽 간 원자성. DB와는 별개. **ChainedTransactionManager**: Best Effort. 첫 번째 커밋 성공 후 두 번째 실패 시 불일치 발생. **Outbox Pattern**: DB 트랜잭션 안에 Outbox 테이블 기록, Debezium이 Kafka 발행 담당. 진정한 원자성이지만 인프라 복잡도가 올라간다.
+</Callout>
+
+`@TransactionalEventListener(AFTER_COMMIT)`으로 DB 커밋 후 Kafka를 발행하는 방식도 있다. DB 롤백 시 발행하지 않으므로 "DB에만 있고 Kafka에는 없는" 문제는 해결된다. 단, Kafka 발행 자체가 실패하면 유실이다 — 이 경우에도 Outbox Pattern이 근본 해결책이다.
+
+## Spring Batch에서의 Exactly-Once
+
+Kafka에서 읽어 DB에 저장하는 배치에서 "정확히 한 번"을 근접하게 달성하는 조합이 있다.
+
+`KafkaItemReader`는 `saveState=true`로 설정하면 Chunk 완료마다 partition offset을 `ExecutionContext`에 저장한다. 재시작 시 `JobRepository`에서 저장된 offset을 복원해 `KafkaConsumer.seek()`로 해당 위치부터 재처리한다.
+
+여기서 핵심 조건 두 가지: **`enable.auto.commit=false`** (Batch Checkpoint와 Kafka offset 동기화를 위해), **멱등 Writer** (재처리 시 동일 결과 보장을 위해).
+
+```sql
+-- UPSERT로 멱등성 보장
+INSERT INTO processed_orders (id, amount, status)
+VALUES (?, ?, ?)
+ON CONFLICT (id) DO UPDATE
+  SET amount = EXCLUDED.amount, status = EXCLUDED.status
+```
+
+Chunk 처리 중 실패 시 Batch는 저장된 offset부터 재처리한다. 이미 저장된 레코드는 UPSERT로 동일 결과가 보장된다. "At-Least-Once + 멱등 Write = 사실상 Exactly-Once"다.
+
+<Aside label="설계 철학">
+Spring Kafka의 모든 레이어가 공통으로 마주치는 질문은 같다 — 실패 시 어디서부터 재처리할 것인가, 그리고 재처리해도 결과가 동일한가. AckMode, ErrorHandler, TransactionManager, KafkaItemReader 모두 이 두 질문에 대한 각기 다른 답이다.
+</Aside>
+
+## 정리
+
+- `KafkaTemplate.send()`는 비동기다. 결과 확인(`whenComplete` 또는 `.get()`)은 호출자 책임이다.
+- `AckMode`와 에러 핸들러는 독립적이다. `MANUAL_IMMEDIATE`에서 예외 발생 시 `acknowledge()` 호출 위치가 At-Least-Once를 결정한다.
+- `DefaultErrorHandler` + DLT는 파티션 처리 무한 중단을 막는 최소 안전망이다. 재시도 불가 예외는 반드시 지정하라.
+- DB + Kafka 원자성은 `ChainedTransactionManager`로 Best Effort까지 달성하고, 진정한 원자성이 필요하면 Outbox Pattern으로 간다.
+- Spring Batch에서 `enable.auto.commit=false` + `saveState=true` + 멱등 Writer 조합이 현실적인 Exactly-Once다.
+
+"정확히 한 번"은 Kafka 레벨에서만(토픽 간) 달성 가능하고, DB와의 조합에서는 항상 "멱등 처리로 보완하는 At-Least-Once"가 더 현실적인 선택이다.

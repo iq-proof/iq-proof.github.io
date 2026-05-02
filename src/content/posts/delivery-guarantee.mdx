@@ -1,0 +1,103 @@
+---
+title: "Kafka는 어떻게 메시지를 정확히 전달하는가"
+description: "At-Most-Once부터 Exactly-Once까지, Kafka 전달 보장의 전 계층을 추적한다. Producer 멱등성, 트랜잭션 Two-Phase Commit, Consumer offset 커밋 타이밍이 어떻게 맞물려 최종 보장을 결정하는지 살펴본다."
+pubDate: 2026-05-02
+category: dev
+tags: [kafka, exactly-once, idempotence, transactions, consumer-offset]
+difficulty: intermediate
+series:
+  slug: kafka-deep-dive
+  title: Kafka Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Kafka를 쓰면 메시지가 정확히 한 번 처리된다고 믿는 사람이 많다. 사실이 아니다. 기본 설정은 At-Least-Once, 즉 중복이 가능하다. 그렇다면 전달 보장은 어떻게 결정되고, Exactly-Once를 달성하려면 무엇이 필요한가?
+
+## 커밋 타이밍이 보장 단계를 결정한다
+
+전달 보장 3단계의 본질은 단 하나의 질문으로 귀결된다. **offset 커밋은 처리 전에 하는가, 처리 후에 하는가?**
+
+커밋은 "여기까지 처리 완료"라는 선언이다. 처리 전에 커밋하면 크래시 후 재시작 시 그 메시지를 다시 읽지 않는다. 유실이다. 처리 후에 커밋하면 커밋 직전 크래시 시 재시작 후 같은 메시지를 다시 읽는다. 중복이다.
+
+```
+At-Most-Once  → poll() → commitSync() → process()  // 커밋 후 처리 → 유실 가능
+At-Least-Once → poll() → process() → commitSync()  // 처리 후 커밋 → 중복 가능
+```
+
+Producer 쪽도 같은 논리가 적용된다. `acks=0`이면 응답 확인 없이 전송하므로 브로커 미수신 시 유실된다. `acks=all + retries`이면 성공 응답 전까지 재시도하므로 유실은 없지만 재시도 중복이 발생한다. **최종 전달 보장은 Producer 보장과 Consumer 보장의 교집합이다.**
+
+## Producer 멱등성 — 재시도 중복을 브로커가 차단한다
+
+`acks=all + retries`는 유실을 막지만 재시도로 인한 중복을 만든다. 브로커가 메시지를 받았는데 응답이 네트워크에서 유실되면, Producer는 같은 메시지를 다시 보낸다. 브로커는 이를 구분할 방법이 없다.
+
+`enable.idempotence=true`는 이 문제를 브로커 레벨에서 해결한다. Producer 초기화 시 브로커에서 고유한 **PID(ProducerID)** 를 발급받고, 이후 모든 배치에 파티션별 단조 증가하는 **Sequence Number** 를 붙인다.
+
+```
+브로커 시퀀스 검사:
+  seq == lastSeq + 1 → 정상 → 기록
+  seq == lastSeq     → 중복 → 무시 (OK 응답 반환)
+  seq > lastSeq + 1  → 순서 역전 → OutOfOrderSequenceException
+```
+
+재시도로 동일 배치가 재전송되면 브로커는 `seq == lastSeq`를 감지하고 무시한 뒤 Producer에게 성공으로 응답한다. 중복이 사라진다.
+
+이 덕분에 `max.in.flight.requests.per.connection=5`를 유지하면서도 순서를 보장할 수 있다. 멱등성 이전에는 순서 보장을 위해 이 값을 1로 낮춰야 했고 처리량이 4배 가까이 감소했다. Kafka 3.0부터 멱등성이 기본값이 된 이유다.
+
+<Callout type="warning" title="멱등성의 보장 범위">
+PID는 Producer 인스턴스당 한 번 발급된다. **재시작하면 새 PID** 를 받으므로 이전 세션의 메시지와 구분되지 않는다. 멱등성은 단일 파티션, 단일 세션 내에서만 중복을 차단한다. Producer 재시작 후 중복 방지는 트랜잭션이 필요하다.
+</Callout>
+
+## 트랜잭션 — 멀티 파티션 원자성과 좀비 차단
+
+주문 완료 이벤트를 `orders` 토픽에 쓰고 재고 감소 이벤트를 `inventory` 토픽에 쓰는 작업이 원자적이어야 한다면 멱등성만으로는 부족하다. 한쪽만 성공하면 데이터가 불일치한다.
+
+`transactional.id`를 설정하면 Kafka의 **Transaction Coordinator(TC)** 가 Two-Phase Commit으로 멀티 파티션 원자적 쓰기를 보장한다.
+
+```
+Phase 1 (Prepare): Producer → TC → PrepareCommit 상태를 __transaction_state에 기록
+Phase 2 (Commit):  TC → 각 파티션 브로커 → COMMIT 마커 기록
+                   read_committed Consumer는 COMMIT 마커 이후에야 DATA 배치를 읽는다
+```
+
+TC가 Phase 1 후 장애나도 새 TC가 `__transaction_state`를 읽어 Phase 2를 완료한다. Phase 1 전에 장애나면 `transaction.timeout.ms` 초과 후 자동 abort된다.
+
+트랜잭션은 **Producer Epoch** 로 좀비 인스턴스를 차단한다. 새 인스턴스가 동일 `transactional.id`로 초기화하면 TC는 Epoch를 증가시키고 이전 인스턴스의 PID를 무효화한다. 구 인스턴스가 send/commit을 시도하면 브로커가 `ProducerFencedException`을 던진다.
+
+`transactional.id`는 인스턴스마다 고유해야 한다. 여러 인스턴스가 같은 ID를 쓰면 서로가 서로를 Fencing하며 트랜잭션이 계속 abort된다.
+
+## Exactly-Once의 실제 범위
+
+트랜잭션 Producer와 `isolation.level=read_committed`를 조합하면 Read-Process-Write 패턴에서 EOS를 달성할 수 있다.
+
+```java
+producer.beginTransaction();
+for (ConsumerRecord<K,V> record : records) {
+    producer.send(new ProducerRecord<>("output-topic", transform(record)));
+}
+producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+producer.commitTransaction();
+// output 발행 + Consumer offset 커밋 = 하나의 트랜잭션
+```
+
+`sendOffsetsToTransaction()`이 핵심이다. Consumer의 offset 커밋을 트랜잭션에 포함시켜, 크래시 시 output 발행과 offset 커밋이 함께 rollback된다. 재시작 후 같은 메시지를 재처리해도 이전 output은 abort 마커가 붙어 `read_committed` Consumer에게 보이지 않는다.
+
+`read_committed` Consumer는 **LSO(Last Stable Offset)** 까지만 읽는다. LSO는 가장 오래된 미완료 트랜잭션의 시작 offset이다. 트랜잭션이 오래 열려있으면 그 이후에 커밋된 메시지도 읽히지 않는다. `transaction.timeout.ms`를 적절히 설정하고 실패 시 빠르게 `abortTransaction()`을 호출해야 하는 이유다.
+
+<Callout type="note" title="트레이드오프">
+EOS는 공짜가 아니다. 처리량이 At-Least-Once 대비 약 20~35% 감소하고 Transaction Coordinator 왕복 지연이 추가된다. 더 중요한 제약은 **보장 범위**다. Kafka EOS는 Kafka 토픽 간에만 적용된다. 처리 결과를 외부 DB에 저장하거나 API를 호출하는 로직은 EOS 보장 밖이다. 이 경우 DB UPSERT나 처리 이력 테이블 같은 애플리케이션 레벨 멱등성이 필요하다. **대부분의 실무에서는 At-Least-Once + 멱등 처리가 EOS보다 실용적이다.**
+</Callout>
+
+## 정리
+
+- 전달 보장은 Producer의 `acks/retries` 설정과 Consumer의 offset 커밋 타이밍 조합으로 결정된다.
+- `enable.idempotence=true`는 단일 세션 내 재시도 중복을 브로커 레벨에서 차단한다. 처리량 감소는 1% 미만이므로 항상 켜두는 것이 합리적이다.
+- 트랜잭션은 멀티 파티션 원자성과 좀비 차단을 제공하지만 처리량을 35%까지 낮춘다.
+- Kafka EOS는 Kafka 내부 파이프라인에서만 유효하다. 외부 시스템 연계에는 별도 멱등성 설계가 필요하다.
+- 결제/잔액처럼 멱등화가 어렵고 Kafka 내부에서 완결되는 경우에만 트랜잭션 EOS를 선택하고, 나머지는 At-Least-Once + UPSERT 조합으로 충분하다.
+
+다음 글에서는 Consumer Group의 리밸런싱이 어떻게 일어나는지, 그리고 Cooperative Rebalancing이 Stop-the-World 문제를 어떻게 완화하는지 추적한다.
