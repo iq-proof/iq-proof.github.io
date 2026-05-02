@@ -17,6 +17,7 @@ import Callout from '@/components/mdx/Callout.astro';
 import Theorem from '@/components/mdx/Theorem.astro';
 import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
 
 `torch.optim.SGD(momentum=0.9)`를 호출할 때, 대부분은 "기울기의 지수평균을 누적한다"는 정도만 알고 있다. 하지만 이 한 줄 뒤에는 물리학의 관성 방정식, Chebyshev 다항식 최적화, 정보이론적 하한, 시변 마찰 ODE가 숨어 있다. Momentum optimizer의 모든 설계 결정은 하나의 질문에서 출발한다 — **gradient descent의 수렴을 이론적으로 가속할 수 있는 최대치는 얼마이고, 그 대가는 무엇인가?**
 
