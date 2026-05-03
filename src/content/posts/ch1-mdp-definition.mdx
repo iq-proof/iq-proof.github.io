@@ -1,0 +1,134 @@
+---
+title: "MDP는 왜 정확히 6개의 성분으로 정의되는가"
+description: "Measurable space와 stochastic kernel부터 POMDP의 belief-MDP 변환까지, 강화학습 이론 전체를 떠받치는 수학적 토대를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, mdp, markov-property, bellman, pomdp]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+강화학습 교재의 첫 페이지에는 거의 항상 "$\text{MDP} = (\mathcal{S}, \mathcal{A}, P, R, \gamma)$"라는 정의가 등장한다. 다섯 성분을 외우면 충분한 것처럼 보인다. 그런데 왜 $\mathcal{S}$는 **measurable** 이어야 하는가? 왜 $\gamma$는 정확히 $[0, 1)$이어야 하는가? 그리고 여섯 번째 성분 $\rho_0$는 왜 존재하는가? 이 질문들에 답하지 않으면, Bellman equation이 "왜 성립하는가"를 영원히 설명할 수 없다.
+
+## MDP 6-tuple의 수학적 의미
+
+MDP의 엄밀한 정의는 $\mathcal{M} = (\mathcal{S}, \mathcal{A}, P, R, \gamma, \rho_0)$이다. 각 성분은 다음 역할을 맡는다.
+
+```
+┌──────────────────────────────────────────────────────┐
+│  𝒮 ──► state space         (무엇을 관찰하나?)        │
+│  𝒜 ──► action space        (무엇을 조종하나?)        │
+│  P ──► transition kernel   (어디로 가나?)            │
+│  R ──► reward function     (왜 하나?)               │
+│  γ ──► discount factor     (언제까지 최적화?)        │
+│  ρ₀ ──► initial distribution (어디서 시작?)         │
+└──────────────────────────────────────────────────────┘
+```
+
+$\mathcal{S}$가 단순히 "집합"이 아니라 **measurable space**이어야 하는 이유는 기대값의 정의 때문이다. $\mathbb{E}[V(s')]$를 계산하려면 $\int_\mathcal{S} V(s') P(\mathrm{d}s' \mid s, a)$라는 적분이 정의되어야 하고, 이는 $\mathcal{S}$ 위에 $\sigma$-algebra가 존재해야만 가능하다. Borel measurable하지 않은 state space에서 value function의 기대값을 쓰는 것은 — 형식적으로 — 정의되지 않은 연산이다.
+
+전이 커널 $P$는 **stochastic kernel**이어야 한다. 즉, 각 $(s, a)$에 대해 $P(\cdot \mid s, a)$는 $\mathcal{S}$ 위의 확률 측도이고, 동시에 $(s, a) \mapsto P(B \mid s, a)$는 measurable이어야 한다. 이 두 조건이 동시에 성립해야 Fubini-Tonelli 정리를 적용해 적분 순서를 바꿀 수 있다. Bellman equation의 재귀 구조는 이 순서 교환에 의존한다.
+
+## Markov 성질 — 과거를 버릴 수 있다는 것의 의미
+
+MDP 이론에서 Markov 성질은 단순한 "편의 가정"이 아니다. Value function $V^\pi(s)$가 **state의 함수**로 well-defined되는 것 자체가 Markov 성질을 전제한다.
+
+<Theorem kind="proposition" number="1" title="Value Function의 well-definedness">
+전이 커널이 Markov 성질 $P(s_{t+1} \in B \mid h_t, a_t) = P(s_{t+1} \in B \mid s_t, a_t)$을 만족하면, 정책 $\pi$ 하에서 value function
+
+$$V^\pi(s) := \mathbb{E}\left[\sum_{t=0}^{\infty} \gamma^t R(s_t, a_t) \,\Big|\, s_0 = s\right]$$
+
+은 state $s$만의 함수로 유일하게 존재한다.
+</Theorem>
+
+<Proof>
+Markov 성질이 있으면 Bellman operator $T^\pi V(s) := \mathbb{E}[R(s,a) + \gamma V(s') \mid s]$가 $B(\mathcal{S})$(유계 가측 함수 공간) 위의 $\gamma$-contraction이 된다. Banach 고정점 정리에 의해 유일한 $V^\pi$가 존재한다. Markov 성질이 없으면, $\mathbb{E}[\cdot \mid s]$가 history에 따라 달라지므로 value가 state만의 함수로 정의될 수 없다.
+</Proof>
+
+이 결과는 결정적인 함의를 준다. History-dependent policy $\mu(a \mid h_t)$는 stationary Markovian policy $\pi(a \mid s)$보다 더 나을 수 없다. State $s_t$가 이미 미래 dynamics를 결정하는 데 충분한 정보(sufficient statistic)를 담고 있기 때문이다.
+
+## Discount와 Horizon — $\gamma < 1$의 필요성
+
+$\gamma \in [0, 1)$는 단순히 "먼 미래를 덜 중요하게 보는" 장치가 아니라, 무한 누적 보상의 수렴을 보장하는 수학적 조건이다.
+
+<Theorem kind="theorem" number="2" title="누적 보상의 수렴">
+$|R| \leq R_{\max}$이면 $\gamma \in [0, 1)$에서
+
+$$|G_t| \leq \sum_{k=0}^{\infty} \gamma^k R_{\max} = \frac{R_{\max}}{1 - \gamma} < \infty$$
+
+$\gamma = 1$이면 동일 조건에서 $G_t = \sum_{k=0}^{\infty} R_{t+k}$가 일반적으로 발산한다.
+</Theorem>
+
+Finite-horizon MDP에서는 $V_t(s)$가 남은 시간 $t$에 의존하는 시간-의존 함수가 된다. Infinite-horizon discounted에서는 $\gamma < 1$이 contraction을 만들어 time-independent $V(s)$를 보장한다. $\gamma = 1$을 다루려면 Cesaro 평균 $\lim_{T \to \infty} \frac{1}{T}\sum_{t=0}^{T-1} R_t$로 정의되는 **average-reward** 세팅으로 넘어가야 하며, 이때 value는 $V(s) = J + h(s)$로 분해된다 — 여기서 $J$는 step당 평균 보상, $h(s)$는 potential term이다.
+
+<Callout type="note" title="트레이드오프">
+세 가지 horizon 설정은 각기 다른 최적 정책 구조를 요구한다. **Finite-horizon**: 시간-의존 정책 $\pi_t(a \mid s)$가 필수. **Discounted**: stationary 정책 $\pi(a \mid s)$로 충분 (Puterman 정리). **Average-reward**: Blackwell optimal 정책이 필요하며, value decomposition $J + h(s)$를 통한 별도 알고리즘이 요구된다. 실무에서 discounted setting이 지배적인 이유는 이 세 가지 중 이론과 알고리즘이 가장 깔끔하게 맞아떨어지기 때문이다.
+</Callout>
+
+## Stationary Policy의 충분성 — Puterman 정리
+
+Finite MDP, discounted infinite-horizon ($\gamma < 1$), bounded reward 조건에서 **deterministic stationary Markovian policy** 중에 최적이 존재한다. History-dependent이거나 stochastic한 policy가 더 나을 수 없다.
+
+핵심 논거는 다음과 같다. Bellman 최적 방정식
+
+$$V^*(s) = \max_a \left[R(s, a) + \gamma \sum_{s'} P(s' \mid s, a) V^*(s')\right]$$
+
+의 greedy solution $\pi^*(s) = \arg\max_a [\cdots]$는 자동으로 (1) deterministic이고, (2) Markovian이며, (3) stationary이다. 이 $\pi^*$가 달성하는 value가 $V^*$와 일치함을 보이면 정리가 완성된다.
+
+Stochastic policy가 더 나을 수 없는 이유: $V^\pi(s) = \sum_a \pi(a \mid s) Q^\pi(s, a) \leq \max_a Q^\pi(s, a)$이므로, 확률적 혼합보다 최대값을 선택하는 deterministic이 항상 같거나 낫다.
+
+## POMDP — Markov 성질이 깨질 때
+
+현실의 많은 문제는 agent가 hidden state $s_t$를 직접 관찰하지 못하고, noisy observation $o_t \sim O(\cdot \mid s_t)$만 받는다. 이것이 **POMDP**($\mathcal{S}, \mathcal{A}, \mathcal{O}, P, O, R, \gamma$)이다.
+
+POMDP에서 observation history $h_t^o = (o_0, a_0, \ldots, o_t)$가 있을 때 Markov 성질은 $o_t$ 기준으로 성립하지 않는다. 해결책은 **belief state** $b_t(s) = \Pr(s_t = s \mid h_t^o)$를 새로운 "state"로 삼는 것이다.
+
+Bayes update rule로 belief를 갱신한다:
+
+$$b_{t+1}(s') = \frac{O(o_{t+1} \mid s') \sum_s P(s' \mid s, a_t) b_t(s)}{Z}$$
+
+이 변환의 핵심 결과: belief space $\Delta(\mathcal{S})$ 위에서 정의된 **belief MDP**
+
+$$\mathcal{M}_{\text{belief}} = (\Delta(\mathcal{S}),\, \mathcal{A},\, P_b,\, R_b,\, \gamma)$$
+
+는 완전한 observable MDP다. Ch1-01의 measurability 조건을 모두 만족하므로, Bellman equation과 Value Iteration이 그대로 적용된다. 문제는 belief space의 차원: $n$-state POMDP의 belief space는 $(n-1)$차원 simplex이며, 이것이 연속적이고 고차원이라는 점이 현실적 계산 장벽이 된다.
+
+<Aside label="현대 RL과의 연결">
+Deep RL에서 RNN/LSTM이 recurrent hidden state를 유지하는 것은 belief state를 암묵적으로 학습하는 것으로 해석할 수 있다. 6-tuple MDP의 엄밀한 정의는 "왜 memory가 필요한가"를 설명하는 이론적 근거가 된다.
+</Aside>
+
+## 정리
+
+- MDP의 6번째 성분 $\rho_0$를 포함한 모든 성분은 기대값의 존재성이라는 하나의 요구에서 도출된다.
+- Markov 성질은 편의 가정이 아니라 value function이 state의 함수로 well-defined되는 필요충분조건이다.
+- $\gamma \in [0, 1)$은 무한 급수의 수렴을 보장하며, 이것이 깨지면 average-reward라는 완전히 다른 이론이 필요하다.
+- POMDP는 MDP가 아닌 새로운 문제가 아니라, belief space라는 continuous state space 위의 MDP다.
+
+MDP의 수학적 엄밀성은 단순히 "이론가를 위한 것"이 아니다. Bellman equation이 수렴하는 이유, Policy Iteration이 유한 step 내 끝나는 이유, Q-learning이 optimal로 수렴하는 이유 — 전부 이 6-tuple 정의에서 흘러나온다.
+
+<Reference
+  title="Markov Decision Processes: Discrete Stochastic Dynamic Programming"
+  authors="Puterman, M. L."
+  year={1994}
+  venue="Wiley"
+  url="https://www.wiley.com/en-us/Markov+Decision+Processes%3A+Discrete+Stochastic+Dynamic+Programming-p-9780471619772"
+/>
+
+<Reference
+  title="Planning and Acting in Partially Observable Stochastic Domains"
+  authors="Kaelbling, L. P., Littman, M. L., and Cassandra, A. R."
+  year={1998}
+  venue="Artificial Intelligence"
+  url="https://www.sciencedirect.com/science/article/pii/S0004370298000847"
+/>

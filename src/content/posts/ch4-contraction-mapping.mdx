@@ -1,0 +1,154 @@
+---
+title: "Bellman operator는 왜 수렴이 보장되는가"
+description: "Banach Fixed Point Theorem이 RL 수렴 보장의 뿌리인 이유부터 T^π와 T^* 의 contraction 증명, Value Iteration 정지 기준, γ→1 한계까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, bellman-operator, contraction-mapping, value-iteration]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Value Iteration은 왜 수렴하는가? "Bellman equation을 반복하면 된다"는 설명은 절차를 기술할 뿐, 이유를 말하지 않는다. 수렴 보장의 뿌리는 1922년 Banach가 증명한 고정점 정리에 있고, RL의 모든 핵심 연산자 — $T^\pi$와 $T^*$ — 는 그 정리의 조건을 만족하도록 설계되어 있다. 왜 하필 sup-norm인가? 왜 $\gamma < 1$ 이어야 하는가?
+
+## 완비 거리공간과 수축 사상
+
+Banach Fixed Point Theorem의 무대는 **완비 거리공간 $(X, d)$** 이다. 완비성은 "Cauchy 수열이 반드시 공간 안에서 수렴한다"는 조건으로, 유리수 $\mathbb{Q}$ 처럼 극한이 공간 밖으로 빠져나가는 불완비 공간에서는 정리가 성립하지 않는다.
+
+RL에서 이 역할을 하는 공간은 bounded function space $B(\mathcal{S})$ 로, sup-norm $\|V\|_\infty = \sup_s |V(s)|$ 을 거리로 갖는 Banach space다. 이 norm은 "모든 state에서 동시에" 거리를 측정하므로, value function 전체의 균일 수렴을 다룰 수 있다.
+
+<Theorem kind="theorem" number="1" title="Banach Fixed Point Theorem (1922)">
+완비 거리공간 $(X, d)$ 에서 $\gamma$-contraction $T: X \to X$ ($\gamma < 1$) 가 주어지면:
+
+1. 유일한 고정점 $x^* \in X$ 가 존재한다: $T(x^*) = x^*$
+2. 임의 초기값 $x_0$에서 iteration $x_{k+1} = T(x_k)$ 는 $x^*$로 수렴한다
+3. A Priori bound: $d(x_k, x^*) \leq \gamma^k \cdot d(x_0, x^*)$
+4. A Posteriori bound: $d(x_k, x^*) \leq \frac{\gamma}{1-\gamma} d(x_k, x_{k-1})$
+</Theorem>
+
+<Proof>
+핵심은 $(x_k)$가 Cauchy 수열임을 보이는 것이다. 삼각부등식으로 $n > m$에 대해
+
+$$d(x_n, x_m) \leq d(x_1, x_0) \sum_{j=m}^{n-1} \gamma^j \leq \frac{\gamma^m}{1-\gamma} d(x_1, x_0)$$
+
+$m \to \infty$ 이면 우변이 0으로 수렴하므로 Cauchy 수열. 완비성에 의해 극한 $x^*$가 존재하고, $T$의 연속성으로부터 $T(x^*) = x^*$. 유일성은 두 고정점 $x^*, y^*$에 대해 $d(x^*, y^*) = d(T(x^*), T(y^*)) \leq \gamma \cdot d(x^*, y^*)$, 즉 $(1-\gamma) d(x^*, y^*) \leq 0$에서 따른다. $\square$
+</Proof>
+
+## $T^\pi$와 $T^*$가 수축 사상인 이유
+
+이제 Bellman operator들이 이 정리의 조건을 만족함을 보인다.
+
+**Policy evaluation operator** $T^\pi$는 affine 연산자다:
+
+$$T^\pi V = r^\pi + \gamma P^\pi V$$
+
+두 value function의 차이를 추적하면:
+
+$$\|T^\pi V - T^\pi V'\|_\infty = \gamma \|P^\pi(V - V')\|_\infty$$
+
+$P^\pi$는 row-stochastic matrix (각 행의 합이 1) 이므로, 임의 $s$에 대해
+
+$$|(P^\pi(V-V'))(s)| = \left|\sum_{s'} P^\pi(s,s')(V(s')-V'(s'))\right| \leq \sum_{s'} P^\pi(s,s') \|V-V'\|_\infty = \|V-V'\|_\infty$$
+
+따라서 $\|T^\pi V - T^\pi V'\|_\infty \leq \gamma \|V - V'\|_\infty$. $T^\pi$는 $\gamma$-contraction이다.
+
+**Optimal Bellman operator** $T^*$는 nonlinear다:
+
+$$(T^* V)(s) = \max_a \left[r(s,a) + \gamma \sum_{s'} P(s'|s,a) V(s')\right]$$
+
+`max` 연산이 포함되므로 affine 논법을 직접 쓸 수 없다. 여기서 Max-Lipschitz 보조정리가 필요하다.
+
+<Theorem kind="lemma" number="2" title="Max-Lipschitz">
+벡터 함수족 $f_a, g_a \in \mathbb{R}^{|\mathcal{S}|}$ 에 대해:
+
+$$\left\|\max_a f_a - \max_a g_a\right\|_\infty \leq \max_a \|f_a - g_a\|_\infty$$
+</Theorem>
+
+<Proof>
+임의 state $s$에서 $a^* = \arg\max_a f_a(s)$로 놓으면
+
+$$\max_a f_a(s) - \max_a g_a(s) \leq f_{a^*}(s) - g_{a^*}(s) \leq |f_{a^*}(s) - g_{a^*}(s)| \leq \max_a \|f_a - g_a\|_\infty$$
+
+반대 방향도 대칭적으로 성립하므로 절댓값 부등식이 따른다. 모든 $s$에 대해 성립하므로 sup를 취하면 결론을 얻는다. $\square$
+</Proof>
+
+$T^*$에서 $f_a(s) = r(s,a) + \gamma \sum_{s'} P(s'|s,a) V(s')$로 정의하면, 각 action $a$에 대해 $\|f_a - g_a\|_\infty \leq \gamma \|V - V'\|_\infty$이고, Max-Lipschitz 보조정리로부터
+
+$$\|T^* V - T^* V'\|_\infty \leq \gamma \|V - V'\|_\infty$$
+
+즉, nonlinear임에도 $T^*$는 $\gamma$-contraction이다.
+
+<Callout type="note" title="왜 sup-norm인가">
+L2 norm에서는 stochastic matrix $P$가 $\|Px\|_2 \leq \|x\|_2$를 보장하지 않는다. $P$의 최대 특이값이 1보다 클 수 있기 때문이다. Sup-norm은 row-stochastic의 구조 (행 합 = 1) 를 정확히 포착하므로, RL의 contraction 분석은 sup-norm 위에서만 깔끔하게 성립한다.
+</Callout>
+
+## 정지 기준의 유도
+
+Banach 정리의 A Posteriori bound는 알고리즘에 직접 쓸 수 있는 정지 기준을 준다.
+
+$$\|V_k - V^*\|_\infty \leq \frac{\gamma}{1-\gamma} \|V_k - V_{k-1}\|_\infty$$
+
+이 부등식은 telescoping sum으로 증명된다: $V_k - V^* = \sum_{j=k}^{\infty}(V_j - V_{j+1})$ 이고, contraction에 의해 $\|V_j - V_{j+1}\| \leq \gamma^{j-k+1} \|V_k - V_{k-1}\|$이므로, 무한 합이 $\frac{\gamma}{1-\gamma}\|V_k - V_{k-1}\|$로 bound된다.
+
+원하는 정확도 $\epsilon$에 도달하는 실용적 기준:
+
+$$\|V_k - V_{k-1}\|_\infty < \epsilon \cdot \frac{1-\gamma}{\gamma} \implies \|V_k - V^*\|_\infty < \epsilon$$
+
+필요 iteration 수는
+
+$$k \approx \frac{\log(1/\epsilon)}{-\log \gamma} \approx \frac{\log(1/\epsilon)}{1-\gamma}$$
+
+로, $\gamma = 0.9$이면 $\epsilon = 10^{-6}$ 달성에 약 130회, $\gamma = 0.99$이면 약 1380회가 필요하다.
+
+## 트레이드오프 — $\gamma$와 수렴 속도의 긴장
+
+$\gamma$가 1에 가까워질수록 무엇이 약해지는가?
+
+<Callout type="warning" title="γ → 1 에서의 한계">
+$\gamma = 1$이면 $\|T^* V - T^* V'\|_\infty \leq 1 \cdot \|V - V'\|_\infty$, 즉 nonexpansive일 뿐 contraction이 아니다. Banach 정리의 조건이 깨지고, Value Iteration의 수렴이 보장되지 않는다.
+</Callout>
+
+필요 iteration 수 $k \sim \log(1/\epsilon)/(1-\gamma)$ 는 $\gamma \to 1^-$일 때 발산한다. 이 한계는 세 가지 문제 설정을 나누는 경계이기도 하다:
+
+| 설정 | $\gamma$ | 수렴 | 비고 |
+|------|---------|------|------|
+| Discounted | $< 1$ | Linear ($\gamma^k$) | Banach 정리 직접 적용 |
+| Episodic | $= 1$, finite $T$ | 유한 단계 | terminal state에서 종료 |
+| Average-reward | $= 1$, continuing | Blackwell optimal | differential value function $W(s)$ 필요 |
+
+Average-reward 설정에서는 단일 scalar $\rho^*$ (장기 평균 보상) 가 목표가 되고, Bellman 방정식이
+
+$$\rho^* + W^*(s) = \max_a\left[r(s,a) + \sum_{s'} P(s'|s,a) W^*(s')\right]$$
+
+으로 바뀐다. $W(s)$는 각 state의 "상대적 가치"로, discounted value function의 $\gamma \to 1$ 극한에 해당한다.
+
+<Aside label="실무 선택">
+$\gamma$의 관례적 선택은 문제의 time scale에 따른다. Episode 길이가 $T$라면 $\gamma \approx 1 - 1/T$가 근사 기준이다. Robotics와 Atari는 대개 $\gamma = 0.99$, continuous control은 $\gamma = 0.95$ 전후를 쓴다. $\gamma$가 클수록 먼 미래를 고려하지만, 수렴 속도는 선형으로 느려진다.
+</Aside>
+
+## 정리
+
+- Banach Fixed Point Theorem은 **완비 거리공간 + $\gamma$-contraction**의 조합에서 유일 고정점의 존재와 선형 수렴을 보장한다.
+- $T^\pi$는 row-stochastic matrix의 성질로, $T^*$는 Max-Lipschitz 보조정리로 각각 $\gamma$-contraction임이 증명된다.
+- A Posteriori bound $\frac{\gamma}{1-\gamma}\|V_k - V_{k-1}\|_\infty$는 $V^*$를 모르고도 수렴을 판단할 수 있는 실용적 정지 기준을 제공한다.
+- $\gamma < 1$은 단순 관습이 아니라 contraction 조건의 핵심이며, $\gamma \to 1$에서 수렴 보장이 무너지는 지점이 Average-reward 설정으로의 전환을 동기화한다.
+
+수식 한 줄 뒤에는 "Cauchy 수열이 공간 밖으로 빠져나가지 않도록"이라는 구체적인 완비성 요구가 숨어 있다.
+
+<Reference
+  title="Markov Decision Processes: Discrete Stochastic Dynamic Programming"
+  authors="Puterman, M. L."
+  year={1994}
+  venue="Wiley"
+  url="https://onlinelibrary.wiley.com/doi/book/10.1002/9780470316887"
+/>

@@ -1,0 +1,121 @@
+---
+title: "Bellman Equation은 왜 작동하는가"
+description: "Discounted return의 수렴 조건부터 Bellman operator의 고정점 존재성까지, RL 가치 함수 이론의 수학적 토대를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, bellman-equation, value-function, discount-factor, operator-theory]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RL의 모든 가치 함수 — $V^\pi(s)$, $Q^\pi(s, a)$, $V^*(s)$ — 는 discounted return의 기댓값으로 정의된다. 그런데 이 합이 유한한지, 방정식의 해가 존재하는지, 반복 계산이 수렴하는지는 당연한 사실이 아니다. $\gamma < 1$이라는 제약 하나가 이 모든 질문에 동시에 답한다는 것을 어떻게 증명하는가?
+
+## Return이 유한하려면
+
+시간 $t$부터의 누적 보상을 정의하면:
+
+$$G_t = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}$$
+
+reward가 상수 $R = 1$이라 가정할 때 $\gamma = 1$이면 $G_t = \infty$이고, $\gamma = 0.9$이면 $G_t = 10$이다. 이 차이는 직관에 불과하다. 수학적으로 유한성을 보장하려면 bounded reward 가정 $|R_t| \leq R_{\max}$과 $\gamma \in [0, 1)$이 함께 필요하다.
+
+<Theorem kind="theorem" number="1" title="Absolute Convergence of Discounted Return">
+$|R_t| \leq R_{\max}$이고 $\gamma \in [0, 1)$이면, 거의 모든 trajectory에 대해
+
+$$|G_t| \leq \frac{R_{\max}}{1 - \gamma} < \infty$$
+</Theorem>
+
+<Proof>
+삼각 부등식과 기하급수 공식을 순서대로 적용한다.
+
+$$\left|G_t\right| \leq \sum_{k=0}^{\infty} \gamma^k |R_{t+k+1}| \leq R_{\max} \sum_{k=0}^{\infty} \gamma^k = \frac{R_{\max}}{1 - \gamma} < \infty \quad \square$$
+</Proof>
+
+$G_t$가 bounded random variable이므로 기댓값 $\mathbb{E}[G_t]$도 유한하다. 이것이 $V^\pi(s) = \mathbb{E}_\pi[G_t \mid S_t = s]$의 정의 자체가 의미를 갖는 이유다. $\gamma = 1$이고 $R_t \geq R_{\min} > 0$이면 $G_t \geq R_{\min} \cdot \infty = \infty$이므로 infinite-horizon에서 return이 정의되지 않는다. Episodic MDP나 average-reward formulation은 이 문제를 우회하는 두 가지 선택지다.
+
+## 가치 함수 사이의 관계
+
+$V^\pi$와 $Q^\pi$는 독립적으로 정의되지 않는다. 세 가지 관계식이 이 둘을 엮는다.
+
+**전확률 법칙**: 정책 $\pi$에서 상태 $s$의 가치는 가능한 모든 행동의 가중 평균이다.
+
+$$V^\pi(s) = \sum_a \pi(a \mid s)\, Q^\pi(s, a)$$
+
+**한 걸음 전망**: 행동 $a$를 취한 뒤 다음 상태 $s'$의 가치로 재귀한다.
+
+$$Q^\pi(s, a) = R(s, a) + \gamma \sum_{s'} P(s' \mid s, a)\, V^\pi(s')$$
+
+두 식을 결합하면 Bellman expectation equation이 된다.
+
+$$V^\pi(s) = \sum_a \pi(a \mid s) \left[ R(s, a) + \gamma \sum_{s'} P(s' \mid s, a)\, V^\pi(s') \right]$$
+
+이 방정식의 특징은 우변에 $V^\pi$가 다시 등장한다는 것이다. 무한 합의 정의에서 출발해 재귀 구조를 얻었다. 유도의 핵심은 tower property — $\mathbb{E}[G_{t+1} \mid S_t = s]$를 $S_{t+1}$로 한 번 더 조건부함으로써 $V^\pi(s')$를 꺼낼 수 있다는 것 — 과 Markov 성질이다. 또한 reward가 bounded일 때 $|V^\pi(s)| \leq R_{\max}/(1-\gamma)$가 성립하며, 이는 정리 1과 기댓값의 Jensen 부등식으로 직접 유도된다.
+
+**Advantage function** $A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s)$는 "평균 대비 이득"이다. 정의에 의해 $\sum_a \pi(a \mid s) A^\pi(s, a) = 0$이 항상 성립한다. 이 단순한 뺄셈이 policy gradient 이론에서 분산을 낮추는 baseline correction의 근거가 된다.
+
+## Bellman Operator와 고정점
+
+Bellman equation을 함수 공간의 언어로 재기술하면 일반적인 수렴 이론을 바로 끌어쓸 수 있다. bounded function들의 공간 $B(\mathcal{S})$에 sup-norm $\|f\|_\infty = \sup_s |f(s)|$을 부여하면 완비 거리공간이 된다.
+
+정책 유도 보상 $r^\pi(s) = \sum_a \pi(a \mid s) R(s, a)$와 전이 행렬 $P^\pi(s' \mid s) = \sum_a \pi(a \mid s) P(s' \mid s, a)$를 정의하면 Bellman operator를 간결하게 쓸 수 있다.
+
+$$T^\pi V = r^\pi + \gamma P^\pi V$$
+
+$V^\pi$는 이 연산자의 **고정점** $V^\pi = T^\pi V^\pi$다. $T^\pi$는 affine 연산자이므로 두 함수 사이의 거리 변화를 정확히 추적할 수 있다.
+
+$$\|T^\pi V - T^\pi V'\|_\infty = \|\gamma P^\pi (V - V')\|_\infty \leq \gamma \|V - V'\|_\infty$$
+
+마지막 부등식에서 $P^\pi$가 stochastic matrix($\|P^\pi\|_\infty = 1$)임을 사용한다. $\gamma < 1$이므로 $T^\pi$는 $\gamma$-contraction이다. Banach fixed point theorem에 의해 유일한 고정점이 존재하고, 임의의 초기값 $V_0$에서 시작한 반복 $V_{k+1} = T^\pi V_k$는
+
+$$\|V_k - V^\pi\|_\infty \leq \gamma^k \|V_0 - V^\pi\|_\infty$$
+
+의 속도로 수렴한다.
+
+## 고정점의 닫힌 형태
+
+유한 MDP에서 고정점 방정식 $V^\pi = r^\pi + \gamma P^\pi V^\pi$를 정리하면 선형방정식이 된다.
+
+$$(I - \gamma P^\pi)\, V^\pi = r^\pi$$
+
+이 방정식이 유일한 해를 가지려면 $(I - \gamma P^\pi)$가 가역이어야 한다. stochastic matrix의 spectral radius $\rho(P^\pi) \leq 1$이고 $\gamma < 1$이므로 $\rho(\gamma P^\pi) \leq \gamma < 1$이다. 따라서 $(I - \gamma P^\pi)$의 모든 eigenvalue는 $1 - \gamma\mu$꼴인데, $|1 - \gamma\mu| \geq 1 - \gamma > 0$이므로 영이 되지 않는다. 가역성이 보장된다.
+
+역행렬은 Neumann series로 표현된다.
+
+$$V^\pi = (I - \gamma P^\pi)^{-1} r^\pi = \sum_{k=0}^{\infty} (\gamma P^\pi)^k r^\pi$$
+
+전개하면 $r^\pi + \gamma P^\pi r^\pi + \gamma^2 (P^\pi)^2 r^\pi + \cdots$인데, 이는 정확히 discounted return의 정의 — 첫 스텝 보상, 한 스텝 뒤의 기대 보상을 $\gamma$배 할인, 두 스텝 뒤를 $\gamma^2$배 할인, ... — 와 일치한다. 정의로 시작해 operator를 거쳐 닫힌 형태로 돌아오는 순환이 완성된다.
+
+<Callout type="note" title="트레이드오프: γ의 역할">
+$\gamma$는 단순한 hyperparameter가 아니다. $\gamma < 1$은 (1) return의 절대 수렴, (2) 가치 함수의 유한성, (3) Bellman operator의 contraction, (4) 선형방정식의 가역성을 동시에 보장하는 수학적 조건이다. $\gamma \to 1$로 키울수록 먼 미래를 더 많이 반영하지만, 수렴 속도가 $O(\gamma^k)$로 느려지고 value iteration의 반복 횟수가 폭발한다. $\gamma = 0.99$에서 수렴에 필요한 반복이 $\gamma = 0.9$의 약 10배가 된다는 점은 실용적으로 중요하다.
+</Callout>
+
+<Aside label="직관">
+$\gamma < 1$이라는 단일 제약이 해석학(급수 수렴), 선형대수(행렬 가역성), 함수해석학(contraction mapping)을 관통한다. RL의 수학적 구조가 이 하나의 조건 위에 세워져 있다는 것이 이 챕터들의 공통 메시지다.
+</Aside>
+
+## 정리
+
+- $\gamma \in [0, 1)$와 bounded reward는 discounted return $G_t$가 절대수렴하는 충분조건이다.
+- $V^\pi$와 $Q^\pi$는 전확률 법칙과 한 걸음 전망으로 연결되며, 결합하면 Bellman expectation equation이 된다.
+- Bellman operator $T^\pi$는 $\gamma$-contraction이므로 유일한 고정점 $V^\pi$가 존재하고 반복 계산이 선형 수렴한다.
+- 닫힌 형태 $V^\pi = (I - \gamma P^\pi)^{-1} r^\pi$는 Neumann series로 전개하면 discounted return의 정의와 정확히 일치한다.
+
+다음 글에서는 이 Bellman operator에 "greedy max"를 추가한 optimality operator $T^*$로 넘어가, $V^*$의 존재성과 policy improvement의 단조성을 추적한다.
+
+<Reference
+  title="Reinforcement Learning: An Introduction"
+  authors="Sutton, R. S. and Barto, A. G."
+  year={2018}
+  venue="MIT Press"
+  url="http://incompleteideas.net/book/the-book-2nd.html"
+/>

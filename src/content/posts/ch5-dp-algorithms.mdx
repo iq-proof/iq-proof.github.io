@@ -1,0 +1,133 @@
+---
+title: "GPI — 모든 RL 알고리즘을 하나의 틀로 보는 법"
+description: "Policy Evaluation의 수렴 보장부터 Policy Improvement Theorem, Value Iteration의 Bellman residual, 그리고 GPI가 Q-learning과 Actor-Critic까지 통합하는 방식을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, policy-iteration, bellman, gpi, dynamic-programming]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Policy Iteration과 Value Iteration, Monte Carlo와 Q-learning, Actor-Critic과 DQN — 이 알고리즘들은 서로 다른 것처럼 보이지만 Sutton & Barto(2018)는 이를 하나의 틀로 묶는다. 그 틀이 **Generalized Policy Iteration(GPI)**다. 그런데 이 통합이 가능한 이유는 무엇인가? 그리고 통합을 가능하게 하는 수학적 기반은 어디서 오는가?
+
+## Policy Evaluation: $T^\pi$가 contraction인 이유
+
+모든 것의 출발점은 주어진 정책 $\pi$의 가치함수 $V^\pi$를 계산하는 문제다. Bellman expectation operator를 다음과 같이 정의한다.
+
+$$
+T^\pi V(s) := r^\pi(s) + \gamma \sum_{s'} P^\pi(s' \mid s) V(s')
+$$
+
+이 operator가 $\gamma$-contraction임을 보이면 iterative evaluation의 수렴이 보장된다.
+
+<Theorem kind="theorem" number="1" title="Bellman Expectation Operator Contraction">
+함수공간 $(B(\mathcal{S}), \|\cdot\|_\infty)$에서 $T^\pi$는 $\gamma$-contraction이다.
+
+$$\|T^\pi V - T^\pi V'\|_\infty \leq \gamma \|V - V'\|_\infty \quad \forall V, V'$$
+</Theorem>
+
+<Proof>
+임의의 state $s$에서
+
+$$|T^\pi V(s) - T^\pi V'(s)| = \left|\gamma \sum_{s'} P^\pi(s' \mid s)(V(s') - V'(s'))\right|$$
+
+$$\leq \gamma \sum_{s'} P^\pi(s' \mid s)|V(s') - V'(s')| \leq \gamma \|V - V'\|_\infty \underbrace{\sum_{s'} P^\pi(s' \mid s)}_{=1}$$
+
+stochastic matrix의 행 합이 1이므로 성립한다. $\square$
+</Proof>
+
+이 결과에서 두 가지가 따라온다. 첫째, 임의의 초기값 $V_0$에서 시작하더라도 $V_k \to V^\pi$가 지수적 속도로 보장된다: $\|V_k - V^\pi\|_\infty \leq \gamma^k \|V_0 - V^\pi\|_\infty$. 둘째, $\gamma$가 1에 가까울수록 수렴이 느려진다. $\gamma = 0.99$이면 $10^{-6}$ 정확도까지 약 1375회, $\gamma = 0.999$이면 약 13,800회가 필요하다.
+
+직접 해법 $(I - \gamma P^\pi)^{-1} r^\pi$는 $O(|\mathcal{S}|^3)$ 비용으로 한 번에 풀지만, $|\mathcal{S}| > 1000$이면 iterative 방법이 현실적이다.
+
+## Policy Improvement: greedy가 항상 낫거나 같은 이유
+
+$V^\pi$를 알고 있을 때, 각 state에서 $Q^\pi(s, a) = r(s, a) + \gamma \sum_{s'} P(s' \mid s, a) V^\pi(s')$를 계산할 수 있다. $Q^\pi(s, a) > V^\pi(s)$라면 현재 행동 $a$가 $\pi$의 평균보다 낫다는 뜻이다. Howard(1960)의 Policy Improvement Theorem은 이 직관을 미래 전체로 확장한다.
+
+<Theorem kind="theorem" number="2" title="Policy Improvement Theorem (Howard 1960)">
+Greedy policy $\pi'(s) = \arg\max_a Q^\pi(s, a)$에 대해,
+
+$$Q^\pi(s, \pi'(s)) \geq V^\pi(s) \;\forall s \quad \Rightarrow \quad V^{\pi'}(s) \geq V^\pi(s) \;\forall s$$
+</Theorem>
+
+<Proof>
+임의의 state $s$에서 $\pi'$ 따라 전개하면,
+
+$$V^{\pi'}(s) = \mathbb{E}_{a \sim \pi'(\cdot|s)}[Q^\pi(s, a)] \geq \mathbb{E}_{a \sim \pi(\cdot|s)}[Q^\pi(s, a)] = V^\pi(s)$$
+
+한 발 더 나아가 $Q^\pi$의 정의를 전개하면:
+
+$$V^{\pi'}(s) \geq r(s, \pi'(s)) + \gamma \mathbb{E}_{s_1}[V^\pi(s_1)] \geq r(s, \pi'(s)) + \gamma \mathbb{E}_{s_1}[V^{\pi'}(s_1)]$$
+
+두 번째 부등호는 귀납 가정 $V^\pi(s_1) \leq V^{\pi'}(s_1)$이고, discounting $\gamma < 1$이 이 재귀를 수렴시킨다. $\square$
+</Proof>
+
+"Strict improvement가 있으면 유한 step 안에 최적 정책에 도달한다"는 따름 정리도 이어진다. Deterministic stationary policy의 수는 $|\mathcal{A}|^{|\mathcal{S}|}$(유한)이고, 각 iteration에서 다른 정책이 나오려면 strict improvement가 필요하며, bounded value function은 무한한 strict improvement를 허용하지 않기 때문이다.
+
+## Value Iteration: max operator와 Bellman residual
+
+Policy Iteration이 evaluation을 수렴까지 수행하는 것과 달리, Value Iteration은 Bellman optimality operator $T^*$를 직접 반복한다.
+
+$$
+T^* V(s) := \max_a \left[r(s, a) + \gamma \sum_{s'} P(s' \mid s, a) V(s')\right]
+$$
+
+$T^*$도 $\gamma$-contraction임을 보일 수 있다. Max-Lipschitz 부등식 $|\max_i f_i - \max_i g_i| \leq \max_i |f_i - g_i|$를 쓰면 $T^\pi$의 증명과 구조가 같다. 따라서 $V_k \to V^*$가 지수적으로 보장된다.
+
+실용적으로 중요한 것은 **Bellman residual**이다. $\text{BR}_k := \|T^* V_k - V_k\|_\infty$라 하면:
+
+$$
+\|V_k - V^*\|_\infty \leq \frac{\text{BR}_k}{1 - \gamma}
+$$
+
+이 부등식이 정지 기준으로 쓰인다. $\gamma \to 1$일수록 residual이 매우 작아야만 $\epsilon$-optimal을 보장할 수 있다는 사실이 수렴 속도 문제의 정량적 설명이기도 하다.
+
+<Callout type="note" title="트레이드오프: PI vs VI">
+Policy Iteration의 반복 수는 실무에서 보통 10~100회지만, 각 iteration에서 evaluation을 완전히 수행해야 한다. Value Iteration은 iteration당 비용이 작지만 수렴까지 $k \propto \log(1/\epsilon)/\log(1/\gamma)$회가 필요하다. 상태 공간이 작고 $\gamma$가 0.99 미만이면 PI, 크고 $\gamma$가 0.999에 가까우면 Asynchronous VI가 현실적이다.
+</Callout>
+
+Asynchronous VI(Gauss-Seidel)는 한 state씩 update하면서 이미 업데이트된 값을 즉시 사용한다. 모든 state가 무한히 업데이트된다는 조건 아래 같은 고정점으로 수렴한다(Bertsekas & Tsitsiklis 1989).
+
+## GPI: E와 I를 임의로 섞어도 수렴한다
+
+Policy Iteration과 Value Iteration을 잇는 개념이 GPI다. PE를 $n$회만 수행하고 improvement하는 것을 **Modified PI**라 부르는데, $n = \infty$이면 Policy Iteration, $n = 1$이면 Value Iteration이 된다.
+
+Sutton & Barto(2018)의 핵심 주장은 다음이다: E(evaluation)과 I(improvement)를 **임의의 순서와 횟수로 interleave**해도, 둘 다 충분히 많이 일어나면 $V^*, \pi^*$로 수렴한다.
+
+수렴의 논리는 이렇다. E가 충분히 일어나면 $V_k \to V^{\pi_k}$ (어떤 속도든). $V^{\pi_k}$가 고정되면 I는 단조 개선을 보장한다. Policy space가 유한(tabular)이면 단조 개선은 유한 step 안에 fixed point에 도달한다. 그 fixed point에서 정책은 자기 자신에 대해 greedy다 — 이것이 Bellman optimality의 정의다.
+
+이 틀이 강력한 이유는 model이 없어도 작동하기 때문이다. E 프로세스를 샘플링으로 근사하면:
+
+| 알고리즘 | E 방식 | I 방식 |
+|----------|--------|--------|
+| Policy Iteration | 수렴까지 iterative | greedy |
+| Value Iteration | 1-step $T^*$ | implicit (max) |
+| Monte Carlo | full rollout | greedy |
+| TD / SARSA | 1-step bootstrap | $\varepsilon$-greedy |
+| Q-learning | 1-step off-policy bootstrap | implicit greedy |
+| Actor-Critic | critic이 bootstrap | actor가 개선 |
+
+Q-learning의 update $Q(s,a) \leftarrow Q(s,a) + \alpha[r + \gamma \max_{a'} Q(s', a') - Q(s,a)]$에서 $\max_{a'}$가 implicit improvement이고, TD target이 implicit evaluation이다. Deep RL(DQN, PPO, A3C)도 같은 구조다.
+
+<Aside label="Deadly Triad">
+Function approximation에서 GPI가 발산할 수 있다. Off-policy + bootstrapping + FA가 동시에 만족되면 오차가 누적된다(Sutton 2015). DQN이 experience replay와 frozen target network를 쓰는 이유가 여기 있다 — GPI 틀은 유효하지만, 실무 안정성은 별개다.
+</Aside>
+
+## 정리
+
+- $T^\pi$와 $T^*$는 모두 $\gamma$-contraction이며, 이것이 Policy Evaluation과 Value Iteration의 수렴 근거다.
+- Policy Improvement Theorem은 greedy 선택이 현재 정책보다 항상 낫거나 같음을 보장하고, finite MDP에서 유한 step 안에 최적 정책에 도달함을 함의한다.
+- Bellman residual $\|T^* V_k - V_k\|_\infty \leq \epsilon(1-\gamma)$은 Value Iteration의 정지 기준이자 $\gamma \to 1$ 문제의 정량적 표현이다.
+- GPI는 E와 I의 interleaving 방식에 무관하게 같은 고정점으로 수렴한다 — 이것이 수십 년간 별도로 발전한 RL 알고리즘들이 하나의 틀 아래 있는 이유다.
+
+다음 글에서는 model을 모를 때 E 프로세스를 Monte Carlo와 Temporal Difference로 어떻게 근사하는지, 그리고 그 근사가 GPI 수렴 조건을 어떻게 만족시키는지 추적한다.

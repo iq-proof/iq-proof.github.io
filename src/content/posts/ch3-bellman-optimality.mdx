@@ -1,0 +1,123 @@
+---
+title: "Bellman Optimality Equation은 왜 Value Iteration을 보증하는가"
+description: "최적 가치 함수의 정의부터 Bellman Optimality Operator의 수축 성질까지, Value Iteration 수렴의 수학적 근거를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, bellman-equation, value-iteration, contraction-mapping, dynamic-programming]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RL에서 "최적 정책을 찾는다"는 말은 구체적으로 무엇을 찾는다는 뜻인가? 단순히 보상을 많이 주는 정책을 탐색하는 게 아니라, 수학적으로 정의된 $V^*$를 먼저 구하고 거기서 정책을 역산한다는 뜻이다. 이 역산 경로가 value-based RL의 핵심이며, 그 경로를 작동시키는 엔진이 Bellman Optimality Equation이다. 왜 이 방정식 하나가 Value Iteration의 수렴을 보증하는가?
+
+## 최적 가치 함수의 정의
+
+정책 $\pi$마다 value function $V^\pi(s)$가 다르다. 그 중 최선을 정의한다:
+
+$$
+V^*(s) := \sup_{\pi \in \Pi} V^\pi(s), \qquad Q^*(s, a) := \sup_{\pi \in \Pi} Q^\pi(s, a)
+$$
+
+유한 MDP에서는 정책 수가 $|\mathcal{A}|^{|\mathcal{S}|}$로 유한하므로 $\sup$은 $\max$로 대체된다. 중요한 것은 이 최댓값이 **어떤 단일 deterministic stationary 정책 $\pi^*$에 의해 모든 state에서 동시에 달성된다**는 점이다. 이를 Puterman(2005)은 다음과 같이 정리한다.
+
+<Theorem kind="theorem" number="1" title="Deterministic Stationary Optimal Policy의 존재">
+유한 state/action, discounted infinite-horizon MDP에서 어떤 deterministic stationary 정책 $\pi^*: \mathcal{S} \to \mathcal{A}$가 존재하여 $V^{\pi^*}(s) = V^*(s)$가 모든 $s$에서 성립한다.
+</Theorem>
+
+<Proof>
+State $s$에서 임의의 stochastic policy $\pi$의 value는 $Q^\pi$의 convex combination이다: $V^\pi(s) = \sum_a \pi(a|s) Q^\pi(s, a)$. Convex combination의 최댓값은 극단점(extreme point)에서 달성되고, simplex의 극단점은 정확히 하나의 action에 확률 1을 부여하는 deterministic policy다. 따라서 $\max_\pi V^\pi(s) = \max_a Q^*(s, a)$이며, 이를 모든 state에서 동시에 선택하는 deterministic 정책 $\pi^*(s) = \arg\max_a Q^*(s, a)$가 최적임을 보일 수 있다. $\square$
+</Proof>
+
+Bounded reward $|R| \leq R_{\max}$와 $\gamma < 1$ 조건 하에서 $\|V^*\|_\infty \leq R_{\max}/(1-\gamma)$가 보장되므로, $V^*$는 bounded function space $\mathbb{R}^S$ 안에 존재한다.
+
+## Bellman Optimality Equation
+
+$V^*$를 정의했다면, 그것이 만족하는 방정식을 유도할 수 있다. Bellman Expectation Equation이 정책 평균($\sum_a \pi(a|s)$)을 취한다면, Optimality Equation은 최적 선택($\max_a$)을 취한다:
+
+$$
+V^*(s) = \max_a \left[ R(s, a) + \gamma \sum_{s'} P(s' \mid s, a) V^*(s') \right] \qquad \forall s \in \mathcal{S}
+$$
+
+$Q^*$로 표현하면:
+
+$$
+Q^*(s, a) = R(s, a) + \gamma \sum_{s'} P(s' \mid s, a) \max_{a'} Q^*(s', a')
+$$
+
+이 방정식이 단순한 재귀 정의가 아닌 이유는 **$V^*$가 이 방정식의 유일한 해**이기 때문이다. 즉 방정식을 풀면 반드시 최적 가치 함수가 나온다. 유일성 증명은 다음 절의 수축 성질에서 따라온다.
+
+## Bellman Optimality Operator와 수축 성질
+
+방정식을 연산자로 추상화한다. Bellman Optimality Operator $T^*: \mathbb{R}^S \to \mathbb{R}^S$를 다음과 같이 정의한다:
+
+$$
+(T^* V)(s) := \max_a \left\{ R(s, a) + \gamma \sum_{s'} P(s' \mid s, a) V(s') \right\}
+$$
+
+$T^\pi V = r^\pi + \gamma P^\pi V$가 affine(선형)인 것과 달리, $T^*$는 $\max$ 때문에 **nonlinear**다. 이 차이가 알고리즘 설계에 결정적 영향을 준다: $T^\pi$는 $(I - \gamma P^\pi)^{-1} r^\pi$로 직접 풀 수 있지만, $T^*$는 fixed point iteration으로만 접근 가능하다.
+
+<Theorem kind="theorem" number="2" title="$T^*$는 $\gamma$-contraction in $\|\cdot\|_\infty$">
+임의의 $V, V' \in \mathbb{R}^S$에 대해 $\|T^* V - T^* V'\|_\infty \leq \gamma \|V - V'\|_\infty$.
+</Theorem>
+
+<Proof>
+각 state $s$에서 Max-Lipschitz 보조정리를 적용한다: $|\max_a f(a) - \max_a g(a)| \leq \max_a |f(a) - g(a)|$. 이를 이용하면
+
+$$
+|(T^* V)(s) - (T^* V')(s)| \leq \max_a \left| \gamma \sum_{s'} P(s'|s,a)[V(s') - V'(s')] \right|
+$$
+
+$P(s'|s,a)$가 stochastic matrix($\sum_{s'} P(s'|s,a) = 1$)이므로 weighted average는 $\|V - V'\|_\infty$를 넘지 않는다. 따라서 $|(T^* V)(s) - (T^* V')(s)| \leq \gamma \|V - V'\|_\infty$. State $s$에 대해 supremum을 취하면 증명이 완료된다. $\square$
+</Proof>
+
+Banach Fixed Point Theorem에 의해, $\gamma < 1$인 contraction mapping은 완비거리공간에서 유일한 고정점을 가지며 임의의 초기값에서 반복 적용 시 그 고정점으로 수렴한다. $T^* V^* = V^*$이므로 $V^*$가 바로 그 유일한 고정점이다. Value Iteration은 $V_{k+1} = T^* V_k$를 반복하는 것이며, 수렴 속도는:
+
+$$
+\|V_k - V^*\|_\infty \leq \gamma^k \|V_0 - V^*\|_\infty
+$$
+
+로 기하급수적이다.
+
+## Greedy Policy 추출과 트레이드오프
+
+$V^*$를 구했다면 최적 정책은 단 한 번의 연산으로 나온다:
+
+$$
+\pi^*(s) = \arg\max_a Q^*(s, a) = \arg\max_a \left[ R(s, a) + \gamma \sum_{s'} P(s'|s,a) V^*(s') \right]
+$$
+
+여러 action이 동률이어도 성능은 동일하다. Tie-breaking은 성능이 아니라 구현 편의의 문제다.
+
+<Callout type="note" title="트레이드오프">
+**$V^*$가 정확할 때**: greedy policy는 최적을 보장한다. 그러나 $\|V - V^*\|_\infty = \varepsilon$인 근사값에서 greedy를 수행하면 성능 손실이 $\frac{2\gamma}{1-\gamma}\varepsilon$까지 증폭될 수 있다. $\gamma \to 1$에서 이 증폭 계수는 발산한다. deep RL에서 value network의 근사 오차가 불안정성을 유발하는 이유가 여기에 있다.
+
+또한 $T^*$의 nonlinearity는 Policy Evaluation($T^\pi$)과 Policy Improvement(greedy) 사이의 비대칭을 만든다. Evaluation은 $O(S^3)$으로 정확히 풀리지만, Improvement는 모든 action을 비교해야 한다. Policy Iteration이 Value Iteration보다 적은 iteration으로 수렴하는 이유는 이 구조적 차이에서 나온다.
+</Callout>
+
+## 정리
+
+- $V^*(s) = \max_\pi V^\pi(s)$는 유한 MDP에서 deterministic stationary policy에 의해 달성된다.
+- Bellman Optimality Equation $V^* = T^* V^*$는 $V^*$의 고정점 방정식이며, 유일한 해다.
+- $T^*$의 $\gamma$-contraction 성질이 Value Iteration의 수렴을 보증한다.
+- Greedy policy 추출은 $V^*$에서 1-step 연산이지만, 근사 오차는 $\frac{2\gamma}{1-\gamma}$ 배 증폭된다.
+
+이 구조는 Q-learning과 Actor-Critic을 포함한 거의 모든 value-based RL 알고리즘의 이론적 토대다. Banach Fixed Point Theorem을 통한 수렴 증명은 다음 글에서 다룬다.
+
+<Reference
+  title="Markov Decision Processes: Discrete Stochastic Dynamic Programming"
+  authors="Puterman, M. L."
+  year={2005}
+  venue="Wiley"
+  url="https://www.wiley.com/en-us/Markov+Decision+Processes%3A+Discrete+Stochastic+Dynamic+Programming-p-9780471727828"
+/>

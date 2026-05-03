@@ -1,0 +1,149 @@
+---
+title: "RL 성능 분석의 언어 — State Distribution부터 근사 오차까지"
+description: "Performance Difference Lemma의 닭과 달걀 문제부터 greedy 정책 손실의 수학적 bound까지, 현대 RL 이론이 공유하는 하나의 언어를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, policy-optimization, performance-difference-lemma, advantage-function]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+TRPO, PPO, Actor-Critic — 현대 RL 알고리즘들은 서로 다른 이름을 가지지만 동일한 수학적 언어로 쓰여 있다. 그 언어의 어휘는 state distribution, advantage function, surrogate objective 세 가지다. 이 언어를 모르면 알고리즘 코드를 읽을 수 있어도 왜 그렇게 설계됐는지 알 수 없다. 세 어휘는 어디서 오고, 어떻게 연결되는가?
+
+## 첫 번째 어휘: State Distribution
+
+정책 $\pi$를 고정하면 환경에서 어느 상태를 얼마나 자주 방문하는지가 결정된다. 이를 **discounted state distribution**으로 정의한다.
+
+$$
+d^\pi(s) := (1-\gamma) \sum_{t=0}^{\infty} \gamma^t \mathbb{P}(S_t = s \mid \pi, \rho_0)
+$$
+
+$(1-\gamma)$는 정규화 상수다. $\sum_t \gamma^t = 1/(1-\gamma)$이므로 이를 곱하면 $\sum_s d^\pi(s) = 1$이 성립한다. 정책의 성능은 이 분포로 단순하게 표현된다.
+
+$$
+J(\pi) = \frac{1}{1-\gamma} \mathbb{E}_{s \sim d^\pi}[r^\pi(s)]
+$$
+
+여기서 $r^\pi(s) = \sum_a \pi(a \mid s) r(s, a)$다. $d^\pi$는 "어느 상태에 자주 방문하는가"를 담고 있으므로, 성능은 방문 분포에 대한 기대 보상의 가중합이다.
+
+$\gamma \to 1$이면 discounted distribution은 stationary distribution $d^\pi_\infty$에 가까워진다. Ergodic Markov chain (irreducible + aperiodic)에서는 초기 분포와 무관하게 $d^\pi_t \to d^\pi_\infty$로 수렴한다. Perron-Frobenius 정리에 의해 고유값 1이 단순(simple)하면 stationary distribution이 유일하다.
+
+## 두 번째 어휘: Performance Difference Lemma
+
+두 정책 $\pi$와 $\pi'$의 성능 차이를 정확히 표현하면 어떻게 되는가? Kakade & Langford(2002)의 답은 다음과 같다.
+
+$$
+J(\pi') - J(\pi) = \frac{1}{1-\gamma}\, \mathbb{E}_{s \sim d^{\pi'}, a \sim \pi'(\cdot \mid s)}[A^\pi(s, a)]
+$$
+
+<Theorem kind="theorem" number="1" title="Performance Difference Lemma">
+임의의 두 정책 $\pi, \pi'$와 무한 시간 할인 MDP $(\mathcal{S}, \mathcal{A}, P, r, \rho_0, \gamma)$에 대해, 위 등식이 정확히 성립한다.
+</Theorem>
+
+<Proof>
+정책 $\pi'$의 trajectory에서 telescoping identity를 적용한다.
+
+$$
+\sum_{t=0}^{\infty} \gamma^t \big(\gamma V^\pi(s_{t+1}) - V^\pi(s_t)\big) = -V^\pi(s_0)
+$$
+
+양변에 $\tau \sim \pi'$에 대한 기대값을 취하면 우변은 $-J(\pi)$다. 좌변에 $r(s_t, a_t)$를 더하고 빼면:
+
+$$
+J(\pi') - J(\pi) = \mathbb{E}_{\tau \sim \pi'}\left[\sum_{t=0}^{\infty} \gamma^t \big(r(s_t, a_t) + \gamma V^\pi(s_{t+1}) - V^\pi(s_t)\big)\right]
+$$
+
+Bellman equation으로부터 괄호 안이 $A^\pi(s_t, a_t)$임을 확인할 수 있다. Tower property를 적용하고 $d^{\pi'}$의 정의를 대입하면 결론을 얻는다. $\square$
+</Proof>
+
+이 공식에서 **닭과 달걀 문제**가 드러난다. 새 정책 $\pi'$의 성능을 평가하려면 $d^{\pi'}$를 알아야 하고, $d^{\pi'}$를 알려면 $\pi'$를 실행해야 하며, 실행하기 전에 어떤 $\pi'$이 좋은지 알 수 없다.
+
+## 세 번째 어휘: Advantage Function
+
+PDL의 우변에 등장하는 $A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s)$가 **advantage function**이다. 상태 $s$에서 행동 $a$를 취하는 것이 현재 정책의 평균 대비 얼마나 좋은지를 나타낸다.
+
+<Callout type="note" title="On-policy advantage의 합">
+정책 $\pi$에 대해 상태 $s$에서 항상 $\sum_a \pi(a \mid s) A^\pi(s, a) = 0$이 성립한다. advantage는 절대적 가치가 아니라 상대적 척도다.
+</Callout>
+
+Policy Gradient에서 advantage가 중요한 두 번째 이유는 **분산 감소**다. $\nabla J(\pi) \propto \mathbb{E}[\nabla \log \pi(a \mid s) Q^\pi(s, a)]$에서 $V^\pi(s)$를 빼도 기대값이 변하지 않는다.
+
+$$
+\mathbb{E}_a[\nabla \log \pi_\theta(a \mid s) \cdot V^\pi(s)] = V^\pi(s) \nabla_\theta \sum_a \pi_\theta(a \mid s) = 0
+$$
+
+$\sum_a \pi(a \mid s) = 1$의 미분이 0이기 때문이다. 따라서 $b(s) = V^\pi(s)$는 gradient 기대값을 보존하면서 분산을 줄이는 최적에 가까운 baseline이다.
+
+## 닭과 달걀 문제의 해결: Surrogate Objective와 Trust Region
+
+$d^{\pi'} \to d^\pi$로 근사하면 PDL의 우변을 계산 가능한 **surrogate objective**로 만들 수 있다.
+
+$$
+L_\pi(\pi') := \frac{1}{1-\gamma}\,\mathbb{E}_{s \sim d^{\pi}, a \sim \pi'(\cdot \mid s)}[A^\pi(s, a)]
+$$
+
+이 근사의 오차는 두 분포의 거리에 비례한다. Schulman(2015)은 이를 KL divergence로 bound해 TRPO의 이론적 근거를 제시했다.
+
+$$
+J(\pi') - J(\pi) \geq L_\pi(\pi') - \frac{2\gamma}{(1-\gamma)^2} D_{\text{KL}}(\pi', \pi) \cdot \max_{s,a}|A^\pi(s, a)|
+$$
+
+이 부등식이 trust region constraint $D_{\text{KL}}(\pi', \pi) \leq \delta$를 정당화한다. $L_\pi(\pi') > C \cdot \delta$이면 improvement가 보장된다. PPO의 clip 비율 $[1-\epsilon, 1+\epsilon]$은 이 KL constraint의 first-order 근사다.
+
+<Aside label="설계 철학">
+TRPO와 PPO의 차이는 trust region을 어떻게 구현하느냐다. TRPO는 KL constraint를 명시적으로 풀고, PPO는 importance ratio를 clip해서 암묵적으로 제어한다. 수학적 동기는 하나 — surrogate 근사 오차를 제어하라.
+</Aside>
+
+## 오차가 누적되면: 근사 오차와 정책 손실
+
+실전에서는 $Q^*$를 정확히 알 수 없다. $\hat{Q}$가 $\epsilon$-optimal이면 ($\|\hat{Q} - Q^*\|_\infty \leq \epsilon$), greedy 정책 $\hat{\pi}$의 손실은 얼마인가?
+
+$$
+J(\pi^*) - J(\hat{\pi}) \leq \frac{2\epsilon}{(1-\gamma)^2}
+$$
+
+상수 $1/(1-\gamma)^2$의 구조가 의미심장하다. 첫 번째 $(1-\gamma)^{-1}$은 무한 시간 합산에서, 두 번째는 Bellman equation 반복에서 오차가 누적되는 효과다. $\gamma \to 1$이면 이 상수는 발산한다 — 장기적 미래를 중시할수록 작은 근사 오차도 큰 손실로 이어진다.
+
+tabular 환경에서 $\epsilon$-optimal $Q$를 학습하는 데 필요한 샘플 수는 Hoeffding 부등식으로 유도하면 $\tilde{O}(|\mathcal{S}||\mathcal{A}|/\epsilon^2)$다. 모델을 아는 planning의 $O(|\mathcal{S}|^2|\mathcal{A}|)$ 시간복잡도와 비교하면, learning은 정확도 $\epsilon$에 대해 $1/\epsilon^2$의 추가 비용을 지불한다.
+
+<Callout type="warning" title="트레이드오프">
+discount factor $\gamma$가 클수록 (1) 근사 오차의 증폭이 커지고 ($(1-\gamma)^{-2}$ factor), (2) stationary distribution 수렴이 느려지며, (3) sample complexity가 증가한다. 반면 $\gamma$가 작으면 근시안적 정책이 된다. $\gamma$는 정확도와 장기성의 트레이드오프를 결정하는 핵심 하이퍼파라미터다.
+</Callout>
+
+## 정리
+
+네 챕터를 관통하는 구조는 하나다 — **성능을 state distribution에 대한 기대값으로 표현하고, 그 분포를 제어하거나 근사함으로써 알고리즘을 설계한다**.
+
+- $d^\pi$는 "어디를 방문하는가"를 담고, $J(\pi) = \frac{1}{1-\gamma}\mathbb{E}_{s \sim d^\pi}[r^\pi(s)]$로 성능을 결정한다.
+- PDL은 두 정책의 성능 차이를 advantage의 가중합으로 정확히 분해하지만, $d^{\pi'}$가 미지수라는 구조적 문제를 노출한다.
+- Surrogate objective는 $d^{\pi'} \to d^\pi$로 이 문제를 우회하고, trust region은 그 근사 오차를 제어한다.
+- 근사 Q-함수에서 오는 정책 손실은 $(1-\gamma)^{-2}$로 증폭되며, tabular learning의 sample complexity는 $\tilde{O}(|\mathcal{S}||\mathcal{A}|/\epsilon^2)$다.
+
+이 네 개념을 하나의 언어로 읽고 나면, TRPO/PPO의 수식이 임의적 선택이 아니라 필연임을 이해하게 된다.
+
+<Reference
+  title="Approximately Optimal Approximate Reinforcement Learning"
+  authors="Kakade, S. and Langford, J."
+  year={2002}
+  venue="ICML"
+  url="https://people.eecs.berkeley.edu/~pabbeel/cs287-fa09/readings/KakadeLangford-2002.pdf"
+/>
+
+<Reference
+  title="Trust Region Policy Optimization"
+  authors="Schulman, J. et al."
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1502.05477"
+/>

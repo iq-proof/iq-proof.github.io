@@ -1,0 +1,177 @@
+---
+title: "RL에서 함수 근사는 왜 불안정한가"
+description: "무한 상태 공간의 선형 근사부터 Deadly Triad의 발산, Linear MDP의 수렴 보장, Bisimulation 기반 상태 추상화까지 — 함수 근사의 수렴 조건을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, function-approximation, deadly-triad, linear-mdp, bisimulation]
+difficulty: advanced
+series:
+  slug: rl-foundations-deep-dive
+  title: Rl Foundations Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Tabular RL은 상태마다 값을 하나씩 저장한다. 로봇의 관절 각도나 픽셀 이미지처럼 상태 공간이 무한하거나 연속이면, 이 전략은 처음부터 불가능하다. 그래서 함수 근사가 필요하다 — 그런데 이 근사를 도입하는 순간 수렴 보장이 무너지기 시작한다. 어떤 조건에서 수렴하고, 어떤 조건에서 발산하는가?
+
+## 선형 근사의 출발점
+
+가장 단순한 함수 근사는 **선형 모델**이다.
+
+$$V_\theta(s) = \theta^T \phi(s)$$
+
+여기서 $\phi: \mathcal{S} \to \mathbb{R}^d$는 feature map, $\theta \in \mathbb{R}^d$는 학습할 파라미터다. 상태 하나하나를 저장하는 대신, $d$차원 feature 공간에서 공유 표현으로 모든 상태의 값을 근사한다.
+
+선형 모델의 핵심 장점은 **볼록성**이다. Loss landscape가 convex이므로 수렴 분석이 가능하다. Tsitsiklis & Van Roy (1997)는 이 설정에서 TD(0) 알고리즘이 수렴함을 증명했다.
+
+$$\theta_{t+1} = \theta_t + \alpha_t \delta_t \phi(s_t)$$
+
+TD error $\delta_t = r_t + \gamma V_{\theta_t}(s_{t+1}) - V_{\theta_t}(s_t)$에 따라 파라미터를 업데이트한다.
+
+<Theorem kind="theorem" number="1" title="On-Policy TD(0) 수렴 (Tsitsiklis & Van Roy 1997)">
+On-policy 설정에서, Robbins-Monro 조건(`$\sum \alpha_t = \infty, \sum \alpha_t^2 < \infty$`)을 만족하는 학습률로 TD(0)를 실행하면 $\theta_t \to \theta^*$ (a.s.)이다. 수렴점 $\theta^*$는 **Projected Bellman equation의 유일한 고정점**이다.
+
+$$\theta^* = \arg\min_\theta \| \Pi T^\pi V_\theta - V_\theta \|_{d^\pi}^2$$
+</Theorem>
+
+수렴점은 optimal value가 아니라 **Projected Bellman의 고정점**이라는 점이 중요하다. Feature map이 $V^\pi$를 span하지 못하면 근본적인 근사 오차가 남는다.
+
+$$\| V^*_\theta - V^\pi \|_{d^\pi} \leq \frac{1}{1-\gamma} \| V^\pi - \Pi V^\pi \|_{d^\pi}$$
+
+이 오차는 알고리즘이 아니라 feature map의 표현력이 결정한다.
+
+## Deadly Triad — 세 조건이 만나면 발산한다
+
+On-policy 수렴 결과는 아름답지만, 현실의 deep RL은 그 조건을 거의 항상 위반한다.
+
+**Deadly Triad**는 세 조건의 조합이다 (Baird 1995, Sutton & Barto 2018).
+
+1. **Off-policy learning** — behavior policy $\mu$로 탐색하고 target policy $\pi$를 최적화
+2. **Bootstrapping** — TD error $\delta_t = r_t + \gamma Q(s_{t+1}, a') - Q(s_t, a_t)$에서 $Q$ 자신을 사용
+3. **Function Approximation** — $Q$를 $\theta$로 파라미터화
+
+<Theorem kind="theorem" number="2" title="Deadly Triad (Baird 1995)">
+위 세 조건이 동시에 만족되면, linear function approximation을 사용하는 TD/Q-learning이 **발산(diverge)** 할 수 있다.
+</Theorem>
+
+<Proof>
+Off-policy TD update의 기대값을 분석하면 수렴을 결정하는 행렬은
+
+$$A_{\text{off}} = \mathbb{E}\left[\rho_t \phi(s_t)(\phi(s_t) - \gamma\phi(s_{t+1}))^T\right]$$
+
+여기서 $\rho_t = \pi(a_t|s_t)/\mu(a_t|s_t)$는 importance sampling weight다. On-policy에서 $A$는 positive definite이지만, off-policy에서 $A_{\text{off}}$는 **음의 고유값**을 가질 수 있다. Bootstrapping은 $Q(s')$의 추정 오차를 feedback loop에 포함시키므로, 음의 고유값 방향으로 파라미터가 지수적으로 증가할 수 있다. $\square$
+</Proof>
+
+Baird의 counterexample은 7-state MDP에서 8-feature linear approximation이 Q-learning 하에서 $\|\theta\| \to \infty$로 발산함을 명시적으로 보인다. 동일한 MDP에서 on-policy SARSA는 수렴한다.
+
+<Callout type="warning" title="Deadly Triad와 Deep RL">
+DQN, A3C, PPO 등 대부분의 deep RL 알고리즘은 이 세 조건을 동시에 만족한다. DQN이 experience replay와 target network를 도입하는 이유가 바로 이 불안정성을 완화하기 위해서다. Target network는 bootstrapping target을 고정해 feedback loop를 끊고, experience replay는 데이터의 시간적 상관관계를 줄인다. 하지만 이 기법들도 발산을 완전히 제거하지는 못한다 — Deadly Triad의 **근본적 해결은 알고리즘 수준에서 이루어져야 한다**.
+</Callout>
+
+Gradient Temporal Difference (GTD)는 이 문제를 알고리즘적으로 해결한다. 보조 변수 $w$를 도입해 TD error를 "criticality"로 unweight함으로써, off-policy bias를 흡수하고 수렴 조건을 회복한다.
+
+## Linear MDP — MDP 구조 자체에서 나오는 수렴 보장
+
+Deadly Triad의 교훈은 "임의의 MDP에서 off-policy + bootstrap + FA는 위험하다"이다. 그렇다면 MDP 자체에 특별한 구조가 있으면 어떨까?
+
+**Linear MDP**는 transition kernel이 feature의 선형 결합인 MDP다 (Jin et al. 2020).
+
+$$P(s'|s,a) = \sum_{i=1}^d \phi_i(s,a)\, \mu_i(s'), \quad R(s,a) = \phi(s,a)^T \theta_R$$
+
+이 구조에서 놀라운 결과가 성립한다.
+
+<Theorem kind="theorem" number="3" title="Linear MDP에서 Optimal Q는 Linear">
+Linear MDP에서 optimal Q-function은 feature map에 대해 linear하다.
+
+$$Q^*(s,a) = \phi(s,a)^T w^*$$
+
+for some $w^* \in \mathbb{R}^d$.
+</Theorem>
+
+<Proof>
+Bellman optimality equation에 $Q^*(s,a) = \phi(s,a)^T w^*$를 대입하면
+
+$$\phi(s,a)^T w^* = \phi(s,a)^T \theta_R + \gamma \sum_i \phi_i(s,a) \mathbb{E}_{s' \sim \mu_i}\left[\max_{a'} \phi(s',a')^T w^*\right]$$
+
+우변을 $\phi(s,a)^T(\ldots)$의 형태로 정리하면 $w^*$에 대한 고정점 방정식이 된다. 선형 공간에서의 contraction으로 유일한 해가 존재한다. $\square$
+</Proof>
+
+이 구조 위에서 LSVI-UCB (Least-Squares Value Iteration with Upper Confidence Bounds) 알고리즘은 다음 regret bound를 달성한다.
+
+$$\text{Regret}(K) = \tilde{O}(d^{3/2} H^{3/2} \sqrt{K})$$
+
+$d$(feature 차원), $H$(horizon), $K$(에피소드 수)의 **다항식** 바운드다. Tabular RL의 지수적 상태 의존성과 달리, feature 차원만으로 sample complexity가 결정된다.
+
+## Bisimulation — 어떤 상태가 진짜로 다른가
+
+Linear MDP는 MDP 구조에 강한 가정을 요구한다. 더 일반적인 설정에서 "어떤 상태들이 실제로 구별 필요한가"라는 질문이 **state abstraction**의 출발점이다.
+
+두 상태 $s, s'$가 **bisimilar**하다는 것은, 모든 행동에 대해 reward가 같고 다음 상태의 분포가 동일한 equivalence class로 분해된다는 것이다.
+
+<Theorem kind="theorem" number="4" title="Bisimilar States의 Value 동치성 (Givan et al. 2003)">
+$s \sim_{\text{bisim}} s'$이면 $V^*(s) = V^*(s')$이다.
+</Theorem>
+
+<Proof>
+Reward와 transition distribution이 equivalence class 단위로 동일하므로, Bellman iteration이 두 상태에 동일하게 적용된다. 귀납법으로 모든 $k$에 대해 $V_k(s) = V_k(s')$이 성립하고, 수렴에서도 동치가 유지된다. $\square$
+</Proof>
+
+Bisimulation이 중요한 이유는 **feature design의 이론적 정당화**를 제공하기 때문이다. Feature map $\phi$가 bisimulation을 포착한다면 — 즉 $\phi(s) = \phi(s') \Rightarrow V^*(s) = V^*(s')$ — 선형 근사의 approximation error가 최소화된다.
+
+현실에서는 정확한 bisimulation보다 $\epsilon$-bisimulation이 더 실용적이다.
+
+$$|V^*(s) - V^*(s')| \leq \frac{2\epsilon}{1-\gamma}$$
+
+$\epsilon$이 작으면 value 오차도 작다. 이 bound는 $(1-\gamma)$의 역수로 증폭되므로, 할인율이 1에 가까울수록 작은 근사 오차도 큰 영향을 미친다.
+
+<Aside label="표현 학습과의 연결">
+Deep RL에서 표현 학습(representation learning)의 목표는 결국 bisimulation을 근사하는 feature를 자동으로 찾는 것이다. DeepMind의 DBC(Deep Bisimulation for Control)가 이 방향을 탐구한다. 이론은 tabular/linear 설정에서 나왔지만, 직관은 신경망 기반 표현 설계로 이어진다.
+</Aside>
+
+## 트레이드오프
+
+네 챕터를 관통하는 공통 구조가 있다 — 수렴 보장과 표현력의 교환.
+
+<Callout type="note" title="트레이드오프">
+| 설정 | 수렴 보장 | 표현력 | 실용성 |
+|:---|:---|:---|:---|
+| Tabular RL | 완전 보장 | 상태 수에 선형 | 작은 MDP만 가능 |
+| Linear FA (on-policy) | 보장됨 | feature span으로 제한 | feature 설계 필요 |
+| Linear FA (off-policy) | **없음** (Deadly Triad) | 동일 | DQN의 근본 불안정성 |
+| Linear MDP + LSVI-UCB | 다항식 regret | feature dim에 의존 | 구조 가정 강함 |
+| Deep RL (NN) | 이론 없음 | 매우 높음 | 현실적이나 불안정 |
+
+선형 근사는 수렴 이론이 완전하지만 표현력이 제한된다. 신경망은 표현력이 높지만 이론이 없다. Linear MDP는 그 중간 — 구조를 가정하는 대가로 sample efficiency 보장을 얻는다.
+</Callout>
+
+## 정리
+
+- 선형 근사 $V_\theta(s) = \theta^T\phi(s)$는 on-policy TD(0)에서 수렴하지만, 수렴점은 optimal이 아닌 Projected Bellman의 고정점이다.
+- Off-policy + Bootstrapping + FA의 **Deadly Triad**는 선형 근사에서도 발산을 유발한다. DQN의 불안정성은 버그가 아니라 이 구조에서 나온다.
+- Linear MDP는 MDP 자체에 선형 구조를 가정함으로써 $\tilde{O}(d^{3/2}H^{3/2}\sqrt{K})$ regret을 달성한다 — exponential이 아닌 polynomial.
+- Bisimulation은 "어떤 상태가 진짜로 다른가"를 수학적으로 정의하고, $\epsilon$-근사에서 value 오차를 $2\epsilon/(1-\gamma)$로 bound한다.
+
+표현력을 높일수록 수렴 보장은 약해진다. Deep RL은 이 트레이드오프의 극단에 서 있다.
+
+<Reference
+  title="An Analysis of Temporal-Difference Learning with Function Approximation"
+  authors="Tsitsiklis, J. R. and Van Roy, B."
+  year={1997}
+  venue="IEEE Transactions on Automatic Control"
+  url="https://ieeexplore.ieee.org/document/580874"
+/>
+
+<Reference
+  title="Provably Efficient Reinforcement Learning with Linear Function Approximation"
+  authors="Jin, C., Yang, Z., Wang, Z., and Jordan, M. I."
+  year={2020}
+  venue="COLT"
+  url="https://arxiv.org/abs/1907.05388"
+/>
