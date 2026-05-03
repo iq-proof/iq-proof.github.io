@@ -1,0 +1,119 @@
+---
+title: "PyTorch Custom Kernel의 핵심은 HBM을 피하는 것이다"
+description: "cpp_extension JIT 컴파일부터 Triton block-level 추상화, cuBLAS/cuDNN 선택 기준, kernel fusion의 정량적 효과까지, PyTorch가 GPU 메모리를 다루는 방식을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [pytorch, cuda, kernel-fusion, triton, hbm]
+difficulty: advanced
+series:
+  slug: pytorch-internals-deep-dive
+  title: Pytorch Internals Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+`torch.add(x, b)` 와 `torch.relu(y)` 를 따로 호출할 때와 한 번에 fuse 해서 호출할 때, 왜 1.5배 이상 성능 차이가 날까? PyTorch의 custom kernel 생태계 — `cpp_extension`, tensor stride, Triton, cuBLAS/cuDNN, kernel fusion — 은 각자 독립적인 도구처럼 보이지만, 모두 같은 하나의 질문으로 수렴한다. **HBM round-trip을 얼마나 줄일 수 있는가?**
+
+## JIT 컴파일의 기반 구조
+
+`torch.utils.cpp_extension.load()` 는 C++/CUDA 소스를 런타임에 컴파일해 Python callable로 만든다. 내부 흐름은 단순하다.
+
+```
+source + flags → hash → cache hit? → load .so
+                              ↓ (miss)
+                         Ninja build → save to ~/.cache/torch_extensions/
+```
+
+캐시 키는 소스 내용과 컴파일 플래그의 해시다. 소스를 한 줄 바꾸면 해시가 바뀌고 재컴파일이 트리거된다. `setup.py + CUDAExtension` 방식은 이 과정을 빌드 타임에 한 번만 수행하고 배포용 `.so`를 생성한다.
+
+PyBind11은 C++ 함수와 Python 사이의 타입 변환을 담당한다. `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)` 블록 안에 등록된 함수는 즉시 Python에서 `my_ext.my_func(tensor)` 형태로 호출 가능하다. `AT_DISPATCH_FLOATING_TYPES` 매크로는 런타임 dtype(`float16`, `float32`, `float64`)에 따라 올바른 C++ template specialization을 자동으로 선택한다.
+
+## Tensor Pointer와 Stride의 계산
+
+Custom kernel에서 tensor를 받을 때 실제로 다루는 것은 raw GPU pointer다. `data_ptr<float>()` 는 `storage.base + storage_offset` 을 typed pointer로 반환한다. 멀티차원 인덱스 `(i_0, ..., i_{n-1})` 의 실제 메모리 주소는 다음과 같다.
+
+$$\text{addr}(i_0, \ldots, i_{n-1}) = \text{base} + \sum_{k=0}^{n-1} i_k \cdot s_k$$
+
+여기서 $s_k$ 는 `tensor.stride(k)` 다. `transpose()` 나 슬라이싱 후에는 stride가 바뀌지만 storage는 바뀌지 않는다 — zero-copy다. 하지만 stride-unaware kernel에 이런 tensor를 넘기면 잘못된 메모리를 읽는다.
+
+<Callout type="warning" title="non-contiguous tensor의 위험">
+`is_contiguous()` 가 `False` 인 tensor를 naive kernel에 넘기면 buffer overread가 발생한다. kernel이 stride를 처리하지 못한다면 `.contiguous()` 를 먼저 호출해 copy를 강제해야 한다. cache miss 비용과 copy 비용 중 어느 쪽이 작은지는 실측으로 결정한다.
+</Callout>
+
+## Triton — 추상화 레벨을 한 단계 올리다
+
+CUDA는 thread 단위로 생각한다. 32개 thread가 warp를 이루고, shared memory bank conflict와 memory coalescing을 개발자가 직접 관리한다. Triton은 **block(tile) 단위**로 생각한다. `tl.load(ptr + offsets, mask=offsets < N)` 는 연속 주소를 접근하면 Triton LLVM backend가 자동으로 coalesced transaction을 생성한다.
+
+```python
+@triton.jit
+def add_kernel(x_ptr, y_ptr, z_ptr, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    tl.store(z_ptr + offsets, x + y, mask=mask)
+```
+
+`@triton.autotune` 은 `BLOCK_SIZE` 와 `num_warps` 조합을 grid search로 탐색해 입력 크기별 최적 설정을 캐시한다. FlashAttention (Dao 2022)과 vLLM의 decode kernel이 Triton으로 구현된 이유는 이 autotune이 CUDA boilerplate 없이 cuDNN과 대등한 성능을 내기 때문이다.
+
+## cuBLAS · cuDNN의 선택 기준
+
+`torch.mm()` 뒤에는 cuBLAS GEMM이 있다.
+
+$$C \leftarrow \alpha A B + \beta C, \quad \text{FLOP} = 2MNK$$
+
+Arithmetic intensity $I \approx K/2$ (대칭 행렬 기준). K가 작으면 memory-bound, K가 크면 compute-bound다. A100에서 `M=N=K=4096` 은 312 TFLOPS를 채운다. `M=100, K=10` 은 15 TFLOPS 수준이다 — 같은 cuBLAS 호출이지만 10배 이상 낮다.
+
+`torch.backends.cudnn.benchmark = True` 는 현재 입력 shape에 대해 implicit GEMM, Winograd, FFT 세 가지 알고리즘을 실제로 실행해 가장 빠른 것을 캐시한다. 초기 warmup에 100ms ~ 1s가 소비되지만 이후에는 overhead가 없다. NCHW → NHWC (channels-last) 변환만으로도 cuDNN이 다른 알고리즘을 선택해 1.5배 이상 빨라질 수 있다.
+
+TF32는 FP32와 같은 exponent range를 유지하면서 mantissa를 23bit에서 10bit로 줄인 포맷이다. A100 이상에서 FP32 GEMM을 호출하면 Tensor Core가 TF32로 자동 변환해 FP32 대비 2배 throughput을 낸다 — 코드 변경 없이.
+
+## Kernel Fusion의 정량적 효과
+
+`y = x + b`, `z = relu(y)` 를 별도 kernel로 실행하면 HBM traffic은 다음과 같다.
+
+$$\text{Traffic}_{\text{sep}} = T_x + T_b + T_y^{\text{write}} + T_y^{\text{read}} + T_z$$
+
+fused kernel은 중간 tensor y를 register에서 처리하므로:
+
+$$\text{Traffic}_{\text{fused}} = T_x + T_b + T_z$$
+
+<Theorem kind="proposition" number="1" title="Element-wise fusion의 HBM 절감률">
+동일한 크기 $N$ 의 element-wise operation 두 개를 fuse 할 때, HBM traffic 절감률은 $\eta = 2T_y / (4T + 2T_y)$ 이며, $T_y = T$ 이면 $\eta = 1/3 \approx 33\%$ 다.
+</Theorem>
+
+<Proof>
+$T_x = T_b = T_z = T_y = N \times 4$ bytes 라 하면, $\text{Traffic}_{\text{sep}} = 5T$, $\text{Traffic}_{\text{fused}} = 3T$. 절감량 $2T$, 절감률 $2T/5T = 40\%$. 실험에서 관찰되는 1.5배 speedup과 일치한다. $\square$
+</Proof>
+
+FlashAttention은 이 원칙의 극단적 적용이다. Standard attention은 $O(N^2)$ HBM access (intermediate softmax weight 저장)가 필요하지만, block-wise online softmax fusion으로 $O(N)$ 으로 줄인다. Dao (2022)의 실험에서 seq_len=4096 기준 3~4배 speedup이 이 HBM traffic 절감에서 온다.
+
+<Callout type="note" title="트레이드오프">
+Kernel fusion은 항상 이득이 아니다. **memory-bound operation끼리 fuse하면 이득, compute-bound operation을 fuse하면 register pressure와 warp divergence가 증가해 오히려 느려진다.** conditional branch가 포함된 fusion은 warp efficiency를 낮춘다. `torch.compile` (TorchInductor)의 자동 fusion heuristic도 이 기준을 따른다: arithmetic intensity가 낮은 op끼리만 묶는다.
+</Callout>
+
+## 정리
+
+- Custom kernel의 경로는 `cpp_extension JIT → PyBind11 → dispatcher` 순이다. 캐시는 hash 기반이고, production은 `setup.py`다.
+- Non-contiguous tensor를 stride-unaware kernel에 넘기면 wrong result 또는 segfault다. 항상 `is_contiguous()` 검사 후 `.contiguous()` fallback을 넣는다.
+- Triton은 block-level 추상화로 CUDA boilerplate를 제거하고, autotune이 shape별 최적 tile size를 탐색한다.
+- cuBLAS/cuDNN은 arithmetic intensity가 높은 (K 큰) 경우에만 compute-bound가 된다. `benchmark=True` 와 channels-last layout이 cuDNN 알고리즘 선택을 바꾼다.
+- Fusion의 이득은 HBM round-trip 제거에서 온다. memory-bound op끼리만 fuse하고, register pressure를 확인하라.
+
+이 다섯 챕터를 관통하는 하나의 원칙이 있다: **GPU 연산의 병목은 계산이 아니라 메모리 이동이다.** Custom kernel 설계의 모든 선택 — JIT vs offline, stride-aware vs contiguous-only, Triton vs CUDA, fused vs separate — 은 이 원칙 위에서 판단한다.
+
+<Reference
+  title="FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+  authors="Dao et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2205.14135"
+/>

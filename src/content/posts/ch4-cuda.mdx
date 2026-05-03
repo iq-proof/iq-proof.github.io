@@ -1,0 +1,136 @@
+---
+title: "GPU 커널 성능은 무엇이 결정하는가"
+description: "SM과 Warp 계층부터 Memory Coalescing, Bank Conflict, Warp Divergence, Reduction 최적화까지 — CUDA 커널 성능을 지배하는 하드웨어 원칙을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [cuda, gpu-architecture, pytorch, memory-optimization, reduction]
+difficulty: advanced
+series:
+  slug: pytorch-internals-deep-dive
+  title: Pytorch Internals Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+PyTorch에서 `loss.backward()`를 부르면 CUDA 커널이 GPU에서 실행된다. 그 커널이 빠른지 느린지는 알고리즘이 아니라 **하드웨어 계층과 얼마나 잘 맞아떨어지는가**에 달려 있다. 같은 연산이 구현 방식에 따라 100배 차이가 나는 이유는 무엇인가?
+
+## SM, Warp, Thread — 병렬화의 계층
+
+NVIDIA GPU는 Grid → Block → Warp → Thread로 조직된다. 이 계층이 단순한 네이밍 컨벤션이 아니라는 점이 핵심이다.
+
+**Warp**는 32개 스레드가 하나의 명령어를 동시에 실행하는 최소 실행 단위다. SIMT(Single Instruction Multiple Thread)라고 부른다. 명령어 fetch·decode 비용을 32분의 1로 줄이는 대신, 32개 스레드가 같은 PC(program counter)를 공유한다.
+
+**Block**은 shared memory를 공유하는 스레드 묶음이며, 반드시 같은 SM(Streaming Multiprocessor)에서만 실행된다. Shared memory가 SM당 물리 자원(48–100 KB)이기 때문이다. Block이 SM에 바인딩되면 종료될 때까지 이동하지 않는다.
+
+**Occupancy**는 SM이 동시에 운용할 수 있는 warp 수의 비율이다.
+
+$$\text{Occupancy} = \frac{\text{Active warps per SM}}{\text{Max resident warps per SM}}$$
+
+A100·H100에서 max = 64 warp/SM(2048 스레드). Occupancy가 높을수록 스케줄러가 선택할 수 있는 ready warp가 많아지고, 메모리 지연을 다른 warp 실행으로 숨길 수 있다.
+
+<Aside label="Latency Hiding">
+Global memory 접근은 200–400 사이클이 필요하다. 이 동안 SM 스케줄러는 다른 ready warp를 실행한다. Warp 수 $K \geq L$(메모리 지연 사이클)이면 대기 시간이 완전히 숨겨진다. Occupancy가 낮으면 숨길 warp가 없어 SM이 idle 상태로 기다린다.
+</Aside>
+
+## Memory Hierarchy와 Roofline
+
+GPU 메모리 계층은 레지스터(1 사이클) → Shared Memory(4–10 사이클) → L1/L2(30–200 사이클) → HBM(200–400 사이클)으로 구성된다. HBM 대역폭은 A100 기준 2 TB/s, H100 기준 3 TB/s지만, 이 수치에 도달하려면 접근 패턴이 올바르게 정렬되어야 한다.
+
+Roofline 모델은 커널이 어느 병목에 걸려 있는지를 두 줄로 요약한다.
+
+$$\text{Achieved throughput} = \min\left(\text{Peak FLOP/s},\ \text{Peak BW} \times I\right)$$
+
+여기서 **Arithmetic Intensity** $I = \text{FLOPs} / \text{Bytes}$. H100 기준 전환점은 $I^* = 141\,\text{TFLOP/s} / 3\,\text{TB/s} \approx 47\,\text{FLOP/byte}$. SAXPY($y += ax$)의 $I \approx 0.25$이므로, 이 연산은 피크 컴퓨트의 0.5%만 활용한다 — 전형적인 memory-bound 사례다.
+
+Shared memory tiling은 이 비율을 바꾸는 핵심 기법이다. $T \times T$ 타일을 HBM에서 한 번 로드하고 $T$번 재사용하면 effective $I$가 $T$배 증가한다. H100에서 $T \leq 110$ 정도까지 shared memory에 올라가므로, 잘 설계된 행렬 연산은 compute-bound 영역에 도달할 수 있다.
+
+## Memory Coalescing과 Bank Conflict
+
+같은 warp의 32개 스레드가 연속된 128 byte를 접근하면 **1 transaction**. 각자 256 byte stride로 흩어진 주소를 접근하면 **32 transaction**. 이 차이가 대역폭 활용률 1:32의 격차를 만든다.
+
+<Theorem kind="proposition" number="1" title="Strided Access의 Transaction Cost">
+Thread $i$가 주소 $a_i = a_0 + i \cdot (s \times 4)$(stride factor $s$)로 접근할 때, transaction 수 $\approx \min(32,\, s)$.
+</Theorem>
+
+<Proof>
+$s = 1$이면 범위 $[a_0, a_0 + 124]$ — 128 byte 한 cache line, 1 transaction. $s = 32$이면 thread마다 별도 128-byte line — 32 transaction. $s$가 32 이상이면 항상 최대 32 transaction으로 포화된다. $\square$
+</Proof>
+
+Shared memory에서는 **Bank Conflict**가 같은 문제의 내부 버전이다. 32개 bank가 독립적인 port를 가지므로 이상적으로는 1 사이클에 32개 접근이 가능하다. 그런데 Bank ID = `(address / 4) % 32`이고, 같은 bank의 다른 주소에 $k$개 스레드가 동시 접근하면 $k$ 사이클로 직렬화된다.
+
+```cpp
+// 2D 배열에서 열 방향 읽기 — 32-way conflict
+__shared__ float tile[32][32];
+// thread (0,j), (1,j), ..., (31,j) 모두 bank j 접근
+float val = tile[threadIdx.x][0];  // ← 32-way conflict
+
+// 해결: padding으로 stride = 33
+__shared__ float tile_padded[32][33];
+// bank ID = (i * 33 + j) % 32 → 연속 32개가 서로 다른 bank
+```
+
+Padding 트릭이 작동하는 수학적 이유는 $\gcd(33, 32) = 1$이라는 사실에 있다. Stride가 32와 서로소면, 연속 32개 주소가 32개 서로 다른 bank를 방문한다.
+
+<Callout type="warning" title="트레이드오프">
+Padding은 bank conflict를 제거하지만 shared memory 사용량을 증가시킨다(`32 × 33 × 4 = 4224 bytes` vs `32 × 32 × 4 = 4096 bytes`). Shared memory가 늘어나면 SM당 올릴 수 있는 block 수가 줄어 occupancy가 하락할 수 있다. Warp shuffle은 shared memory 자체를 우회하는 더 근본적인 해법이다.
+</Callout>
+
+## Warp Divergence
+
+SIMT의 같은 PC 공유가 조건 분기를 만나면 문제가 된다. `if (threadIdx.x % 2 == 0)`처럼 warp 내 스레드가 서로 다른 branch를 선택하면, 하드웨어는 두 path를 순차적으로 실행하고 각 path에서 해당하지 않는 스레드의 write-back을 mask로 억제한다. 결과: 2-way divergence는 throughput이 절반.
+
+```cuda
+// ✗ 50% throughput — warp 내부에서 절반씩 나뉨
+if (threadIdx.x % 2 == 0) { path_A(); } else { path_B(); }
+
+// ✓ No divergence — block 단위 조건은 warp 전체가 uniform
+if (blockIdx.x % 2 == 0) { path_A(); } else { path_B(); }
+
+// ✓ Branch-free — predication으로 write만 선택
+float a = compute_A(x);
+float b = compute_B(x);
+result = (threadIdx.x % 2 == 0) ? a : b;  // 두 path 모두 실행, write만 선택
+```
+
+Volta(2017) 이후 Independent Thread Scheduling이 도입되어 이론적으로 divergence 비용이 줄었지만, per-thread PC 유지로 register pressure가 증가하고 `__syncthreads()` 필요성도 남아 있다. Divergence 회피는 여전히 권장 사항이다.
+
+## Reduction 최적화 — 7단계의 의미
+
+Mark Harris(2007)의 7-step reduction optimization은 앞의 모든 원칙이 수렴하는 사례다.
+
+Naive interleaved reduction(stride = 1, 2, 4...)은 stride = 32에서 32-way bank conflict를 만든다. **Sequential addressing**(stride를 크게 시작해 절반씩 줄임)으로 초기 단계의 coalescing을 개선하면 약 2배 빨라진다.
+
+최종 단계(stride ≤ 16)에서는 shared memory를 완전히 우회하는 **warp shuffle**이 최적이다.
+
+```cuda
+// Warp shuffle: shared memory 없이 register 간 직접 전달
+float warpSum = sdata[tid];
+warpSum += __shfl_down_sync(0xFFFFFFFF, warpSum, 16);
+warpSum += __shfl_down_sync(0xFFFFFFFF, warpSum, 8);
+warpSum += __shfl_down_sync(0xFFFFFFFF, warpSum, 4);
+warpSum += __shfl_down_sync(0xFFFFFFFF, warpSum, 2);
+warpSum += __shfl_down_sync(0xFFFFFFFF, warpSum, 1);
+if (tid == 0) atomicAdd(output, warpSum);
+```
+
+Shuffle의 latency는 1–2 사이클로, shared memory의 4–10 사이클보다 짧다. 그리고 warp 내부이므로 `__syncthreads()`가 불필요하다. 이 두 가지가 맞물려 naive 대비 3–4배 빠른 reduction이 가능하다.
+
+| Step | Optimization | 개선 원인 |
+|------|-------------|----------|
+| Interleaved | 기준 | Bank conflict, poor coalescing |
+| Sequential | ~2× | Stride 역순 → coalescing 개선 |
+| Unroll last warp + Shuffle | ~3–4× | Shared mem bypass, sync 제거 |
+| Template `BLOCK_SIZE` | +10–20% | 컴파일러 loop unroll 가능 |
+
+## 정리
+
+- GPU 성능은 알고리즘 복잡도보다 **메모리 접근 패턴과 하드웨어 계층의 정합**이 결정한다.
+- Coalescing(연속 접근), bank conflict 회피(padding 또는 shuffle), warp divergence 최소화는 독립된 최적화가 아니라 같은 원칙의 세 가지 표현이다 — *하드웨어가 병렬로 처리할 수 있는 단위로 작업을 정렬하라*.
+- Roofline 모델은 커널이 어느 병목에 있는지 한 장으로 진단한다. Nsight Compute의 "Achieved Occupancy"와 "Memory Throughput"은 이 두 축의 실측값이다.
+- `torch.sum()` 같은 내장 연산도 이 원칙 위에 구현되어 있다. custom kernel을 작성하거나 프로파일링 결과를 해석할 때, 이 계층을 머릿속에 갖고 있는 것과 그렇지 않은 것은 완전히 다른 출발점이다.

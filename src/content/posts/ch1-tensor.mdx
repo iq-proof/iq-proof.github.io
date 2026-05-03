@@ -1,0 +1,125 @@
+---
+title: "PyTorch Tensor는 왜 Storage와 Metadata로 분리되어 있는가"
+description: "단순한 다차원 배열처럼 보이는 Tensor가 실제로 6원소 튜플로 구성된 이유부터, stride가 CUDA 커널 선택을 바꾸고 view가 zero-copy인 이유까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [pytorch, tensor, stride, memory-layout, cuda]
+difficulty: advanced
+series:
+  slug: pytorch-internals-deep-dive
+  title: Pytorch Internals Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+PyTorch를 쓰는 대부분의 사람은 Tensor를 "다차원 배열"로 이해한다. 그러나 `.view()`가 왜 어떤 경우에 실패하는지, `.contiguous()`가 왜 갑자기 필요해지는지, `permute()` 후 convolution이 왜 느려지는지 — 이 질문들은 모두 같은 뿌리에서 나온다. PyTorch Tensor는 배열이 아니라 **Storage와 Metadata의 분리된 묶음**이다. 이 분리가 어떻게 설계되었고, 어떤 결과를 만드는가?
+
+## Tensor는 6원소 튜플이다
+
+PyTorch의 Tensor를 정확하게 쓰면 다음과 같다.
+
+$$\text{Tensor} = (\text{Storage}, \text{size}, \text{stride}, \text{offset}, \text{dtype}, \text{device})$$
+
+**Storage**는 단순한 1D byte array다. FP32 12개짜리 tensor라면 48바이트의 raw memory가 전부다. 나머지 다섯 원소는 이 Storage를 어떻게 해석할지를 결정하는 metadata다.
+
+index $(i_0, i_1, \ldots, i_{n-1})$에서 Storage 안의 위치를 계산하는 공식은 단순하다.
+
+$$\text{byte\_offset}(i_0, \ldots, i_{n-1}) = \text{offset} + \sum_{k=0}^{n-1} i_k \cdot s_k$$
+
+shape `(3, 4)`의 tensor를 예로 들면, stride는 `(4, 1)`이고 `tensor[1, 2]`의 offset은 $1 \times 4 + 2 \times 1 = 6$이다. Storage의 6번째 float을 읽으면 된다.
+
+이 구조가 중요한 이유는 **Storage를 건드리지 않고 metadata만 바꾸면 전혀 다른 tensor가 된다는 점**이다.
+
+## Stride가 만드는 zero-copy 연산
+
+<Theorem kind="proposition" number="1" title="View는 Storage를 공유한다">
+`.view()`, `.transpose()`, `.permute()` 등으로 생성된 tensor는 원본과 같은 Storage를 가리킨다.
+</Theorem>
+
+<Proof>
+`.view(new_shape)`는 새로운 stride를 계산할 뿐 Storage를 변경하지 않는다. `.transpose(dim0, dim1)`은 `stride[dim0]`과 `stride[dim1]`을 교환하고 size도 교환한다. 두 경우 모두 `storage.data_ptr()`이 동일하므로 같은 메모리를 가리킨다.
+</Proof>
+
+결과적으로 `y = x.view(2, 6)`를 실행한 후 `y[0, 0] = 999`로 수정하면 `x[0, 0]`도 999가 된다. Storage를 공유하기 때문이다.
+
+Row-major(C-order) tensor에서 stride 공식은 명확하다.
+
+$$s_k = \prod_{j=k+1}^{n-1} d_j$$
+
+shape `(2, 3, 4)`라면 stride는 `(12, 4, 1)`이다. 이 조건을 만족하면 C-contiguous, 만족하지 않으면 non-contiguous다.
+
+```python
+x = torch.arange(12.0).reshape(3, 4)
+y = x.view(2, 6)
+
+print(x.data_ptr() == y.data_ptr())   # True — 같은 Storage
+print(x.stride(), y.stride())          # (4, 1) vs (6, 1)
+```
+
+## NCHW vs NHWC — stride가 성능을 바꾼다
+
+같은 데이터를 NCHW `(N, C, H, W)`로 배치하면 stride는 `(C·H·W, H·W, W, 1)`이다. NHWC `(N, H, W, C)`로 permute하면 stride는 `(H·W·C, W·C, C, 1)`이 된다. shape이 달라진 게 아니다 — **메모리 접근 패턴**이 달라진 것이다.
+
+cuDNN은 입력 tensor의 stride pattern을 확인해 최적 커널을 선택한다. NCHW는 채널이 연속으로 저장되어 채널별 연산에 캐시 효율이 좋고, NHWC는 같은 위치의 모든 채널이 연속되어 pixel-wise 처리에 유리하다. 이 차이가 convolution 성능을 2-10배 바꿀 수 있다.
+
+```python
+x_nchw = torch.randn(2, 3, 4, 4)
+print(x_nchw.stride())              # (48, 16, 4, 1)
+print(x_nchw.is_contiguous())       # True
+
+x_nhwc = x_nchw.permute(0, 2, 3, 1)
+print(x_nhwc.stride())              # (48, 12, 3, 1)
+print(x_nhwc.is_contiguous())       # False
+```
+
+`permute()` 후에는 non-contiguous 상태다. 이 tensor를 `reshape()`하거나 `matmul()`에 넘기면 내부적으로 `.contiguous()`가 호출되어 **암묵적 copy**가 발생한다. 숨겨진 비용이다.
+
+## reshape은 view인가 copy인가
+
+`.reshape()`은 다음과 같이 동작한다.
+
+$$\text{reshape}(x) = \begin{cases} \text{view}(x, \text{new\_shape}) & \text{if C-contiguous} \\ \text{contiguous}(x).\text{view}(\text{new\_shape}) & \text{otherwise} \end{cases}$$
+
+contiguous tensor라면 zero-copy view다. non-contiguous라면 먼저 copy를 만든 후 view를 반환한다. `data_ptr()`의 변화로 확인할 수 있다.
+
+```python
+x = torch.arange(24.0).reshape(2, 3, 4)
+y = x.reshape(6, 4)
+print(x.data_ptr() == y.data_ptr())   # True — view
+
+x_t = x.permute(2, 1, 0)
+z = x_t.reshape(4, 6)
+print(x_t.data_ptr() == z.data_ptr()) # False — copy
+```
+
+`.expand()`와 `.repeat()`의 차이도 같은 맥락이다. `expand()`는 stride에 0을 삽입해 메모리 재사용(zero-copy)하고, `repeat()`은 실제로 데이터를 복제한다. `a.expand(32, 1000)`의 Storage는 원본과 동일하지만 `a.repeat(32, 1)`의 Storage는 32배 크다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프: 유연성 vs 안전성">
+Storage-Metadata 분리는 강력한 zero-copy 연산을 가능하게 하지만, non-contiguous 상태를 언제든지 만들어낼 수 있다. `permute()` 후 연산을 이어붙이는 코드는 눈에 보이지 않는 implicit copy를 곳곳에 숨길 수 있다. 대규모 tensor에서 이 copy는 OOM 또는 PCIe 병목으로 이어진다.
+</Callout>
+
+Device 차원에서도 같은 원칙이 적용된다. `tensor.to('cuda')`는 Storage를 GPU HBM으로 복사한다. PCIe 4.0 x16 기준 bandwidth는 약 16 GB/s이므로, 400MB tensor 하나를 옮기는 데 ~25ms가 걸린다. pinned memory(`pin_memory=True`)를 쓰면 OS의 페이지 교환 없이 직접 DMA로 전송되어 2-3배 빠르다.
+
+dtype도 Storage와 독립된 metadata다. `int32 + float32`의 결과는 float32이고, tensor가 존재하면 tensor의 dtype이 scalar보다 우위다. `torch.tensor(0.5) + 1`의 결과가 float64가 아니라 float32인 이유다.
+
+<Aside label="설계 철학">
+Storage-Metadata 분리는 "데이터는 한 번만 저장하고, 해석은 여러 번 바꿀 수 있어야 한다"는 철학이다. 이 덕분에 `.view()`, `.transpose()`, `.narrow()`, `.expand()`가 모두 zero-copy다. 대신 사용자는 contiguity 상태를 스스로 추적해야 한다는 책임이 생긴다.
+</Aside>
+
+## 정리
+
+- PyTorch Tensor는 `(Storage, size, stride, offset, dtype, device)` 6원소 튜플이다. "다차원 배열"이 아니다.
+- index에서 메모리 위치는 $\text{offset} + \sum i_k \cdot s_k$로 계산된다. stride가 이 변환의 핵심이다.
+- `.view()`, `.transpose()`, `.permute()`는 Storage를 공유한다(zero-copy). `.contiguous()`와 `.repeat()`은 새 Storage를 만든다(copy).
+- `.reshape()`는 contiguous면 view, non-contiguous면 copy다. 자동이지만 비용은 숨겨진다.
+- NCHW vs NHWC의 stride 차이가 cuDNN 커널 선택을 바꾸고, 성능을 수 배 달라지게 한다.
+
+이 구조를 이해하면 `.contiguous()`가 왜 필요한지, `OOM`이 어디서 왔는지, `.permute()` 이후 연산이 왜 느려지는지 — 모두 같은 프레임으로 읽힌다.

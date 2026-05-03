@@ -1,0 +1,129 @@
+---
+title: "Mixed Precision Training의 수학 — FP16은 왜 위험하고 BF16은 왜 안전한가"
+description: "IEEE 754 비트 구조부터 FP16 언더플로우의 정량적 분석, Loss Scaling의 수학적 정당성, BF16·TF32·Stochastic Rounding까지 — Mixed Precision의 설계 결정을 하나의 원리로 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [mixed-precision, fp16, bf16, loss-scaling, quantization]
+difficulty: advanced
+series:
+  slug: pytorch-internals-deep-dive
+  title: Pytorch Internals Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+`torch.autocast()` 한 줄로 학습이 빨라진다. 그런데 그 한 줄 뒤에서 PyTorch는 무엇을 하고 있는가? 단순히 "16비트로 계산한다"가 아니다. FP16의 표현 범위가 ML 그래디언트를 조용히 0으로 만드는 문제, 그것을 Loss Scaling으로 우회하는 수학, 그리고 BF16이 그 우회 자체를 필요 없게 만드는 이유 — 이 모든 결정은 하나의 원리에서 나온다. **수의 범위와 정밀도는 독립적으로 설계할 수 있다.**
+
+## 비트 하나가 학습을 결정한다
+
+IEEE 754 부동소수점 수는 세 필드로 정의된다.
+
+$$x = (-1)^S \times 1.M \times 2^{E - \text{bias}}$$
+
+여기서 $S$는 부호, $E$는 지수 필드, $M$은 가수부다. bias는 $2^{e-1} - 1$로 정해진다. FP32의 8비트 지수는 bias 127, FP16의 5비트 지수는 bias 15다.
+
+이 차이가 범위를 기하급수적으로 벌린다.
+
+| 타입 | 구조 | 최솟값 (정규화) | 최댓값 | 기계 엡실론 |
+|------|------|----------------|--------|------------|
+| FP32 | 1+8+23 | $1.2 \times 10^{-38}$ | $3.4 \times 10^{38}$ | $\approx 1.2 \times 10^{-7}$ |
+| FP16 | 1+5+10 | $6.1 \times 10^{-5}$ | $6.5 \times 10^{4}$ | $\approx 9.8 \times 10^{-4}$ |
+| BF16 | 1+8+7  | $1.2 \times 10^{-38}$ | $3.4 \times 10^{38}$ | $\approx 7.8 \times 10^{-3}$ |
+
+FP16은 지수 비트가 5개뿐이다. 표현 가능한 범위가 FP32보다 $2^{23}$배 좁다. BF16은 지수 비트를 8개로 유지하는 대신 가수부를 7비트로 줄였다. 범위는 FP32와 동일하고, 정밀도만 포기했다.
+
+## FP16 언더플로우 — 조용한 재앙
+
+딥 네트워크의 그래디언트는 backpropagation을 거치며 작아진다. 층이 깊어질수록 체인 룰의 야코비안 곱이 지수적으로 줄어들기 때문이다.
+
+<Theorem kind="proposition" number="1" title="FP16 언더플로우 임계값">
+FP16의 정규화 범위 하한은 $6.1 \times 10^{-5}$다. ML의 전형적인 그래디언트 $\nabla L \sim 10^{-5}$ ~ $10^{-7}$ 중 상당 부분은 이 임계값 미만이다. FP16에서 $|g| < 6.1 \times 10^{-5}$인 그래디언트는 예외 없이 0으로 변환된다.
+</Theorem>
+
+<Proof>
+FP16 정규화 수의 최소 지수는 $E = 1$이므로 최솟값은 $2^{1 - 15} = 2^{-14} \approx 6.1 \times 10^{-5}$다. 이 미만의 수는 서브노멀(subnormal) 영역으로 떨어지거나 0으로 flush된다. 서브노멀의 절대 하한은 $2^{-24} \approx 5.96 \times 10^{-8}$이지만, 많은 하드웨어 구현이 서브노멀을 0으로 처리하므로 정규화 하한이 실질적 임계값이다. $\square$
+</Proof>
+
+이것이 "silent underflow"다. NaN도 없고 예외도 없다. 그래디언트가 그냥 사라진다. ResNet-50의 초기 학습에서 얕은 층의 그래디언트 언더플로우 비율이 80%를 넘는다는 측정이 이를 뒷받침한다.
+
+<Callout type="warning" title="언더플로우 비율(UFR)">
+$\text{UFR} = |\{i : |g_i| < 6.1 \times 10^{-5}\}| / |\{g_i\}|$. 이 값이 높을수록 체계적 편향(systematic bias)이 커지고, loss가 수렴하지 않는다. GradScaler 없이 FP16을 쓰는 것은 이 위험을 그대로 감수하는 것이다.
+</Callout>
+
+## Loss Scaling — 체인 룰을 이용한 범위 이동
+
+해결책은 단순하다. Loss를 상수 $S$배 키운 뒤 backward를 돌리면, 체인 룰의 선형성에 의해 모든 그래디언트가 $S$배가 된다.
+
+$$L_{\text{scaled}} = L \times S \implies \frac{\partial L_{\text{scaled}}}{\partial W} = S \times \frac{\partial L}{\partial W}$$
+
+<Theorem kind="theorem" number="2" title="Loss Scaling Correctness">
+$L_s = L \times S$로 backward를 수행한 뒤 optimizer 적용 직전 $g \leftarrow g / S$로 unscale하면, weight 업데이트는 scaling이 없는 경우와 정확히 동일하다.
+</Theorem>
+
+<Proof>
+$g_s = S \times g$이므로, unscale 후 $\hat{g} = g_s / S = g$. Optimizer 업데이트: $W_{\text{new}} = W_{\text{old}} - \alpha \hat{g} = W_{\text{old}} - \alpha g$. Momentum optimizer의 경우에도 unscale된 그래디언트로 누적되므로 동일하다. $\square$
+</Proof>
+
+PyTorch의 `GradScaler`는 이 과정을 자동화한다. `scaler.scale(loss).backward()`로 $S$배 scaled backward, `scaler.unscale_(optimizer)`로 원상 복구, `scaler.step(optimizer)`로 업데이트, `scaler.update()`로 동적 $S$ 조정이다.
+
+동적 조정 규칙은 간단하다. NaN/Inf 감지 시 $S \leftarrow S / 2$, 연속 2000 스텝 동안 clean이면 $S \leftarrow \min(2S, S_{\max})$. 이진 스케일 조정이 수렴과 계산 편의 사이의 균형점이다.
+
+## BF16 — 범위를 포기하지 않은 선택
+
+FP16 + Loss Scaling의 복잡성을 근본적으로 피하는 방법이 BF16이다. 지수 비트를 8개로 유지하면 그래디언트가 어떤 크기이든 표현 가능하다. 따라서 언더플로우가 발생하지 않고, Loss Scaling이 불필요하다.
+
+대가는 가수부가 7비트로 줄어드는 것이다. 기계 엡실론이 $\approx 7.8 \times 10^{-3}$으로 커진다. FP32 대비 정밀도가 약 1/100이다. 그러나 SGD의 배치 노이즈($\sim 10^{-2}$ ~ $10^{-1}$)가 BF16 정밀도 손실($\sim 10^{-3}$)보다 크기 때문에, 수렴에 미치는 영향은 무시할 수 있다.
+
+Llama, Mistral, Gemma가 모두 BF16을 기본값으로 쓰는 이유가 여기 있다. "정밀도를 약간 포기하되, 범위 문제를 완전히 제거한다"는 선택이다.
+
+TF32는 다른 방향의 설계다. A100 이상에서만 동작하며, API 레벨에서는 FP32 입출력을 유지한다. 내부적으로는 가수부를 10비트로 줄여 연산을 2~8배 가속하지만, 사용자 코드는 수정할 필요가 없다. `torch.backends.cuda.matmul.allow_tf32 = True` 한 줄이면 된다. 투명한(transparent) 가속이다.
+
+<Aside label="설계 철학">
+FP16은 "범위와 정밀도를 함께 줄였다". BF16은 "정밀도만 줄이고 범위를 지켰다". TF32는 "API를 건드리지 않고 내부만 바꿨다". 세 결정 모두 같은 질문의 다른 답이다 — *수의 어느 부분을 포기할 것인가*.
+</Aside>
+
+## Stochastic Rounding과 극단적 양자화
+
+FP8, INT8로 나아갈수록 표준 반올림(round-to-nearest-even)의 한계가 드러난다. RNE는 체계적 편향을 만들 수 있다. 항상 같은 방향으로 반올림되면 그래디언트 방향이 일관되게 왜곡된다.
+
+Stochastic Rounding은 이 편향을 확률적으로 제거한다.
+
+$$\text{round}_{\text{stoch}}(x) = \begin{cases} \lceil x \rceil & \text{with prob } x - \lfloor x \rfloor \\ \lfloor x \rfloor & \text{with prob } 1 - (x - \lfloor x \rfloor) \end{cases}$$
+
+기댓값이 정확히 $x$가 된다 — $\mathbb{E}[\text{round}_{\text{stoch}}(x)] = x$. 소수부만큼의 확률로 올림, 나머지 확률로 내림을 선택하면 기댓값이 원래 값과 일치한다.
+
+누적 합 오차의 관점에서도 이점이 있다. RNE의 누적 오차는 $O(n \cdot \epsilon)$로 선형 증가하지만, Stochastic Rounding의 누적 오차는 $O(\epsilon)$로 bounded된다. 랜덤 워크이기 때문이다. Kahan Summation은 보완 변수 $c$를 이용해 각 스텝의 반올림 오차를 다음 스텝에서 빼주는 방식으로, 오차를 $O(\epsilon^2)$로 낮춘다.
+
+H100(Hopper)의 native FP8 연산이 Stochastic Rounding을 전제로 설계된 것은 이 이론적 근거 때문이다.
+
+## 정리
+
+- FP16의 정규화 하한 $6.1 \times 10^{-5}$는 ML 그래디언트의 상당 부분을 조용히 0으로 만든다. 이것이 Loss Scaling의 유일한 존재 이유다.
+- Loss Scaling은 체인 룰의 선형성을 이용해 모든 그래디언트를 $S$배로 이동시킨다. Unscale 후 weight 업데이트는 수학적으로 동일하다.
+- BF16은 지수 비트를 FP32와 동일하게 유지해 언더플로우를 원천 차단한다. Modern LLM이 BF16을 기본으로 쓰는 이유다.
+- Stochastic Rounding은 INT8/FP8 같은 극단적 양자화에서 체계적 편향을 제거하는 유일한 방법이다.
+
+수의 어느 부분을 포기할 것인가 — 이 질문에 대한 각기 다른 답이 FP16, BF16, TF32, FP8이다.
+
+<Reference
+  title="Mixed Precision Training"
+  authors="Micikevicius et al."
+  year={2018}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1710.03740"
+/>
+
+<Reference
+  title="A Study of BFLOAT16 for Deep Learning Training"
+  authors="Kalamkar et al."
+  year={2019}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1905.12322"
+/>
