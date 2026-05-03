@@ -1,0 +1,144 @@
+---
+title: "RLHF는 왜 세 단계여야 하는가"
+description: "SFT의 format alignment부터 Reward Hacking의 정량화, Iterative RLHF의 수렴까지 — PPO가 붕괴하지 않으려면 무엇이 필요한가를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [rlhf, sft, reward-model, ppo, llm-alignment]
+difficulty: advanced
+series:
+  slug: llm-alignment-deep-dive
+  title: Llm Alignment Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RLHF 파이프라인을 처음 보는 사람은 종종 "왜 세 단계인가?"라고 묻는다. SFT는 그냥 fine-tuning이고, RM은 그냥 분류기이고, PPO는 그냥 강화학습 아닌가? 각 단계가 전 단계의 **실패 모드를 막기 위해 설계**되었다는 사실을 알면 이 구조가 달리 보인다. 그렇다면 PPO는 왜 SFT 없이는 붕괴하는가?
+
+## SFT — Format Alignment 없이는 출발할 수 없다
+
+Pretrained LM은 웹 문서의 next-token을 최적화한다. "Who is Elon Musk?"를 입력하면 웹 뉘앙스로 관련 산문을 이어쓴다. 사용자의 명령에 직접 답하는 패턴은 pretraining 데이터의 작은 부분이다.
+
+SFT의 목적은 단 하나다 — 정책을 instruction-following 분포로 재정향한다.
+
+$$L_\mathrm{SFT}(\theta) = -\mathbb{E}_{(x, y^*) \sim \mathcal{D}_\mathrm{SFT}}\!\left[\log \pi_\theta(y^* \mid x)\right]$$
+
+Ouyang et al. (2022)의 ablation은 이것이 단순한 선택이 아님을 보인다. SFT 없이 pretrained 모델에 직접 PPO를 적용하면 정책이 붕괴한다. RM도 instruction context를 이해하지 못하기 때문이다 — SFT가 없으면 RM의 backbone도 pretrained 상태이고, instruction-aware representation이 없어 spurious feature(길이, 특정 키워드)를 proxy로 학습한다. PPO가 그 proxy를 최대화하면 의미 없는 verbose 출력이 쏟아진다.
+
+$\pi_\mathrm{SFT}$는 이후 두 가지 역할을 한다. RM 초기화의 시작점이 되고, PPO의 KL anchor가 된다.
+
+## Reward Model — Bradley-Terry로 선호를 수치화한다
+
+RM의 핵심 질문은 선호 데이터 `$(x, y_w, y_l)$`로부터 scalar reward를 어떻게 학습하는가다. Bradley-Terry 모델은 이를 logistic regression으로 환원한다.
+
+$$L_\mathrm{RM}(\phi) = -\mathbb{E}_{(x, y_w, y_l)}\!\left[\log \sigma(r_\phi(x, y_w) - r_\phi(x, y_l))\right]$$
+
+이 loss는 $r_\phi$에 대해 strictly convex이므로 SGD가 global optimum으로 수렴한다. 단, reward는 덧셈 상수에 대해 identifiable하지 않다.
+
+$$\log \sigma((r + c) - (r' + c)) = \log \sigma(r - r')$$
+
+절대 스케일은 임의적이다. PPO에서는 reward의 difference만 사용하므로 문제가 되지 않지만, KL penalty 계수 $\beta$ 설정 시 reward scale을 먼저 추정해야 한다.
+
+RM 초기화 전략은 세 가지다. Scratch 초기화는 데이터 효율이 최악이다. Pretrained 초기화는 언어 이해는 있지만 instruction-aware representation이 없어 수렴이 느리다. $\pi_\mathrm{SFT}$ 초기화는 이미 instruction format에 정렬된 representation을 재사용한다 — head가 배워야 할 것은 "이미 나뉜 semantic signal의 weighted sum"뿐이다. Ouyang 실험에서 SFT 초기화는 2–3배 빠른 수렴과 human preference accuracy +5–10%p 향상을 보였다.
+
+## PPO with KL — 최적 정책의 closed-form
+
+KL-constrained 목적함수는 다음과 같다.
+
+$$\max_\pi \mathbb{E}_{x, y \sim \pi}\!\left[r_\phi(x, y)\right] - \beta\, D_\mathrm{KL}\!\bigl(\pi(\cdot \mid x) \,\|\, \pi_\mathrm{SFT}(\cdot \mid x)\bigr)$$
+
+이 문제의 closed-form 해가 존재한다.
+
+<Theorem kind="theorem" number="1" title="KL-Constrained Optimal Policy">
+위 목적함수의 유일한 최적해는 다음과 같다.
+
+$$\pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_\mathrm{SFT}(y \mid x)\, \exp\!\left(\frac{r_\phi(x, y)}{\beta}\right)$$
+
+여기서 $Z(x) = \sum_{y'} \pi_\mathrm{SFT}(y' \mid x) \exp(r_\phi(x, y')/\beta)$는 partition function이다.
+</Theorem>
+
+<Proof>
+각 $(x, y)$에 대한 Lagrangian의 functional derivative를 0으로 놓으면
+
+$$r_\phi(x, y) - \beta \log \frac{\pi(y \mid x)}{\pi_\mathrm{SFT}(y \mid x)} - \beta = 0$$
+
+이를 $\pi^*(y \mid x)$에 대해 풀고 normalization 조건을 적용하면 partition function $Z(x)$가 정의되며 위 식을 얻는다. $\square$
+</Proof>
+
+이것은 **reference policy를 reward로 exponential tilting**하는 것이다. $\beta$가 작을수록 high-reward action에 집중(sharp), $\beta$가 클수록 $\pi_\mathrm{SFT}$에 가깝게 유지(smooth). InstructGPT에서 $\beta \in [0.01, 0.05]$를 사용했다. PPO는 이 closed-form의 first-order approximation이며, clipping이 KL constraint를 근사한다.
+
+## Reward Hacking — Goodhart's Law의 정량화
+
+KL penalty가 없으면 정책은 RM의 spurious feature를 exploit한다. 길이가 긴 답변이 reward가 높으면, PPO는 의미 없는 장문을 생성한다. 이것은 Goodhart's Law의 LLM 버전이다.
+
+Gao et al. (2023)은 이를 정량화했다.
+
+$$J_\mathrm{gold}(\pi) = \alpha \sqrt{D_\mathrm{KL}(\pi \| \pi_\mathrm{SFT})} - \beta \, D_\mathrm{KL}(\pi \| \pi_\mathrm{SFT})$$
+
+첫 항은 KL이 커질수록 reward가 증가하는 효과(OOD에서도 좋은 방향으로 generalize), 둘째 항은 spurious feature exploit 비용이다. 두 번째 항이 eventually dominates하므로 최적 KL budget이 존재한다.
+
+$$D_\mathrm{KL}^* = \left(\frac{\alpha}{2\beta}\right)^2$$
+
+Gao의 summarization 실험에서 $\alpha \approx 0.83$, $\beta \approx 0.23$이었고, 최적 KL $\approx 5.2$ 이후에는 gold reward가 하락했다.
+
+<Callout type="warning" title="트레이드오프">
+$\beta$를 높이면 optimal KL이 낮아지고 reward hacking이 줄지만, 정책이 $\pi_\mathrm{SFT}$에서 멀리 가지 못해 reward 자체도 제한된다. RM ensemble은 분산을 줄여 $\alpha$를 낮추는 효과가 있다. 두 전략은 상호 보완적이다.
+</Callout>
+
+## Iterative RLHF — LLaMA 2의 5-Ring 구조
+
+Single-shot RLHF의 근본 문제는 RM이 $\pi_\mathrm{SFT}$ 분포로만 학습했는데, PPO가 그 분포에서 멀어진 정책을 평가해야 한다는 것이다. OOD extrapolation error가 $\sqrt{D_\mathrm{KL}}$에 비례해 커진다.
+
+Touvron et al. (2023)의 LLaMA 2는 이를 5번의 반복으로 해결한다.
+
+$$\pi_0 \xrightarrow{\mathrm{RM_0, PPO}} \pi_1 \xrightarrow{\text{new pref data}} \mathrm{RM_1} \xrightarrow{\mathrm{PPO}} \pi_2 \;\cdots\; \xrightarrow{\mathrm{RM_4}} \pi_5$$
+
+각 iteration에서 현재 정책 $\pi_i$의 출력으로 선호 데이터를 재수집하고, $\mathrm{RM}_i$를 그 분포로 학습한다. PPO의 KL anchor도 $\pi_\mathrm{SFT}$가 아니라 $\pi_i$다. 따라서 RM이 평가하는 분포와 PPO가 rollout하는 분포가 항상 일치한다 — on-policy learning이다.
+
+결과는 MT-Bench 기준 7.0(SFT) → 9.0(5번 반복)으로, cumulative KL은 0.23으로 bounded됐다. Iteration 3 이후 diminishing return이 시작되며, 5번이 cost-benefit 최적점이다.
+
+## Process Reward Model — 단계마다 신호를 준다
+
+수학 reasoning처럼 다단계 추론이 필요한 task에서 ORM(Outcome Reward Model)은 terminal reward만 준다. 중간 단계가 틀렸는지 알 수 없어 credit assignment가 어렵다.
+
+PRM(Process Reward Model)은 각 step $t$마다 reward를 부여한다.
+
+$$r_\mathrm{PRM}(x, y_{\leq t}) \in \mathbb{R}, \quad t = 1, 2, \ldots, T$$
+
+Lightman et al. (2023)의 MATH 벤치마크 실험에서 PRM은 ~59% Pass@1, ORM은 ~56%였다. 핵심은 credit assignment의 분산이다 — ORM은 terminal에서만 backprop하므로 중간 step의 gradient가 감쇠한다. PRM은 각 step에 직접 신호가 있어 분산이 $T$배 낮다. Step-level 라벨은 per-label 비용이 낮아 총 annotation cost는 ORM과 비슷하다.
+
+<Aside label="설계 철학">
+RLHF의 각 단계는 앞 단계의 실패 모드를 막는다. SFT가 없으면 RM이 맹목적이고, KL이 없으면 PPO가 RM을 exploit하고, iterative 구조가 없으면 OOD gap이 쌓인다. 전체 구조는 "어디서 붕괴하는가"에 대한 연속적인 답이다.
+</Aside>
+
+## 정리
+
+- SFT는 instruction-following format을 정렬한다. 이것 없이는 RM도 PPO도 동작하지 않는다.
+- RM의 Bradley-Terry loss는 strictly convex하지만, reward scale은 덧셈 상수에 invariant하다.
+- PPO의 optimal policy는 $\pi_\mathrm{SFT}$를 reward로 exponential tilting한 closed-form으로 존재한다.
+- Gao 2023은 gold reward가 $\alpha\sqrt{D_\mathrm{KL}} - \beta D_\mathrm{KL}$을 따름을 정량화했다 — optimal KL budget 이후 hacking이 시작된다.
+- LLaMA 2의 5-ring iterative RLHF는 on-policy RM 학습으로 OOD gap을 각 iteration마다 제거한다.
+
+다음 글에서는 이 closed-form optimal policy를 reward 없이 직접 학습하는 DPO(Direct Preference Optimization)로 넘어간다.
+
+<Reference
+  title="Training language models to follow instructions with human feedback"
+  authors="Ouyang et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2203.02155"
+/>
+
+<Reference
+  title="Scaling Laws for Reward Model Overoptimization"
+  authors="Gao et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2210.10760"
+/>

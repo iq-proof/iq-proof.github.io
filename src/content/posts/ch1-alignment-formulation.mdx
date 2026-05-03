@@ -1,0 +1,145 @@
+---
+title: "LLM은 왜 처음부터 Misaligned인가"
+description: "Next-token 예측이 인간 의도와 어긋나는 근본 원인부터 Bradley-Terry 모델, Plackett-Luce 랭킹, Alignment Tax까지 — Pretraining의 한계가 RLHF를 필연으로 만드는 이유를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-alignment, rlhf, bradley-terry, preference-learning, alignment-tax]
+difficulty: advanced
+series:
+  slug: llm-alignment-deep-dive
+  title: Llm Alignment Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ChatGPT가 RLHF로 "정렬된다"는 사실은 잘 알려져 있다. 그러나 **왜** RLHF가 필요한가에 대한 이론적 토대는 종종 생략된다. Pretraining이 이미 세계 지식을 담았다면, 무엇이 문제인가? 그리고 그 문제를 해결하는 수학은 어디서 왔는가?
+
+## Pretraining의 목표와 인간 의도 사이의 간격
+
+표준 LLM의 pretraining loss는 다음과 같다.
+
+$$
+L_\mathrm{pretrain}(\theta) = -\mathbb{E}_{(x,y) \sim \mathcal{D}_\mathrm{web}}\!\left[\log p_\theta(y|x)\right]
+$$
+
+이 식은 웹 데이터의 **다음 토큰 분포**를 학습한다. 웹에는 문법적으로 완벽하고 설득력 있는 잘못된 정보, 매끄럽게 작성된 위험한 조언, 주류 편향이 담긴 텍스트가 뒤섞여 있다. 모델은 그 모든 것을 균등하게 학습한다.
+
+<Theorem kind="proposition" number="1" title="Pretraining은 필요 조건이지만 충분 조건이 아니다">
+Next-token loss를 최소화하는 모델도, 임의의 human-preferred task에서 우수할 필요는 없다.
+</Theorem>
+
+<Proof>
+$p_\theta$가 $\mathcal{D}_\mathrm{web}$의 empirical distribution에 수렴하더라도, human preference 분포 $\mathcal{D}_\mathrm{human}$에서의 기대 손실
+
+$$\mathbb{E}_{(x,y) \sim \mathcal{D}_\mathrm{human}}[-\log p_\theta(y|x)]$$
+
+은 보장되지 않는다. $\mathcal{D}_\mathrm{web}$의 low-probability region에서 발생하는 human-preferred output이 존재한다면, $p_\theta$는 그 영역의 확률을 낮게 할당했을 것이다. $\square$
+</Proof>
+
+이것이 **outer alignment failure**다. 모델이 base objective를 완벽히 달성해도 인간 의도와 어긋날 수 있다. GPT-3가 few-shot 학습에 탁월하면서도 explicit instruction을 제대로 따르지 못했던 것은 이 간격의 구체적 증거다.
+
+## 선호로부터 Reward를 추론하는 방법
+
+인간 의도를 수학적으로 정의하는 한 가지 방법은 **revealed preference**다. Samuelson(1938)의 통찰 — 선택 행위 자체가 숨겨진 utility를 드러낸다는 것 — 은 RLHF의 이론적 토대가 된다.
+
+preference 데이터를 다음과 같이 정의하자.
+
+$$
+\mathcal{D} = \{(x_i, y_w^{(i)}, y_l^{(i)})\}_{i=1}^N
+$$
+
+주어진 prompt $x_i$에서 $y_w \succ y_l$ (인간이 $y_w$를 선택)이라는 관찰로부터, 관찰되지 않은 reward function $r^*(x, y)$를 복원하는 것이 목표다.
+
+이 학습 문제의 핵심 가정은 두 가지다. 첫째, 선호 관계가 complete하고 transitive하면, 그 선호를 설명하는 utility function이 존재한다 (Samuelson 1938). 둘째, 인간의 선택은 stochastic하며 다음과 같이 모델링된다.
+
+$$
+P(y_w \succ y_l \mid x) = \sigma(r(x, y_w) - r(x, y_l))
+$$
+
+## Bradley-Terry: Logit Link의 정당성
+
+위 식은 Bradley-Terry 모델(1952)이다. 왜 하필 sigmoid인가?
+
+Luce(1959)의 choice axiom이 그 답이다. **Independence of Irrelevant Alternatives(IIA)** — 제3의 선택지가 추가되어도 두 대안 간 선호 확률의 비가 불변이어야 한다는 조건을 만족하면, logit form이 유일하게 결정된다.
+
+$$
+P(y_1 \succ y_2) = \frac{e^{r_1}}{e^{r_1} + e^{r_2}} = \sigma(r_1 - r_2)
+$$
+
+<Callout type="note" title="Strict Convexity">
+Bradley-Terry의 negative log-likelihood $L(\phi) = -\sum_i \log \sigma(r_w - r_l)$는 reward에 대해 strictly convex다. 이차 도함수 $\frac{\partial^2}{\partial z^2}[-\log\sigma(z)] = \sigma(z)(1-\sigma(z)) > 0$이 이를 보장한다. Global minimum이 유일하므로, gradient descent의 수렴이 보장된다.
+</Callout>
+
+한 가지 구조적 특징이 있다. Reward는 additive constant에 불변이다 — $r$과 $r + c$는 동일한 preference를 생성한다. Reward는 절대값이 아닌 **차이**로만 정의된다.
+
+## Plackett-Luce: Pairwise를 넘어 Ranking으로
+
+Bradley-Terry는 $(y_w, y_l)$ 쌍만 다룬다. Plackett-Luce(1975)는 이를 $k$개 응답의 ranking으로 일반화한다.
+
+$$
+P(\sigma) = \prod_{i=1}^{k} \frac{e^{r_{\sigma(i)}}}{\sum_{j=i}^{k} e^{r_{\sigma(j)}}}
+$$
+
+Bradley-Terry는 $k=2$의 특수해다. Ranking의 정보론적 이점은 명확하다.
+
+$$
+\text{k개 ranking의 정보량} = \log k! \text{ bits} \gg 1 \text{ bit (pairwise)}
+$$
+
+$k=5$이면 ranking 하나가 약 7개의 pairwise comparison과 동등한 정보를 담는다. LLaMA-2와 Constitutional AI가 ranking 데이터를 사용하는 이유다. 다만 실제 라벨링 비용(cognitive load, 불일치 가능성)이 높아지는 trade-off가 따른다.
+
+## Alignment Tax와 KL Anchor
+
+Preference learning으로 reward를 학습한 뒤 PPO로 정책을 최적화하면, 예상치 못한 현상이 생긴다. InstructGPT(Ouyang et al. 2022)는 RLHF 후 instruction following이 43% 향상된 반면, code generation은 약 7% 하락했다. 이것이 **alignment tax**다.
+
+세 축 — Helpful, Honest, Harmless — 은 항상 일치하지 않는다. 안전을 우선할수록 도움이 될 수 있는 요청도 거부하고(over-refusal), 도움을 극대화하려 할수록 위험한 응답이 통과할 수 있다. Tax는 피할 수 없다. 다만 완화할 수 있다.
+
+그 완화 메커니즘이 **KL penalty**다.
+
+$$
+\max_\pi \mathbb{E}_x[\mathbb{E}_{y \sim \pi}[r(x,y)]] - \beta\, D_\mathrm{KL}(\pi(\cdot|x) \,\|\, \pi_\mathrm{SFT}(\cdot|x))
+$$
+
+이 목표의 최적해는 다음과 같다.
+
+$$
+\pi^*(y|x) \propto \pi_\mathrm{SFT}(y|x) \cdot \exp\!\left(\frac{r(x,y)}{\beta}\right)
+$$
+
+$\beta$가 크면 정책이 $\pi_\mathrm{SFT}$ 근처에 머물러 pretraining 지식이 보존된다. $\beta$가 작으면 reward 극대화 쪽으로 치우쳐 distribution shift가 심해진다. InstructGPT는 $\beta \approx 0.05$를 사용했다.
+
+<Aside label="설계 철학">
+Alignment는 pretraining의 "수정"이 아니다. Pretraining이 웹 분포에 수렴하는 동안, alignment는 그 분포를 human preference 방향으로 재가중한다. KL anchor는 그 재가중이 너무 급격하지 않도록 붙잡는 닻이다.
+</Aside>
+
+## 정리
+
+- Pretraining loss의 최소화는 $\mathcal{D}_\mathrm{web}$에의 수렴이다. Human preference $\mathcal{D}_\mathrm{human}$과의 간격이 outer alignment failure를 만든다.
+- Revealed preference 이론은 쌍별 비교로부터 숨겨진 reward function을 복원하는 것을 정당화한다.
+- Bradley-Terry(pairwise)와 Plackett-Luce(ranking)는 IIA 공리 아래 logit form으로 유일하게 결정된다.
+- Alignment tax는 HHH 세 축의 충돌에서 비롯되며, KL penalty $\beta$를 통해 완화할 수 있지만 제거할 수는 없다.
+
+Pretraining이 "무엇을 알고 있는가"를 결정한다면, alignment는 "무엇을 말해야 하는가"를 결정한다. 이 두 목표가 같지 않다는 사실 위에 RLHF의 모든 수학이 세워진다.
+
+<Reference
+  title="Training language models to follow instructions with human feedback"
+  authors="Ouyang et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2203.02155"
+/>
+
+<Reference
+  title="Deep Reinforcement Learning from Human Preferences"
+  authors="Christiano et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03741"
+/>

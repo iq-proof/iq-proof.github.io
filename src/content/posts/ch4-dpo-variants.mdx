@@ -1,0 +1,148 @@
+---
+title: "DPO 이후의 선택들 — IPO, KTO, SimPO, ORPO, GRPO는 무엇을 고쳤는가"
+description: "DPO의 Bradley-Terry 가정이 낳은 overfit 문제부터 PPO의 critic 제거까지, 최신 alignment 기법 5종의 설계 결정과 트레이드오프를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-alignment, dpo, preference-optimization, rlhf, grpo]
+difficulty: advanced
+series:
+  slug: llm-alignment-deep-dive
+  title: Llm Alignment Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DPO(Rafailov 2023)는 PPO 파이프라인을 단 하나의 log-sigmoid 손실로 압축했다. 그러나 그 손실 함수 안에는 Bradley-Terry 확률 모델이라는 가정이 숨어 있고, 이 가정이 균열되는 순간 DPO도 함께 흔들린다. IPO, KTO, SimPO, ORPO, GRPO — 이 다섯 기법은 각각 DPO의 서로 다른 균열을 겨냥한 패치다. 공통 분모는 무엇이고, 각자 어떤 가정을 새로 도입하는가?
+
+## DPO가 깨지는 지점
+
+DPO의 손실은 다음과 같다.
+
+$$
+L_\mathrm{DPO} = -\mathbb{E}\!\left[\log \sigma\!\left(\beta h_\pi\right)\right]
+$$
+
+여기서 $h_\pi = \log(\pi/\pi_\mathrm{ref})(y_w) - \log(\pi/\pi_\mathrm{ref})(y_l)$. 이 식은 Bradley-Terry 모델 $p(y_w \succ y_l) = \sigma(\beta h_\pi)$를 MLE로 최적화한 결과다.
+
+문제는 $\log \sigma(\cdot)$가 unbounded라는 것이다. 모델은 $h_\pi \to +\infty$로 밀어붙이면 손실을 계속 줄일 수 있다. 이는 두 가지 상황에서 특히 심각해진다. 첫째, SFT 출력처럼 **결정적 선호**(항상 이기는 쪽이 고정된)가 많은 데이터에서 gradient가 폭발한다. 둘째, 긴 시퀀스는 짧은 시퀀스보다 $\log \pi(y)$의 절댓값이 커서 **길이 편향**이 생긴다. 셋째, reference model을 메모리에 올려야 하는 **운용 비용**이 항상 따라붙는다.
+
+## IPO — target을 bounded로 고정한다
+
+Azar et al.(2023)의 IPO는 log-sigmoid를 squared loss로 교체한다.
+
+$$
+L_\mathrm{IPO} = \mathbb{E}\!\left[\left(h_\pi - \frac{1}{2\beta}\right)^2\right]
+$$
+
+target $1/(2\beta)$는 Bradley-Terry 해석에서 약 62% 선호 확률에 해당한다($\sigma(1/2) \approx 0.622$). DPO의 $h_\pi \to \infty$와 달리, IPO는 $h_\pi$를 유한한 값으로 강제 수렴시킨다.
+
+<Theorem kind="proposition" number="1" title="IPO gradient boundedness">
+$|h_\pi| \leq M$이면 $|\nabla_\theta L_\mathrm{IPO}| \leq 2(M + 1/(2\beta)) \cdot \|\nabla h_\pi\|_\infty$.
+</Theorem>
+
+<Proof>
+squared loss $(h - c)^2$의 gradient는 $2(h - c)$로 $h$의 선형 함수다. DPO의 $\log\sigma(\cdot)$와 달리 exponential divergence가 없으므로, $h$가 bounded이면 gradient도 bounded. $\square$
+</Proof>
+
+## KTO — 심리학으로 unpaired 데이터를 처리한다
+
+DPO와 IPO는 모두 $(x, y_w, y_l)$ 쌍을 요구한다. Ethayarajh et al.(2024)의 KTO는 각 샘플에 "desirable/undesirable" 라벨만 붙인 **unpaired** 데이터로 작동한다.
+
+이론적 근거는 Kahneman-Tversky의 prospect theory다. 인간은 기준점 대비 이득은 오목하게(diminishing returns), 손실은 볼록하게(loss aversion) 평가한다. KTO는 이를 비대칭 value function으로 인코딩한다.
+
+$$
+L_\mathrm{KTO} = -\mathbb{E}_\mathrm{des}[v(x)] + \lambda\, \mathbb{E}_\mathrm{udes}[v(x)], \quad x = \beta\log(\pi/\pi_\mathrm{ref}) - z_\mathrm{ref}
+$$
+
+여기서 $v(z) = z^\alpha$ ($z \geq 0$, concave), $v(z) = -\lambda(-z)^\beta$ ($z < 0$, convex). 원래 Kahneman-Tversky 파라미터는 $\alpha = \beta = 0.88$, $\lambda = 2.25$.
+
+<Aside label="설계 철학">
+KTO가 LLM에 prospect theory를 "적용"한다는 주장은 심리학적으로 논란이 있다. LLM이 인간의 심리적 원리를 이해하는 것이 아니다. 다만 loss landscape의 모양이 비대칭적 페널티를 만들어내고, 그 결과가 safety에 유리하다는 **절차적 정당성**이 KTO의 실질적 근거다.
+</Aside>
+
+DPO가 $h_w - h_l$이라는 **상대 차이**를 사용하는 반면, KTO는 각 샘플의 reference point 대비 **절댓값**을 사용하므로 쌍이 필요 없다.
+
+## SimPO와 ORPO — reference model을 제거한다
+
+SimPO(Meng et al., 2024)는 두 가지를 동시에 한다. Reference model을 제거하고, 길이 편향을 명시적으로 교정한다.
+
+$$
+L_\mathrm{SimPO} = -\mathbb{E}\!\left[\log\sigma\!\left(\frac{\beta}{|y_w|}\log\pi(y_w) - \frac{\beta}{|y_l|}\log\pi(y_l) - \gamma\right)\right]
+$$
+
+$\log\pi(y) / |y|$는 per-token 평균 log-likelihood다. Park et al.(2024)의 분석에 따르면 DPO의 reference model이 사실상 length normalization 역할을 했다. SimPO는 이를 명시적 나누기로 대체하면서 frozen 모델 하나를 메모리에서 내린다. margin $\gamma$는 선호 판단의 threshold를 조정한다.
+
+ORPO(Hong et al., 2024)는 더 나아가 SFT 단계와 preference training을 통합한다.
+
+$$
+L_\mathrm{ORPO} = -\log\pi(y_w) + \lambda \cdot \left(-\log\sigma(\log\mathrm{odds}(y_w) - \log\mathrm{odds}(y_l))\right)
+$$
+
+log-odds $= \log\pi(y) - \log(1-\pi(y))$는 probability의 선형 스케일(logit)이다. 첫 항이 "정답을 배운다"면, 두 번째 항이 "선호도를 구분한다". 3단계 파이프라인(SFT → RM → DPO)을 단일 forward pass로 압축하므로 계산량이 대폭 줄어든다.
+
+## GRPO — PPO의 critic을 group 통계로 교체한다
+
+GRPO(DeepSeek, Shao et al., 2024)는 preference 데이터 없이 **reward 신호**로 학습하는 방법이다. PPO가 critic network $V(s)$로 advantage를 추정하는 것과 달리, GRPO는 같은 프롬프트에서 $G$개의 샘플을 뽑아 그 그룹 통계를 baseline으로 사용한다.
+
+$$
+A_i = \frac{r_i - \bar{r}_G}{\sigma_G + \epsilon}
+$$
+
+<Theorem kind="proposition" number="2" title="Group baseline unbiasedness">
+$\mathbb{E}[\hat{A}_i] = Q^\pi(x, y_i) - V^\pi(x) = A^\pi(y_i)$.
+</Theorem>
+
+<Proof>
+$\mathbb{E}[r_i] = Q^\pi(x, y_i)$이고, $\mathbb{E}[\bar{r}_G] = (1/G)\sum_j Q^\pi(x, y_j) = V^\pi(x)$ (같은 프롬프트에서 독립 샘플이므로). 따라서 $\mathbb{E}[\hat{A}_i] = Q^\pi - V^\pi = A^\pi(y_i)$. $\square$
+</Proof>
+
+표준화는 variance를 1로 고정해 gradient scale을 안정화한다. Critic NN이 없으므로 70B 모델 기준 메모리를 약 40% 절감한다. DeepSeek-R1은 이 구조에 Process Reward Model(PRM)을 결합해 수학·코드 reasoning을 훈련했다.
+
+## 트레이드오프
+
+다섯 기법이 각각 해결한 문제와 새로 도입한 제약을 정리한다.
+
+<Callout type="note" title="기법별 트레이드오프">
+**IPO**: overfit 방지 ↑, reference model 여전히 필요, target $1/(2\beta)$의 이론적 정당화 부족.
+
+**KTO**: unpaired 데이터 활용 ↑, annotation cost ↓, 하지만 loss aversion 파라미터($\lambda, \alpha$)가 task마다 다를 수 있고 LLM에 prospect theory를 적용하는 이론적 근거가 약하다.
+
+**SimPO**: memory ↓(reference 제거), length bias 완전 해결. 단, reference model의 domain adaptation 역할이 함께 사라진다. domain-specific task에서는 DPO가 나을 수 있다.
+
+**ORPO**: 파이프라인 단순화 ↑, 효율 ~4배. "정답이면서 비선호"인 샘플에서 SFT signal과 OR signal이 충돌할 수 있다.
+
+**GRPO**: critic 제거 ↑, reasoning task에 강함. 그룹 내 모든 reward가 동일하면 advantage = 0 → gradient 없음. absolute reward가 중요한 task에는 PPO가 유리할 수 있다.
+</Callout>
+
+## 정리
+
+- **DPO의 두 균열**은 unbounded $h_\pi$(IPO가 패치)와 reference model 의존(SimPO·ORPO·GRPO가 제거)이다.
+- **IPO → squared loss**로 overfit 방지, target $1/(2\beta)$로 bounded convergence.
+- **KTO → unpaired** 라벨만으로 학습, 비대칭 페널티로 safety 유리.
+- **SimPO → reference 제거 + 길이 정규화**, ORPO → SFT와 preference를 단일 loss로.
+- **GRPO → group baseline**으로 critic을 empirical statistics로 대체, 수학·코드 reasoning에 적합.
+
+다섯 기법이 공유하는 하나의 방향이 있다 — reference model이라는 암묵적 의존을 점진적으로 걷어내는 것. 그 끝에 있는 질문은 "baseline 없이 alignment가 가능한가"이다.
+
+<Reference
+  title="A General Theoretical Paradigm to Understand Learning from Human Feedback"
+  authors="Azar et al."
+  year={2023}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2310.12036"
+/>
+
+<Reference
+  title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models"
+  authors="Shao et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2402.03300"
+/>

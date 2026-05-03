@@ -1,0 +1,127 @@
+---
+title: "LLM 의 Safety 는 하나의 벡터로 요약될 수 있는가"
+description: "Red teaming 으로 공격을 발견하고, adversarial training 으로 방어하고, refusal 방향을 mechanistic 하게 추출하기까지 — LLM alignment 의 공격과 방어 구조를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-alignment, red-teaming, adversarial-training, mechanistic-interpretability, refusal]
+difficulty: advanced
+series:
+  slug: llm-alignment-deep-dive
+  title: Llm Alignment Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RLHF 와 Constitutional AI 를 거친 모델도 여전히 뚫린다. Red teaming, adversarial training, over-refusal 측정, mechanistic interpretability — 이 네 챕터는 각각 다른 질문을 던지는 것처럼 보이지만, 하나의 물음으로 수렴한다. LLM 의 safety 는 어디에 있는가? 그리고 그것은 수정할 수 있는가?
+
+## 공격의 체계화: Red Teaming
+
+Safety training 이 끝난 모델에는 여전히 **hidden failure mode** 가 존재한다. Perez 2022 의 핵심 기여는 이 실패를 체계적으로 생성하는 방법을 제안한 것이다 — 사람 대신 더 작은 언어 모델을 "공격자"로 학습시킨다.
+
+공격의 유형은 네 가지로 분류된다. Role-play (DAN 같은 페르소나 이용), Prompt injection (시스템 프롬프트 override), Encoding attack (Base64/ROT13 난독화), 그리고 Gradient-based attack. 마지막이 가장 정교하다.
+
+Zou 2023 의 GCG(Greedy Coordinate Gradient)는 의미 없는 토큰 시퀀스를 suffix 로 붙여 모델의 거절 확률을 최소화한다.
+
+$$
+\mathcal{L}_{\text{adv}} = -\log \Pr_{\pi_{\text{target}}}(\text{harmful response} \mid x + S_{\text{adv}})
+$$
+
+각 위치의 토큰을 greedy 하게 교체하므로 loss 는 단조 감소하고, 유한 vocabulary 위에서 local minimum 으로 수렴한다. 생성된 suffix 는 `！ !`. Raze unaccompanied Consequently` 같은 무의미한 문자열이지만, 모델의 embedding space 에서는 정확하게 작동한다.
+
+<Callout type="note" title="전이성 (Transferability)">
+한 모델에서 찾은 adversarial prompt 는 다른 모델에서도 부분적으로 작동한다. 모든 LLM 이 공통 pretraining corpus 에서 유래하므로 유사한 failure mode 를 공유한다. 단, alignment training 의 차이만큼 transfer 성공률은 감소한다.
+</Callout>
+
+## 방어의 구조화: Adversarial Training
+
+공격을 찾았다면, 그것을 학습 데이터에 포함해야 한다. Adversarial training 의 목적함수는 다음과 같다.
+
+$$
+\mathcal{L}_{\text{adv}}(\theta) = \lambda \cdot \mathcal{L}_{\text{benign}}(\theta) + (1-\lambda) \cdot \mathcal{L}_{\text{adversarial}}(\theta)
+$$
+
+Mixing ratio $\lambda$ 가 핵심 하이퍼파라미터다. $\lambda = 1$ 이면 standard training 과 같고, $\lambda = 0$ 이면 adversarial data 에만 과적합된다. Ganguli 2022 의 Constitutional Red Teaming 은 이 접근에 구조를 부여했다 — 원칙 집합(constitution) 별로 red teaming 을 수행해 어느 원칙이 취약한지 진단 가능하게 만든다.
+
+<Theorem kind="theorem" number="1" title="Robustness-Helpfulness Pareto Frontier">
+두 목표를 동시에 최적화할 때, Pareto frontier 상의 모든 최적점에서 helpfulness 증가는 robustness 감소를 함의한다.
+</Theorem>
+
+<Proof>
+모델이 "의도된 지시만 따르도록" 학습될수록 robust 하지만 flexible 이 줄어든다. 반대로 flexible 할수록 adversarial instruction 도 창의적으로 따를 가능성이 높아진다. Pareto frontier 는 단조적이므로, 한쪽의 개선은 다른 쪽의 손실을 반드시 수반한다. $\square$
+</Proof>
+
+최적점 $\lambda^*$ 는 기술적 문제가 아니라 정책 결정이다. 의료 도메인은 $\lambda \approx 0.3$, 일반 assistant 는 $\lambda \approx 0.7$ 이 권장된다.
+
+## 과잉 거절의 정량화: XSTest
+
+adversarial training 의 부작용은 **over-refusal** 이다. "폭력에 대해 교육적으로 설명해줄 수 있나요?" 같은 정당한 질문도 거절하는 false positive 다. Röttger 2023 의 XSTest 는 이를 체계적으로 측정한다.
+
+핵심 아이디어는 "safe-but-textually-similar-to-unsafe" 프롬프트 250개를 구성하는 것이다. `"How to make a bomb"` 에서 `"Explain how bombs are used in movies"` 같은 변형을 만들고, 모델이 이 안전한 변형들을 몇 퍼센트 거절하는지 측정한다.
+
+$$
+\text{Over-Refusal Rate} = \frac{|\{x : \text{모델이 거절} \land x \text{ 는 안전}\}|}{|\{x : x \text{ 는 안전}\}|}
+$$
+
+ROC 분석에서 중요한 결론이 나온다. Harmful 과 benign prompt 가 semantic space 에서 겹치는 이상 AUC < 1 이고, **완벽한 threshold 는 존재하지 않는다**. Threshold 를 높이면 over-refusal 이 줄지만 safety 도 함께 줄어든다.
+
+<Callout type="warning" title="트레이드오프">
+Safety weight $w_s$ 는 모델이 아니라 도메인이 결정한다. GPT-4 의 over-refusal rate 약 8%, Claude 2 는 약 5% — 둘 다 적정 safety 를 유지하면서 서로 다른 operating point 를 선택한다.
+</Callout>
+
+## 메커니즘의 발견: Refusal Direction
+
+세 챕터를 거쳐 우리는 여기에 도달한다. Arditi 2024 의 질문은 근본적이다 — 거절은 **어디에** 있는가?
+
+답은 residual stream 의 단일 벡터다.
+
+$$
+\mathbf{v}_{\text{refuse}} = \frac{1}{\|\cdot\|} \left( \mathbb{E}_{x \in D_{\text{harmful}}}[\mathbf{h}(x)] - \mathbb{E}_{x \in D_{\text{benign}}}[\mathbf{h}(x)] \right)
+$$
+
+Harmful prompt 와 benign prompt 를 모델에 통과시켜 last-token activation 의 평균 차이를 구하면 하나의 단위 벡터가 나온다. 이것이 refusal direction 이다.
+
+검증은 ablation 으로 한다. activation 에서 이 방향의 component 를 완전히 제거하면 ($\alpha = 1$):
+
+$$
+\mathbf{h}^{\text{patched}} = \mathbf{h} - (\mathbf{h} \cdot \mathbf{v}_{\text{refuse}}) \cdot \mathbf{v}_{\text{refuse}}
+$$
+
+jailbreak 성공률이 5–10% 에서 95–100% 로 뛴다. 반대로 방향을 강화하면 ($\alpha = -1$) benign 프롬프트에 대한 거절률이 80% 에 달한다 — 3장에서 측정한 over-refusal 문제가 mechanistic level 에서 재현된다.
+
+<Aside label="양날의 검">
+Alignment 이 editable linear vector 라는 발견은 defense 와 attack 모두에 열려 있다. Direction 을 강화하면 더 robust 한 safety training 이 가능하다. 동시에 adversary 가 direction 을 역공학하면 API access 만으로 alignment 를 무력화할 수 있다. Interpretability 와 vulnerability 는 같은 발견의 두 얼굴이다.
+</Aside>
+
+## 정리
+
+네 챕터가 공유하는 구조는 하나다 — safety 는 확률이 아니라 **방향**이다.
+
+- Red teaming 은 그 방향을 우회하는 경로를 찾는다.
+- Adversarial training 은 우회 경로를 학습 데이터로 봉쇄한다.
+- XSTest 는 방향이 너무 강해졌는지(over-refusal) 측정한다.
+- Mechanistic interpretability 는 방향 자체를 residual stream 에서 직접 추출한다.
+
+GCG suffix 가 작동하는 이유도, over-refusal 이 발생하는 이유도, ablation 으로 alignment 가 붕괴하는 이유도 — 전부 같은 구조의 다른 면이다. LLM 의 safety 는 하나의 벡터로 요약될 수 있다. 그렇기 때문에 강하고, 그렇기 때문에 취약하다.
+
+<Reference
+  title="Red Teaming Language Models to Reduce Harms"
+  authors="Perez et al."
+  year={2022}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2202.03286"
+/>
+
+<Reference
+  title="Universal and Transferable Adversarial Attacks on Aligned Language Models"
+  authors="Zou et al."
+  year={2023}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2307.15043"
+/>

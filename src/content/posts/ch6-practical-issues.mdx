@@ -1,0 +1,144 @@
+---
+title: "RLHF는 왜 길고, 느리고, 불안정한가"
+description: "Length bias의 수학적 근원부터 Gao 2023 scaling law의 최적 KL, β 범위, PPO/DPO의 수렴 보장, 평가 왜곡까지 — alignment training의 구조적 취약점을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [rlhf, dpo, reward-model, alignment, evaluation]
+difficulty: advanced
+series:
+  slug: llm-alignment-deep-dive
+  title: Llm Alignment Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Alignment training을 마친 모델은 이상하게도 하나같이 긴 답변을 생성한다. reward model은 최적화할수록 실제 성능이 오히려 떨어지고, β 하나를 잘못 고르면 학습이 폭주하거나 멈춘다. 평가 지표는 서로 다른 순위를 가리킨다. 이 현상들은 각각 별개의 버그인가, 아니면 하나의 구조적 문제에서 비롯된 것인가?
+
+## 길이가 긴 이유 — log-prob의 누적
+
+LLM의 생성 확률은 토큰 단위로 분해된다.
+
+$$
+\log \pi(y \mid x) = \sum_{t=1}^{|y|} \log \pi(y_t \mid x, y_{<t})
+$$
+
+각 항은 음수다. 그러므로 응답이 길수록 합은 더 음수가 된다. 여기까지는 "긴 응답이 불리하다"는 결론이 나올 것 같다. 역설은 **비교** 에서 생긴다.
+
+DPO loss의 핵심 항을 보면,
+
+$$
+\mathrm{logits} = \beta \sum_t \left[\log \pi(y_{w,t}) - \log \pi_{\mathrm{ref}}(y_{w,t})\right] - \beta \sum_t \left[\log \pi(y_{l,t}) - \log \pi_{\mathrm{ref}}(y_{l,t})\right]
+$$
+
+선호된 응답 `$y_w$`가 비선호 `$y_l$`보다 길면, 왼쪽 합산의 항 수가 더 많다. 각 항의 부호가 양수라면 누적값도 더 크다. 즉 **길이 자체가 logit을 끌어올리는 구조**다. Bradley-Terry RM도 동일한 방식으로 작동한다: 학습 데이터에서 선호된 응답이 평균적으로 더 길었다면, RM은 `$r(y) \approx \alpha + \beta \cdot |y|$`를 정확한 MLE로서 학습한다. spurious correlation이 아니라 **정확한 최대우도 추정의 결과**다.
+
+완화책은 per-token 정규화다. SimPO는 `$(\beta/|y|)\log\pi(y)$`로 길이를 상쇄한다. 하지만 수학 chain-of-thought처럼 길이가 품질과 양의 상관인 task에서는 이 보정 자체가 penalty가 된다.
+
+## 최적화할수록 나빠지는 이유 — Gao 2023 scaling law
+
+Proxy RM을 더 강하게 최적화하면 실제 성능(gold reward)이 어느 지점부터 하락한다. Gao et al. (2023)은 이 관계를 다음과 같이 정량화했다.
+
+$$
+J_{\mathrm{gold}}(\pi^*(\delta)) = \alpha\sqrt{\delta} - \beta\delta + C
+$$
+
+여기서 `$\delta = D_{\mathrm{KL}}(\pi \| \pi_{\mathrm{ref}})$`다. 해석은 단순하다: KL budget이 작을 때는 proxy signal이 gold signal과 일치하므로 `$\alpha\sqrt{\delta}$` 항이 지배한다. KL이 커지면 정책이 RM의 훈련 분포를 벗어나고, specification error가 누적되어 `$\beta\delta$` 항이 지배한다.
+
+<Theorem kind="theorem" number="1" title="최적 KL budget">
+위 scaling law를 `$\delta$`에 대해 미분하면,
+
+$$
+\frac{dJ_{\mathrm{gold}}}{d\delta} = \frac{\alpha}{2\sqrt{\delta}} - \beta = 0 \implies \delta^* = \left(\frac{\alpha}{2\beta}\right)^2
+$$
+
+`$\delta^*$`를 넘으면 KL budget을 늘릴수록 gold performance가 하락한다.
+</Theorem>
+
+<Proof>
+`$J_{\mathrm{gold}} = \alpha\sqrt{\delta} - \beta\delta + C$`의 `$\delta$`에 대한 일차 도함수를 0으로 두면 위 결과가 즉시 따라온다. 이차 도함수 `$-\alpha/(4\delta^{3/2}) < 0$`이므로 이는 최댓값이다.
+</Proof>
+
+RM을 키우면 어떻게 변하는가? `$\alpha \propto \log(\text{RM size})$`, `$\beta \propto 1/\text{RM size}$`이므로 `$\delta^*$`는 증가하지만 로그 스케일로 느리게 늘어난다. K개의 독립 RM을 앙상블하면 specification error가 `$1/\sqrt{K}$`로 감소해 `$\delta^*$`가 `$\sqrt{K}$`배 증가한다.
+
+## β는 얼마여야 하는가
+
+`$\beta$`는 alignment training에서 reward signal과 KL penalty 사이의 균형추다. 너무 작으면 RM의 artifact만 최적화하는 reward hacking이 발생하고, 너무 크면 policy가 reference에서 벗어나지 못해 alignment signal이 전달되지 않는다.
+
+<Callout type="note" title="β 범위 요약">
+RLHF(PPO): `$[0.01, 0.1]$`. RM이 동적으로 업데이트되므로 작은 값으로도 stability 확보 가능.
+
+DPO: `$[0.1, 0.5]$`. Pre-collected pair를 반복 사용하므로 off-policy divergence 제어를 위해 더 큰 값 필요.
+
+`$\beta < 0.005$`는 두 경우 모두 reward hacking 위험권이다.
+</Callout>
+
+DPO에서 `$\beta$`가 더 큰 이유는 구조적이다. RLHF는 매 iteration마다 RM을 새로 평가하므로 target이 동적으로 변한다. DPO는 preference label이 고정되어 있어 target drift가 없다. 따라서 policy가 더 aggressive하게 최적화해도 target이 도망가지 않는다.
+
+learning rate의 상대 비율도 중요하다. value function LR은 policy LR과 같게, RM LR은 policy LR의 0.1–1.0배로 설정하는 것이 경험적으로 안정적이다. RM이 너무 빠르게 업데이트되면 policy가 변화하는 target을 쫓다가 oscillation한다.
+
+## PPO vs DPO — bias-variance 분해
+
+두 방식의 차이는 on-policy/off-policy의 bias-variance trade-off로 정확하게 기술된다.
+
+PPO는 매 iteration 새 trajectory를 샘플링하므로 distribution shift가 0이다. 대신 매번 새 데이터가 필요해 sampling cost가 `$O(N \times \text{iter})$`에 비례한다. PPO의 clipping은 TRPO의 KL hard constraint를 soft constraint로 완화한 것이고, 이론적으로 단조 성능 향상을 보장한다.
+
+DPO는 preference pair를 한 번 수집해 여러 epoch 재사용한다. sampling cost는 `$O(1)$`이지만, 학습이 진행되면서 policy가 data collection 시점의 분포에서 멀어진다. Rafailov et al. (2024)의 분석에 따르면 이 bias는 `$O(\sqrt{D_{\mathrm{KL}}(\pi_\theta \| \pi_{\mathrm{data}})})$`에 비례한다.
+
+$$
+\mathbb{E}[\text{estimation error}] = \underbrace{\text{bias}(\text{distribution shift})}_{\text{DPO에서 누적}} + \underbrace{\text{variance}(\text{sampling})}_{\text{PPO에서 누적}}
+$$
+
+실전에서 Meta, DeepSeek 등이 DPO를 선택하는 이유는 sampling cost의 차이가 압도적이기 때문이다. safety-critical domain이나 70B+ 모델에서는 이론적 단조성이 더 중요해 PPO 또는 hybrid를 선택하는 경향이 있다.
+
+## 평가 지표가 신뢰할 수 없는 이유
+
+Alignment training 후 모델을 비교하는 기준이 제각각인 데는 이유가 있다. LLM-as-judge는 세 가지 systematic bias를 가진다.
+
+**Position bias** (+5%): 먼저 제시된 응답이 유리하다. forward/reverse 순서로 각각 평가한 뒤 평균을 취하면 상쇄된다.
+
+**Length bias** (+10%): 내용과 무관하게 긴 응답이 유리하다. Dubois et al. (2024)의 length-controlled win rate는 응답 쌍을 길이 구간으로 나누어 각 구간 내에서 win rate를 계산한 뒤 평균 낸다.
+
+$$
+WR_{\text{controlled}} = \frac{1}{K}\sum_{k=1}^{K} WR_k
+$$
+
+**Self-preference bias** (+15%): GPT-4를 judge로 쓰면 GPT-4 응답이 과대평가된다.
+
+이 bias들은 독립적으로 작용하며 누적되면 실제 ranking을 뒤집을 수 있다. Chatbot Arena의 Bradley-Terry ELO는 intransitive preferences가 존재해도 log-likelihood를 최대화하는 방식으로 단일 rating으로 수렴하지만, 비슷한 수준의 모델 사이 순위는 95% CI가 겹치면 통계적으로 신뢰하기 어렵다.
+
+<Aside label="평가의 역설">
+alignment training의 목표는 "더 나은 모델"을 만드는 것이지만, 더 나은 모델을 측정하는 도구 자체가 alignment training의 산물(길이 선호, self-preference)에 의해 왜곡된다. 지표를 최적화할수록 지표의 신뢰도가 낮아지는 구조다.
+</Aside>
+
+## 정리
+
+- `$\log\pi(y \mid x)$`의 누적 구조는 RM과 DPO 모두에서 길이-보상 spurious correlation을 **정확한 MLE**로 학습하게 만든다.
+- Gao 2023의 scaling law는 proxy RM 최적화에 최적점 `$\delta^* = (\alpha/2\beta)^2$`이 존재함을 보여준다. 이 점을 넘으면 KL budget을 늘릴수록 gold performance가 하락한다.
+- `$\beta$`는 RLHF에서 `$[0.01, 0.1]$`, DPO에서 `$[0.1, 0.5]$`가 안정적이다. `$\beta < 0.005$`는 두 경우 모두 reward hacking 위험권이다.
+- PPO는 bias 없는 on-policy 보장을 제공하고, DPO는 sampling 효율을 제공한다. 선택은 `$\text{bias} + \text{variance}$` 중 어느 쪽 비용을 더 감당할 수 있느냐의 문제다.
+- LLM-as-judge의 position/length/self-preference bias는 측정 도구 자체를 왜곡한다. length-controlled win rate와 cross-judge evaluation이 현재로서 가장 현실적인 보정이다.
+
+alignment training의 구조적 취약점들은 하나의 공통 원인으로 수렴한다 — **proxy를 최적화하면 proxy가 측정하던 대상에서 멀어진다**. 이 문제를 완전히 해결한 방법은 아직 없다.
+
+<Reference
+  title="Scaling Laws for Reward Model Overoptimization"
+  authors="Gao et al."
+  year={2023}
+  venue="ICML"
+  url="https://arxiv.org/abs/2210.10760"
+/>
+
+<Reference
+  title="Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+  authors="Rafailov et al."
+  year={2024}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.18290"
+/>
