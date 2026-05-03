@@ -1,0 +1,143 @@
+---
+title: "Pruning은 무엇을 제거하는가 — saliency에서 hardware까지"
+description: "OBD의 2차 Taylor 전개부터 NVIDIA 2:4 Sparse Tensor Core까지, 뉴럴넷 프루닝의 모든 설계 결정이 하나의 질문으로 수렴하는 과정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [pruning, sparsity, hessian, lottery-ticket, nm-sparsity]
+difficulty: advanced
+series:
+  slug: efficient-ml-deep-dive
+  title: Efficient Ml Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Pruning의 역사는 30년이 넘는다. 그런데 OBD(1990)에서 GPTQ(2023)까지, 겉으로는 전혀 다른 기법들이 사실 하나의 질문에 답하고 있다 — **"어떤 weight를 제거했을 때 loss가 가장 적게 오르는가?"** 이 질문에 어떤 가정을 추가하느냐에 따라 magnitude pruning이 나오고, OBS가 나오고, 2:4 Sparse Tensor Core가 나온다.
+
+## Saliency의 기원 — 2차 Taylor 전개
+
+LeCun의 OBD는 이 질문에 처음으로 수학적 답을 제시했다. 학습이 충분히 수렴했다면 gradient $g \approx 0$이므로, weight $w_i$를 0으로 제거할 때 loss 변화는 다음으로 근사된다.
+
+$$
+\Delta L_i \approx \tfrac{1}{2} H_{ii} w_i^2
+$$
+
+Full Hessian $H \in \mathbb{R}^{d \times d}$는 $d = 10^6$만 돼도 4TB 메모리가 필요하므로, OBD는 $H \approx \mathrm{diag}(H_{ii})$로 diagonal을 가정한다. 이 가정 하에 각 weight의 saliency $s_i = \tfrac{1}{2}H_{ii}w_i^2$는 독립적으로 계산된다.
+
+여기서 magnitude pruning의 이론적 위치가 드러난다. $H_{ii} \approx c$ (상수)로 가정하면 $s_i \propto w_i^2$이고, ranking이 $|w_i|$와 동일해진다. 즉 **magnitude pruning은 OBD의 isotropic Hessian 케이스**다.
+
+<Callout type="note" title="가정의 계층">
+$\Delta L \approx \tfrac{1}{2}\Delta w^\top H \Delta w$ (Taylor, 모두 공유) → diagonal $H$ 가정 (OBD) → $H \approx cI$ 가정 (Magnitude). 더 강한 가정일수록 계산이 쉽고, 더 자주 틀린다.
+</Callout>
+
+## OBS — diagonal 가정을 풀면
+
+Hassibi의 OBS(1993)는 diagonal 가정을 제거하고 full Hessian으로 간다. 핵심 아이디어는 "weight $i$를 0으로 강제하되, 나머지 weight를 optimal하게 조정한다"는 constrained optimization이다.
+
+$$
+\min_{\Delta w} \tfrac{1}{2} \Delta w^\top H \Delta w \quad \text{s.t.} \quad e_i^\top \Delta w + w_i = 0
+$$
+
+Lagrangian으로 풀면 closed-form이 나온다.
+
+$$
+\Delta w = -\frac{w_i}{[H^{-1}]_{ii}} H^{-1} e_i, \qquad \Delta L_i^{\text{OBS}} = \tfrac{1}{2}\frac{w_i^2}{[H^{-1}]_{ii}}
+$$
+
+<Theorem kind="proposition" number="1" title="OBD는 OBS의 특수 케이스">
+$H$가 diagonal이면 $[H^{-1}]_{ii} = 1/H_{ii}$이므로 $\Delta L_i^{\text{OBS}} = \tfrac{1}{2}H_{ii}w_i^2 = \Delta L_i^{\text{OBD}}$. OBD와 OBS는 동일해진다.
+</Theorem>
+
+<Proof>
+Diagonal $H$에서 역행렬의 $(i,i)$ 성분은 $1/H_{ii}$. 대입하면 $\Delta L_i^{\text{OBS}} = \tfrac{1}{2}w_i^2 \cdot H_{ii} = \Delta L_i^{\text{OBD}}$. $\square$
+</Proof>
+
+OBS의 진짜 기여는 "다른 weight의 optimal adjustment"다. weight $i$를 제거한 뒤 나머지 weight들이 $\Delta w$만큼 즉시 보상하므로, fine-tuning 없이 prune이 가능하다. GPTQ(2023)는 이 아이디어를 "single-column quantization → 나머지 column update"로 일반화해 LLM에 부활시킨다.
+
+## Magnitude의 실용성 — iterative와 lottery ticket
+
+이론적으로 OBS가 우월하더라도, 실전 표준은 magnitude pruning이다. $O(d)$ 정렬만 필요하고, Hessian 추정 noise에 영향받지 않는다. 그리고 **iterative retraining이 Hessian 정보의 부재를 보완**한다.
+
+Han(2015)의 Deep Compression 실험에서 AlexNet sparsity 89%일 때 one-shot은 6% acc drop, iterative + retrain은 0.4% drop이었다.
+
+Frankle & Carlin(2019)의 Lottery Ticket Hypothesis는 이 iterative 절차에 더 깊은 의미를 부여했다. Dense network 안에는 sparse subnetwork가 존재하며, 그 subnetwork를 **원본 initialization으로 reset**해서 다시 학습하면 dense와 동등한 성능에 도달한다는 것이다.
+
+$$
+\exists\, M \in \{0,1\}^d : f(x;\, W_0 \odot M) \text{ trains to dense-equivalent accuracy}
+$$
+
+여기서 핵심은 $W_0$다. 동일한 mask $M$을 random initialization $W_0'$에 적용하면 성능 회복이 안 된다. **mask가 아니라 mask와 initialization의 조합**이 winning ticket이다.
+
+pre-trained LLM의 fine-tuning에서는 또 다른 문제가 생긴다. Magnitude는 task와 무관한 pre-train 결과를 반영하므로, fine-tuning 중 실제로 task에 활용되는 weight를 잘못 prune할 수 있다. Sanh(2020)의 Movement Pruning은 이 문제를 gradient의 방향으로 해결한다.
+
+$$
+S_i = \sum_t -\frac{\partial L^{(t)}}{\partial w_i} \cdot w_i^{(t)}
+$$
+
+$S_i > 0$이면 gradient step이 $w_i$를 0에서 멀어지게 하므로 task에 활용되고 있다는 신호다. $S_i < 0$이면 0으로 향하는 중 — prune 후보다. **Magnitude는 task-agnostic, Movement는 task-aware**.
+
+## 트레이드오프 — 이론적 정확도 vs 실용성
+
+지금까지의 흐름을 정리하면, 가정을 완화할수록 정확하지만 비용이 증가한다.
+
+<Callout type="note" title="트레이드오프">
+| 방법 | Hessian 사용 | 비용 | 정확도 |
+|------|-------------|------|-------|
+| Magnitude | 없음 ($H \approx cI$) | $O(d)$ | 낮음 |
+| OBD | Diagonal | $O(d)$ (Fisher) | 중간 |
+| OBS | Full | $O(d^3)$ | 높음 |
+| GPTQ | Layer-wise column | $O(\text{col}^2)$ | 중간-높음 |
+
+LLM처럼 $d \gg 10^9$인 경우 full Hessian은 물리적으로 불가능하다. Layer-wise OBS(GPTQ)는 이 간극을 bridging한다.
+</Callout>
+
+그러나 이 모든 논의는 **wall-clock speedup이 없다**는 공통 한계를 가진다. Unstructured pruning은 irregular sparsity pattern 때문에 Tensor Core가 사용 불가능하다. 90% sparse weight matrix도 실제로 1.5× 미만의 inference speedup을 내는 경우가 많다.
+
+## Hardware — N:M sparsity와 Sparse Tensor Core
+
+NVIDIA Ampere의 2:4 sparsity는 이 gap을 채운다. 4개의 weight element 중 정확히 2개를 0으로 만들면, hardware가 non-zero의 위치 index(2-bit × 2)를 저장하고 해당 activation만 선택해서 dot product를 계산한다.
+
+```
+Dense:  [w0, w1, w2, w3] · [a0, a1, a2, a3]  — 4 ops
+2:4:    [w0,  0, w2,  0] → values [w0, w2], index [0, 2]
+        [a0, a2]  — 2 ops, exactly 1/2
+```
+
+이 pattern이 **고정되어 있기 때문에** hardware가 deterministic하게 skip할 수 있고, 정확히 2× throughput이 보장된다. 이론이 아니라 silicon 수준의 보장이다.
+
+ResNet-50 ImageNet 실험에서 2:4 magnitude pruning 후 retrain 시 acc drop은 0.3% 이하이고, wall-clock은 1.7-2×다. Unstructured 90%와 비교하면 sparsity ratio는 열세지만 실제 speedup은 압도적이다.
+
+2:4와 INT8을 결합하면 약 3-4×, INT4 LLM(Hopper 기준)에서는 5-8×까지 가능하다. **알고리즘적 sparsity와 hardware-aware sparsity의 지향점은 다르다** — 전자는 acc 보존 극대화, 후자는 실제 배포 throughput 극대화.
+
+## 정리
+
+- Pruning의 이론적 뿌리는 $\Delta L \approx \tfrac{1}{2}H_{ii}w_i^2$이며, magnitude pruning은 $H \approx cI$의 특수 케이스다.
+- OBS는 full Hessian + 나머지 weight optimal adjustment로 정확도를 높이며, GPTQ는 이를 LLM에 scalable하게 적용한다.
+- Lottery Ticket은 pruning을 "후처리"가 아닌 "원본 initialization의 winning subnetwork 발견"으로 재정의한다.
+- Pre-trained LLM fine-tuning에서는 magnitude보다 movement(task gradient 방향)가 올바른 saliency 신호다.
+- 실제 배포에서 wall-clock speedup은 알고리즘적 sparsity보다 hardware-aligned pattern(2:4 N:M)이 결정한다.
+
+Pruning의 30년은 "올바른 가정"을 찾아온 역사다. 각 기법의 가정이 어디서 깨지는지를 알면, 내 모델과 타겟 하드웨어에 맞는 선택이 보인다.
+
+<Reference
+  title="Optimal Brain Damage"
+  authors="LeCun, Denker, Solla"
+  year={1990}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/1989/hash/6c9882bbac1c7093bd25041881277658-Abstract.html"
+/>
+
+<Reference
+  title="Optimal Brain Surgeon and General Network Pruning"
+  authors="Hassibi, Stork"
+  year={1993}
+  venue="IEEE International Conference on Neural Networks"
+  url="https://ieeexplore.ieee.org/document/298572"
+/>

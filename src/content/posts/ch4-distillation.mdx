@@ -1,0 +1,144 @@
+---
+title: "Knowledge Distillation은 왜 단순 압축이 아닌가"
+description: "Hinton 2015의 soft target 원리부터 dark knowledge, feature distillation, relation-based KD, 그리고 self-distillation까지 — KD의 본질이 function transfer임을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [knowledge-distillation, soft-target, feature-distillation, model-compression]
+difficulty: advanced
+series:
+  slug: efficient-ml-deep-dive
+  title: Efficient Ml Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Pruning과 Quantization이 weight space의 redundancy를 제거한다면, Knowledge Distillation(KD)은 다른 축에서 작동한다 — **큰 모델이 학습한 function을 작은 모델에 이식**한다. 그런데 같은 architecture끼리도 KD가 성능을 올린다는 사실은 "압축"이라는 설명만으로는 부족하다. KD의 본질은 무엇인가?
+
+## Soft Target이 Hard Label보다 많은 것을 담는 이유
+
+Hard label은 `[cat: 1, dog: 0, truck: 0, ...]`처럼 1-bit 신호다. Teacher의 soft target은 다르다.
+
+```
+T=4 에서의 soft target (cat 이미지):
+  cat: 0.62, dog: 0.23, truck: 0.10, plane: 0.04, ...
+```
+
+`dog: 0.23`은 단순한 오분류 확률이 아니다. **cat과 dog가 시각적으로 유사하다는 manifold 구조**가 인코딩되어 있다. Hinton은 이를 *dark knowledge*라 불렀다 — hard label에 없는 non-target class 간의 상대적 확률 비율.
+
+이 비율을 수식으로 쓰면 정확하다.
+
+$$
+\log\frac{p_i}{p_j} = \frac{z_i - z_j}{T}
+$$
+
+Temperature $T$로 스케일된 logit 차이가 inter-class similarity를 인코딩한다. $T$를 키우면 이 차이가 더 선명하게 드러나고, $T \to \infty$이면 균등 분포로 가지만 — 1차 Taylor 전개 결과, logit 차이 정보는 $1/T$ 스케일로 **보존**된다.
+
+$$
+p_i \approx \frac{1}{K}\left(1 + \frac{z_i - \bar{z}}{T}\right) + O(1/T^2)
+$$
+
+## $T^2$ Factor — Gradient를 살리는 정확한 보정
+
+KD loss는 흔히 이렇게 쓴다.
+
+$$
+L_{\mathrm{KD}}(z^S, z^T; T) = T^2 \cdot \mathrm{KL}\!\left(\mathrm{softmax}\!\left(\frac{z^T}{T}\right) \,\Big\|\, \mathrm{softmax}\!\left(\frac{z^S}{T}\right)\right)
+$$
+
+$T^2$는 임의의 정규화가 아니다. KD loss의 student logit에 대한 gradient를 계산하면 다음이 나온다.
+
+$$
+\frac{\partial L_{\mathrm{KD}}}{\partial z^S_i} = T\left(p^S_i - p^T_i\right)
+$$
+
+High-$T$ regime에서 $p^S, p^T$가 모두 균등 분포에 가까우므로 그 차이는 $O(1/T)$이다. 두 항의 곱: $T \cdot O(1/T) = O(1)$. Hard label loss의 gradient $\partial L_{\mathrm{CE}}/\partial z^S_i = p^S_i - y_i$도 $O(1)$이므로, $T^2$가 있어야 두 항이 같은 스케일을 유지한다. $T^2$가 없으면 $T$가 커질수록 KD gradient가 소실되고 $\alpha$의 의미가 $T$에 종속된다.
+
+<Callout type="note" title="트레이드오프">
+$T$가 크면 dark knowledge 활용도가 높아지지만, $T^2$ factor 없이는 gradient가 $1/T$로 줄어 KD signal이 hard label에 압도된다. $T^2$는 이 trade-off를 $\alpha$ 하나로 통제하게 만드는 정확한 보정이다.
+</Callout>
+
+## Feature와 Relation — Logit 너머의 Transfer
+
+Logit KD는 출력단만 모방한다. Teacher의 중간 표현을 활용하는 방법이 두 갈래로 발전했다.
+
+**Feature-based KD** (FitNets, Attention Transfer)는 intermediate feature map을 직접 매칭한다.
+
+$$
+L_{\mathrm{hint}} = \|F^T - g(F^S)\|_2^2
+$$
+
+$g$는 student와 teacher의 channel 수가 다를 때 dimension을 맞추는 1×1 conv adapter다. Attention Transfer는 channel을 collapse해서 spatial attention map만 매칭한다.
+
+$$
+A(F) = \sum_{c=1}^C |F_c|^p \in \mathbb{R}^{H \times W}
+$$
+
+이 방식은 student/teacher의 channel 수 차이를 자동으로 처리하므로 architecture-agnostic하다.
+
+**Relation-based KD** (RKD, Park 2019)는 더 근본적인 invariance를 요구한다 — 개별 embedding이 아니라 **sample 간의 거리와 각도**를 보존하라.
+
+$$
+L_{\mathrm{RKD\text{-}D}} = \sum_{i,j} \ell_\delta\!\left(\psi_D^T(x_i, x_j),\, \psi_D^S(x_i, x_j)\right)
+$$
+
+student의 embedding 좌표 자체는 teacher와 달라도 된다. pairwise distance 구조만 일치하면 된다. 이 translation/rotation invariance 덕분에 RKD는 embedding metric learning의 teacher-guided 변형으로 볼 수 있다.
+
+세 방식의 joint loss는 다음과 같다.
+
+$$
+L = (1-\alpha-\beta-\gamma)\,L_{\mathrm{CE}} + \alpha\,L_{\mathrm{resp}} + \beta\,L_{\mathrm{feat}} + \gamma\,L_{\mathrm{rel}}
+$$
+
+세 방식이 class-level prediction, per-sample intermediate state, cross-sample structure를 각각 다른 invariance로 transfer하기 때문에 joint 사용이 일관되게 single 사용을 앞선다.
+
+## Self-Distillation — 압축 없는 KD의 역설
+
+Born-Again Networks (Furlanello 2018)는 이 역설적 결과를 보고했다. **같은 architecture**로 KD를 반복하면 generation마다 성능이 단조 증가한다.
+
+```
+Generation 0 (hard label only):  71.2%
+Generation 1 (KD from Gen 0):    72.0%
+Generation 2 (KD from Gen 1):    72.4%
+Generation 3:                     72.6%
+  ... (eventually saturates)
+```
+
+이것은 model 압축이 아니다. 메커니즘 후보는 셋이다 — label smoothing 효과, implicit ensemble, curriculum signal. Yuan 2020은 KD가 "input-aware label smoothing"이라 분석했다. 고정된 uniform mixing이 아니라, teacher가 입력별로 다른 soft target을 생성하므로 단순 label smoothing보다 일관되게 우월하다.
+
+Allen-Zhu & Li (2020)의 multi-view hypothesis는 더 깊이 파고든다. 큰 모델이 학습 데이터의 다양한 feature view를 capture하고, KD가 그 ensemble-like 표현을 student에 이식한다는 주장이다.
+
+<Aside label="설계 철학">
+Self-distillation의 존재는 KD의 본질이 "정보 압축"이 아님을 말한다. KD의 core는 **학습 signal의 질을 높이는 것** — teacher의 function이 student에게 더 풍부한 gradient를 공급한다.
+</Aside>
+
+## 정리
+
+- Hard label은 class identity만 전달한다. Soft target은 class 간 유사도 구조(dark knowledge)를 추가로 전달한다.
+- $T^2$ factor는 고온에서 KD gradient가 소실되지 않도록 정확히 보정한다 — 임의 관행이 아니라 수학적 필연이다.
+- Feature KD와 Relation KD는 logit KD와 다른 invariance를 가지며, joint 사용이 일관되게 우월하다.
+- Self-distillation은 압축 없이도 성능이 오른다 — KD의 본질이 function transfer임을 가장 직접적으로 보여준다.
+
+다음 글에서는 Low-Rank Factorization으로 넘어간다 — weight matrix 자체를 분해해 parameter를 줄이는 또 다른 compression axis를 다룬다.
+
+<Reference
+  title="Distilling the Knowledge in a Neural Network"
+  authors="Hinton et al."
+  year={2015}
+  venue="NeurIPS Workshop"
+  url="https://arxiv.org/abs/1503.02531"
+/>
+
+<Reference
+  title="Relational Knowledge Distillation"
+  authors="Park et al."
+  year={2019}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1904.05068"
+/>

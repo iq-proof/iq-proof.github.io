@@ -1,13 +1,13 @@
 ---
-title: "LLM Quantization: 정보 손실을 설계하는 기술"
-description: "Uniform MSE 공식부터 NF4의 Lloyd-Max 최적성까지, LLM 양자화의 다섯 가지 접근이 공유하는 하나의 질문 — 어디서 손실을 허용할 것인가 — 을 추적한다."
+title: "LLM Quantization은 왜 scale 결정의 문제인가"
+description: "INT8부터 BitNet 1.58-bit까지, scale·granularity·calibration의 세 가지 선택이 어떻게 quantization accuracy의 Pareto frontier를 결정하는지 추적한다."
 pubDate: 2026-05-03
 category: ai
-tags: [quantization, llm, int8, gptq, awq]
+tags: [quantization, llm, gptq, ste, efficient-ml]
 difficulty: advanced
 series:
-  slug: llm-efficiency-deep-dive
-  title: Llm Efficiency Deep Dive
+  slug: efficient-ml-deep-dive
+  title: Efficient Ml Deep Dive
   order: 3
 draft: false
 featured: false
@@ -19,114 +19,130 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-LLM을 압축할 때 우리는 정보를 잃는다. 문제는 정보 손실을 막는 것이 아니라 **어디서, 얼마나** 잃을지 설계하는 것이다. INT8, GPTQ, AWQ, SmoothQuant, NF4는 모두 이 하나의 질문에 대한 서로 다른 대답이다 — 그리고 각각의 대답은 "어디가 중요한가"에 대한 서로 다른 가정에서 출발한다. 왜 이 기법들이 같은 문제를 다르게 푸는가?
-
-## 손실의 수학적 토대
-
-어떤 기법이든 출발점은 같다. 실수 $x$를 정수 격자로 매핑한 뒤 복원하면 오차가 생긴다.
+Quantization을 배울 때 가장 먼저 만나는 수식은
 
 $$
-x_q = \mathrm{clamp}\!\left(\mathrm{round}\!\left(\frac{x - z}{s}\right),\ 0,\ 2^b - 1\right), \quad \hat{x} = s \cdot x_q + z
+x_q = \mathrm{clip}(\mathrm{round}(x/s) + z,\, q_{\min},\, q_{\max})
 $$
 
-균등 분포를 가정하면 이 오차의 기댓값은 닫힌 형태로 구해진다.
+이다. 그런데 이 수식에서 실제로 모든 결정을 내리는 것은 $s$ 하나다 — scale을 어떻게 정하느냐가 정확도의 전부를 결정한다. PTQ, QAT, GPTQ, AWQ, NF4까지, 챕터마다 다른 이름으로 등장하는 기법들은 결국 **"$s$를 어떤 기준으로 구할 것인가"** 라는 하나의 질문에 대한 다른 답이다.
+
+## scale 결정의 세 가지 축
+
+quantization에서 내려야 하는 결정은 세 가지 축으로 정리된다.
+
+**calibration 방법**: absolute-max는 $s = \max|x|/q_{\max}$로 단순하지만 outlier 하나가 scale 전체를 지배한다. percentile은 tail을 잘라 main mass의 정밀도를 보호한다. KL divergence minimization은
 
 $$
-\mathrm{MSE}_b = \frac{s^2}{12}, \quad s = \frac{\mathrm{range}}{2^b}
+s^* = \arg\min_s D_{\mathrm{KL}}(P_{\text{orig}} \| P_{\text{quant}}(s))
 $$
 
-이 공식에서 두 가지 결론이 나온다. 첫째, **비트를 1 줄이면 MSE는 4배 증가**한다 — $s$가 두 배가 되기 때문이다. 둘째, scale $s$를 어떻게 정하느냐가 오차를 결정한다. Per-tensor quantization은 하나의 전역 $s$를 쓰고, per-channel은 채널마다 $s_i$를 쓴다. 이상치(outlier) 한 채널이 전역 scale을 지배하면 나머지 99%는 양자화 해상도를 낭비한다. Per-channel이 per-tensor보다 항상 오차가 작거나 같은 이유가 여기 있다.
+으로 원 분포와 quantized 분포의 정보 손실을 최소화한다. TensorRT의 calibration 표준이 여기서 나왔다.
 
-## Transformer의 이상치 문제
+**granularity**: per-tensor는 matrix 전체에 하나의 $(s, z)$를 쓴다. per-channel은 output dimension마다 독립적인 scale을 두어 채널 간 magnitude 차이를 보정한다. per-group은 128개 elements 단위로 scale을 잡는다 — GPTQ의 표준. granularity가 세밀해질수록 정확도는 오르지만 metadata overhead도 따라붙는다.
 
-표준 CNN과 달리 Transformer activation에는 **특정 채널에만 집중되는 극단값**이 존재한다. LLaMA-65B 수준의 모델에서는 평균 magnitude가 ~1인데 최댓값이 100-200에 달하는 채널이 나타난다. Gaussian이라면 최댓값은 $5\sigma$ 수준이어야 한다 — 실제는 $100\sigma$에 가깝다.
+**bit-width**: INT-$b$는 $2^b$ levels를 제공한다. INT8은 256 levels로 사실상 lossless baseline, INT4는 16 levels로 GPTQ/AWQ를 요구하고, BitNet의 1.58-bit는 $\{-1, 0, +1\}$ 3 levels다.
 
-이 이상치가 INT8 scale을 지배하면 정상 값 대부분이 0 또는 1로 뭉개진다. LLM.int8()은 이를 **혼합 정밀도**로 해결한다.
+<Callout type="note" title="rounding error의 분산">
+$x \sim \mathrm{Uniform}([-s/2, s/2])$ 가정 시 rounding error의 분산은
 
 $$
-y_i = \begin{cases} \sum_{j \in O} W_{ij} x_j & \text{(FP16, outlier)} \\ \sum_{j \notin O} (W_{ij}\;\text{INT8}) \otimes (x_j\;\text{INT8}) & \text{(otherwise)} \end{cases}
+\mathrm{Var}(\hat{x} - x) = \frac{s^2}{12}
 $$
 
-outlier channel 판별 기준은 $\max_i |a_{ij}| / \mathrm{std}_i(a_{ij}) > 6$이다. 실험적으로 이 채널의 비율은 전체의 0.1–1% 수준이다. 1%를 FP16으로 보호하고 99%를 INT8로 처리하면 메모리는 ~4배 줄면서 perplexity 손실은 1% 미만에 묶인다.
-
-<Callout type="note" title="트레이드오프: LLM.int8()">
-threshold $\tau = 6$은 경험적 값이다. 낮추면 FP16 채널이 늘어나 메모리 절감이 줄고, 높이면 이상치를 INT8로 처리해 정확도가 떨어진다. 모델과 태스크에 따라 튜닝이 필요하다.
+이다. **rounding error는 scale에 선형**하다 — scale을 키우면 정밀도가 그대로 떨어진다.
 </Callout>
 
-## GPTQ: output 오차를 직접 최소화
+## PTQ: fine-tune 없이 얼마나 갈 수 있나
 
-LLM.int8()이 activation 이상치를 다룬다면, GPTQ는 **weight 양자화 시 output error를 직접 최소화**한다.
+Post-Training Quantization은 calibration set(수백~수천 sample)으로 scale을 결정하고 가중치를 교체한다. 학습이 없다는 것이 PTQ의 최대 장점이다.
 
-목적함수는 다음과 같다.
+그런데 여기서 layer-wise error 누적이 문제가 된다. 각 layer $\ell$의 quantization error $\epsilon_\ell$는 forward pass에서
+
+$$
+\|\Delta y\| \leq \sum_\ell \prod_{k > \ell} \|W_k\|_{\text{op}} \cdot \|\epsilon_\ell\|
+$$
+
+로 쌓인다. network가 깊을수록, 압축률이 같아도 누적 error는 늘어난다.
+
+Cross-Layer Equalization(CLE)은 이 문제를 연속 layer의 channel magnitude를 geometric mean으로 균형 맞춰 완화한다. 연속 layer $W_1, W_2$에 대해 $s_i = \sqrt{r_1^{(i)} \cdot r_2^{(i)}}$로 변환하면 출력은 동일하지만 per-tensor scale의 dynamic range 활용도가 오른다.
+
+**INT8까지는 PTQ가 safe baseline이다. INT4 아래부터는 다른 무언가가 필요하다.**
+
+## QAT와 STE: 미분 불가능한 함수를 학습시키는 트릭
+
+`round` 함수의 derivative는 거의 모든 점에서 0이다. QAT는 이 문제를 Straight-Through Estimator(STE)로 우회한다.
+
+$$
+y = \mathrm{stop\text{-}grad}(q(x)) + x - \mathrm{stop\text{-}grad}(x)
+$$
+
+forward에서는 $y = q(x)$, backward에서는 $\nabla_x y = 1$. round를 identity처럼 취급하는 "거짓 gradient"다.
+
+<Theorem kind="proposition" number="1" title="STE in expectation">
+$x \in [-s/2, s/2]$ uniform noise 가정 시, $\mathbb{E}[\nabla_x \mathrm{round}(x/s) \cdot s] = 1$. STE는 stochastic rounding 하에서 정확하다.
+</Theorem>
+
+<Proof>
+uniform noise에서 round의 기대 gradient는 identity다. STE는 이 기대값을 결정론적 근사로 쓴다. $\square$
+</Proof>
+
+이 트릭이 QAT, LSQ(learnable scale), BitNet 1.58-bit까지 모든 학습형 quantization의 토대다. 4-bit 이하에서 PTQ의 accuracy가 급락하는 이유는 PTQ가 이 적응 과정 없이 고정된 grid에 가중치를 욱여넣기 때문이다. QAT는 학습이 가중치 분포를 quantization grid에 맞춰 수렴시킨다.
+
+## GPTQ와 AWQ: LLM에서 INT4를 가능하게 한 두 아이디어
+
+GPTQ(Frantar 2023)는 Optimal Brain Surgeon의 30년 만의 부활이다. layer-wise objective
 
 $$
 \min_{\hat{W}} \|WX - \hat{W}X\|_F^2
 $$
 
-핵심 도구는 Hessian $H = 2XX^T / N$과 그 역행렬이다. $j$번째 weight를 양자화할 때 나머지 weight를 다음 규칙으로 보정한다.
+를 column 단위로 순차 풀면서, column $q$를 quantize할 때 발생하는 error를 나머지 column들이 즉시 흡수하도록 Hessian $H = XX^\top$으로 보정한다.
 
 $$
-\Delta w = (w_j - \hat{w}_j) \cdot H^{-1}_{:,j} \;/\; H^{-1}_{jj}
+W[:, q+1:] \leftarrow W[:, q+1:] - \frac{w_q - \hat{w}_q}{H^{-1}_{qq}} \cdot H^{-1}_{q, q+1:}
 $$
 
-이것은 quadratic loss에 대한 exact Newton step이다 — 중요한 weight(큰 $H_{jj}$)는 적게 보정하고, 덜 중요한 weight는 많이 보정한다. 실제로는 row 단위로 순차 적용하고, group size 128로 묶어 Hessian 역행렬을 Cholesky 분해로 효율화한다. INT4에서 naive 대비 perplexity 1–2% 이득을 얻는다.
+LLaMA-7B INT4 naive PTQ의 perplexity drop이 5 이상인 반면, GPTQ는 0.5 미만이다. **column-wise error compensation이 그 차이를 만든다.**
 
-## AWQ와 SmoothQuant: 등가 변환의 두 방향
+AWQ(Lin 2023)와 SmoothQuant(Xiao 2023)는 LLM 특유의 문제를 겨냥한다 — 일부 hidden dimension의 activation magnitude가 다른 채널의 100~1000배인 "outlier feature". per-tensor scale이 이 outlier 하나에 지배되면 나머지 99% 채널의 effective bits는 1에 가까워진다.
 
-두 기법은 같은 수학적 트릭을 반대 방향으로 적용한다.
-
-$$
-WX = (W \cdot S)(S^{-1} X) \quad \text{(AWQ)}
-\qquad
-WX = (W \cdot S^{-1})(S \cdot X) \quad \text{(SmoothQuant)}
-$$
-
-**AWQ**는 activation magnitude에 비례한 $S$로 weight를 키운다. salient weight — 큰 activation과 곱해지는 1%의 weight — 가 INT4에서 상대 오차가 작아지도록 보호한다. Hessian 없이 한 번의 forward pass로 $S$를 결정하므로 GPTQ보다 빠르다.
-
-**SmoothQuant**는 반대다. activation의 이상치를 $S$로 weight 쪽으로 흡수해 **W8A8**을 가능하게 만든다. 최적 $s_j$는 MSE 최소화 조건에서 해석적으로 구해진다.
-
-$$
-s_j = \left(\frac{R_x^j}{R_w^j}\right)^{0.5}
-$$
-
-W8A8 하드웨어(GPU, TPU) 커널은 FP16보다 5–10배 빠르다 — batch size가 클수록 이 이득이 극대화된다.
+두 기법 모두 동일한 equivalent transform $Y = W X = (WS^{-1})(SX)$를 쓰지만 목적이 다르다.
 
 <Callout type="note" title="트레이드오프: AWQ vs SmoothQuant">
-AWQ는 weight만 INT4로 압축 — weight 저장 비용이 핵심인 배포 환경에 적합하다. SmoothQuant는 W8A8 하드웨어가 있을 때만 진정한 latency 개선이 가능하다. 하드웨어 없이는 메모리 절감만 남는다.
+**AWQ**: $S$를 activation outlier channel의 magnitude에 맞춰 weight를 줄여 weight-only(W4A16) quantization을 안전하게 만든다. activation은 FP16 유지. INT4 LLM serving(vLLM, TensorRT-LLM)의 표준.
+
+**SmoothQuant**: $s_i = \max(|X_i|)^\alpha / \max(|W_i|)^{1-\alpha}$로 outlier를 weight 쪽으로 transfer해 W8A8을 가능하게 한다. weight와 activation 모두 INT8 — throughput 최적화.
+
+같은 수식, 반대 방향의 $S$ 선택.
 </Callout>
 
-## NF4: 분포를 아는 양자화
+## 4-bit 이하: distribution-aware codebook의 시대
 
-앞의 기법들이 "어디가 중요한가"를 묻는다면, NF4는 "분포를 알면 격자를 어떻게 놓아야 하는가"를 묻는다.
+INT4의 16 levels는 Gaussian 분포에 sub-optimal이다. weight의 대부분이 0 근처에 몰려 있는데 uniform spacing은 outlier를 위해 grid를 낭비한다.
 
-Pre-trained LLM weight는 Gaussian에 가깝다. INT4의 균등 격자는 꼬리에 level을 낭비하고 피크에 부족하다. NF4는 16개 level을 표준정규분포의 quantile에 배치한다.
+NF4(Dettmers 2023)는 정규분포의 quantile로 codebook을 구성한다. codebook entries $q_i \approx \Phi^{-1}(i/17)$ — Lloyd algorithm의 Gaussian 최적해다. LLaMA-7B에서 INT4 GPTQ의 perplexity drop이 0.5일 때 NF4는 0.2다.
+
+BitNet b1.58(Ma 2024)은 이 논리를 극단까지 밀어붙인다. weight를 $\{-1, 0, +1\}$로 제한하면 $\log_2 3 \approx 1.585$ bit/weight이고,
 
 $$
-q_i = \Phi^{-1}\!\left(\frac{i + 0.5}{16}\right), \quad i = 0, \ldots, 15
+y_j = \sum_{i: W_{ji}=1} x_i - \sum_{i: W_{ji}=-1} x_i
 $$
 
-이것은 정규분포에 대한 Lloyd-Max quantizer의 수렴점이다 — 주어진 level 수에서 기댓값 MSE를 최소화하는 이론적 최적 배치다. 실험적으로 Gaussian weight에서 INT4 대비 15–20% MSE 감소를 보인다. QLoRA는 이 NF4를 frozen base model에, LoRA adapter를 FP16으로 학습해 7B 모델을 단일 GPU에서 fine-tuning 가능하게 만들었다.
+MatMul이 sign-flip과 add만으로 환원된다. 곱셈이 사라진다.
 
-<Aside label="통합 시각">
-다섯 기법을 관통하는 질문은 하나다 — **"어디서 손실을 허용할 것인가?"** LLM.int8()은 이상치 채널, GPTQ는 덜 중요한 weight, AWQ는 activation 작은 채널, SmoothQuant는 weight 쪽으로 이상치를 이전, NF4는 꼬리 영역. 각 설계 선택은 서로 다른 하드웨어, 배포 시나리오, 정확도 요구에서 유효하다.
+<Aside label="정보 이론적 관점">
+source coding 관점에서 optimal quantization의 codebook은 Lloyd algorithm의 수렴점이다 — $q_k = \mathbb{E}[X | X \in V_k]$. Gaussian distribution에서 이 수렴점이 quantile-based codebook에 수렴한다는 것이 NF4의 정당화다. uniform grid(INT4)는 Gaussian에 대해 information-theoretically inefficient하다.
 </Aside>
 
 ## 정리
 
-- Uniform quantization의 MSE는 $s^2/12$다 — scale을 어떻게 정하느냐가 곧 오차를 결정한다.
-- LLM activation의 이상치(0.1–1% 채널)는 양자화 전략 전체를 바꾼다 — LLM.int8()은 이를 FP16으로 격리하고, SmoothQuant는 weight로 흡수한다.
-- GPTQ는 Hessian으로 output error를 직접 최소화하고, AWQ는 activation salience로 보호할 weight를 선별한다.
-- NF4는 weight 분포가 Gaussian임을 이용해 Lloyd-Max 최적 격자를 구성한다.
+- quantization의 accuracy는 **scale 결정의 함수**다 — calibration 방법, granularity, bit-width의 세 축이 Pareto를 결정한다.
+- PTQ는 INT8까지 safe. INT4부터는 GPTQ(column-wise error compensation) 또는 QAT(STE 기반 분포 수렴)가 필요하다.
+- LLM의 activation outlier는 equivalent transform($Y = (WS^{-1})(SX)$)으로 처리한다 — AWQ는 W4A16, SmoothQuant는 W8A8을 타깃으로 $S$의 방향이 반대다.
+- 4-bit 이하에서는 distribution-aware codebook(NF4)이나 ternary(BitNet)처럼 **weight 분포의 모양 자체를 설계에 반영**해야 한다.
 
-정보 손실은 피할 수 없다. 어디서 잃을지 선택하는 것이 양자화 설계의 전부다.
-
-<Reference
-  title="LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale"
-  authors="Dettmers et al."
-  year={2022}
-  venue="NeurIPS"
-  url="https://arxiv.org/abs/2208.07339"
-/>
+scale 하나를 어떻게 정하느냐 — 이 질문이 INT8에서 1.58-bit까지의 스펙트럼 전체를 관통한다.
 
 <Reference
   title="GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"
@@ -134,4 +150,11 @@ $$
   year={2023}
   venue="ICLR"
   url="https://arxiv.org/abs/2210.17323"
+/>
+<Reference
+  title="QLoRA: Efficient Finetuning of Quantized LLMs"
+  authors="Dettmers et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.14314"
 />

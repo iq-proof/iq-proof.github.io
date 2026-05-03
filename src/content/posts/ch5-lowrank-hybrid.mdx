@@ -1,0 +1,135 @@
+---
+title: "모델 압축의 4축은 어떻게 하나의 철학으로 수렴하는가"
+description: "Low-rank factorization의 Eckart-Young 정리부터 LoRA의 intrinsic rank 가설, Tucker 분해, Hybrid recipe까지 — 학습된 가중치의 redundancy를 제거하는 통일된 관점을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [model-compression, low-rank, lora, tensor-decomposition, quantization]
+difficulty: advanced
+series:
+  slug: efficient-ml-deep-dive
+  title: Efficient Ml Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+학습된 신경망 가중치에는 공통된 패턴이 있다. SVD를 걸어보면 singular value가 long-tail을 그린다. top 10%가 전체 에너지의 80%를 차지한다. 이 하나의 사실이 Low-rank factorization, Tensor decomposition, LoRA, Hybrid recipe를 하나의 철학으로 묶는다. **가중치 행렬은 사실상 low-rank다** — 그렇다면 나머지는 버려도 되지 않는가?
+
+## Eckart-Young 정리가 말하는 것
+
+행렬 $W \in \mathbb{R}^{m \times n}$의 SVD는 다음과 같다.
+
+$$
+W = U \Sigma V^\top, \quad \sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_n \geq 0
+$$
+
+rank-$r$ truncation $W_r = \sum_{i=1}^{r} \sigma_i u_i v_i^\top$는 Frobenius norm 의미에서 **유일한 최적 해**다.
+
+<Theorem kind="theorem" number="1" title="Eckart-Young">
+$$
+W_r = \arg\min_{B:\,\mathrm{rank}(B) \leq r} \|W - B\|_F^2, \quad \|W - W_r\|_F^2 = \sum_{i=r+1}^{n} \sigma_i^2
+$$
+</Theorem>
+
+<Proof>
+rank-$r$ 행렬 $B = XY^\top$로 매개변수화하고 $\|W - XY^\top\|_F^2$를 KKT 조건으로 최소화하면 $X = U_{:,:r}$, $Y^\top = \Sigma_{:r,:r} V_{:,:r}^\top$가 된다. 잔차 에너지는 제거된 singular value의 제곱합과 같다. $\square$
+</Proof>
+
+이 정리는 강력한 보증을 제공한다. "얼마나 버려도 되는가"의 질문이 spectrum을 보는 것으로 환원된다. $1024 \times 1024$ 가중치를 rank-64로 압축하면 파라미터가 96.9% 감소하고, 에너지 손실은 $\sum_{i>64} \sigma_i^2$이다. 학습된 가중치의 spectrum이 실제로 heavy-head라면, 이 손실은 작다.
+
+## Tensor 차원으로의 확장
+
+2D 행렬에서 작동하는 SVD는 4D conv kernel에 직접 적용되지 않는다. $K \in \mathbb{R}^{C_o \times C_i \times k \times k}$는 4개의 mode를 가진 텐서다. Tucker decomposition은 이를 일반화한다.
+
+$$
+\mathcal{T} \approx \mathcal{G} \times_1 U^{(1)} \times_2 U^{(2)} \times_3 U^{(3)} \times_4 U^{(4)}
+$$
+
+core tensor $\mathcal{G} \in \mathbb{R}^{R_1 \times R_2 \times R_3 \times R_4}$가 압축된 표현을 담고, factor matrix $U^{(i)}$가 각 mode의 basis를 정의한다. $K \in \mathbb{R}^{64 \times 32 \times 3 \times 3}$에 Tucker $(16, 16, 3, 3)$을 적용하면 5배 압축이 달성된다.
+
+MobileNet의 depthwise separable convolution은 Tucker의 특수 사례다. depthwise($C_i \times 1 \times k \times k$)는 spatial mode를 그대로 유지하면서 channel mixing을 분리하고, pointwise($C_o \times C_i \times 1 \times 1$)는 spatial을 건드리지 않는다. 표준 conv의 $C_o \cdot C_i \cdot k^2$ 파라미터가 $C_i \cdot k^2 + C_o \cdot C_i$로 감소한다 — $k=3$이면 약 9배 차이다.
+
+```
+Standard conv:  C_o × C_i × k × k   (모든 channel × spatial 동시)
+Depthwise:      C_i × 1 × k × k     (채널별 공간 필터)
+Pointwise:      C_o × C_i × 1 × 1   (채널 혼합만)
+```
+
+CP decomposition은 rank-1 outer product의 합으로 표현한다. $\mathcal{T} \approx \sum_{r=1}^{R} u_r^{(1)} \otimes \cdots \otimes u_r^{(N)}$. 직관적으로 가장 단순하지만, CP rank 결정이 NP-hard여서 Tucker보다 실용성이 낮다.
+
+## LoRA — delta를 low-rank로 표현하다
+
+SVD-based truncation은 이미 학습된 가중치를 압축하는 데 쓰인다. LoRA(Hu 2022)는 다른 질문을 던진다. **fine-tuning 시의 가중치 변화 $\Delta W$가 low-rank라면?**
+
+Aghajanyan 2020의 "intrinsic rank" 가설은 이 직관을 뒷받침한다. BERT의 task-specific update $\Delta W$의 stable rank는 32–128 수준 — full rank 768의 일부다. pre-training이 광범위한 지식을 습득하고 fine-tuning은 좁은 과제에 적응하므로, 작은 변화로도 충분하다는 논리다.
+
+$$
+\boxed{W' = W_0 + \frac{\alpha}{r} \cdot BA, \quad B \in \mathbb{R}^{d_{out} \times r},\ A \in \mathbb{R}^{r \times d_{in}},\ W_0\ \text{frozen}}
+$$
+
+$B$는 zero로 초기화되어 학습 시작 시 $\Delta W = 0$을 보장한다. 학습이 진행되면서 $B$가 활성화된다. 70B 모델에서 $r=8$이면 학습 가능한 파라미터가 전체의 0.05%에 불과하다.
+
+QLoRA(Dettmers 2023)는 여기에 quantization을 더한다. $W_0$를 NF4로 4비트 양자화하고 $BA$만 FP16으로 학습한다. 65B 모델의 메모리 요구량이 130GB에서 약 43GB로 줄어든다 — 80GB GPU 단일 장치에서 fine-tuning이 가능해지는 수준이다.
+
+<Callout type="note" title="트레이드오프">
+LoRA의 전제는 intrinsic rank 가설이다. architecture 변경이 필요한 task, 강한 domain shift, long-context fine-tuning에서는 rank가 부족해 plateau가 빨리 온다. 반대로 instruction following이나 QA 같은 in-domain adaptation에서는 full fine-tuning을 압도한다. rank $r$은 spectrum 분석과 validation curve로 결정하는 것이 원칙이다.
+</Callout>
+
+## Hybrid Recipe — 네 축의 곱셈 효과
+
+각 압축 기법은 다른 redundancy를 제거한다.
+
+| 축 | 제거하는 redundancy |
+|---|---|
+| Pruning | weight support |
+| Quantization | precision |
+| Distillation | architecture capacity |
+| Low-rank / Tensor decomp | rank |
+
+독립적으로 다른 차원을 건드리므로 효과가 곱해진다.
+
+$$
+\rho_{\text{total}} = \rho_{\text{prune}} \cdot \rho_{\text{quant}} \cdot \rho_{\text{distill}} \cdot \rho_{\text{lowrank}}
+$$
+
+Han 2016의 Deep Compression은 이 철학의 초기 구현이다. magnitude pruning으로 9–13배 sparsity를 얻고, k-means weight clustering으로 4비트 codebook을 만들고, Huffman coding으로 추가 1.4배를 얻는다. AlexNet 240MB가 6.9MB로 줄었다.
+
+현재 LLM serving stack은 이를 더 밀어붙인다. GPTQ INT4 + KV cache INT8 + FlashAttention + PagedAttention을 조합하면 naive FP16 대비 10–20배 throughput이 가능하다.
+
+순서도 중요하다. Pruning 후 nonzero weight의 dynamic range가 좁아지므로 같은 bit budget으로 더 촘촘한 quantization grid를 얻는다. prune → quantize가 일반적 표준인 이유다.
+
+<Aside label="설계 원칙">
+각 기법을 적용한 후 fine-tuning을 끼워 넣는 것이 핵심이다. 기법을 쌓을수록 오차가 누적되고, fine-tuning이 각 단계의 acc drop을 회복시킨다. OmniQuant처럼 differentiable joint optimization으로 단계를 합치면 더 나은 Pareto를 달성할 수 있다.
+</Aside>
+
+## 정리
+
+- 학습된 가중치의 singular value는 long-tail이다. 이것이 모든 low-rank 기법의 공통 전제다.
+- Eckart-Young 정리는 SVD truncation이 Frobenius norm 의미에서 rank-$r$ approximation의 유일한 최적 해임을 보장한다.
+- Tucker decomposition은 이를 4D tensor로 확장하고, MobileNet의 separable conv는 그 특수 사례다.
+- LoRA는 fine-tuning 시의 $\Delta W$가 low-rank라는 가설 위에서 학습 비용을 100–1000배 줄인다.
+- 네 축의 압축을 순서에 맞게 쌓으면 효과가 곱해진다.
+
+redundancy는 여러 이름을 가지고 있다 — singular value, rank, precision, capacity. 하지만 그것을 측정하고 제거하는 도구는 결국 하나의 질문으로 수렴한다: **어느 방향이 정말 중요한가?**
+
+<Reference
+  title="LoRA: Low-Rank Adaptation of Large Language Models"
+  authors="Hu et al."
+  year={2022}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2106.09685"
+/>
+
+<Reference
+  title="Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding"
+  authors="Han et al."
+  year={2016}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1510.00149"
+/>

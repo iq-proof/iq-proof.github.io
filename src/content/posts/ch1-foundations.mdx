@@ -1,13 +1,13 @@
 ---
-title: "Diffusion Model의 수학적 기원 — 물리에서 생성으로"
-description: "브라운 운동과 Fokker-Planck 방정식에서 시작해 DDPM의 posterior closed-form까지, 확산 모델의 설계 철학을 관통하는 단일 원리를 추적한다."
+title: "모델 효율화의 4축 — Memory, Compute, Latency, Throughput"
+description: "Efficient ML의 모든 기법을 관통하는 4가지 축의 정의부터 Roofline model, 압축 분류의 직교성, 그리고 알고리즘 압축률과 wall-clock speedup의 괴리까지 추적한다."
 pubDate: 2026-05-03
 category: ai
-tags: [diffusion-model, score-matching, sde, ddpm, markov-chain]
+tags: [efficient-ml, roofline-model, quantization, pruning, gpu]
 difficulty: advanced
 series:
-  slug: diffusion-model-deep-dive
-  title: Diffusion Model Deep Dive
+  slug: efficient-ml-deep-dive
+  title: Efficient Ml Deep Dive
   order: 1
 draft: false
 featured: false
@@ -19,109 +19,120 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-Diffusion Model의 모든 수식은 하나의 물음에서 출발한다 — **노이즈로 무너진 것을 어떻게 복원하는가?** 이 질문은 1905년 Einstein의 브라운 운동 논문에도 있었고, 1982년 Anderson의 Reverse SDE에도 있었으며, 2020년 Ho의 DDPM에서야 비로소 실용적 생성 모델로 착지했다. 물리학의 언어가 머신러닝의 언어로 번역되기까지 무엇이 필요했는가?
+"INT8로 양자화하면 4배 빠르다"는 말은 절반만 맞다. 압축률이 곧 속도 향상이라는 등식은 GPU의 메모리 계층과 Tensor Core의 작동 방식을 무시한 단순화다. Efficient ML의 모든 기법 — Pruning, Quantization, Distillation, Kernel Fusion — 은 결국 네 가지 축 위에서 서로를 트레이드오프한다. 그 축을 정확히 정의하지 않으면, 어느 기법이 어디서 의미를 갖는지 판단할 수 없다.
 
-## 물리적 직관 — 브라운 운동과 확산
+## 4축의 정의
 
-1D 브라운 운동 $X_t = B_t$는 시간에 비례해 분산이 증가한다.
+효율화 논의의 출발점은 네 축의 명확한 구분이다.
 
-$$\mathbb{E}[X_t^2] = t$$
+**Memory** $M$은 단순히 파라미터 수가 아니다.
 
-이 단순한 사실이 forward diffusion의 토대다. 이미지 $x_0$에 매 스텝 작은 가우시안 노이즈를 더하면, $t$가 커질수록 원본 신호는 희미해지고 결국 순수한 노이즈 $\mathcal{N}(0, I)$로 수렴한다. 이것이 물리학에서 말하는 "계가 평형 상태로 완화(relaxation)되는" 과정이다.
+$$
+M = M_{\text{params}} + M_{\text{activations}} + M_{\text{KV cache}} + M_{\text{optimizer}}
+$$
 
-역방향으로 생각하면 생성이 된다. 노이즈 $x_T$에서 시작해 각 스텝의 노이즈를 "되감으면" 데이터 $x_0$가 복원된다. 문제는 역방향 과정을 어떻게 수학적으로 기술하느냐다.
+KV cache는 모델 크기와 무관하게 시퀀스 길이에 선형으로 증가한다. LLaMA-7B (32 layers, $d=4096$)에서 시퀀스 4096, FP16 기준으로 KV cache만 약 2GB다. 파라미터 14GB와 **별도**로 추가된다.
 
-## Forward Process — Markov Chain과 분산 보존
+**Compute** $C$는 forward 1 토큰 기준 FLOPs로 정의한다. Transformer에서 $C \approx 6NP$ ($N$ = 시퀀스 길이, $P$ = 파라미터 수).
 
-DDPM의 forward process는 다음 Markov chain으로 정의된다.
+**Latency** $L$은 단일 쿼리의 end-to-end 시간이다. P50이 아닌 **P99**가 user experience를 결정한다. P99/P50 비율이 5라는 것은 일부 쿼리가 중앙값의 5배 느리다는 뜻이고, GC pause, kernel preemption, memory contention이 그 원인이다.
 
-$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(\sqrt{1-\beta_t}\, x_{t-1},\, \beta_t I\right)$$
+**Throughput** $T$는 단위 시간당 처리량이다. 배치 크기 $B$가 커지면 $T(B) = B / L(B)$는 saturation까지 증가하지만, $L(B)$ 자체는 단조증가한다. Latency와 Throughput은 같은 hardware에서 **정반대 방향**으로 당긴다.
 
-여기서 $\beta_t \in (0, 1)$는 사전에 정해진 noise schedule이다. 이 형태가 특별한 이유는 **분산 보존** 때문이다. 초기 데이터 분포가 unit variance를 가지면, 모든 $t$에서 $\mathbb{E}[\|x_t\|^2] \approx d$가 유지된다.
+## Roofline — memory-bound와 compute-bound의 경계
 
-$$\mathbb{E}[\|x_t\|^2] = (1-\beta_t)\,\mathbb{E}[\|x_{t-1}\|^2] + \beta_t d \approx d$$
+4축의 병목이 어디인지를 정량화하는 도구가 Roofline model이다.
 
-이 안정성 덕분에 학습이 수치적으로 발산하지 않는다. Schedule의 선택도 중요하다. Ho 2020의 linear schedule은 구현이 단순하지만, Nichol-Dhariwal 2021의 cosine schedule은 초반 정보 손실을 늦춰 더 나은 이미지 품질을 얻는다.
+$$
+\text{Performance} \leq \min\bigl(\pi_{\text{peak}},\; \beta \cdot \mathrm{AI}\bigr)
+$$
 
-## Closed-Form — $O(T)$를 $O(1)$로
+여기서 **Arithmetic Intensity**는 다음과 같다.
 
-Markov chain을 따라 $t$번 반복 계산하는 것은 학습 중 너무 느리다. 핵심 통찰은 여러 번의 독립 가우시안 노이즈를 **하나의 가우시안으로 합칠 수 있다**는 것이다.
+$$
+\mathrm{AI} = \frac{\text{FLOPs}}{\text{bytes accessed}}
+$$
 
-$\alpha_t := 1 - \beta_t$, $\bar{\alpha}_t := \prod_{s=1}^t \alpha_s$로 정의하면 다음 closed-form이 성립한다.
+$\pi_{\text{peak}}$는 peak FLOP/sec, $\beta$는 memory bandwidth. $\mathrm{AI} < \pi_{\text{peak}} / \beta$이면 memory-bound, 그 이상이면 compute-bound다.
 
-$$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar{\alpha}_t}\, x_0,\, (1 - \bar{\alpha}_t) I\right)$$
+A100 기준으로 경계는 $312 \times 10^{12} / (1.55 \times 10^{12}) \approx 201$ FLOP/byte다. Standard attention의 AI는 대략 $d$ (head dim, 예: 128) — **memory-bound 영역**이다. FlashAttention이 SRAM tiling으로 effective AI를 높여 compute-bound 영역으로 이동하는 이유가 여기서 나온다.
 
-<Theorem kind="theorem" number="1" title="Forward Closed-Form (귀납법)">
-Forward Markov chain $x_t = \sqrt{1-\beta_t}\, x_{t-1} + \sqrt{\beta_t}\, \epsilon_t$에서, 임의의 $t$에 대해 다음이 성립한다.
+<Callout type="note" title="Memory-bound regime의 함의">
+연산이 memory-bound 구간에 있으면 FLOPs를 줄여도 latency가 그대로다. bytes accessed를 줄여야 — 즉 메모리 접근 패턴을 바꿔야 — 빨라진다. "FLOPs 50% 감소 = 2배 빠름"이라는 가정이 무너지는 지점이다.
+</Callout>
 
-$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+## 압축의 4분류와 직교성
+
+모든 압축 기법은 네 가지로 분류된다. 각각이 **다른 차원의 redundancy**를 제거한다는 것이 핵심이다.
+
+- **Pruning**: $\tilde{W} = W \odot M$, $M \in \{0,1\}^d$ — weight의 support를 줄인다.
+- **Quantization**: $\tilde{W} = Q(W)$, $Q: \mathbb{R} \to \{q_1,\ldots,q_K\}$ — precision을 줄인다.
+- **Distillation**: 더 작은 architecture로 teacher의 함수를 이전한다 — 파라미터 수 자체를 줄인다.
+- **Low-Rank**: $\tilde{W} = UV^\top$, $r \ll \min(m,n)$ — 행렬의 유효 차원을 줄인다.
+
+Pruning과 Low-Rank는 같은 weight matrix에 적용해도 **다른 redundancy**를 잡는다. $W = I_n$은 sparse(n개 nonzero)이지만 full-rank다. $W = \mathbf{1}\mathbf{1}^\top$은 rank-1이지만 dense다. 두 분류는 서로 다른 manifold에 존재한다.
+
+이 직교성 때문에 조합 시 압축률이 곱해진다. Han 2016의 Deep Compression은 Pruning 9× × Quantization 5.5× × Huffman ≈ 49×를 달성했다.
+
+<Theorem kind="proposition" number="1" title="Latency vs Throughput trade-off">
+배치 크기 $B$가 커지면 throughput $T(B) = B / L(B)$는 saturation까지 단조증가하고, latency $L(B)$는 단조증가한다.
 </Theorem>
 
 <Proof>
-$t=1$: $x_1 = \sqrt{\alpha_1} x_0 + \sqrt{1-\alpha_1} \epsilon_1 = \sqrt{\bar{\alpha}_1} x_0 + \sqrt{1-\bar{\alpha}_1} \epsilon_1$. 성립.
-
-$t-1$에서 $x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} x_0 + \sqrt{1-\bar{\alpha}_{t-1}} \epsilon'$가 성립한다고 가정하자. 그러면
-
-$$x_t = \sqrt{\alpha_t}\, x_{t-1} + \sqrt{\beta_t}\, \epsilon_t = \sqrt{\alpha_t \bar{\alpha}_{t-1}}\, x_0 + \sqrt{\alpha_t(1-\bar{\alpha}_{t-1})}\, \epsilon' + \sqrt{\beta_t}\, \epsilon_t$$
-
-두 독립 가우시안의 합의 분산은 $\alpha_t(1-\bar{\alpha}_{t-1}) + \beta_t = 1 - \alpha_t \bar{\alpha}_{t-1} = 1 - \bar{\alpha}_t$이므로, 합쳐서 단일 $\epsilon_{\text{new}} \sim \mathcal{N}(0,I)$로 표현된다. 따라서
-
-$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\, \epsilon_{\text{new}} \qquad \square$$
+Compute-bound이면 $L_{\text{compute}} \propto B$. Memory-bound이면 weight load 비용 $C_w$가 amortize되어 $L \approx C_w + B \cdot c$, throughput $T = B/(C_w + Bc) \to 1/c$ as $B \to \infty$. 따라서 $T$는 saturation, $L$은 단조증가. $\square$
 </Proof>
 
-이 결과 덕분에 학습 중 임의의 시각 $t$를 샘플링하고 $x_t$를 단번에 생성할 수 있다. 샘플링 비용이 $O(T)$에서 $O(1)$로 줄어드는 것이 DDPM 학습의 실용성을 결정한다.
+## Hardware-Software 궁합 — 알고리즘 압축률 ≠ wall-clock speedup
 
-## Reverse Process — Score를 학습한다
+Unstructured sparsity 90%인데 실제 속도가 1.5배도 안 나오는 일이 흔하다. 이유는 세 가지다.
 
-Reverse process는 다음 문제로 귀결된다. "지금 $x_t$를 보고 있을 때, 어느 방향으로 노이즈를 빼야 $x_{t-1}$에 가까워지는가?" 이 방향이 바로 **score function**이다.
+첫째, Tensor Core는 dense GEMM에 최적화되어 있다. Irregular sparsity는 mma instruction이 활용하지 못한다. A100의 Sparse Tensor Core는 **2:4 structured sparsity** (4개 연속 weight 중 2개가 0)에서만 정확히 2× TFLOPS를 낸다.
 
-$$s(x_t, t) := \nabla_{x_t} \log p(x_t, t)$$
+둘째, GPU memory hierarchy의 bandwidth 차이가 크다.
 
-Anderson(1982)은 forward SDE에 대응하는 역방향 SDE가 다음과 같음을 보였다.
+```
+HBM (off-chip)    80 GB    1.55 TB/s    400 ns
+L2 cache          40 MB    4   TB/s     100 ns
+SMEM/L1 (per SM) 192 KB   ~19  TB/s     20 ns
+Register                   ~80  TB/s     1 cycle
+```
 
-$$dx_t = \left[ f(t)\, x_t - g^2(t)\, \nabla_x \log p(x_t, t) \right] dt + g(t)\, d\bar{W}_t$$
+FlashAttention이 SMEM tiling으로 HBM access를 줄이는 것, INT8 GPTQ가 weight bandwidth를 4× 줄이는 것 — 모두 이 계층에서 실질적인 효과가 나온다.
 
-Score는 density의 gradient이므로, 확률이 높은 쪽(데이터 분포)을 향한다. 신경망 $\epsilon_\theta(x_t, t)$가 이 score를 근사하도록 학습되는데, score와 noise 예측은 다음 관계로 연결된다.
+셋째, H100으로 갈수록 AI boundary($\pi/\beta$)가 증가해 memory-bound 영역이 넓어진다. 같은 attention이 V100에서는 AI boundary 139, H100에서는 295 — FlashAttention의 가치가 더 커진다.
 
-$$\nabla_{x_t} \log q(x_t \mid x_0) = -\frac{\epsilon}{\sqrt{1-\bar{\alpha}_t}}$$
+<Aside label="설계 원칙">
+알고리즘 압축률은 "무엇을 줄였는가"를 말하고, wall-clock speedup은 "실제 병목이 무엇인가"를 말한다. 두 숫자가 같으려면 그 병목이 정확히 줄인 축이어야 한다. Roofline으로 먼저 확인하라.
+</Aside>
 
-즉, **noise를 예측하는 것과 score를 학습하는 것은 수학적으로 동치**다. DDPM이 noise prediction loss를 쓰는 이유가 여기 있다 — noise는 항상 unit variance이므로 gradient flow가 안정적이다.
+## 트레이드오프
 
-## Posterior와 학습 타깃
+4축은 독립적으로 최적화할 수 없다.
 
-역과정의 학습 타깃은 true posterior $q(x_{t-1} \mid x_t, x_0)$이다. Bayes' rule과 가우시안의 곱 성질 덕분에 이 posterior 역시 가우시안이다.
+| 시나리오 | 우선 축 | 트레이드오프 |
+|---------|--------|-------------|
+| Mobile 추론 | Memory + Latency | Throughput 포기 |
+| LLM serving (high QPS) | Throughput + Memory | P99 latency 증가 |
+| Autonomous driving | P99 Latency | Throughput, Memory 비용 증가 |
+| Edge (배터리) | Energy ∝ Memory bandwidth | 정확도 일부 희생 |
 
-$$q(x_{t-1} \mid x_t, x_0) = \mathcal{N}(\tilde{\mu}_t, \tilde{\beta}_t I)$$
+Quantization은 memory bandwidth를 줄이지만 FLOPs는 그대로다 (dequant 후 FP16 연산). "INT8이니까 4배 빠르다"는 주장은 memory-bound regime에서만 성립한다. Compute-bound layer (large GEMM, small $N$)에서는 효과가 미미하다.
 
-$$\tilde{\mu}_t = \frac{\sqrt{\bar{\alpha}_{t-1}}\, \beta_t}{1 - \bar{\alpha}_t}\, x_0 + \frac{\sqrt{\alpha_t}(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t}\, x_t, \qquad \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t}\, \beta_t$$
-
-<Callout type="note" title="트레이드오프">
-**Discrete vs Continuous**: DDPM의 $T=1000$ 이산 근사는 구현이 단순하고 DDIM 가속이 가능하다. 반면 Song et al.(2021)의 Score-SDE는 수학적 엄밀성과 exact likelihood를 얻는 대신 ODE solver가 필요하다. 실무에서는 discrete DDPM, 이론 분석에는 continuous SDE가 쓰인다. **Fixed schedule의 한계**: $\beta_t$를 미리 고정하면 closed-form이 존재하지만 문제마다 최적 schedule이 다를 수 있다. Cosine schedule은 이 간극을 고정 + 단순한 방식으로 좁혔다.
-</Callout>
-
-$t$가 클수록 $\tilde{\mu}_t$에서 $x_t$의 가중치가 커지고 $x_0$의 가중치는 줄어든다. 직관적으로, 노이즈가 많이 쌓인 상태에서는 원본 정보보다 현재 관찰이 더 신뢰할 만하다.
+Pareto frontier 위에서만 비교가 의미를 갖는다. 모델 A가 accuracy 85%, P99 10ms이고 B가 accuracy 83%, P99 5ms라면, 두 점은 incomparable이다. SLO(latency 상한)가 7ms라면 B만 가능하고, accuracy 하한이 84%라면 A만 가능하다. 단일 숫자 비교는 그 SLO 조건을 숨긴다.
 
 ## 정리
 
-- Diffusion Model의 설계는 브라운 운동의 분산 증가 → forward process, Anderson(1982)의 Reverse SDE → score matching, DDPM의 closed-form → $O(1)$ 샘플링이라는 세 번의 번역을 거쳐 완성된다.
-- $\bar{\alpha}_t = \prod \alpha_s$는 단순한 표기가 아니라 "여러 가우시안 노이즈를 하나로 합칠 수 있다"는 사실의 압축이다.
-- Noise prediction과 score matching은 같은 목적함수의 두 이름이다.
-- True posterior의 closed-form이 존재하기 때문에 DDPM의 학습 타깃이 명확하다. 이 closed-form이 없었다면 학습 시간은 $T$배 늘어났을 것이다.
+- Memory, Compute, Latency, Throughput은 독립된 축이다. "모델이 작으면 빠르다"는 등식은 이 축들이 동일하다는 가정을 숨기고 있다.
+- Roofline model로 memory-bound/compute-bound 경계를 먼저 파악해야 어느 기법이 의미를 갖는지 알 수 있다.
+- Pruning, Quantization, Distillation, Low-Rank는 서로 다른 redundancy를 제거하므로 조합 시 압축률이 곱해진다.
+- 알고리즘 압축률과 wall-clock speedup의 괴리는 hardware-software 궁합 — structured sparsity, Tensor Core, vendor library 지원 — 에서 온다.
 
-다음 글에서는 이 posterior로부터 ELBO를 어떻게 분해하는지, 그리고 DDPM의 simplified loss가 왜 이론적으로 정당화되는지 추적한다.
-
-<Reference
-  title="Denoising Diffusion Probabilistic Models"
-  authors="Ho, Jain, Abbeel"
-  year={2020}
-  venue="NeurIPS"
-  url="https://arxiv.org/abs/2006.11239"
-/>
+4축과 Roofline은 이후 모든 챕터의 분석 도구다. Pruning이 어느 축을 움직이는지, FlashAttention이 왜 compute-bound로 이동하는지, PagedAttention이 KV cache의 어느 항을 줄이는지 — 전부 이 frame 안에서 읽힌다.
 
 <Reference
-  title="Score-Based Generative Modeling through Stochastic Differential Equations"
-  authors="Song, Sohl-Dickstein, Kingma, Kumar, Ermon, Poole"
-  year={2021}
+  title="Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding"
+  authors="Han et al."
+  year={2016}
   venue="ICLR"
-  url="https://arxiv.org/abs/2011.13456"
+  url="https://arxiv.org/abs/1510.00149"
 />
