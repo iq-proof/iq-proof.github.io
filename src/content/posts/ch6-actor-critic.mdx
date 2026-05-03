@@ -1,0 +1,153 @@
+---
+title: "Actor-Critic은 왜 둘이 같이 학습해야 하는가"
+description: "GPI의 비동기 구현으로서의 Actor-Critic 프레임워크를 출발점으로, Baseline의 수학적 정당성, Softmax 정책의 기하학, Linear FA의 수렴 조건과 Deadly Triad까지, 협력 체계의 작동 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, actor-critic, policy-gradient, function-approximation, advantage]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model Free Rl Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Q-Learning과 SARSA는 가치 함수 하나로 정책을 암묵적으로 표현한다. Actor-Critic은 그것을 **명시적으로 둘로 쪼갠다** — 행동을 선택하는 Actor와 그 행동을 평가하는 Critic. 왜 이 분리가 필요하며, 둘이 서로 다른 속도로 학습해야만 수렴이 보장되는가?
+
+## GPI의 비동기 구현
+
+Generalized Policy Iteration(GPI)의 고전 도식은 순차적이다. Policy Evaluation이 $V^\pi$로 완전히 수렴한 후, Policy Improvement가 $\pi'$를 만들고, 다시 Evaluation이 시작된다. 하지만 Actor-Critic은 이 반복을 **매 시간 스텝마다** 동시에 실행한다.
+
+```
+Critic (TD):  V(s) ← V(s) + α_c [r + γV(s') - V(s)]
+Actor (PG):   θ ← θ + α_a ∇_θ log π_θ(a|s) A(s,a)
+```
+
+각 경험 $(s, a, r, s')$마다 Critic이 한 스텝 TD 업데이트를 하고, Actor가 그 TD 오차를 Advantage로 삼아 정책 파라미터를 조금 움직인다. 이것이 GPI의 **비동기 버전**이다. 정책이 고정된 채로 가치가 수렴하기를 기다리지 않는다.
+
+이 협력의 핵심 수식은 다음과 같다.
+
+$$
+\theta_{t+1} = \theta_t + \alpha_a \underbrace{\delta_t}_{\text{advantage}} \nabla_\theta \log \pi_\theta(a_t \mid s_t)
+$$
+
+$$
+w_{t+1} = w_t + \alpha_c \delta_t \nabla_w V_w(s_t), \quad \delta_t = r_t + \gamma V_w(s_{t+1}) - V_w(s_t)
+$$
+
+TD 오차 $\delta_t$는 단순한 예측 오류가 아니다. $V_w$가 $V^\pi$에 충분히 가까울 때, $\delta_t$의 기댓값은 정확히 Advantage $A^\pi(s_t, a_t) = Q^\pi(s_t, a_t) - V^\pi(s_t)$와 일치한다. Critic이 제공하는 것은 "이 행동이 평균보다 얼마나 좋았는가"라는 **상대적 신호**다.
+
+## Baseline이 Gradient를 Unbiased로 유지하는 이유
+
+Policy Gradient Theorem의 원형은 $Q^\pi(s,a)$를 직접 사용한다.
+
+$$
+\nabla_\theta J(\pi_\theta) = \mathbb{E}_{s \sim d^\theta,\, a \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(a \mid s)\, Q^\pi(s,a)]
+$$
+
+$Q^\pi$는 에피소드 전체의 누적 보상이므로 분산이 극히 높다. 여기서 임의의 상태 의존 함수 $b(s)$를 빼도 gradient의 기댓값이 변하지 않는다는 사실이 핵심이다.
+
+<Theorem kind="proposition" number="1" title="Baseline Unbiasedness">
+임의의 상태 의존 baseline $b(s)$에 대해,
+
+$$
+\mathbb{E}_{a \sim \pi_\theta(\cdot \mid s)}\bigl[\nabla_\theta \log \pi_\theta(a \mid s)\, b(s)\bigr] = 0
+$$
+</Theorem>
+
+<Proof>
+$\sum_a \pi(a \mid s) = 1$을 $\theta$로 미분하면 $\sum_a \nabla_\theta \pi(a \mid s) = 0$이다. 따라서
+
+$$
+\mathbb{E}_{a \mid s}[\nabla_\theta \log \pi(a \mid s)] = \sum_a \pi(a \mid s) \cdot \frac{\nabla_\theta \pi(a \mid s)}{\pi(a \mid s)} = \sum_a \nabla_\theta \pi(a \mid s) = 0
+$$
+
+$b(s)$가 $a$에 무관하므로 이를 기댓값 밖으로 꺼낼 수 있고, $b(s) \cdot 0 = 0$. $\square$
+</Proof>
+
+분산을 최소화하는 최적 baseline은 $b^*(s) \approx V^\pi(s)$임이 알려져 있다(Greensmith et al. 2004). 따라서 $A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)$를 사용하는 것은 **이론적으로 최선에 가까운 분산 감소**다. $\mathbb{E}_{a \mid s}[A^\pi(s,a)] = 0$이기 때문에 gradient는 절대적인 보상 수준이 아니라 **상대적 우수성**만 담게 된다.
+
+## Softmax 정책의 기하학
+
+Actor의 파라미터 업데이트는 log-derivative를 통해 이루어진다. Softmax 정책 $\pi_\theta(a \mid s) = \exp(\theta_a / \tau) / Z$에서,
+
+$$
+\nabla_\theta \log \pi_\tau(a \mid s) = \frac{1}{\tau}(e_a - \pi_\tau(a \mid s))
+$$
+
+이 수식의 기하학은 직관적이다. $e_a$는 행동 $a$에 대한 one-hot 벡터이고, $\pi_\tau(a \mid s)$는 현재 정책 분포다. 그 차이는 "선택된 행동 방향으로의 이동 벡터"다. Advantage $\delta_t > 0$이면 해당 행동의 확률을 올리고, $\delta_t < 0$이면 내린다.
+
+온도 파라미터 $\tau$는 탐험-활용 균형을 제어한다. $\tau \to 0$이면 softmax는 argmax로 수렴하고($\pi_\tau \to \delta_{a^*}$), $\tau \to \infty$이면 균등 분포가 된다. 연속 행동 공간에서는 Gaussian 정책 $\pi(a \mid s) = \mathcal{N}(\mu_\theta(s), \sigma^2_\theta(s))$를 사용하며, Actor update는 동일한 형태로 작동한다.
+
+$$
+\mu \leftarrow \mu + \alpha_\mu\, A(s, a) \cdot \frac{a - \mu(s)}{\sigma^2(s)}
+$$
+
+이 일반성이 Actor-Critic이 이산·연속 행동 공간 모두에서 동일한 알고리즘 구조를 유지하는 이유다.
+
+## Two-Timescale과 수렴 조건
+
+Actor와 Critic이 같은 학습률로 동시에 움직이면 수렴이 불안정해진다. Critic이 수렴하기 전에 Actor가 정책을 바꾸면, Critic은 계속 움직이는 타겟을 쫓아야 한다. Konda & Tsitsiklis(2000)의 핵심 기여는 이 문제를 **two-timescale stochastic approximation**으로 형식화한 것이다.
+
+$$
+\lim_{t \to \infty} \frac{\alpha_{a,t}}{\alpha_{c,t}} = 0, \quad \sum_t \alpha_{c,t} = \infty, \quad \sum_t \alpha_{c,t}^2 < \infty
+$$
+
+Critic의 학습률이 충분히 크고 Actor의 학습률이 상대적으로 작을 때, Critic dynamics는 Actor가 "frozen"된 것처럼 빠르게 $V^{\pi_\theta}$로 수렴하고, Actor는 이미 수렴한 Critic을 바탕으로 정확한 gradient 방향으로 움직인다. 실전에서는 $\alpha_c \approx 10 \times \alpha_a$ 정도가 기본값이다.
+
+<Callout type="warning" title="트레이드오프: 학습률 설정">
+$\alpha_a \approx \alpha_c$이면 Actor와 Critic이 동시에 빠르게 움직여 gradient 방향이 계속 변하고 수렴이 불안정해진다. $\alpha_a \ll \alpha_c$이면 Critic이 먼저 수렴하지만, 전체 학습이 느려진다. 학습률 스케줄 선택이 Actor-Critic의 안정성을 실질적으로 결정한다.
+</Callout>
+
+## Linear FA와 Deadly Triad
+
+Critic을 선형 함수 $\hat{V}(s; w) = w^\top \phi(s)$로 근사하면 이론이 깔끔해진다. Tsitsiklis & Van Roy(1997)는 on-policy linear TD(0)가 almost surely 수렴함을 증명했다. 수렴점 $w^*$는 참값 $V^\pi$가 아니라 **linear 부분공간으로의 orthogonal projection**, 즉 $\hat{V}(s; w^*) = \Pi_\Phi V^\pi(s)$다.
+
+그러나 세 조건이 동시에 충족되면 수렴 보장이 사라진다.
+
+```
+Off-policy  +  Bootstrapping  +  Function Approximation
+    ↑               ↑                     ↑
+다른 정책 샘플   TD로 미래 추정       파라미터 공유
+```
+
+이것이 **Deadly Triad**(Baird 1995, Sutton & Barto 2018)다. Baird의 counterexample은 7개 상태와 선형 FA만으로 off-policy TD가 $\|w_t\| \to \infty$로 발산함을 보인다. Semi-gradient 업데이트는 target $\gamma w^\top \phi(s')$의 $w$ 의존성을 무시하는데, 이 근사가 on-policy에서는 무해하지만 off-policy에서는 importance ratio와 결합해 음의 피드백 없이 발산을 허용한다.
+
+DQN이 experience replay와 target network를 도입한 이유가 여기에 있다. 이론적 보장은 아니지만, 상관관계를 줄이고 gradient를 평활화해 경험적으로 Deadly Triad를 완화한다.
+
+<Aside label="설계 철학">
+Actor-Critic의 모든 장치 — two-timescale, advantage baseline, on-policy 제약 — 는 하나의 문제에 대한 답이다. **움직이는 두 개의 타겟이 서로를 불안정하게 만들지 않도록 협력의 속도와 범위를 제어하라**. 이 철학이 A3C, PPO, SAC 등 이후 알고리즘들에도 이어진다.
+</Aside>
+
+## 정리
+
+- Actor-Critic은 GPI의 비동기 구현이다. 매 스텝마다 Policy Evaluation과 Improvement가 동시에 한 발씩 진행된다.
+- TD 오차 $\delta_t$는 Advantage $A^\pi(s,a)$의 편향된 추정치다. Critic이 정확해질수록 편향이 줄어든다.
+- Baseline $V^\pi(s)$를 빼면 gradient는 unbiased를 유지하면서 분산이 극적으로 감소한다.
+- Two-timescale($\alpha_a \ll \alpha_c$)이 없으면 수렴 보장이 성립하지 않는다.
+- On-policy linear FA는 수렴이 보장되지만, Off-policy + Bootstrapping + FA의 Deadly Triad는 발산을 허용한다.
+
+이 체계 위에 entropy regularization, GAE, parallel rollout을 얹은 것이 A3C와 PPO다. 다음 시리즈에서는 이 확장들을 추적한다.
+
+<Reference
+  title="Actor-Critic Algorithms"
+  authors="Konda, V. R. and Tsitsiklis, J. N."
+  year={2000}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/1999/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html"
+/>
+
+<Reference
+  title="An Analysis of Temporal-Difference Learning with Function Approximation"
+  authors="Tsitsiklis, J. N. and Van Roy, B."
+  year={1997}
+  venue="IEEE Transactions on Automatic Control"
+  url="https://ieeexplore.ieee.org/document/580874"
+/>

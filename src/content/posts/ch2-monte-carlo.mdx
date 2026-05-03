@@ -1,0 +1,156 @@
+---
+title: "Monte Carlo RL은 왜 두 가지 방문 방식을 갖는가"
+description: "First-visit과 every-visit의 bias 차이부터 off-policy importance sampling의 분산 폭발까지, MC 계열 알고리즘이 공유하는 하나의 긴장을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, monte-carlo, importance-sampling, policy-iteration]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model Free Rl Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Monte Carlo RL의 핵심 아이디어는 단순하다 — episode를 끝까지 굴려 얻은 실제 return $G_t$로 value를 추정한다. 그런데 이 단순한 원칙 위에서 five가지 알고리즘(first-visit, every-visit, MC control with ES, $\epsilon$-soft, off-policy IS)이 서로 다른 선택을 한다. 그 선택들을 관통하는 공통 긴장은 무엇인가?
+
+## 출발점: return의 sample mean
+
+Value function의 정의는 기대값이다.
+
+$$
+V^\pi(s) = \mathbb{E}_\pi[G_t \mid S_t = s]
+$$
+
+추정 전략은 뻔하다 — 많은 episode에서 $s$를 방문할 때마다 return $G_t$를 모아 평균을 낸다. Law of Large Numbers에 의해 이 평균은 $V^\pi(s)$로 수렴한다.
+
+문제는 "방문할 때마다"라는 부분에서 생긴다. 하나의 episode 안에서 같은 state를 여러 번 지날 수 있다. 그 방문들을 모두 쓸 것인가, 첫 번째만 쓸 것인가.
+
+## First-visit vs Every-visit — unbiased와 asymptotically unbiased의 차이
+
+**First-visit MC**는 각 episode에서 state $s$의 첫 번째 방문 $T(s,n) = \min\{t : S_t^{(n)} = s\}$의 return만 수집한다.
+
+$$
+\hat{V}_N^{\text{FV}}(s) = \frac{1}{N(s)} \sum_{n:\, s \in \tau_n} G_{T(s,n)}^{(n)}
+$$
+
+서로 다른 episode들은 독립이므로, 수집된 return들은 i.i.d.다. LLN이 직접 적용되고, 각 sample은 즉시 unbiased다.
+
+**Every-visit MC**는 같은 episode 내의 모든 방문 $\{t : S_t^{(n)} = s\}$에서 return을 수집한다. Sample 수는 늘어나지만, 같은 episode 안의 return들은 trajectory를 공유하므로 상관성이 생긴다.
+
+<Theorem kind="proposition" number="1" title="Every-visit intra-episode correlation">
+같은 episode $(n)$에서 $t < t'$일 때, 두 방문의 return은 다음과 같이 상관된다.
+
+$$
+\rho(G_t^{(n)},\, G_{t'}^{(n)}) \approx \gamma^{2(t'-t)}
+$$
+</Theorem>
+
+<Proof>
+$G_t^{(n)}$과 $G_{t'}^{(n)}$은 $t'$ 이후의 reward를 공유한다. 공유 부분의 크기는 $\gamma^{t'-t}$로 감쇠하므로, covariance의 지배항은 $\gamma^{2(t'-t)} \cdot \text{Var}(G_{t'})$가 된다. 따라서 correlation은 거리 $t'-t$에 대해 기하급수적으로 감소한다. $\square$
+</Proof>
+
+이 상관성 때문에 every-visit은 LLN을 직접 적용할 수 없다. Singh & Sutton (1996)의 Lemma 2–3은 ergodic theorem을 경유해 극한에서 수렴을 보장하지만, 각 sample이 즉시 unbiased라고는 말할 수 없다 — **asymptotically unbiased**에 그친다.
+
+실무에서는 every-visit이 더 빠르다. Correlation factor보다 sample 수의 증가가 수렴 속도를 지배하기 때문이다.
+
+## 수렴 속도 — $O(1/\sqrt{N})$과 그 함의
+
+i.i.d. 가정 하에 CLT를 적용하면,
+
+$$
+\sqrt{N}\bigl(\hat{V}_N - V^\pi\bigr) \xrightarrow{d} \mathcal{N}(0,\, \sigma^2(s))
+$$
+
+여기서 $\sigma^2(s) = \text{Var}(G_t \mid S_t = s)$는 return의 분산이다. 표준오차 $\sigma/\sqrt{N}$은 정확도 $\epsilon$을 반으로 줄이려면 episode를 4배 더 필요로 한다는 뜻이다. Return 분산이 크면 — 예를 들어 long-horizon task나 $\gamma \approx 1$인 환경 — 수렴이 극도로 느려진다.
+
+Bounded return $G_t \in [a, b]$라면 Hoeffding 부등식이 distribution-free 보장을 준다.
+
+$$
+P\!\left(|\hat{V}_N - V^\pi| > \epsilon\right) \leq 2\exp\!\left(-\frac{2N\epsilon^2}{(b-a)^2}\right)
+$$
+
+CLT 기반 신뢰구간보다 훨씬 느슨하지만, return 분포를 모를 때의 안전한 선택이다.
+
+## Control로의 확장 — Exploring Starts의 이상과 현실
+
+Value 추정에서 policy 최적화로 넘어가면, 문제가 하나 추가된다. Greedy policy는 deterministic하므로, 선택받지 못한 action의 $Q^\pi(s, a)$를 영원히 추정할 수 없다.
+
+**Exploring Starts(ES)**는 각 episode를 균등 분포에서 뽑은 $(s_0, a_0)$로 시작해 모든 state-action pair의 무한 방문을 보장한다. 이 조건 아래 MC control은 $\hat{Q}_k \to Q^*$, $\pi_k \to \pi^*$를 a.s. 보장한다.
+
+<Callout type="warning" title="Exploring Starts의 비현실성">
+환경을 임의의 state에서 시작하도록 제어할 수 없는 경우 — 로봇, 위험 환경, 실세계 시스템 — ES는 적용 불가능하다. 이 가정을 완화하는 것이 $\epsilon$-soft 계열의 출발점이다.
+</Callout>
+
+**$\epsilon$-greedy policy**는 policy 자체에 exploration을 내장한다.
+
+$$
+\pi_{\text{eg}}(a|s) = \begin{cases}
+1 - \epsilon + \epsilon/|\mathcal{A}| & a = \arg\max_a Q(s,a) \\
+\epsilon/|\mathcal{A}| & \text{otherwise}
+\end{cases}
+$$
+
+$\epsilon > 0$이 유지되는 한 모든 $(s,a)$의 방문이 보장되고, GPI 단계마다 value가 단조 증가한다. 단, 고정 $\epsilon$이면 수렴점은 $\pi^*_\epsilon$ — unrestricted optimal $\pi^*$가 아니다. $\epsilon_k \to 0$ 스케줄을 쓰면 $\pi^*$에 접근하지만, exploration-exploitation 균형을 직접 설계해야 한다.
+
+## Off-Policy IS — bias와 variance의 새로운 긴장
+
+On-policy의 한계는 behavior policy와 target policy가 같아야 한다는 것이다. Off-policy는 데이터를 생성한 policy $b$와 평가하려는 policy $\pi$를 분리한다.
+
+$$
+\rho_{t:T-1} = \prod_{k=t}^{T-1} \frac{\pi(a_k|s_k)}{b(a_k|s_k)}
+$$
+
+이 importance ratio를 return에 곱하면 분포의 차이를 보정할 수 있다.
+
+**Ordinary IS(OIS)**는 $\hat{V}^{\text{OIS}} = \frac{1}{N}\sum_n \rho_n G_n$으로 정의되며 unbiased다. 그러나 $\pi$와 $b$가 멀수록 $\rho$의 분산이 폭발한다 — $b$가 잘 탐험하지 않는 행동을 $\pi$가 선호할수록 $\rho \gg 1$인 outlier가 추정값을 흔든다.
+
+**Weighted IS(WIS)**는 $\rho$를 정규화해 분산을 억제한다.
+
+$$
+\hat{V}^{\text{WIS}} = \frac{\sum_n \rho_n G_n}{\sum_n \rho_n}
+$$
+
+각 sample은 biased하지만, $N \to \infty$에서 a.s. 수렴한다. 현대 Deep RL의 PPO가 쓰는 clipped IS ratio는 이 아이디어의 직접적 계승이다.
+
+<Aside label="Off-policy의 필요조건">
+Coverage assumption — $\pi(a|s) > 0$이면 반드시 $b(a|s) > 0$ — 을 위반하면 target policy가 원하는 action을 behavior data에서 관찰할 수 없다. IS 추정 자체가 불가능해진다.
+</Aside>
+
+## 트레이드오프
+
+다섯 가지 알고리즘이 공유하는 하나의 긴장은 **탐험의 비용을 누가 어디서 부담하는가**다.
+
+| 방법 | 탐험 보장 | 최적성 | 주요 비용 |
+|---|---|---|---|
+| First-visit MC | 없음 (평가만) | $V^\pi$ 수렴 | 높은 분산 |
+| MC ES | 외부 제어 | $\pi^*$ | 비현실적 가정 |
+| $\epsilon$-soft | policy 내장 | $\pi^*_\epsilon$ | exploration 비용, $\epsilon$ 설계 |
+| Off-policy OIS | behavior policy | $V^\pi$ 또는 $Q^*$ | 분산 폭발 |
+| Off-policy WIS | behavior policy | asymptotic | 편향, coverage 필요 |
+
+<Callout type="note" title="분산 vs 편향">
+MC 계열 전반에서 unbiasedness를 고집할수록 분산이 올라가고, 분산을 낮추려 하면 편향이 끼어든다. First-visit이 every-visit보다 깔끔하고, OIS가 WIS보다 정확하지만, 실무에서 더 자주 선택되는 것은 always 후자다.
+</Callout>
+
+## 정리
+
+- First-visit MC는 i.i.d. sample을 이용한 unbiased 추정이고, every-visit MC는 correlated sample을 활용해 더 빠르게 수렴하지만 asymptotically unbiased에 그친다.
+- 수렴 속도는 $O(1/\sqrt{N})$이며, return 분산 $\sigma^2(s)$이 병목이다 — variance가 큰 task는 episode를 기하급수적으로 더 필요로 한다.
+- Exploring Starts는 이론적으로 $\pi^*$를 보장하지만 비현실적이고, $\epsilon$-greedy는 현실적이지만 optimal에서 $\epsilon$만큼 떨어진 정책에 수렴한다.
+- Off-policy IS는 OIS(unbiased, 고분산)와 WIS(biased, 저분산)의 트레이드오프로 귀결된다 — 이 긴장은 다음 장의 TD learning에서 bootstrap이라는 전혀 다른 방식으로 해소된다.
+
+<Reference
+  title="On the Convergence of Stochastic Iterative Dynamic Programming Algorithms"
+  authors="Singh & Sutton"
+  year={1996}
+  venue="Neural Computation"
+  url="https://doi.org/10.1162/neco.1996.8.6.1293"
+/>

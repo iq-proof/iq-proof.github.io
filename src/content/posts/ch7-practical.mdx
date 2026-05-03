@@ -1,0 +1,167 @@
+---
+title: "Model-Free RL의 수렴은 왜 이렇게 까다로운가"
+description: "Deadly Triad의 세 조건이 동시에 만족될 때 발산이 일어나는 이유부터, Experience Replay·Reward Shaping·Deep RL의 공학적 우회까지, Model-Free RL 수렴 이론의 전체 지형을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, deadly-triad, convergence, reward-shaping, experience-replay]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model Free Rl Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Tabular Q-Learning은 수렴한다. Linear TD(0)도 on-policy라면 수렴한다. 그런데 같은 알고리즘들을 조금만 비틀면 — off-policy로, function approximation과 함께, bootstrapping을 유지한 채 — weight vector의 norm이 지수적으로 폭발한다. 왜 이 세 조건의 조합만 치명적인가?
+
+## Deadly Triad — 세 조건의 기하학
+
+Sutton & Barto(2018)는 다음 세 가지를 **Deadly Triad**라고 부른다.
+
+1. **Function Approximation**: $\hat{V}(s) = \mathbf{w}^\top \mathbf{x}(s)$, 상태 공간보다 훨씬 낮은 차원 $d$.
+2. **Bootstrapping**: TD 업데이트가 $\hat{V}(s')$를 타겟으로 사용한다.
+3. **Off-Policy Learning**: 행동 정책 $\beta$와 타겟 정책 $\pi$가 다르다.
+
+이 중 둘만 있으면 안전하다. 셋이 동시에 충족되는 순간 수렴 보장이 사라진다.
+
+왜인가? 핵심은 **Projected Bellman Operator** $\bar{\mathcal{T}}^\pi = \Pi \mathcal{T}^\pi$의 수축성에 있다. On-policy에서 projection $\Pi$는 stationary distribution $d^\pi$에 대한 weighted norm을 사용한다. 이 norm 아래에서 $\bar{\mathcal{T}}^\pi$는 $\gamma$-contraction이므로 고정점으로 수렴한다.
+
+Off-policy에서는 데이터가 $d^\beta$에서 온다. $d^\beta \neq d^\pi$이면 projection의 기하학이 달라지고, $\bar{\mathcal{T}}^\pi$의 고유값 중 1을 초과하는 것이 생긴다 — 폭주의 수학적 원인이다.
+
+<Theorem kind="theorem" number="1" title="Baird (1995) — Off-Policy + Bootstrap + FA 발산">
+7-state linear function approximation MDP에서 off-policy Q-Learning(behavior policy 균등, target policy greedy)을 semi-gradient TD로 적용하면:
+
+$$
+\|\mathbf{w}_t\| \to \infty \quad \text{(거의 확실하게)}
+$$
+</Theorem>
+
+<Proof>
+Projected Bellman operator $\bar{\mathcal{T}}^Q$가 off-policy 분포 $d^\beta$ 아래에서 더 이상 $\|\cdot\|_{d^\pi}$ norm에 대한 contraction이 아님을 보인다. Baird's 7-state feature에서 state 1–4가 동일한 feature $\mathbf{x} = [1,1,1,1,0,0,0]^\top$를 공유하므로, linear FA는 이들의 값을 강제로 같게 만든다. Off-policy gradient는 이 제약과 MDP 구조 사이의 모순을 해소하려 $\mathbf{w}$를 계속 조정하고, 제약이 모순적이면 $\|\mathbf{w}\| \to \infty$로 발산한다. $\square$
+</Proof>
+
+반면, 셋 중 하나만 제거해도 안전해진다. Tabular(FA 없음)라면 off-policy Q-Learning도 수렴하고(Watkins & Dayan 1992), on-policy라면 linear TD도 수렴한다(Tsitsiklis & Van Roy 1997).
+
+## 안전선 — Tabular와 Linear FA의 경계
+
+Tabular setting에서는 feature가 one-hot encoding이므로 projection이 정보를 잃지 않는다. Projected Bellman operator는 여전히 $\gamma$-contraction이고, 모든 주요 알고리즘이 수렴한다.
+
+| 알고리즘 | 정책 | Bootstrap | 수렴 |
+|----------|------|-----------|------|
+| Tabular MC | on-policy | ✗ | ✓ a.s. |
+| Tabular SARSA | on-policy | ✓ | ✓ a.s. |
+| Tabular Q-Learning | off-policy | ✓ | ✓ a.s. |
+| Linear TD(0) | on-policy | ✓ | ✓ (Tsitsiklis-Van Roy) |
+| Linear Q-Learning | off-policy | ✓ | **✗ 발산 가능** |
+
+Linear FA의 안전선은 "on-policy"다. 이 선을 넘는 순간 이론적 보장이 사라진다.
+
+<Callout type="warning" title="Deadly Triad 체크리스트">
+실제 알고리즘을 설계할 때 다음을 확인하라. Off-policy인가? Bootstrapping을 쓰는가? Function approximation을 쓰는가? 셋 모두 "예"라면, 수렴 보장 없이 경험적 안정성에 의존하는 영역에 진입한 것이다.
+</Callout>
+
+## Experience Replay — 상관관계 끊기
+
+Deadly Triad는 이론적 문제다. DQN(Mnih 2015)은 이를 공학적으로 우회한다. Experience Replay buffer가 그 핵심이다.
+
+On-policy 데이터 시퀀스 $\tau_1, \tau_2, \ldots$는 시간적으로 강하게 상관된다. SGD는 i.i.d. 샘플을 가정하므로, 상관된 시퀀스는 variance를 폭증시킨다. Replay buffer는 과거 transition $(s, a, r, s')$를 저장해두고, 학습 시 무작위로 샘플링한다. 시간적으로 멀리 떨어진 transition들은 거의 독립적이므로 i.i.d. 가정에 가까워진다.
+
+$$
+\text{Corr}((s_t, a_t), (s_{t'}, a_{t'})) \approx 0 \quad (|t - t'| \gg 1)
+$$
+
+동시에, 같은 transition을 여러 번 재사용하므로 sample efficiency도 올라간다. Buffer 크기 $N = 10^6$, 매 스텝 4번 gradient update라면, 환경 상호작용 횟수 대비 25만 배의 update가 가능하다.
+
+Prioritized Experience Replay(Schaul 2016)는 여기서 한 걸음 더 나간다. TD error가 큰 transition — agent가 예측에 가장 크게 실패한 상황 — 을 더 자주 샘플링한다.
+
+$$
+P(i) = \frac{|\delta_i|^\alpha}{\sum_j |\delta_j|^\alpha}
+$$
+
+Atari 벤치마크에서 uniform replay 대비 3–4배 sample efficiency 향상이 보고됐다.
+
+## Reward Shaping — Optimal Policy를 건드리지 않고 학습을 가속하는 법
+
+Sparse reward 환경에서 agent는 거의 모든 스텝에서 0 reward를 받는다. Credit assignment가 극도로 어렵다. 직관적 해결책은 reward에 "힌트"를 추가하는 것이다 — 하지만 임의의 shaping은 optimal policy 자체를 바꿀 수 있다.
+
+Ng, Harada & Russell(1999)은 어떤 형태의 shaping이 optimal policy를 보존하는지 증명했다.
+
+<Theorem kind="theorem" number="2" title="Ng-Harada-Russell (1999) — Potential-Based Shaping의 Optimality Preservation">
+Shaping function이
+
+$$
+F(s, a, s') = \gamma\Phi(s') - \Phi(s)
+$$
+
+형태이면, shaped MDP와 original MDP는 동일한 optimal policy를 가진다.
+</Theorem>
+
+<Proof>
+Shaped Q-value를 계산하면:
+
+$$
+Q'(s, a) = Q(s, a) + \gamma\Phi(s') - \Phi(s)
+$$
+
+이를 재귀적으로 풀면 $V'(s) = V(s) + \Phi(s)$, $Q'(s, a) = Q(s, a) + \Phi(s)$가 된다. 따라서 advantage:
+
+$$
+A'(s, a) = Q'(s, a) - V'(s) = [Q(s,a) + \Phi(s)] - [V(s) + \Phi(s)] = A(s, a)
+$$
+
+Advantage가 완전히 같으므로 $\arg\max_a A'(s,a) = \arg\max_a A(s,a)$, 즉 optimal policy가 보존된다. $\square$
+</Proof>
+
+Manhattan distance 기반 potential $\Phi(s) = -d(s, \text{goal})$을 사용하면, 목표에 가까워질수록 positive bonus, 멀어지면 negative penalty가 매 스텝마다 추가된다. Sparse reward 환경에서 첫 goal 도달 시간이 약 4배 단축된다는 실험 결과가 있다.
+
+<Aside label="설계 요령">
+Potential function의 선택이 학습 속도를 결정한다. Domain knowledge가 풍부할수록 더 좋은 $\Phi$를 설계할 수 있다. 이론적 보장은 $\Phi$가 어떤 함수이든 성립하므로, 자유롭게 실험할 수 있다.
+</Aside>
+
+## 트레이드오프 — 이론과 실무의 간극
+
+Model-Free RL의 수렴 지형을 한 문장으로 요약하면: **이론적 보장과 실무 성능은 반비례한다**.
+
+<Callout type="note" title="트레이드오프">
+Tabular 알고리즘은 수렴 보장이 가장 강하지만, 고차원 문제에 확장되지 않는다. Linear FA는 on-policy에서 수렴이 증명되지만, off-policy에서 Deadly Triad에 걸린다. Neural network 기반 Deep RL은 이론적 보증이 거의 없지만, Atari 수준의 복잡한 문제를 경험적으로 해결한다. DQN의 Target Network와 Replay Buffer는 이론적 해결이 아닌 공학적 우회다.
+</Callout>
+
+Policy Gradient 계열은 예외적으로 이론이 더 강하다. On-policy이므로 distribution mismatch가 없고, Policy Gradient Theorem(Sutton 1999)이 objective의 정확한 gradient를 보장한다. TRPO(Schulman 2015)는 KL constraint 아래 단조 개선을 증명한다.
+
+$$
+J(\pi_\text{new}) \geq J(\pi_\text{old}) - \frac{4\epsilon\gamma}{(1-\gamma)^2} \cdot \mathbb{E}_{s \sim d^\pi}[D_\text{KL}(\pi_\text{old} \| \pi_\text{new})]
+$$
+
+Q-Learning이 "auxiliary fixed-point를 off-policy로 찾는" 구조인 반면, Policy Gradient는 "원래 목적함수를 직접 최대화"하므로 이론적으로 더 안정적이다.
+
+## 정리
+
+- **Deadly Triad**: Off-Policy + Bootstrap + FA가 동시에 충족되면 Projected Bellman Operator의 수축성이 깨져 발산한다. 셋 중 하나만 빼면 안전하다(Baird 1995, Tsitsiklis & Van Roy 1997).
+- **Experience Replay**: 시간적 상관관계를 끊어 SGD의 i.i.d. 가정을 회복하고, 같은 데이터의 재사용으로 sample efficiency를 높인다.
+- **Potential-Based Shaping**: $F = \gamma\Phi(s') - \Phi(s)$ 형태는 advantage를 불변으로 유지하므로 optimal policy를 보존하면서 학습을 가속한다(Ng-Harada-Russell 1999).
+- **Deep RL의 현실**: DQN은 이론적 보증 없이 경험적으로 작동한다. 이 간극을 메우는 것이 현대 RL 이론의 미해결 과제다.
+
+이론이 멈추는 지점에서 엔지니어링이 시작된다 — 그리고 그 경계가 바로 Deep RL이 서 있는 자리다.
+
+<Reference
+  title="Reinforcement Learning: An Introduction (2nd ed.)"
+  authors="Sutton, R.S. & Barto, A.G."
+  year={2018}
+  venue="MIT Press"
+  url="http://incompleteideas.net/book/the-book-2nd.html"
+/>
+
+<Reference
+  title="Human-level control through deep reinforcement learning"
+  authors="Mnih et al."
+  year={2015}
+  venue="Nature"
+  url="https://www.nature.com/articles/nature14236"
+/>

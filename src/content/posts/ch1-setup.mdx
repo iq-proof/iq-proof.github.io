@@ -1,0 +1,129 @@
+---
+title: "Model-Free RL의 네 가지 근본 질문"
+description: "Model-free RL의 출발점인 planning vs learning 패러다임 차이부터 sample complexity, GPI 통합 틀, exploration-exploitation 조건까지 — 이후 모든 알고리즘의 동기를 하나의 프레임으로 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, model-free, q-learning, exploration, gpi]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model Free Rl Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+MC, TD, Q-Learning, SARSA — 이름도 다르고 업데이트 규칙도 다르지만, 이 알고리즘들은 모두 같은 철학 아래 움직인다. 환경의 dynamics를 모른 채 sample만으로 최적 정책을 찾는다는 선언. 그러나 선언만으로는 부족하다. **왜 model-free는 필연적으로 비효율적이고, 그 비효율을 어떤 구조로 극복하는가?**
+
+## Planning과 Learning의 분기점
+
+Model-based 세계는 환경을 안다. 전이 확률 $P(s' \mid s, a)$와 보상 $R(s, a)$가 주어지면, Value Iteration은 순수한 계산으로 최적 가치함수를 뽑아낸다. 탐험도 없고, 실패도 없다. 체스 엔진이 규칙을 알고 수를 미리 계산하는 것과 같다.
+
+Model-free는 정반대다. $P$와 $R$을 모르므로, 환경과 직접 부딪히며 sample $(s, a, r, s')$을 쌓아야 한다. 이것이 **planning 대 learning의 분기**다. 전자는 모든 정보를 가진 채 최적해를 계산하고, 후자는 부분 정보를 점진적으로 쌓아 귀납한다.
+
+이 분기의 대가는 sample complexity로 나타난다. Kearns–Singh(1999)의 결과는 냉정하다.
+
+$$
+\mathcal{C}_{\text{model-based}}(\epsilon) = \tilde{O}\!\left(\frac{|S||A|}{\epsilon^2(1-\gamma)^2}\right), \qquad
+\mathcal{C}_{\text{model-free}}(\epsilon) = \tilde{O}\!\left(\frac{|S||A|}{(1-\gamma)^3\epsilon^2}\right)
+$$
+
+두 식의 비율은 정확히 $\tilde{\Theta}(1/(1-\gamma))$다. $\gamma = 0.99$라면 model-free는 model-based보다 약 100배 더 많은 sample이 필요하다. Long-horizon task일수록 격차는 폭증한다.
+
+<Aside label="왜 (1−γ)⁻¹ 만큼 더 필요한가">
+Model-free는 $P$를 추정하지 않고 $Q$를 직접 추정한다. 그런데 $Q(s, a)$의 업데이트는 $V(s')$의 부정확한 추정값을 bootstrap으로 사용한다. 이 bias가 수렴 속도를 저하시켜 추가 $(1-\gamma)^{-1}$ factor를 만든다.
+</Aside>
+
+## Online과 Offline, 그리고 Distribution Shift
+
+Model-free 내에서도 또 하나의 축이 있다. Online은 agent가 환경과 실시간으로 상호작용하며 sample을 수집하고 즉시 학습한다. Offline은 고정된 데이터셋 $\mathcal{D}$만 사용하고 환경에 접근할 수 없다.
+
+Online은 exploration을 직접 통제할 수 있다. Offline은 그럴 수 없다. 데이터를 생성한 behavior policy $\beta$가 target policy $\pi$와 다를 때, 이미 수집된 데이터에서 학습하는 Q-Learning은 방문되지 않은 $(s', a')$ 쌍의 Q값을 제대로 업데이트하지 못한다.
+
+<Callout type="warning" title="Distribution Shift의 메커니즘">
+$\max_{a'} Q(s', a')$에서 max 연산자는 convex 함수다. Jensen 부등식에 의해
+
+$$\mathbb{E}\!\left[\max_{a'} \widehat{Q}(s', a')\right] \geq \max_{a'} \mathbb{E}\!\left[\widehat{Q}(s', a')\right]$$
+
+추정 오차가 있는 상태에서 max를 취하면 항상 양의 편향이 발생한다. Offline에서 드물게 방문된 $(s', a')$일수록 이 overestimation이 누적된다.
+</Callout>
+
+이것이 Offline RL이 별도의 연구 분야로 발전한 이유다. Conservative Q-Learning과 같은 pessimistic estimation 기법들은 이 overestimation을 의도적으로 억제한다.
+
+## GPI — 모든 알고리즘을 관통하는 뼈대
+
+MC, TD, SARSA, Q-Learning이 하나의 프레임으로 묶인다. 바로 **Generalized Policy Iteration(GPI)**다.
+
+```
+Loop:
+  E-step: 현재 정책 π로 sample 수집 → V̂ 또는 Q̂ 업데이트
+  I-step: π ← greedy(Q̂)
+```
+
+차이는 E-step의 깊이와 on/off-policy 여부뿐이다.
+
+| 알고리즘 | E-step 깊이 | Policy |
+|:---|:---|:---|
+| MC Control | Full episode | On-policy |
+| SARSA | 1-step bootstrap | On-policy |
+| Q-Learning | 1-step bootstrap | Off-policy |
+| n-step SARSA | n-step return | On-policy |
+
+Full evaluation을 기다리지 않아도 된다는 것이 핵심이다. Performance Difference Lemma에 의해, $\hat{V} \approx V^{\pi}$의 근사가 $O(\epsilon)$ 오차 이내라면 improvement는 여전히 단조 증가한다. 더 많은 sample이 쌓일수록 $\epsilon \to 0$이고, GPI는 수렴한다.
+
+<Theorem kind="proposition" number="1" title="Off-Policy GPI의 수렴 (Watkins & Dayan 1992)">
+Tabular Q-Learning은 모든 $(s, a)$를 무한히 자주 방문하고 Robbins–Monro 조건
+
+$$\sum_t \alpha_t = \infty, \quad \sum_t \alpha_t^2 < \infty$$
+
+을 만족하면, $Q_t(s, a) \to Q^*(s, a)$ almost surely.
+</Theorem>
+
+<Proof>
+Bellman optimality operator $T^*$는 $\gamma$-contraction이다. Q-Learning의 업데이트는 $T^*$에 대한 확률적 근사(stochastic approximation)로 해석된다. 모든 $(s, a)$를 무한히 방문한다는 조건이 각 좌표의 Robbins–Monro 조건을 만족시키고, $T^*$의 수축 성질이 수렴을 보장한다. 상세 증명은 Tsitsiklis(1994)의 비동기 stochastic approximation 정리로 귀결된다.
+</Proof>
+
+## Exploration의 수학적 조건
+
+수렴 정리의 가정 중 "모든 $(s, a)$를 무한히 방문"이 실제로 의미하는 것이 GLIE(Greedy-in-the-Limit with Infinite Exploration)다.
+
+$$\sum_{t=0}^\infty \epsilon_t = \infty, \qquad \lim_{t \to \infty} \epsilon_t = 0$$
+
+두 조건은 서로 상충하는 것처럼 보이지만 양쪽 모두 필요하다. 첫째 조건이 없으면 일부 state-action이 방문되지 않아 Q값이 수렴하지 않는다. 둘째 조건이 없으면 결국 greedy 정책으로 수렴하지 못한다. $\epsilon_t = 1/t$는 이 두 조건을 모두 만족하는 표준적 스케줄이다.
+
+탐험 전략 사이의 효율성 차이는 regret으로 드러난다.
+
+$$\text{Regret}(T) = \sum_{t=1}^T \left[R^* - R_t\right]$$
+
+ε-greedy는 모든 action을 균등하게 탐험하므로 $O(\sqrt{T})$ regret을 가진다. UCB1은 방문 횟수에 반비례하는 bonus를 추가해 suboptimal action을 체계적으로 제거하고 $O(\log T)$ regret을 달성한다.
+
+$$a_t = \arg\max_a \left[Q_t(s, a) + c\sqrt{\frac{\log t}{N_t(s, a)}}\right]$$
+
+불확실한 action에 bonus를 주어 먼저 탐험하고, 한번 나쁜 action임이 드러나면 자연스럽게 선택 빈도가 줄어든다. Random exploration과 달리 "정보를 가장 많이 얻을 수 있는 곳"을 우선 방문한다.
+
+<Callout type="note" title="트레이드오프">
+ε-greedy는 구현이 단순하고 튜닝 파라미터가 하나뿐이다. UCB1은 이론적으로 최적이지만 방문 횟수 $N(s, a)$를 추적해야 하고, multi-state MDP로의 확장이 non-trivial하다. 실제 deep RL에서는 entropy regularization이 Boltzmann exploration의 연속적 근사로 사용된다.
+</Callout>
+
+## 정리
+
+- Model-free는 $P, R$ 없이 sample만으로 학습한다 — 그 대가는 model-based 대비 $\tilde{\Theta}(1/(1-\gamma))$배 더 많은 sample이다.
+- Online vs offline의 차이는 exploration 통제 가능성에 있고, offline에서는 distribution shift로 인한 Q값 overestimation이 구조적으로 발생한다.
+- MC, TD, SARSA, Q-Learning은 모두 GPI의 E-step 깊이와 on/off-policy 선택의 변형이다 — 공통 뼈대를 알면 각 알고리즘의 동기가 투명해진다.
+- 수렴 보장의 핵심 조건은 GLIE다. 충분한 탐험 없이는 Q-Learning도 suboptimal에 수렴할 수 있다.
+
+이후 챕터들은 이 네 가지 질문의 구체적 답이다. Monte Carlo는 GPI의 가장 단순한 episodic 구현이고, TD는 bootstrap으로 E-step을 한 스텝으로 압축하고, Q-Learning은 off-policy로 exploration과 exploitation을 완전히 분리한다.
+
+<Reference
+  title="Finite-Time Bounds for Fitted Value Iteration"
+  authors="Kearns and Singh"
+  year={1999}
+  venue="Journal of Machine Learning Research"
+  url="https://www.jmlr.org/papers/v1/kearns00a.html"
+/>

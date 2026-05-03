@@ -1,0 +1,146 @@
+---
+title: "n-step Return에서 TD(λ)까지: 하나의 스펙트럼"
+description: "TD(0)와 MC 사이의 연속체를 n-step return이 어떻게 매개변수화하는가. bias-variance 트레이드오프의 수학적 분해부터 eligibility trace의 세 가지 구현까지."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, td-lambda, eligibility-trace, bias-variance, n-step]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model Free Rl Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+TD(0)는 1-step bootstrap이고 MC는 전체 에피소드를 쓴다. 둘 다 극단이다. 실제 환경에서 최적은 그 사이 어딘가에 있다. **n-step return은 이 스펙트럼을 단 하나의 정수 $n$으로 매개변수화**하고, TD(λ)는 그것을 연속 파라미터 $\lambda$로 확장한다. 왜 이 구조가 자연스럽고, 그 대가로 무엇이 필요한가?
+
+## n-step Return의 정의와 두 극단
+
+시점 $t$에서의 n-step return은 다음과 같이 정의된다.
+
+$$
+G_{t:t+n} := R_{t+1} + \gamma R_{t+2} + \cdots + \gamma^{n-1} R_{t+n} + \gamma^n V(S_{t+n})
+$$
+
+실제 reward를 $n$번 모은 뒤, 그 이후는 현재 추정값 $V$로 bootstrap한다.
+
+$n=1$이면 $G_{t:t+1} = R_{t+1} + \gamma V(S_{t+1})$ — 정확히 TD(0)다. $n \to \infty$이면 episode가 끝날 때까지 reward를 모두 더하게 되어 $G_t$, 즉 MC와 동일해진다. 수학적으로 두 극단은 $n$ 하나로 통일된다.
+
+<Theorem kind="proposition" number="1" title="n-step Return의 Unbiased Expectation">
+Policy $\pi$ 하에서 $V = V^\pi$(정확한 value function)이면,
+
+$$\mathbb{E}[G_{t:t+n} \mid S_t = s] = V^\pi(s)$$
+</Theorem>
+
+<Proof>
+Bellman equation을 $n$번 재귀적으로 적용하면, $\mathbb{E}[G_{t:t+n}]$은 정확히 $V^\pi(s)$로 전개된다. $V$가 정확할 때 bootstrap 오차가 없으므로 기댓값이 unbiased다. $\square$
+</Proof>
+
+## Bias-Variance 분해
+
+$n$을 크게 하면 무조건 좋을까? 그렇지 않다. 현재 $\hat{V}$가 $V^\pi$에서 오차 $\varepsilon$만큼 벗어나 있다고 하자.
+
+**Bias**는 $n$이 커질수록 기하급수적으로 감소한다.
+
+$$|\text{Bias}(G_{t:t+n})| \leq \gamma^n \varepsilon$$
+
+직관: 먼 미래에 bootstrap이 일어날수록, $V$의 오차가 현재 return에 미치는 영향은 $\gamma^n$배로 줄어든다.
+
+**Variance**는 반대 방향으로 움직인다. reward가 독립적이라면:
+
+$$\text{Var}(G_{t:t+n}) \approx \sigma_R^2 \cdot \frac{1 - \gamma^{2n}}{1 - \gamma^2}$$
+
+$n$개의 random reward를 더하는 것이므로 variance는 $n$에 따라 증가한다.
+
+MSE = Bias² + Variance를 $n$의 함수로 보면:
+
+$$\text{MSE}(n) = \gamma^{2n} \varepsilon^2 + C \cdot n \cdot \sigma_R^2$$
+
+이를 $n$에 대해 최소화하면 최적 $n^*$가 존재한다.
+
+$$n^* \approx \frac{1}{2|\log \gamma|} \log\left(\frac{C \sigma_R^2}{\varepsilon^2}\right)$$
+
+<Callout type="note" title="경험적 최적 n">
+Random walk 같은 표준 환경에서 $n^* \in (4, 8)$이 자주 나타난다. 짧은 에피소드와 빠른 reward signal에서는 $n \in (2, 4)$, sparse reward 환경에서는 더 큰 $n$이 유효하다.
+</Callout>
+
+## λ-return: 모든 n의 가중 평균
+
+최적 $n$을 사전에 모른다면? Sutton(1988)의 답은 **모든 $n$에 대해 기하 가중 평균**을 취하는 것이다.
+
+$$G_t^\lambda := (1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} G_{t:t+n}$$
+
+가중치 $(1-\lambda)\lambda^{n-1}$의 합은 정확히 1이다 — 기하급수의 합 공식으로 바로 확인된다. 이것은 합법적인 가중 평균이다.
+
+- $\lambda = 0$: 가중치가 $n=1$에 전부 집중 → TD(0)
+- $\lambda \to 1$: 가중치가 모든 $n$에 균등 → 극한에서 MC
+
+단일 파라미터 $\lambda$가 TD에서 MC까지의 전체 스펙트럼을 매개변수화한다. 그리고 $\hat{V}$가 $V^\pi$이면 $\mathbb{E}[G_t^\lambda] = V^\pi(s)$가 성립한다 — 각 $G_{t:t+n}$이 unbiased이고 선형 결합이 convex 합이므로.
+
+## Forward View와 Backward View의 등가성
+
+λ-return을 직접 계산하려면 에피소드가 끝날 때까지 기다려야 한다. 각 시점마다 모든 $n$의 n-step return을 계산하면 $O(T^2)$. 이것이 **forward view**의 비용이다.
+
+Sutton(1988)은 이를 **eligibility trace**로 $O(T)$에 온라인 계산할 수 있음을 보였다.
+
+매 step마다 TD error를 계산하고:
+
+$$\delta_t = R_{t+1} + \gamma V(S_{t+1}) - V(S_t)$$
+
+eligibility trace를 decay시키며 현재 state를 기록한다.
+
+$$e_t(s) = \gamma\lambda\, e_{t-1}(s) + \mathbb{1}[S_t = s]$$
+
+그리고 모든 state를 동시에 업데이트한다.
+
+$$V(s) \leftarrow V(s) + \alpha\, \delta_t\, e_t(s) \quad \text{for all } s$$
+
+이것이 **backward view**다. 핵심 결과:
+
+<Theorem kind="theorem" number="2" title="Forward-Backward 등가성 (Sutton 1988)">
+Episodic, tabular 설정에서, forward view(λ-return으로 에피소드 후 업데이트)와 backward view(trace + TD error로 매 step 업데이트)는 최종 value function이 정확히 일치한다.
+</Theorem>
+
+<Proof>
+$G_{t:t+n} - V(S_t) = \sum_{k=0}^{n-1} \gamma^k \delta_{t+k}$로 n-step return을 TD error의 합으로 표현한 뒤, $G_t^\lambda - V(S_t)$를 전개하면 $\sum_{j=t}^{\infty} \delta_j (\gamma\lambda)^{j-t}$가 된다. Backward view에서 $\sum_t \delta_t e_t(s)$를 합산 순서를 바꿔 정리하면 같은 식이 나온다. $\square$
+</Proof>
+
+Trace $e_t(s) = \sum_{k=0}^{t} (\gamma\lambda)^{t-k} \mathbb{1}[S_k = s]$는 과거 방문 기록을 기하급수적으로 decay시킨 것이다. λ-return의 기하 가중치 $\lambda^{n-1}$과 trace의 기하 decay $(\gamma\lambda)^{t-k}$는 같은 구조의 앞뒤다.
+
+## 세 가지 Trace: 무엇을 선택할 것인가
+
+Backward view의 실제 구현에서 trace는 세 가지 변형이 있다.
+
+**Accumulating**: $e_t(s) = \gamma\lambda\, e_{t-1}(s) + \mathbb{1}[S_t = s]$. 재방문할수록 trace가 누적되어 커진다. 직관적이지만 variance가 높고 수치 불안정 위험이 있다.
+
+**Replacing**: 재방문 시 trace를 1로 reset한다. $e_t(s) = 1$ if $S_t = s$, else $\gamma\lambda\, e_{t-1}(s)$. 항상 $e_t(s) \in [0, 1]$을 보장하므로 variance가 낮다.
+
+**Dutch trace** (Seijen & Sutton 2014): 선형 함수 근사 $V_w = w^\top \phi$에서 forward-backward의 불일치를 correction term으로 정확히 보정한다.
+
+$$e_t = \gamma\lambda\, e_{t-1} + \left(1 - \alpha\gamma\lambda\, e_{t-1}^\top \phi_t\right) \phi_t$$
+
+이것이 **True Online TD(λ)**다. 에피소드 끝이 아니라 **매 step에서** forward view와 정확히 일치한다.
+
+<Callout type="note" title="트레이드오프">
+Accumulating은 이론이 명확하고 구현이 단순하지만 variance가 높다. Replacing은 variance를 낮추지만 이론적 보장이 약하다. Dutch는 선형 함수 근사에서 이론적으로 가장 강하지만 구현이 복잡하다. Tabular라면 replacing, 선형 FA라면 Dutch, 비선형(딥러닝)이라면 trace 대신 n-step return을 직접 사용하는 것이 일반적이다.
+</Callout>
+
+<Aside label="설계 철학">
+TD(λ)의 핵심 통찰은 "모든 $n$을 동시에 시도한다"는 것이 아니다. 그보다는, bias와 variance의 트레이드오프가 기하 구조를 가진다는 관찰이다. 기하 가중치가 trace의 기하 decay와 정확히 대응되기 때문에 온라인 계산이 가능해진다. GAE(Schulman 2016)도 같은 철학을 actor-critic에 이식한 것이다.
+</Aside>
+
+## 정리
+
+- n-step return $G_{t:t+n}$은 TD(0)와 MC를 $n=1$과 $n=\infty$의 특수 경우로 통일한다.
+- Bias는 $\gamma^n \varepsilon$로 감소하고 variance는 $n \cdot \sigma_R^2$으로 증가한다. 최적 $n^*$는 이 균형점이다.
+- λ-return은 모든 $n$에 기하 가중치를 부여한 weighted average이며, 단일 파라미터 $\lambda \in [0, 1]$이 전체 스펙트럼을 결정한다.
+- Eligibility trace(backward view)는 forward view와 수학적으로 등가이면서 계산 복잡도를 $O(T^2)$에서 $O(T)$로 낮춘다.
+- Trace 종류(accumulating / replacing / Dutch)는 variance 제어와 forward-backward 등가성의 정밀도 사이의 트레이드오프다.
+
+다음 글에서는 이 eligibility trace가 actor-critic 구조에서 어떻게 policy gradient와 결합되는지 추적한다.
