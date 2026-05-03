@@ -1,0 +1,154 @@
+---
+title: "인과 추론의 네 가지 무기 — RCT부터 Doubly Robust까지"
+description: "Potential outcomes의 fundamental problem부터 DiD·RDD의 자연 실험, IPW의 분산 위험, 그리고 DR의 이중 보험까지 — causal ML의 식별 전략을 하나의 흐름으로 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [causal-inference, potential-outcomes, doubly-robust, rct, observational-study]
+difficulty: advanced
+series:
+  slug: experimental-statistics-mlops-deep-dive
+  title: Experimental Statistics Mlops Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ML 모델이 학습하는 것은 상관관계다. 그런데 정책 결정, A/B 실험 설계, 의료 개입 평가는 모두 **인과관계**를 요구한다. 단순 차이 통계가 "왜 틀렸는가"를 이해하려면 어디서 시작해야 하는가?
+
+## 관찰의 근본 문제
+
+Rubin의 potential outcomes framework는 불편한 진실에서 출발한다. Unit $i$에 대해 두 잠재 결과 $Y_i(1)$과 $Y_i(0)$이 *동시에 존재*하지만, 우리는 그 중 하나만 관찰한다. 개인 수준의 인과 효과 $Y_i(1) - Y_i(0)$는 원리적으로 직접 측정할 수 없다.
+
+평균(ATE)은 가능하다. Random assignment가 $T \perp (Y(0), Y(1))$을 보장하면,
+
+$$
+\tau_{\text{ATE}} = \mathbb{E}[Y(1) - Y(0)] = \mathbb{E}[Y \mid T=1] - \mathbb{E}[Y \mid T=0]
+$$
+
+이 등식이 성립한다. 관찰된 집단 평균의 차이가 곧 인과 효과다. 이것이 RCT가 "황금 표준"인 이유다.
+
+단, 이 논리는 **SUTVA**라는 두 가지 가정을 전제한다. ① 한 unit의 결과가 다른 unit의 처리에 영향받지 않아야 하고(no interference), ② 처리가 일관된 의미를 가져야 한다(no hidden variant). 소셜 네트워크처럼 spillover가 흔한 도메인에서는 이 가정이 조용히 깨진다.
+
+<Callout type="note" title="ITE는 식별 불가능하다">
+개인 수준 효과 $Y_i(1) - Y_i(0)$는 관찰 불가능하다. 대신 조건부 평균 $\tau(x) = \mathbb{E}[Y(1) - Y(0) \mid X = x]$, 즉 CATE는 ML 모델(causal forest, X-learner)로 추정할 수 있다. Segment별 효과가 ATE보다 정보량이 크다.
+</Callout>
+
+## RCT가 불가능할 때 — DiD와 RDD
+
+윤리적 제약, 비용, 이미 일어난 사건 — RCT가 불가능한 상황은 실제로 더 많다. 이때 두 가지 표준 도구가 "우연한 실험적 조건"을 활용한다.
+
+**DiD(Difference-in-Differences)**는 처리 전후 × 처리/통제 집단의 4-cell 비교다.
+
+$$
+\hat\tau_{\mathrm{DiD}} = (\bar Y_{T,\text{post}} - \bar Y_{T,\text{pre}}) - (\bar Y_{C,\text{post}} - \bar Y_{C,\text{pre}})
+$$
+
+통제 집단의 시간 추세를 빼서 처리 효과만 남긴다. 핵심 가정은 **parallel trends** — 처리가 없었다면 두 집단의 추세가 평행했을 것이라는 counterfactual 가정이다. 검증은 불완전하다. pre-trend가 평행해도 post에서 깨질 수 있다.
+
+**RDD(Regression Discontinuity Design)**는 행정적 cutoff를 활용한다. 시험 점수, 나이, GPA처럼 임계값 기준으로 처리 여부가 결정될 때, cutoff 근방의 units은 "사실상 무작위 배정"된 것과 같다. Sharp RDD의 LATE 추정은
+
+$$
+\tau_{\text{LATE}} = \lim_{x \downarrow c} \mathbb{E}[Y \mid X=x] - \lim_{x \uparrow c} \mathbb{E}[Y \mid X=x]
+$$
+
+bandwidth $h$ 선택이 bias-variance tradeoff를 결정한다. 작은 $h$는 분산을 키우고, 큰 $h$는 편향을 키운다.
+
+<Callout type="warning" title="조작(manipulation) 진단">
+RDD에서 학생이 점수를 임계값 직전에 의도적으로 몰아넣으면 local randomization 가정이 깨진다. McCrary(2008) density test로 running variable의 cutoff 연속성을 반드시 확인해야 한다.
+</Callout>
+
+## 관찰 데이터의 confounding 문제
+
+대부분의 데이터는 관찰 데이터다. Confounding이 있으면 naive 차이는 ATE가 아니다.
+
+$$
+\mathbb{E}[Y \mid T=1] - \mathbb{E}[Y \mid T=0] \neq \tau_{\text{ATE}}
+$$
+
+Pearl의 backdoor criterion은 어떤 공변량 집합 $X$가 ATE 식별에 충분한지 알려준다. $X$가 모든 backdoor path를 차단하고 $T$의 descendant를 포함하지 않으면, 조건부 평균의 주변화로 ATE를 계산할 수 있다.
+
+$$
+\tau = \mathbb{E}_X\bigl[\mathbb{E}[Y \mid T=1, X] - \mathbb{E}[Y \mid T=0, X]\bigr]
+$$
+
+실무에서는 Rosenbaum-Rubin(1983)의 propensity score $e(x) = \Pr(T=1 \mid X=x)$가 차원 축소의 핵심 도구다.
+
+<Theorem kind="theorem" number="1" title="Balancing Property">
+$T \perp X \mid e(X)$. 즉 $X$가 100차원이어도 1차원 propensity score로 conditioning하는 것이 $X$ 전체로 conditioning하는 것과 동등하다.
+</Theorem>
+
+IPW(Inverse Probability Weighting)는 이 score를 역수 가중치로 쓴다.
+
+$$
+\hat\tau_{\mathrm{IPW}} = \frac{1}{n}\sum_i\!\left[\frac{T_i Y_i}{\hat e(X_i)} - \frac{(1-T_i)Y_i}{1-\hat e(X_i)}\right]
+$$
+
+$\hat e \to e^*$이면 unbiased지만, $e \to 0$ 또는 $e \to 1$인 구간에서 가중치가 폭증해 분산이 발산한다. Trimming이나 stabilized IPW가 표준 처방이다.
+
+## Doubly Robust — 두 모델의 이중 보험
+
+IPW는 $\hat e$가, outcome regression은 $\hat m$이 정확해야 한다. 두 추정 모두 오차를 동반한다. **AIPW(Augmented IPW)**는 이 취약점을 한 번에 해결한다.
+
+$$
+\hat\tau_{\mathrm{DR}} = \frac{1}{n}\sum_{i=1}^n\!\left[\hat m_1(X_i) - \hat m_0(X_i) + \frac{T_i(Y_i - \hat m_1(X_i))}{\hat e(X_i)} - \frac{(1-T_i)(Y_i - \hat m_0(X_i))}{1-\hat e(X_i)}\right]
+$$
+
+<Theorem kind="theorem" number="2" title="Double Robustness (Bang–Robins 2005)">
+$\hat m \to m^*$ 또는 $\hat e \to e^*$ — 둘 중 하나만 true에 수렴해도 $\hat\tau_{\mathrm{DR}} \to \tau$.
+</Theorem>
+
+<Proof>
+두 경우를 나눠 확인한다.
+
+**Case A** ($\hat m \to m^*$): 잔차 $Y - \hat m_t$가 noise $\epsilon_t$로 수렴. Ignorability 하에서 $\mathbb{E}[T\epsilon_1/\hat e] = 0$이므로 IPW 보정항이 사라지고, $\hat\tau \to \mathbb{E}[m_1^* - m_0^*] = \tau$.
+
+**Case B** ($\hat e \to e^*$): IPW 항이 unbiased하게 $\mathbb{E}[Y(1)]$을 추정하고, outcome 항의 편향을 정확히 cancel한다. 결국 $\hat\tau \to \tau$. $\square$
+</Proof>
+
+두 모델이 모두 정확하면 추가 보너스가 있다. DR은 semiparametric efficiency bound를 달성한다 — 가능한 추정량 중 asymptotic 분산이 최소다.
+
+## 트레이드오프와 실무 가이드
+
+<Callout type="note" title="트레이드오프">
+| 방법 | 필요 조건 | 위험 |
+|------|-----------|------|
+| Outcome regression | $\hat m$ 정확 | misspecification |
+| IPW | $\hat e$ 정확 | extreme weights |
+| AIPW/DR | 둘 중 하나면 OK | 둘 다 틀리면 깨짐 |
+| DML (cross-fit DR) | ML nuisance 가능 | sample size 필요 |
+</Callout>
+
+ML 기반 nuisance 추정에서는 **cross-fitting**(Chernozhukov 2018)이 필수다. 같은 데이터로 $\hat e, \hat m$을 학습하고 ATE를 추정하면 overfit이 bias로 누적된다. K-fold split으로 fold 간 독립성을 확보하면 $\sqrt{n}$-asymptotic normality를 보장할 수 있다.
+
+현재 DoWhy와 EconML의 `LinearDML`, `CausalForestDML`은 cross-fitted DR의 wrapper다. "ignorability 가정이 검증 불가능하다"는 사실은 변하지 않는다. 대신 Rosenbaum bounds나 E-value로 "missed confounder가 얼마나 커야 결론이 뒤집히는가"를 측정하는 sensitivity analysis가 표준 부록이 됐다.
+
+## 정리
+
+- RCT의 unbiasedness는 $T \perp (Y(0), Y(1))$에서 온다. SUTVA가 깨지면 ATE 추정 자체가 흔들린다.
+- DiD는 parallel trends, RDD는 continuity — 두 quasi-experiment는 서로 다른 가정 위에 서 있고, 가정의 진단 방법(pre-trend test, McCrary test)도 함께 써야 한다.
+- IPW의 extreme weight 문제와 outcome regression의 misspecification 위험은 DR로 동시에 완화된다. 단, "두 모델 모두 완전히 틀릴" 가능성은 여전히 사용자 책임이다.
+- ML로 nuisance를 추정할 때는 cross-fitting을 빠뜨리지 마라.
+
+인과 추론은 "어떤 모델을 쓰는가"보다 "어떤 가정 위에 서 있는가"의 문제다.
+
+<Reference
+  title="Causal Inference in Statistics: A Primer"
+  authors="Pearl, Glymour, Jewell"
+  year={2016}
+  venue="Wiley"
+  url="https://www.wiley.com/en-us/Causal+Inference+in+Statistics%3A+A+Primer-p-9781119186847"
+/>
+
+<Reference
+  title="Double/Debiased Machine Learning for Treatment and Structural Parameters"
+  authors="Chernozhukov et al."
+  year={2018}
+  venue="Econometrics Journal"
+  url="https://arxiv.org/abs/1608.00060"
+/>

@@ -1,0 +1,151 @@
+---
+title: "Ground Truth 없이도 모델을 믿을 수 있는가"
+description: "레이블 도착 지연부터 예측 드리프트, 캘리브레이션, 공정성 불가능 정리, 알림 시스템 설계까지 — production ML monitoring의 다섯 가지 층위를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [mlops, monitoring, calibration, fairness, drift-detection]
+difficulty: advanced
+series:
+  slug: experimental-statistics-mlops-deep-dive
+  title: Experimental Statistics Mlops Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Production ML 시스템의 근본 문제는 단순하다 — **모델이 예측한 결과가 맞는지 즉시 알 수 없다**. 사기 탐지는 수주, 이탈 예측은 수개월, 대출 연체는 수년이 지나야 ground truth가 도착한다. 이 지연이 monitoring의 모든 패러다임을 뒤집는다. 그렇다면 정확도를 직접 측정할 수 없는 환경에서 모델을 어떻게 신뢰하는가?
+
+## Ground Truth 지연과 간접 신호의 논리
+
+레이블이 오지 않는다면 간접 신호에 의존해야 한다. 세 전략이 있다.
+
+**Proxy metric**은 최종 레이블 대신 중간 신호를 사용한다. 광고 전환율을 직접 측정하기 어렵다면 체류 시간을 proxy로 삼는다. 이 전략의 핵심 가정은 $\Pr(y \mid z)$가 시간에 따라 안정적이라는 것이다. proxy 자체가 drift하면 신호가 misleading해진다 — proxy도 정기적으로 검증해야 한다.
+
+**Distribution-based monitoring**은 입력 $x$ 또는 예측 $\hat{y}$의 분포 변화를 신호로 사용한다. ground truth 없이 즉시 측정 가능하다는 장점이 있다. 그러나 분포가 변해도 정확도가 정상일 수 있다 — covariate shift가 모델의 robust 방향으로 발생했다면 성능에 영향이 없다. drift signal만으로 retrain을 트리거하는 건 과잉 반응이다.
+
+**Surrogate label**은 규칙 기반 heuristic으로 $\tilde{y}$를 생성한다. 노이즈가 있지만 즉시 사용 가능하다. confident learning으로 노이즈를 정제할 수 있다.
+
+$$
+\tau_{\text{gt}} = t_l - t_p \geq 0
+$$
+
+이 지연이 클수록 세 전략의 *결합*이 필수다. 예측 drift signal $s(t)$와 실제 성능 $A(t)$ 사이의 lagged correlation $r(\ell) = \mathrm{Corr}(s(t),\ A(t+\ell))$을 주기적으로 갱신하면, drift가 성능 저하에 몇 단계 앞서는지 정량화할 수 있다.
+
+## 예측 드리프트 — 인과 체인과 그 단절
+
+input drift → prediction drift → performance drop의 인과 체인은 직관적이지만 세 곳 모두에서 끊어질 수 있다.
+
+```
+input drift ──► prediction drift ──► performance drop
+   p(x)              p(ŷ)               ground truth
+```
+
+모델이 drift에 robust하면 input drift가 prediction drift로 이어지지 않는다. concept drift만 있으면 $p(x)$는 그대로이고 $p(y \mid x)$만 변하므로 prediction drift 신호가 약하다. 반대로 prediction drift가 크더라도 drift가 모델이 무시하는 방향(관련 없는 feature)으로 발생했다면 성능은 정상이다.
+
+<Theorem kind="proposition" number="1" title="Prediction Drift Upper Bound">
+모델 $f$가 1-Lipschitz이면 input drift의 upper bound가 prediction drift를 지배한다.
+
+$$
+W_1(p_{\hat{y}},\ q_{\hat{y}}) \leq W_1(p_x,\ q_x)
+$$
+</Theorem>
+
+<Proof>
+1-Lipschitz 조건 $\|f(x) - f(x')\| \leq \|x - x'\|$에서 Wasserstein 거리의 수송 계획을 그대로 사용하면 prediction 공간의 transport cost가 input 공간의 cost를 초과할 수 없다. 모델이 입력 변화의 일부를 흡수하는 만큼 prediction drift는 input drift보다 작아진다.
+</Proof>
+
+**Hard prediction drift**(class 분포 변화)보다 **Soft confidence drift**(예측 확률의 entropy/평균 변화)가 더 민감한 신호다. 경계 근처 sample이 늘어나면 class 분포는 변하지 않아도 confidence는 이미 떨어져 있다.
+
+## Calibration — 확률의 의미를 지키는 것
+
+정확도와 calibration은 독립적이다. AUC가 0.95여도 ECE가 0.2인 모델은 순위는 맞히지만 확률의 의미가 틀리다. "90% 확률로 양성"이라고 했을 때 실제로 100명 중 90명이 양성이어야 한다 — 이것이 perfect calibration의 요구다.
+
+$$
+\mathbb{E}[y \mid \hat{p}(x) = p] = p \quad \text{for all } p \in [0, 1]
+$$
+
+ECE는 bin별 신뢰도와 정확도의 차이를 가중 평균한다.
+
+$$
+\mathrm{ECE} = \sum_{b=1}^{B} \frac{|B_b|}{n}\,\big|\mathrm{conf}(B_b) - \mathrm{acc}(B_b)\big|
+$$
+
+<Callout type="warning" title="Modern NN의 Over-confidence">
+Guo et al. (2017)은 depth와 width가 증가할수록 NN이 더 over-confident해짐을 보였다. Cross-entropy로 학습된 softmax는 logit을 크게 만들어 confidence를 1에 몰아붙이는 경향이 있다. Temperature scaling — logit을 상수 $T > 1$로 나누는 단순한 사후 보정 — 이 가장 효과적인 첫 번째 조치다.
+</Callout>
+
+Platt scaling은 2개 파라미터로 안정적이지만 표현력이 제한된다. isotonic regression은 큰 sample에서 더 강력하지만 overfit 위험이 있다. 핵심은 calibration 보정이 discrimination(AUC)을 건드리지 않는다는 것이다 — 확률의 의미만 교정한다.
+
+시간에 따른 ECE 추적을 drift의 한 형태로 포함해야 한다. calibration이 무너지면 threshold 기반 의사결정(의료, 금융)의 근거 자체가 흔들린다.
+
+## 공정성 불가능 정리
+
+공정성 criterion은 세 가지가 경쟁한다.
+
+- **Demographic Parity**: $\Pr(\hat{y}=1 \mid A=a) = \Pr(\hat{y}=1 \mid A=b)$
+- **Equalized Odds**: TPR과 FPR 모두 group-invariant
+- **Predictive Parity**: group별 calibration이 성립
+
+<Theorem kind="theorem" number="2" title="Chouldechova 2017 Impossibility">
+Group별 base rate $\pi_a \neq \pi_b$이면 Predictive Parity, Equal FPR, Equal FNR을 동시에 만족하는 classifier는 존재하지 않는다.
+</Theorem>
+
+<Proof>
+Confusion matrix의 항등식에서 $\pi = \mathrm{TPR} \cdot \pi + \mathrm{FPR} \cdot (1-\pi)$가 성립한다. Predictive Parity가 성립하면 이 관계가 각 group에 대해 동일한 (TPR, FPR) 쌍을 요구하게 된다. 그러나 $\pi_a \neq \pi_b$이면 같은 (TPR, FPR)에서 PPV가 두 group 사이에 다르므로 Predictive Parity를 동시에 만족할 수 없다. $\square$
+</Proof>
+
+이 불가능 정리의 귀결은 기술적 문제가 아니라 **정책적 선택**이다. 어느 fairness가 도메인 맥락에 부합하는지 사전에 결정해야 한다. Hardt et al. (2016)은 어떤 모델에도 group별 threshold 조정으로 Equalized Odds를 사후 만족시킬 수 있음을 보였다 — 단, 정확도 손실을 동반한다.
+
+Production monitoring에서는 protected attribute별 TPR/FPR/PPV의 시계열을 추적하고, disparate impact ratio가 0.8 미만이면 즉시 알림을 발생시켜야 한다.
+
+## 알림 시스템 — 통계적 기초
+
+좋은 metric도 알림이 잘못 설계되면 운영자에게 무용지물이다. 너무 민감하면 fatigue로 모든 알림이 무시되고, 너무 보수적이면 silent degradation이 누적된다.
+
+**Multi-level threshold**는 우선순위를 분리한다. PSI 기준으로 0.10 미만은 정상, 0.10~0.25는 warn(Slack), 0.25 이상은 page(PagerDuty), 그 이상은 critical(자동 롤백) 수준으로 분리한다.
+
+**Persistence**는 false alarm을 통계적으로 제어한다. 단일 point의 false alarm rate를 $\alpha$로 두면, $k$ 연속 위반 시 trigger의 false alarm rate는 $\alpha^k$로 감소한다.
+
+$$
+\text{trigger}(t) = \prod_{i=0}^{k-1} \mathbb{1}[m(t-i) > \tau]
+$$
+
+$k=3, \alpha=0.05$이면 false alarm이 $0.000125$ 수준으로 떨어진다. 대가는 detection latency — 처음 2개 point를 놓친다.
+
+<Callout type="note" title="트레이드오프">
+**Multiple testing 누적**: $m$개 feature × $T$일 검정의 누적 false alarm 확률은 $1-(1-\alpha)^{mT} \approx mT\alpha$다. feature 50개 × 30일이면 기대 false alert이 75건이다. Bonferroni 또는 BH 보정으로 $\alpha$를 $mT$로 나눠야 한다. 단, 보정이 너무 강하면 sensitivity가 떨어진다 — 핵심 feature만 strict 보정하고 나머지는 완화하는 계층적 접근이 실용적이다.
+</Callout>
+
+채널 분리는 필수다. drift, performance, system health를 같은 채널에 모으면 alert rate에 반비례해 응답률이 떨어진다. Runbook의 첫 단계는 항상 "어떤 drift type인가" 진단이어야 한다 — drift 유형에 따라 retrain, rollback, data fix 중 처방이 다르다.
+
+## 정리
+
+- Ground truth 지연 환경에서는 proxy + distribution + surrogate의 결합이 유일한 답이다. 단일 신호만으로 retrain을 트리거하지 않는다.
+- Prediction drift는 선행 지표 후보지만 concept drift는 잡지 못한다. hard + soft(confidence) 두 측면을 함께 추적한다.
+- Calibration은 정확도와 직교한다. threshold 기반 의사결정이 있는 시스템에서는 ECE의 시계열 추적이 필수다.
+- Chouldechova의 불가능 정리는 기술 문제가 아니다. 어느 fairness를 우선할지 배포 전에 결정해야 한다.
+- 알림 시스템은 multi-level × persistence × 채널 분리 × multiple testing 보정의 곱이다.
+
+모든 챕터를 관통하는 공통 원칙은 하나다 — **단일 신호는 믿지 않는다**. 간접 신호들의 교차점에서만 실제 degradation을 구별할 수 있다.
+
+<Reference
+  title="On Fairness and Calibration"
+  authors="Chouldechova, A."
+  year={2017}
+  venue="FAccT"
+  url="https://arxiv.org/abs/1703.00056"
+/>
+
+<Reference
+  title="Equality of Opportunity in Supervised Learning"
+  authors="Hardt, M., Price, E., Srebro, N."
+  year={2016}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1610.02413"
+/>

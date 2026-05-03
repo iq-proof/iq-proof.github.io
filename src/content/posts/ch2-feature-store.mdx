@@ -1,0 +1,114 @@
+---
+title: "Feature Store는 왜 단순 캐시가 아닌가"
+description: "중복 계산·재사용 부재·stream/batch 비대칭이라는 세 문제의 근본 원인부터, skew가 O(Δ²)로 성능을 잠식하는 수학적 구조와 dual-store 아키텍처의 설계 결정까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [feature-store, mlops, training-serving-skew, point-in-time, feature-engineering]
+difficulty: advanced
+series:
+  slug: experimental-statistics-mlops-deep-dive
+  title: Experimental Statistics Mlops Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Feature store는 흔히 "online/offline 두 개의 저장소"로 단순화된다. 그런데 Uber가 2017년 Michelangelo를 만든 진짜 동기는 저장이 아니었다. 중복 계산, 재사용 불가, stream/batch 비대칭 — 이 세 문제가 동시에 악화되는 조직에서 feature store는 필수 인프라가 된다. 왜 그리고 어떻게인가?
+
+## 세 가지 문제의 정체
+
+조직에 모델 $M$개, 각 모델이 평균 $F$개 feature를 사용한다고 하자. 각 팀이 독립적으로 구현하면 총 비용은 $M \cdot F \cdot c_{\text{unit}}$이다. 재사용률 $r$이 0.6이면 비용은 $M \cdot F \cdot (1-r) \cdot c_{\text{unit}}$으로 줄어든다. Uber의 보고에서 $r \approx 0.6$ — 같은 user feature를 5개 팀이 각각 SQL로 재구현하던 비용의 40%만으로 운영할 수 있게 됐다.
+
+재사용은 비용만의 문제가 아니다. 한 팀이 발견한 유효한 feature가 $M-1$개 모델로 즉시 전파된다면, 누적 유효 feature 수는 사일로 구조 대비 $M$배에 비례해 늘어난다. 이것이 "quadratic 효과"의 직관이다.
+
+세 번째 문제가 가장 교묘하다. 학습은 batch SQL, 서빙은 streaming Java — 같은 논리적 feature가 두 곳에서 다르게 계산된다. 이것이 training-serving skew의 시작이다.
+
+## Future Leakage — 조용한 재앙
+
+Point-in-time correctness는 이 구조에서 가장 흔히 무너지는 불변식이다. Feature $x_i$의 모든 성분이 시점 $t_i$ 이전 정보만으로 계산되어야 한다는 조건:
+
+$$
+x_i = g(\mathcal{D}_{\leq t_i})
+$$
+
+이 조건이 깨지면 미래 정보가 학습 데이터에 스며든다. 학습 정확도 99%, production 70% — 전형적인 future leakage의 결과다. `WHERE` 절에서 시간 필터를 빠뜨리거나, 정적 dimension 테이블을 현재 값으로 join하거나, 전체 기간 `MAX`를 쓰는 순간 발생한다.
+
+<Theorem kind="proposition" number="1" title="AsOf Join의 시간 복잡도">
+레이블 스트림 $A$의 크기 $n$, feature 이벤트 스트림 $B$의 크기 $m$, $B$가 시간순 정렬된 경우. AsOf join은 $O(n \log m)$ (이진 탐색) 또는 $O(n + m)$ (양쪽 정렬 시 merge).
+</Theorem>
+
+<Proof>
+각 $a \in A$에 대해 $B$에서 $\arg\max_b \{b.t \leq a.t\}$를 찾는 것은 lower bound 검색이므로 $O(\log m)$. 전체 $A$에 대해 $O(n \log m)$. $A$도 정렬되어 있으면 양쪽 포인터를 한 번 스윕하므로 $O(n + m)$. $\square$
+</Proof>
+
+Slowly-Changing Dimension(SCD type 2)에서는 `valid_from <= t_y < valid_to` 조건으로 그 시점의 dimension 값을 점 조회한다. Iceberg/Delta Lake는 `VERSION AS OF` 절로 이를 테이블 레벨에서 자연스럽게 제공한다.
+
+## Skew는 O(Δ²)로 잠식한다
+
+Stream/batch 비대칭이 만드는 skew $\Delta = x_{\text{serve}} - x_{\text{train}}$가 실제로 얼마나 위험한지는 Taylor 전개로 정량화된다.
+
+<Theorem kind="theorem" number="2" title="Quadratic Performance Degradation">
+Loss $\ell$이 $C^2$이고 학습이 수렴하여 $\nabla_x \ell(x_{\text{train}}) \approx 0$, Hessian $H = \nabla_x^2 \ell(x_{\text{train}})$이면:
+
+$$
+\delta(\Delta) = \frac{1}{2}\,\mathrm{tr}(H \Sigma_\Delta) + o(\|\Delta\|^2)
+$$
+</Theorem>
+
+<Proof>
+$x_{\text{serve}}$ 근방에서 Taylor 전개:
+
+$$
+\ell(x_{\text{serve}}) = \ell(x_{\text{train}}) + \nabla \ell^\top \Delta + \frac{1}{2}\,\Delta^\top H \Delta + o(\|\Delta\|^2)
+$$
+
+학습 수렴 가정으로 $\nabla \ell \approx 0$, 1차 항 소멸. 양변 기댓값을 취하고 trace identity $\mathbb{E}[\Delta^\top H \Delta] = \mathrm{tr}(H \Sigma_\Delta)$를 적용하면 결론이 따라온다. $\square$
+</Proof>
+
+1차 항이 0이라는 점이 핵심이다. 수렴한 모델에서는 작은 skew도 quadratic으로 누적된다. Hessian의 eigenvalue 분해 $\delta = \frac{1}{2} \sum_i \lambda_i s_i$에서, 곡률이 큰 방향($\lambda_i$ 큰 feature)의 skew가 가장 위험하다. **Skew 모니터링의 우선순위는 high-curvature feature**다.
+
+전체 skew를 세 원천으로 분리할 수도 있다: $\Delta = \Delta_{\text{pipeline}} + \Delta_{\text{time}} + \Delta_{\text{recompute}}$. 세 원천이 독립이면 각각의 기여가 분리되어 근본 원인을 즉시 판별할 수 있다.
+
+## Dual Store — 설계 필연성
+
+Training과 serving의 access pattern은 정반대다. Training은 TB 단위 full scan, latency는 시간 단위여도 무방하다. Serving은 request당 1~10 entity lookup, p99 < 50ms를 요구한다. 이 두 패턴을 단일 storage가 동시에 제공하는 것은 비용과 관리 측면에서 Pareto-inferior하다 — offline(Parquet/BigQuery) + online(Redis/DynamoDB) 분리가 자연스러운 귀결이다.
+
+두 store를 잇는 것이 **materialization**: offline의 최신 snapshot을 online으로 복사하는 배치 잡이다. Freshness lag $\tau_{\text{lag}} = t_{\text{now}} - t_{\text{last\_materialization}}$가 커질수록 skew가 증가한다. Ch2-03의 결과와 결합하면 — $\Delta_t \propto t$ 가정 시 skew 손실은 $\propto 1/f^2$, 실행 비용은 $\propto f$ — 최적 빈도 $f^* \propto b^{1/3}$ (drift 속도에 따라 조정)이 유도된다.
+
+<Callout type="note" title="트레이드오프">
+**Lambda 아키텍처**: batch + stream 두 파이프라인 → 각각 독립 최적화 가능하지만 codebase 이중화, 동기화 부채. **Kappa 아키텍처**: stream-only로 통합 → 단일 logic, 하지만 historical replay 비용이 Lambda의 batch store 비용과 비슷하게 수렴한다. "단일 codebase"의 이점이 storage 비용으로 흡수된다.
+</Callout>
+
+## 구현 선택의 기준
+
+추상이 실제 시스템으로 구현될 때 선택지는 크게 갈린다.
+
+- **Feast**: registry + 추상화만 제공, storage/compute는 사용자 인프라. lock-in 없음, 운영 부담 있음.
+- **Tecton**: batch/stream/on-demand feature를 single definition으로 컴파일. managed이므로 빠른 시작, Databricks lock-in.
+- **Hopsworks**: Feature → FeatureGroup → FeatureView → TrainingDataset → Model의 명시적 lineage 그래프. governance가 강한 조직에 적합.
+- **Sagemaker/Vertex AI FS**: 각 cloud-native 통합. 단일 클라우드 조직의 빠른 출발점.
+
+Minimum viable feature store는 4개 컴포넌트로 충분하다: entity index(KV), versioned event log(offline), AsOf join(point-in-time), materialization scheduler. 이를 200줄 미만 Python으로 구현할 수 있다는 사실은 개념 검증에 유용하지만, production에서는 분산 storage, fault tolerance, UI/catalog, RBAC이 운영 비용의 대부분을 결정한다.
+
+## 정리
+
+- Feature store의 존재 이유는 저장이 아니라 **중복 계산 제거 + 재사용 + stream/batch 일관성 + lifecycle 관리**다.
+- Future leakage는 `x_i = g(\mathcal{D}_{\leq t_i})` 불변식이 깨질 때 조용히 발생한다. AsOf join과 SCD type 2가 시스템 레벨 차단 도구다.
+- Skew $\Delta$는 $O(\|\Delta\|^2)$로 성능을 잠식한다. 1차 항이 0이므로 작은 skew도 무시할 수 없고, Hessian의 eigenvalue가 우선순위를 결정한다.
+- Dual store는 access pattern의 물리적 차이에서 나온 필연이다. Materialization 빈도는 drift 속도와 비용의 균형점에서 결정된다.
+
+skew 수식 하나 뒤에는 "feature 정의가 학습과 서빙에서 동일해야 한다"는 공학적 요구가 숨어 있다.
+
+<Reference
+  title="Meet Michelangelo: Uber's Machine Learning Platform"
+  authors="Hermann, J. and Del Balso, M."
+  year={2017}
+  venue="Uber Engineering Blog"
+  url="https://www.uber.com/blog/michelangelo-machine-learning-platform/"
+/>

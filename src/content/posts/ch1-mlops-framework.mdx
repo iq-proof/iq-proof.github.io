@@ -1,0 +1,117 @@
+---
+title: "ML 시스템은 왜 모델 그 이상인가"
+description: "ML 부채의 90%가 알고리즘이 아닌 데이터·분포·인과에서 발생하는 이유부터 MLOps 성숙도 최적점 도출까지, production ML 시스템의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [mlops, ml-system, technical-debt, maturity-model, pipeline]
+difficulty: intermediate
+series:
+  slug: experimental-statistics-mlops-deep-dive
+  title: Experimental Statistics Mlops Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+모델 정확도가 올라갔는데 production에서 시스템이 조용히 망가진다. exception은 0이고 서비스는 정상 응답 중이다. 그런데 사용자 경험은 이미 무너졌다. 왜 이런 일이 반복되는가?
+
+## 모델은 시스템의 5%다
+
+Sculley et al. (NIPS 2015)는 production ML 시스템에서 모델 코드가 차지하는 비중이 전체의 약 5%에 불과하다고 주장했다. 나머지 95%는 data ingestion, feature engineering, serving infrastructure, monitoring, configuration이다. 이 관찰이 MLOps라는 분야의 출발점이 됐다.
+
+ML 시스템은 4-tuple로 정의할 수 있다.
+
+$$
+S = (\mathcal{D},\, \mathcal{M},\, \mathcal{R},\, \mathcal{O})
+$$
+
+$\mathcal{D}$는 데이터 플레인(수집·검증·feature 계산), $\mathcal{M}$은 모델 플레인(학습·평가·버전), $\mathcal{R}$은 serving 플레인(추론·라우팅), $\mathcal{O}$는 관측 플레인(drift·경보·재학습 트리거)이다. 각 phase는 독립적인 입출력과 실패 모드를 가진다. 이 분리를 무시하면 한 phase의 결함이 다른 phase로 조용히 전파된다.
+
+## Silent Failure — 전통 SRE가 못 잡는 버그
+
+phase가 4개일 때 end-to-end 결함률은 다음과 같다.
+
+$$
+\epsilon_{\text{e2e}} \approx \epsilon_D + \epsilon_M + \epsilon_R + \epsilon_O
+$$
+
+각 phase가 99% 신뢰도여도 e2e는 96%다. 5 nines를 원하면 phase별로 99.9975%가 필요하다. monitoring이 자동 재학습으로 자정(self-heal)되지 않으면 불가능한 수준이다.
+
+더 심각한 문제는 *silent failure*다. 시스템이 exception 없이 응답하지만 출력의 통계적 특성이 학습 시 가정과 다른 상태를 뜻한다.
+
+$$
+\Pr_{(x, y) \sim p_{\text{prod}}}\!\bigl[\ell(\hat y, y) > \tau\bigr] \gg \Pr_{(x, y) \sim p_{\text{train}}}\!\bigl[\ell(\hat y, y) > \tau\bigr]
+$$
+
+software exception은 0인데 ML loss는 폭증한다. 전통적인 SRE의 SLO/SLI는 이 상태를 감지할 수 없다. ML 시스템은 소프트웨어 SLO와 ML SLO를 **동시에** 모니터링해야 한다.
+
+## ML 부채의 5가지 패턴
+
+Sculley 2015가 분류한 ML 특유의 기술 부채는 일반 소프트웨어 리팩터링으로 해결되지 않는다. 부채가 코드가 아니라 *데이터·학습된 분포·외부 세계의 인과*에 자리 잡기 때문이다.
+
+**Entanglement**: feature $f_i$의 분포가 바뀌면 함께 학습된 모든 $f_j$의 가중치 의미가 달라진다. linear 모델조차 OLS의 $(X^\top X)^{-1}$는 feature 간 공분산에 의존한다. feature 하나를 독립적으로 교체할 수 없다는 뜻이다.
+
+**CACE (Change Anything Changes Everything)**: 입력의 한 부분이 바뀌면 학습된 모든 파라미터에 동시에 영향을 준다. 변경의 blast radius를 작게 유지하는 설계가 필수다.
+
+**Feedback Loop**: 모델 출력이 미래 학습 데이터의 분포에 영향을 준다. 작은 편향 $\epsilon$이 시간 $T$ 후 $\alpha^T \epsilon$으로 발산한다($\alpha > 1$). 추천 시스템의 filter bubble이 전형적인 사례다. counterfactual logging으로 무작위 노출 데이터를 확보해야 이 편향을 측정할 수 있다.
+
+**Pipeline Jungle**: data preparation이 ad-hoc 변환의 사슬로 형성되어 재현도, 범위 추적도 불가능해진 상태. DAG 기반 orchestration으로 각 step의 입출력을 명시화해야 한다.
+
+**Configuration Debt**: hyperparameter·feature flag·routing rule이 검증 없이 수백 개로 폭증한 상태. config-as-code와 schema validation이 필요하다.
+
+<Callout type="warning" title="ML 부채의 비대칭성">
+소프트웨어 부채의 이자는 시간에 선형으로 붙는다. ML 부채의 이자는 분포 변화에 비례하며 불연속적으로 폭증한다. 코드를 깔끔하게 유지해도 데이터 분포가 변하면 부채가 순식간에 쌓인다.
+</Callout>
+
+## MLOps 성숙도와 최적점
+
+성숙도 모델은 "MLOps를 도입하자"는 추상적 목표를 측정 가능한 단계로 바꾼다. Google의 3단계 분류가 의사결정 도구로 가장 실용적이다.
+
+- **Level 0**: notebook 기반, 학습·배포 단절, 재현성 미보장
+- **Level 1**: training pipeline 자동화, feature validation gate, model registry, 일부 monitoring
+- **Level 2**: CT(Continuous Training) 포함. drift·성능 저하·신규 데이터가 trigger가 되어 pipeline이 자동 재실행되고, 배포와 monitoring이 feedback loop를 형성한다
+
+Level이 높아질수록 인시던트 발생률 $\lambda(L)$은 줄지만 운영 인프라 비용 $K(L)$은 늘어난다.
+
+$$
+L^* = \arg\min_L \bigl[\lambda(L) \cdot C(L) + K(L)\bigr]
+$$
+
+이 최적점은 시스템마다 다르다. 소규모 팀이나 계절성 도메인에는 Level 1으로 충분하다. Level 2 인프라를 갖추고도 문화와 인력이 따라오지 못하면 Level 0보다 복잡한 Level 0이 된다.
+
+<Aside label="설계 원칙">
+도구가 성숙도를 만들지 않는다. MLflow를 Level 0에서 tracking만 쓰는 것과 Level 2에서 registry·CI/CD와 연결하는 것은 완전히 다른 사용이다. 도구의 도입보다 각 phase의 SLO 정의와 계약 명시화가 먼저다.
+</Aside>
+
+## 트레이드오프
+
+4 phase 분해와 성숙도 모델 모두 가정을 가진다.
+
+phase 독립 가정은 이상적이다. Sculley 2015의 entanglement 분석이 보여주듯 실제로는 phase 간 결합이 강하며, 독립 가정이 깨지면 e2e 결함률 공식보다 더 나빠진다.
+
+silent failure의 정의는 학습 분포 가정에 의존한다. 학습 분포 자체가 잘못 선택됐다면 지표가 정상이어도 시스템은 처음부터 유효하지 않다.
+
+Level 2의 CT는 "빠르게 나쁜 모델을 자동 배포"하는 위험을 동반한다. 자동화의 속도는 검증 게이트의 품질에 달려 있다. 의료나 금융처럼 규제가 있는 산업에서는 자동 배포 자체가 규제 위반이 될 수 있다.
+
+## 정리
+
+- ML 시스템의 버그는 코드 버그가 아니라 데이터·분포·인과의 버그다.
+- silent failure는 exception이 0인 상태에서 ML loss가 폭증한다. 소프트웨어 SLO만으로는 감지 불가능하다.
+- ML 부채의 5 패턴(Entanglement, CACE, Feedback, Pipeline Jungle, Config Debt)은 일반 리팩터링으로 해결되지 않는다.
+- 최적 성숙도 $L^*$는 인시던트 비용과 운영 비용의 균형점이며, 모든 시스템이 Level 2를 목표할 이유는 없다.
+
+다음 글에서는 이 4 phase 중 Data phase의 핵심 과제인 feature store의 online-offline 일관성 문제를 추적한다.
+
+<Reference
+  title="Hidden Technical Debt in Machine Learning Systems"
+  authors="Sculley et al."
+  year={2015}
+  venue="NIPS"
+  url="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html"
+/>
