@@ -143,6 +143,24 @@ const hasCurrentInCat: Record<Category, boolean> = {
 };
 ---
 
+{/* 모바일 전용 햄버거 — fixed 좌상단, 데스크톱에선 hidden */}
+<button
+  type="button"
+  class="mobile-hamburger"
+  data-sidebar-toggle
+  aria-label="목차 열기"
+  aria-controls="iq-sidebar-content"
+>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <line x1="3" y1="6" x2="21" y2="6" />
+    <line x1="3" y1="12" x2="21" y2="12" />
+    <line x1="3" y1="18" x2="21" y2="18" />
+  </svg>
+</button>
+
+{/* 모바일 backdrop — 사이드바 expanded 시 본문 위에 어두운 overlay */}
+<div class="sidebar-backdrop" data-sidebar-toggle aria-hidden="true"></div>
+
 <aside class="sidebar" id="iq-sidebar" data-state="collapsed" aria-label="Site navigation">
   <button
     type="button"
@@ -317,32 +335,61 @@ const hasCurrentInCat: Record<Category, boolean> = {
     const sidebar = document.getElementById('iq-sidebar');
     if (!sidebar) return;
 
+    const isMobile = () => window.matchMedia('(max-width: 1023px)').matches;
+
     const setState = (expanded) => {
       sidebar.dataset.state = expanded ? 'expanded' : 'collapsed';
       document.body.dataset.sidebarExpanded = String(expanded);
-      const btn = sidebar.querySelector('[data-sidebar-toggle]');
-      if (btn) btn.setAttribute('aria-expanded', String(expanded));
-      try { localStorage.setItem(STORAGE_KEY, String(expanded)); } catch {}
+      sidebar.querySelectorAll('[data-sidebar-toggle]').forEach((btn) => {
+        btn.setAttribute('aria-expanded', String(expanded));
+      });
+      // 모바일은 localStorage 저장 안 함 — 매번 collapsed로 시작 (UX)
+      if (!isMobile()) {
+        try { localStorage.setItem(STORAGE_KEY, String(expanded)); } catch {}
+      }
     };
 
+    // 초기 상태: 모바일은 항상 collapsed, 데스크톱은 localStorage
     let initial = false;
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved === 'true') initial = true;
-    } catch {}
+    if (!isMobile()) {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved === 'true') initial = true;
+      } catch {}
+    }
     setState(initial);
 
-    sidebar.addEventListener('click', (e) => {
+    // 모든 [data-sidebar-toggle] (사이드바 안 토글, 모바일 햄버거, 백드롭) 통합 처리
+    document.addEventListener('click', (e) => {
       const target = e.target;
-      if (target instanceof Element && target.closest('[data-sidebar-toggle]')) {
+      if (!(target instanceof Element)) return;
+      const toggle = target.closest('[data-sidebar-toggle]');
+      if (!toggle) return;
+      // backdrop 클릭은 항상 close
+      if (toggle.classList.contains('sidebar-backdrop')) {
+        setState(false);
+      } else {
         setState(sidebar.dataset.state !== 'expanded');
       }
+    });
+
+    // ESC 키로 모바일에서 닫기
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isMobile() && sidebar.dataset.state === 'expanded') {
+        setState(false);
+      }
+    });
+
+    // viewport resize 시 모바일 ↔ 데스크톱 전환 대응
+    window.matchMedia('(max-width: 1023px)').addEventListener('change', () => {
+      // 모바일로 진입하면 collapsed로 강제 (overlay이라 본문 가리기 방지)
+      if (isMobile()) setState(false);
     });
   })();
 </script>
 
 <style is:global>
-  /* body padding-left — fixed sidebar 옆으로 main/footer 밀기 */
+  /* 데스크톱 — 사이드바가 본문 옆으로 push */
   @media (min-width: 1024px) {
     body {
       padding-left: 56px;
@@ -352,34 +399,133 @@ const hasCurrentInCat: Record<Category, boolean> = {
       padding-left: 300px;
     }
   }
+
+  /* 모바일 — overlay 모드라 본문 padding 변화 X, scroll lock 추가 */
+  @media (max-width: 1023px) {
+    body[data-sidebar-expanded="true"] {
+      overflow: hidden;
+    }
+  }
 </style>
 
 <style>
   /* ──────────────────────────────────────────────────────────
-     레이아웃 — fixed positioning (스크롤 무관)
+     레이아웃
+     - 데스크톱(≥1024px): fixed sidebar, collapsed 56px ↔ expanded 300px (본문 옆으로 push)
+     - 모바일(<1024px): drawer overlay, transform translateX로 슬라이드 인/아웃
      ────────────────────────────────────────────────────────── */
   .sidebar {
-    /* 모바일 숨김 */
-    display: none;
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    background: linear-gradient(180deg, #0a0e1a 0%, #0f1424 100%);
+    border-right: 1px solid var(--color-border-subtle, #374151);
+    overflow: hidden;
   }
 
+  /* 모바일 — drawer 모드 */
+  @media (max-width: 1023px) {
+    .sidebar {
+      width: 85vw;
+      max-width: 320px;
+      transform: translateX(-100%);
+      transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 50;
+    }
+    .sidebar[data-state="expanded"] {
+      transform: translateX(0);
+      box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+    }
+    /* 모바일에선 사이드바 안 .sidebar-toggle은 close 역할 — close 아이콘 + 라벨 항상 보임 */
+    .sidebar > .sidebar-toggle .icon-menu { display: none; }
+    .sidebar > .sidebar-toggle .icon-close { display: block; }
+    .sidebar > .sidebar-toggle .toggle-label {
+      opacity: 1;
+      transition-delay: 0s;
+    }
+    /* 모바일에선 사이드바 안에서 항상 트리 표시 (collapsed/expanded 구분 없음) */
+    .sidebar .sidebar-content {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
+
+  /* 데스크톱 — 기존 collapsed/expanded width 토글 */
   @media (min-width: 1024px) {
     .sidebar {
-      display: flex;
-      flex-direction: column;
-      position: fixed;
-      top: 0;
-      left: 0;
-      bottom: 0; /* viewport 풀 높이 — footer 영향 X */
       width: 56px;
-      background: linear-gradient(180deg, #0a0e1a 0%, #0f1424 100%);
-      border-right: 1px solid var(--color-border-subtle, #374151);
       transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
-      overflow: hidden;
       z-index: 30;
     }
     .sidebar[data-state="expanded"] {
       width: 300px;
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────
+     모바일 햄버거 버튼 — 데스크톱에선 hidden
+     ────────────────────────────────────────────────────────── */
+  .mobile-hamburger {
+    display: none;
+  }
+  @media (max-width: 1023px) {
+    .mobile-hamburger {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: fixed;
+      top: 14px;
+      left: 14px;
+      width: 40px;
+      height: 40px;
+      border: 1px solid var(--color-border-subtle, #374151);
+      background: rgba(10, 14, 26, 0.85);
+      backdrop-filter: blur(8px);
+      color: var(--color-text-primary, #f3f4f6);
+      border-radius: 8px;
+      cursor: pointer;
+      z-index: 49;
+      transition: background 0.15s, color 0.15s;
+    }
+    .mobile-hamburger:hover {
+      background: rgba(34, 211, 238, 0.15);
+      color: var(--color-accent-cyan, #22d3ee);
+    }
+    .mobile-hamburger svg {
+      width: 20px;
+      height: 20px;
+    }
+    /* 사이드바 expanded 시 햄버거 숨김 (사이드바 안 close 버튼 사용) */
+    .sidebar[data-state="expanded"] ~ .mobile-hamburger {
+      opacity: 0;
+      pointer-events: none;
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────
+     모바일 backdrop — 사이드바 expanded 시 본문 위 어두운 overlay
+     ────────────────────────────────────────────────────────── */
+  .sidebar-backdrop {
+    display: none;
+  }
+  @media (max-width: 1023px) {
+    .sidebar-backdrop {
+      display: block;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(2px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
+      z-index: 45;
+    }
+    .sidebar[data-state="expanded"] ~ .sidebar-backdrop {
+      opacity: 1;
+      pointer-events: auto;
     }
   }
 
