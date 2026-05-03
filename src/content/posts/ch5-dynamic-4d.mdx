@@ -1,0 +1,127 @@
+---
+title: "4D 장면은 어떻게 표현되는가 — Dynamic Neural Rendering의 설계 철학"
+description: "Canonical space 분리부터 Topology change, 4D Gaussian Splatting, Monocular 재구성까지, 동적 장면 표현의 핵심 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [neural-rendering, dynamic-nerf, gaussian-splatting, deformation-field, 4d-reconstruction]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+정적 NeRF는 3D 공간을 아름답게 재현한다. 하지만 세계는 움직인다. 사람이 입을 열고, 손가락이 교차하고, 카메라가 이동한다. 이 4개의 챕터가 공유하는 질문은 하나다 — **움직이는 장면을 어떻게 효율적으로 표현하는가?** 그 답은 놀랍도록 일관된 철학에서 나온다.
+
+## 불변과 변화의 분리
+
+Dynamic scene을 표현하는 가장 단순한 방법은 NeRF에 시간 차원을 추가하는 것이다.
+
+$$F_\theta(\mathbf{x}, t, \mathbf{d}) \to (\sigma, \mathbf{c})$$
+
+하지만 이 naive 접근은 세 가지 문제를 만든다. 시간 변화가 작으면 같은 위치의 feature가 highly correlated되어 네트워크가 매 time step마다 별도 feature를 학습해야 하고, 학습 범위 밖의 시간에서 extrapolation이 무너지며, 네트워크 용량이 선형으로 증가한다.
+
+Nerfies(Park 2021)와 D-NeRF(Pumarola 2021)의 해법은 **불변(canonical)과 변화(deformation)를 분리**하는 것이다.
+
+$$\mathbf{x}^{\text{can}} = \mathbf{x} + D_\psi(\mathbf{x}, t)$$
+
+Canonical NeRF $F_\theta(\mathbf{x}^{\text{can}}, \mathbf{d})$는 장면의 기하와 외형을 기억하고, Deformation field $D_\psi$는 각 시간마다 점들이 어디로 이동했는지만 학습한다. 팔이 올라가는 동작에서 팔의 texture와 geometry는 canonical space에 고정되고, deformation field가 "이 시점에서 팔의 점들은 여기 있다"는 정보만 담는다. Canonical feature를 재사용하므로 학습이 빠르고 수렴이 안정적이다.
+
+Deformation field의 Jacobian $\mathbf{J} = \mathbf{I} + \nabla D_\psi$에서, elastic regularizer가 $\|\nabla D_\psi\|_F$를 작게 유지하면 $\det(\mathbf{J}) \approx 1$이 되어 변형이 부피를 보존한다 — 생리학적으로 타당한 motion의 수학적 조건이다.
+
+## Topology Change: 더 높은 차원에서 자르기
+
+Canonical + deformation 분리는 강력하지만 한계가 있다. 이 formulation은 **homeomorphism**, 즉 위상 불변 일대일 대응을 가정한다. 입이 열리고 닫히는 동작은 위상이 바뀐다 — closed surface가 open surface로 전환된다. 단일 canonical space로는 표현 불가능하다.
+
+HyperNeRF(Park 2021)의 답은 공간 자체를 높인다. 3D canonical space를 $\mathbb{R}^{3+H}$ ambient space로 확장하고, 시간에 따라 달라지는 hyperplane으로 그 공간을 자른다.
+
+$$\mathcal{M}(t) = \mathcal{M}^{\text{can}} \cap \{\mathbf{w} = \mathbf{w}(t)\}$$
+
+직관은 단순하다. 3D에서는 입 안쪽 surface가 열림/닫힘이라는 위상 변화를 표현할 수 없다. 4D ambient space에서 canonical surface를 정의하고, 시간마다 다른 방향에서 자르면 — 마치 S자 곡선을 수직선으로 자를 때 교점 개수가 달라지듯 — 서로 다른 위상의 geometry를 얻는다.
+
+<Theorem kind="proposition" number="1" title="Ambient Slicing의 Topology 표현력">
+$H \geq 1$인 ambient space와 time-dependent slicing $\mathbf{w}(t)$가 주어질 때, $\mathcal{M}(t) = \mathcal{M}^{\text{can}} \cap \{\mathbf{w} = \mathbf{w}(t)\}$는 시간에 따라 서로 다른 위상을 가질 수 있다.
+</Theorem>
+
+<Proof>
+Canonical manifold $\mathcal{M}^{\text{can}}$가 $\mathbf{w}$ 축 방향으로 transversally 변화한다고 하자. Slicing surface $\mathcal{S}(t)$가 연속으로 이동할 때, cross-section의 Euler characteristic $\chi(\mathcal{M}(t)) = \int_{\mathcal{M}^{\text{can}}} \delta(\mathbf{w} - \mathbf{w}(t))\, d\mathcal{M}$는 $\mathbf{w}(t)$가 transversal intersection 수가 변하는 값을 통과할 때 변한다. 따라서 topology change가 가능하다. $\square$
+</Proof>
+
+경험적으로 $H = 2$면 실제 비디오 장면(입 열림/닫힘, 손가락 교차)의 대부분을 커버하기에 충분하다. $H = 4$ 이상은 marginal improvement만 있고 계산 비용만 늘어난다.
+
+## 4D Gaussian Splatting: 명시성의 귀환
+
+NeRF 기반 4D 표현의 약점은 속도다. Volume integral과 time sampling이 결합되면 초당 1-2 프레임이 현실이다. 4D Gaussian Splatting은 **명시적 표현(explicit representation)**으로 이 병목을 공략한다.
+
+Yang 2024의 접근은 각 Gaussian에 시간에 따른 polynomial trajectory를 부여한다.
+
+$$\boldsymbol{\mu}_i(t) = \boldsymbol{\mu}_{i,0} + \sum_{k=1}^{K} \boldsymbol{a}_{i,k} t^k$$
+
+$K = 2$(quadratic)면 constant acceleration까지 표현하고, 미분하면 velocity $\mathbf{v}_i(t) = \sum_{k=1}^{K} k \boldsymbol{a}_{i,k} t^{k-1}$를 직접 얻는다. 명시적이고 해석 가능하며, 학습 범위 밖으로도 extrapolate된다.
+
+Wu 2024(4D-GS)의 HexPlane decomposition은 다른 전략을 택한다. 4D 공간(3D spatial + 1D time)을 6개의 2D plane으로 분해한다.
+
+$$F(x,y,z,t) = \sum_{\text{6 planes}} w_i \cdot \text{bilinear}(P_i, \text{coords})$$
+
+XY, XZ, XT, YZ, YT, ZT 각 plane에서 bilinear interpolation으로 feature를 얻고 합산한다. 4D full tensor 대신 6개 2D tensor만 저장하므로 메모리가 효율적이다.
+
+<Callout type="note" title="Polynomial vs HexPlane 트레이드오프">
+Polynomial trajectory는 per-Gaussian 계수를 저장하므로 $N$이 커지면 메모리가 선형 증가한다. 대신 extrapolation이 강하고 velocity가 명시적이다. HexPlane은 global 모델이라 $N$에 무관하지만 고정된 rank 가정으로 high-rank motion을 과소 표현할 수 있다. 짧은 clip의 dense reconstruction에는 HexPlane, long-horizon physics-aware reconstruction에는 polynomial이 우세하다.
+</Callout>
+
+## Monocular Video: 가장 어려운 설정
+
+Multi-view 설정에서는 epipolar geometry가 강력한 제약을 제공한다. Monocular(단일 카메라) 비디오에서는 그 제약이 사라진다. 카메라 움직임과 물체 움직임을 분리할 수 없고, absolute scale은 원리적으로 복원 불가능하다.
+
+<Theorem kind="proposition" number="2" title="Monocular Scale Ambiguity">
+Monocular visual data만으로 camera trajectory의 absolute scale을 복원하는 것은 불가능하다.
+</Theorem>
+
+<Proof>
+Camera trajectory $T_i$를 scale factor $s > 0$으로 scaling하고 depth를 $D'(\mathbf{u}) = s \cdot D(\mathbf{u})$로 조정하면 rendered image는 동일하다. 따라서 임의의 $s$에 대해 동일한 visual observation을 생성하는 해가 존재하며, visual data만으로 $s$를 결정할 수 없다. $\square$
+</Proof>
+
+실무 해법은 multi-term loss다.
+
+$$\min_{\mathbf{T}, \Phi} \mathcal{L}_{\text{photo}} + \lambda_d \mathcal{L}_{\text{depth}} + \lambda_f \mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{reg}}$$
+
+photometric loss가 RGB를 맞추고, depth consistency가 3D geometric 제약을 가하며, optical flow loss가 motion field를 정합시킨다. ARAP(As-Rigid-As-Possible) regularizer는 국소적으로 rigid-like 변형을 유도해 비물리적인 deformation을 억제한다.
+
+COLMAP 같은 전통적 SfM은 moving foreground가 image의 큰 비율을 차지하면 무너진다. RANSAC의 inlier ratio가 낮아지면 카메라 pose 추정 자체가 실패한다. 최근의 MASt3R 같은 feed-forward 접근은 대규모 데이터로 학습된 Vision Transformer가 consecutive frame pair에서 depth와 relative pose를 직접 예측해 dynamic object에 더 강인하게 동작한다.
+
+<Aside label="설계 철학">
+4개의 챕터를 관통하는 원칙은 동일하다 — **모르는 것을 네트워크에 다 맡기지 말고, 알고 있는 구조를 명시적으로 분리하라**. Canonical/deformation 분리, ambient slicing, polynomial trajectory, multi-term loss 모두 이 원칙의 다른 표현이다. 구조를 명시할수록 학습이 효율적이고 결과가 해석 가능해진다.
+</Aside>
+
+## 정리
+
+- **Canonical + Deformation 분리**는 불변 geometry를 재사용하게 해 학습 효율을 높인다. Elastic regularizer가 부피 보존을 유도한다.
+- **Topology change**는 $\mathbb{R}^{3+H}$ ambient space로 확장하고 time-dependent slicing으로 해결한다. $H = 2$면 대부분의 실제 장면에 충분하다.
+- **4D Gaussian Splatting**은 polynomial trajectory(명시적, extrapolation 강함)와 HexPlane decomposition(메모리 효율적, 빠른 lookup)이라는 두 전략을 제시한다.
+- **Monocular 재구성**에서 scale ambiguity는 원리적 한계다. Multi-term loss + strong regularization이 실무적 해법이며, absolute scale은 depth prior나 외부 센서가 필요하다.
+
+동적 장면 표현은 "무엇을 고정하고 무엇을 변화시킬 것인가"를 설계하는 문제다.
+
+<Reference
+  title="Nerfies: Deformable Neural Radiance Fields"
+  authors="Park et al."
+  year={2021}
+  venue="ICCV"
+  url="https://arxiv.org/abs/2011.12948"
+/>
+
+<Reference
+  title="HyperNeRF: A Higher-Dimensional Representation for Topologically Varying Neural Radiance Fields"
+  authors="Park et al."
+  year={2021}
+  venue="ACM TOG"
+  url="https://arxiv.org/abs/2106.13228"
+/>

@@ -1,0 +1,139 @@
+---
+title: "3D 표현의 두 철학 — Explicit과 Implicit은 어떻게 다른가"
+description: "정점과 면으로 위상을 명시하는 Explicit부터 level set으로 표면을 암시하는 Implicit까지, 3D Neural Rendering의 기초 표현 분류를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [3d-representation, implicit-surface, sdf, occupancy, neural-rendering]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+3D 기하학의 모든 표현 방식은 하나의 질문으로 갈린다 — **위상(topology) 정보를 자료 구조에 직접 저장하는가, 아니면 함수의 level set으로 암시하는가**. NeRF부터 3D Gaussian Splatting까지, 최신 neural 3D 기술도 결국 이 분류 위에 서 있다. 왜 SDF는 구현이 까다롭고 Occupancy는 학습이 쉬운가? 그리고 PointNet은 왜 permutation invariance를 이론적으로 보장할 수 있는가?
+
+## 위상을 어디에 저장하는가
+
+Explicit representation의 본질은 단순하다. Mesh $\mathcal{M} = (V, F)$에서 $V \in \mathbb{R}^{3 \times N}$은 정점 좌표이고 $F \in \mathbb{N}^{3 \times M}$은 삼각형 인덱스다. 위상 정보 — 어떤 정점이 연결되는가 — 가 데이터 구조 안에 명시적으로 들어 있다. 위상을 바꾸려면 vertex/face list를 이산적으로 수정해야 한다.
+
+Implicit representation은 정반대 선택을 한다. 함수 $\phi: \mathbb{R}^3 \to \mathbb{R}$를 정의하고, 표면을 그 함수의 level set으로 표현한다.
+
+$$S = \{\mathbf{x} \in \mathbb{R}^3 : \phi(\mathbf{x}) = 0\}$$
+
+위상 정보는 데이터 구조에 없다. $\phi$가 연속함수라면, $t$에 따라 $\phi_t$가 연속으로 변할 때 $S_t = \{\mathbf{x} : \phi_t(\mathbf{x}) = 0\}$도 연속으로 변한다. 핸들 생성, 구멍 소멸 같은 위상 변화가 discrete jump 없이 자동으로 처리된다. Implicit Function Theorem이 보장하는 것이다 — $\phi$가 $C^1$이고 $\nabla\phi(\mathbf{x}_0) \neq 0$이면 level set은 $\mathbf{x}_0$ 근처에서 smooth 2D surface다.
+
+```
+                  메모리      렌더링          위상 변화      편집
+Mesh           O(N)          GPU-fast      discrete      직접 조작
+Point Cloud    O(N)          splatting     soft          직접 조작
+Voxel          O(N³)         raycasting    trivial       grid 조작
+SDF            O(θ)          sphere tracing 자동          implicit
+Occupancy      O(θ)          occupancy-grid 자동          implicit
+```
+
+## SDF와 Eikonal 방정식
+
+Signed Distance Function은 implicit representation 중 가장 정보가 풍부하다.
+
+$$\phi(\mathbf{x}) = \begin{cases} +d(\mathbf{x}, S) & \text{if } \mathbf{x} \text{ outside } S \\ -d(\mathbf{x}, S) & \text{if } \mathbf{x} \text{ inside } S \end{cases}$$
+
+부호가 inside/outside를 알려주고 크기가 표면까지의 거리를 알려준다. 이 거리 함수는 반드시 다음 조건을 만족한다.
+
+$$\|\nabla\phi(\mathbf{x})\| = 1 \quad \text{a.e.}$$
+
+이를 **Eikonal 방정식**이라 한다. $\mathbf{x}$에서 가장 가까운 표면 점을 $\mathbf{x}_*$라 하면, $\nabla\phi(\mathbf{x}) = (\mathbf{x} - \mathbf{x}_*) / \|\mathbf{x} - \mathbf{x}_*\|$이므로 크기가 정확히 1이 된다. 이 성질은 **Sphere Tracing**의 핵심 보장이다.
+
+Sphere Tracing은 ray $\mathbf{r}(t) = \mathbf{r}_0 + t\mathbf{d}$를 따라 표면을 찾는 알고리즘이다. 현재 점에서 step size를 $\phi(\mathbf{x}_k)$로 설정한다.
+
+$$\mathbf{x}_{k+1} = \mathbf{x}_k + \phi(\mathbf{x}_k) \cdot \mathbf{d}$$
+
+Eikonal이 보장된다면 $\phi(\mathbf{x}_k)$가 정확히 표면까지의 거리이므로, 이 step은 표면을 절대 overshoot하지 않는다. Lipschitz-1 함수에서 step size = 함수값은 안전한 "구의 반지름"이다.
+
+<Callout type="warning" title="Neural SDF의 Eikonal 위반">
+Neural network로 $\phi_\theta$를 학습할 때 Eikonal이 자동으로 만족되지는 않는다. $\|\nabla\phi_\theta\| < 1$이면 sphere tracing이 undershooting을 반복해 수렴이 느려지고, $\|\nabla\phi_\theta\| > 1$이면 overshoot으로 표면을 놓친다. DeepSDF 계열에서 Eikonal loss $\mathcal{L}_{\text{eikonal}} = \mathbb{E}[\|\nabla_\mathbf{x}\phi_\theta\| - 1]^2$를 regularization으로 쓰는 이유가 이것이다.
+</Callout>
+
+## PointNet과 Permutation Invariance
+
+Point cloud는 unordered set이다. 같은 기하학이 점들의 순서에 따라 다르게 표현될 수 있다. PointNet(Qi et al. 2017)은 이 문제를 symmetric aggregation으로 해결한다.
+
+$$f(\mathcal{P}) = \text{MLP}_2\!\left(\max_{p \in \mathcal{P}} \text{MLP}_1(p)\right)$$
+
+max는 교환법칙이 성립하므로 점의 순서와 무관하다. 이것이 permutation invariance의 구현이다. 그리고 이는 단순한 공학적 선택이 아니다.
+
+<Theorem kind="theorem" number="1" title="PointNet Universal Approximation (Qi et al. 2017)">
+$\gamma: \mathbb{R}^3 \to \mathbb{R}^{d_1}$과 $f: \mathbb{R}^{d_1} \to \mathbb{R}^{d_2}$가 충분히 큰 MLP이면,
+
+$$\Phi(\mathcal{P}) = f\!\left(\max_{p \in \mathcal{P}} \gamma(p)\right)$$
+
+는 임의의 연속 대칭 함수 $g: \mathcal{S}_n \to \mathbb{R}^{d_2}$를 균등 근사할 수 있다.
+</Theorem>
+
+<Proof>
+(1) max는 임의의 permutation에 대해 가환이므로 $\Phi$는 permutation invariant하다. (2) Hornik(1989)의 universal approximation에 의해 $\gamma$와 $f$ 각각이 임의의 연속 함수를 근사한다. (3) 연속 대칭 함수들의 집합은 균등 위상에서 dense하며, $f \circ \max \circ \gamma$의 합성이 이 집합을 dense하게 근사한다. $\square$
+</Proof>
+
+즉, max-pooling은 단순한 구현 편의가 아니라 이론적으로 정당화된 aggregation이다. T-Net은 이 위에 더해, point cloud를 canonical orientation으로 변환하는 $3 \times 3$ 변환 행렬을 학습한다 — rotation에 robust한 표현을 위해.
+
+## Occupancy와 Marching Cubes
+
+Occupancy function $o: \mathbb{R}^3 \to [0, 1]$은 SDF보다 단순하다. 표면은 $o(\mathbf{x}) = 0.5$의 level set이다. 거리 정보가 없어 sphere tracing은 불가능하지만, 학습은 Binary Cross-Entropy로 안정적으로 수렴한다. Eikonal loss처럼 gradient 계산을 autograd로 거칠 필요가 없다.
+
+Neural implicit에서 mesh를 추출하는 표준 방법은 **Marching Cubes**(Lorensen & Cline 1987)다. Bounding box를 $n \times n \times n$ voxel grid로 분할하고, 각 corner에서 $o(\mathbf{x})$를 평가한다. 8개 corner의 threshold 초과 여부로 $2^8 = 256$가지 configuration code가 생성되고, 미리 계산된 lookup table이 각 code에 대응하는 삼각형 목록을 반환한다. Edge의 정확한 교차점은 선형 보간으로 결정된다.
+
+$$\mathbf{v}_{\text{edge}} = \mathbf{v}_0 + t(\mathbf{v}_1 - \mathbf{v}_0), \quad t = \frac{0.5 - o(\mathbf{v}_0)}{o(\mathbf{v}_1) - o(\mathbf{v}_0)}$$
+
+256 configuration 중 rotation symmetry를 고려하면 실질적으로 15가지 topological class가 존재한다. 알고리즘의 복잡도는 $O(n^3 D)$ — $D$는 네트워크 forward pass 비용이다.
+
+## 트레이드오프
+
+<Callout type="note" title="표현 방식의 트레이드오프">
+| | Explicit (Mesh) | SDF | Occupancy | Hybrid (GS) |
+|---|---|---|---|---|
+| 렌더링 | Rasterization (빠름) | Sphere tracing (느림) | Grid sampling | Splatting (매우 빠름) |
+| 위상 변화 | discrete (어려움) | 연속 (자동) | 연속 (자동) | 연속 |
+| 학습 안정성 | — | Eikonal 필요 | BCE (안정) | — |
+| Mesh 추출 | 직접 | Marching Cubes | Marching Cubes | 추가 처리 필요 |
+| 편집 | 직접 vertex 조작 | Implicit deformation | Implicit deformation | Gaussian parameter |
+
+SDF는 거리 정보 덕분에 sphere tracing과 smooth reconstruction에서 우위이나, Eikonal 제약이 학습을 복잡하게 만든다. Occupancy는 학습이 쉽지만 표면 세밀도가 resolution에 종속된다. Mesh는 CAD, 3D 프린팅, 게임 엔진에서 필수적이지만 위상 변화에 취약하다.
+</Callout>
+
+<Aside label="Hybrid의 위치">
+3D Gaussian Splatting은 이 분류에서 흥미로운 위치를 차지한다. 점의 위치 $\mu$는 explicit (mesh의 정점처럼), 공분산 $\Sigma$는 implicit (어디서든 평가 가능). 빠른 splatting 렌더링과 직접적인 parameter 편집을 동시에 얻는다.
+</Aside>
+
+## 정리
+
+- Explicit은 위상을 $(V, F)$ 자료 구조에 저장한다. 편집이 직접적이지만 위상 변화는 이산적이다.
+- Implicit은 $\phi(\mathbf{x}) = 0$의 level set으로 표면을 정의한다. 위상 변화가 자연스럽고 neural parameterization과 잘 맞는다.
+- SDF의 Eikonal 성질 $\|\nabla\phi\| = 1$은 sphere tracing의 안정성을 이론적으로 보장한다. Neural SDF는 이를 명시적으로 강제해야 한다.
+- PointNet의 max-pooling은 permutation invariance를 보장하는 동시에 대칭 함수의 universal approximator임이 증명된다.
+- Occupancy는 학습 안정성을 선택하고 Marching Cubes로 mesh를 추출한다. SDF는 품질을 선택하고 복잡성을 감수한다.
+
+다음 글에서는 이 표현들이 실제로 빛을 계산하는 방식 — Rendering Equation과 volume rendering integral — 으로 어떻게 연결되는지 추적한다.
+
+<Reference
+  title="PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation"
+  authors="Qi et al."
+  year={2017}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1612.00593"
+/>
+
+<Reference
+  title="DeepSDF: Learning Continuous Signed Distance Functions for Shape Representation"
+  authors="Park et al."
+  year={2019}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1901.05103"
+/>

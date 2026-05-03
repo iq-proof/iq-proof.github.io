@@ -1,0 +1,147 @@
+---
+title: "3D Gaussian Splatting은 왜 NeRF보다 100배 빠른가"
+description: "Anisotropic Gaussian 파라미터화부터 EWA Projection, Tile-based Rasterization, Adaptive Density Control까지 — 3DGS의 모든 설계 결정이 수렴하는 하나의 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [3d-gaussian-splatting, neural-rendering, nerf, rasterization, spherical-harmonics]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+NeRF는 MLP를 통해 3D 장면을 암묵적으로 표현한다. 아름답지만 느리다. 한 장면을 렌더링하는 데 수백 밀리초가 걸린다. 3D Gaussian Splatting(3DGS)은 같은 품질을 30배 빠른 학습과 100배 빠른 렌더링으로 달성한다. 어떻게? 그리고 그 속도가 어떤 설계 결정의 귀결인가?
+
+## 명시적 표현의 출발점: Anisotropic Gaussian
+
+3DGS의 핵심은 장면을 수십만 개의 3D Gaussian으로 표현한다는 것이다. 각 Gaussian은 5가지로 정의된다: 중심 위치 $\boldsymbol{\mu} \in \mathbb{R}^3$, unit quaternion $\mathbf{q} \in S^3$, scaling vector $\mathbf{s} \in \mathbb{R}^3_{>0}$, Spherical Harmonics 계수 $\mathbf{C} \in \mathbb{R}^{48}$, 그리고 opacity $\alpha \in [0,1]$.
+
+covariance 행렬은 다음과 같이 분해된다.
+
+$$
+\boldsymbol{\Sigma} = R(\mathbf{q}) \begin{pmatrix} s_1^2 & 0 & 0 \\ 0 & s_2^2 & 0 \\ 0 & 0 & s_3^2 \end{pmatrix} R(\mathbf{q})^T
+$$
+
+왜 이 분해인가? $\boldsymbol{\Sigma}$를 6개 독립 원소로 직접 최적화하면 gradient descent 도중 행렬이 positive-definite 조건을 벗어날 수 있다. 수치 불안정이다. quaternion + scaling 분해는 $s_i > 0$ 조건만 유지하면 $\boldsymbol{\Sigma}$가 **항상** PD임을 보장한다.
+
+<Theorem kind="proposition" number="1" title="Anisotropic Gaussian PD 보장">
+모든 $\mathbf{q} \in S^3$, $\mathbf{s} \in \mathbb{R}^3_{>0}$에 대해 $\boldsymbol{\Sigma} = R(\mathbf{q})\,\mathbf{S}\mathbf{S}^T R(\mathbf{q})^T$는 positive-definite이다.
+</Theorem>
+
+<Proof>
+임의의 $\mathbf{v} \neq \mathbf{0}$에 대해 $\mathbf{u} := R(\mathbf{q})^T \mathbf{v}$로 놓으면, $R$이 orthogonal이므로 $\mathbf{u} \neq \mathbf{0}$이다. 그러면
+
+$$\mathbf{v}^T \boldsymbol{\Sigma}\, \mathbf{v} = \mathbf{u}^T \mathbf{S}\mathbf{S}^T \mathbf{u} = s_1^2 u_1^2 + s_2^2 u_2^2 + s_3^2 u_3^2 > 0$$
+
+이므로 $\boldsymbol{\Sigma} \succ 0$. $\square$
+</Proof>
+
+quaternion은 타원체의 **방향**, scaling은 타원체의 **주축 길이**를 독립적으로 제어한다. 이 분리가 학습 안정성의 근거다.
+
+## 색상의 표현: Spherical Harmonics
+
+NeRF는 view direction을 MLP에 입력해 view-dependent color를 생성한다. 3DGS는 다른 선택을 한다 — Spherical Harmonics(SH) 전개다.
+
+$$
+\mathbf{c}(\mathbf{d}) = \sum_{l=0}^{L} \sum_{m=-l}^{l} \mathbf{C}^{lm} Y_l^m(\mathbf{d})
+$$
+
+$\{Y_l^m\}$은 $L^2(S^2)$의 complete orthonormal basis다. $L=3$이면 $(L+1)^2 = 16$개 기저, RGB 채널 3개를 곱하면 **48 파라미터/Gaussian**이다.
+
+MLP 평가 대신 다항식 계산만 필요하므로 폐쇄형(closed-form) 평가가 가능하다. 직교 기저라는 성질은 각 계수를 독립적으로 학습할 수 있게 해 수렴을 안정화한다. 낮은 degree $l$은 diffuse, 높은 $l$은 specular를 포착한다.
+
+<Aside label="NeRF와의 차이">
+NeRF의 positional encoding은 Euclidean space에 최적화된 1D Fourier 기반으로, 구면 도메인에서는 SH보다 compact하지 않다. SH는 구면 위 함수 표현에 자연스럽게 맞는 기저다. 실측 벤치마크에서 SH 평가는 MLP보다 5–10배 빠르다.
+</Aside>
+
+## 2D 투영: EWA Jacobian
+
+3D Gaussian을 2D 이미지에 그리려면 perspective projection을 거쳐야 한다. 문제는 perspective projection이 비선형이라는 것이다 — 3D Gaussian을 투영해도 2D에서 Gaussian이 보장되지 않는다.
+
+해결책은 Gaussian 중심 $\boldsymbol{\mu}_{3D}$에서 1차 Taylor 선형화다(Zwicker et al., 2001). Jacobian $J = \partial\boldsymbol{\pi}/\partial\mathbf{X}$를 계산하면,
+
+$$
+J = \begin{pmatrix} f/Z & 0 & -fX/Z^2 \\ 0 & f/Z & -fY/Z^2 \end{pmatrix}
+$$
+
+2D covariance는 covariance 전파 공식에 의해 다음과 같다.
+
+$$
+\boldsymbol{\Sigma}_{2D} = J\, \boldsymbol{\Sigma}_{3D}\, J^T
+$$
+
+perspective projection에서 $Z > 0$이면 $\text{rank}(J) = 2$가 항상 성립하므로, $\boldsymbol{\Sigma}_{3D} \succ 0$이면 $\boldsymbol{\Sigma}_{2D} \succ 0$이다 — 역행렬 계산이 수치적으로 안전하다. 깊이 $Z$가 커질수록 $f/Z$가 작아져 2D splat이 자연스럽게 작아진다. 이 전 과정이 미분 가능하므로 gradient가 역전파된다.
+
+## Tile-based Rasterization과 Alpha-Compositing
+
+2D Gaussian을 이미지에 렌더링하는 방식이 속도의 핵심이다. 3DGS는 이미지를 16×16 tile로 분할하고, 각 tile에 영향을 미치는 Gaussian만 수집해 독립적인 CUDA kernel로 처리한다.
+
+각 tile 안에서 Gaussian을 depth 순으로 정렬한 뒤 alpha-compositing을 적용한다.
+
+$$
+\mathbf{C} = \sum_{i=1}^{K} \alpha_i \left(\prod_{j=1}^{i-1}(1 - \alpha_j)\right) \mathbf{c}_i
+$$
+
+transmittance $T_i = \prod_{j<i}(1-\alpha_j)$가 일정 임계값 이하로 떨어지면 이후 Gaussian은 무시한다(early termination). 대부분의 픽셀은 실제로 10–100개의 Gaussian만 관여하므로 per-pixel 계산량이 $O(K_\text{tile})$로 제한된다.
+
+<Callout type="warning" title="depth sort는 필수다">
+Gaussian을 역순(먼 것에서 가까운 것)으로 정렬하면 transmittance 계산이 틀어져 가까운 불투명 Gaussian이 뒤 Gaussian의 색을 가리지 못한다. depth order가 렌더링 정확도의 전제 조건이다.
+</Callout>
+
+NeRF는 ray별로 MLP를 수백 번 호출한다. 3DGS는 MLP 호출이 없다. tile 단위 CUDA 병렬화가 완벽하게 적용된다. 이것이 100+ FPS의 근거다.
+
+## Adaptive Density Control: Clone · Split · Prune
+
+3DGS가 NeRF보다 단순히 빠른 것만이 아니라 동등한 품질을 달성하는 이유는 학습 도중 Gaussian 개수를 동적으로 조정하기 때문이다.
+
+loss $\mathcal{L}$에 대한 2D 위치 gradient $\|\nabla_{\boldsymbol{\mu}_{2D}} \mathcal{L}\|$가 임계값 $\tau$를 넘으면 해당 Gaussian은 현재 영역을 충분히 표현하지 못한다는 신호다.
+
+- **Clone**: gradient 크고 Gaussian이 작으면 — 같은 위치에 복제
+- **Split**: gradient 크고 Gaussian이 크면 — 크기 1/1.6로 축소 후 두 개로 분할
+- **Prune**: $\alpha < \epsilon$이면 제거
+- **Opacity Reset**: 주기적으로 모든 $\alpha$를 0.5로 초기화
+
+Opacity Reset이 없으면 $\alpha = 1$에 수렴한 Gaussian이 뒤의 모든 Gaussian으로 가는 gradient를 차단한다. Reset은 모든 Gaussian이 재경쟁할 기회를 준다. 초기 ~10k Gaussian에서 시작해 학습 후 ~100k+로 증가하는 것은 이 메커니즘의 결과다.
+
+<Callout type="note" title="트레이드오프">
+Adaptive Density Control은 강력하지만 hyperparameter에 민감하다. gradient threshold $\tau$, scale threshold, pruning $\epsilon$은 scene마다 최적값이 다르다. densification을 너무 자주 하면 overhead가 늘고, 너무 드물면 under-representation이 남는다. opacity reset은 수렴 중인 Gaussian도 흔들어 일시적 품질 저하를 유발한다.
+</Callout>
+
+## 정리
+
+3DGS의 모든 설계 결정은 하나의 원칙으로 수렴한다 — **명시적 기하학 + 닫힌형 계산**. MLP 대신 SH, ray marching 대신 tile rasterization, implicit volume 대신 explicit Gaussian — 각 결정이 NeRF의 계산 병목을 한 겹씩 제거한다.
+
+- quaternion + scaling 분해는 $\boldsymbol{\Sigma} \succ 0$을 항상 보장하며 gradient를 안정화한다.
+- SH는 MLP 평가 없이 폐쇄형으로 view-dependent color를 표현한다.
+- EWA Jacobian은 perspective 비선형성을 1차 선형화로 처리하며 미분 가능성을 유지한다.
+- Tile-based rasterization은 per-pixel 계산을 $O(K_\text{tile})$로 제한해 CUDA 병렬화를 최대화한다.
+- Adaptive Density Control은 gradient 신호에 따라 표현력을 자동으로 조정한다.
+
+Mip-NeRF 360 벤치마크에서 3DGS는 PSNR 27–28 dB, 학습 30분(V100), 렌더링 100+ FPS를 달성한다. 같은 벤치마크에서 NeRF 계열은 1–2일 학습, 1–5 FPS다.
+
+속도는 우연이 아니다. 명시적 표현과 닫힌형 계산이라는 철학의 귀결이다.
+
+<Reference
+  title="3D Gaussian Splatting for Real-Time Radiance Field Rendering"
+  authors="Kerbl et al."
+  year={2023}
+  venue="SIGGRAPH"
+  url="https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/"
+/>
+
+<Reference
+  title="EWA Splatting"
+  authors="Zwicker et al."
+  year={2001}
+  venue="IEEE TVCG"
+  url="https://www.cs.umd.edu/~zwicker/publications/EWASplatting-TVCG02.pdf"
+/>

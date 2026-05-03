@@ -1,0 +1,128 @@
+---
+title: "Text-to-3D는 왜 2D에서 시작하는가"
+description: "3D 데이터 부족이라는 근본 제약부터 Score Distillation Sampling의 유도, Mode-Seeking 한계, VSD의 해결, Multi-View 일관성까지 — Text-to-3D의 설계 결정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [text-to-3d, score-distillation, nerf, diffusion, multi-view]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Text-to-3D는 단순한 생성 문제가 아니다. LAION 5.85B 개의 텍스트-이미지 쌍이 있는 반면, 3D 모델 데이터셋인 Objaverse는 800K 개에 불과하다 — 비율로 치면 7300:1이다. 왜 이 비대칭이 Text-to-3D 전체 설계를 결정짓는가?
+
+## 데이터 비대칭이 만든 선택
+
+3D를 직접 학습하는 것은 자연스러운 출발점처럼 보인다. 하지만 3D diffusion을 scratch부터 학습하려면 방대한 3D 데이터가 필요하고, 그 데이터는 없다. Objaverse 800K에서 모델당 평균 12개의 렌더링을 뽑아도 9.6M 이미지 — LAION 대비 609배 작다.
+
+DreamFusion(Poole et al. 2023)은 이 문제를 우회하는 방식을 제안했다. LAION으로 이미 학습된 2D diffusion model을 **frozen 상태**로 두고, 그것을 3D 파라미터 최적화의 *scoring function*으로만 사용하는 것이다. 3D 데이터 없이 2D prior를 distill한다.
+
+$$
+\text{Text-to-3D} = \text{frozen 2D prior} + \text{differentiable renderer} + \text{score distillation}
+$$
+
+NeRF 파라미터 $\theta$로부터 카메라 $\pi$에서 이미지 $z = g(\theta, \pi)$를 렌더링하고, frozen diffusion이 그 이미지가 텍스트 프롬프트 $y$와 얼마나 일치하는지 평가한다. 평가 결과를 gradient로 변환해 NeRF만 업데이트한다.
+
+## SDS: Score를 Loss로 바꾸는 방법
+
+Frozen diffusion을 scoring function으로 쓰는 핵심 공식이 **Score Distillation Sampling(SDS)**이다.
+
+<Theorem kind="proposition" number="1" title="SDS Gradient">
+NeRF 파라미터 $\theta$에 대한 SDS loss의 gradient:
+
+$$
+\nabla_\theta \mathcal{L}_{\text{SDS}} = \mathbb{E}_{t, \epsilon, \pi} \left[ w(t) \left(\hat{\epsilon}_\phi(z_t; y, t) - \epsilon\right) \frac{\partial z}{\partial \theta} \right]
+$$
+
+여기서 $z_t = \alpha_t z + \sigma_t \epsilon$, $\hat{\epsilon}_\phi$는 frozen diffusion의 noise 예측이다.
+</Theorem>
+
+<Proof>
+NeRF의 rendered image 분포 $q_\theta(z)$와 conditional diffusion $p_\phi(z|y)$ 간의 KL divergence를 전개하면:
+
+$$
+\nabla_\theta \mathrm{KL}(q_\theta \| p_\phi) = -\mathbb{E}_{z \sim q_\theta}\left[\nabla_z \log p_\phi(z|y) \cdot \frac{\partial z}{\partial \theta}\right]
+$$
+
+Diffusion score $\nabla_z \log p_\phi = -\hat{\epsilon}_\phi / \sigma_t$를 대입하고 timestep $t$에 대한 기대값을 취하면 위 형태가 된다. 결정적으로 $\hat{\epsilon}_\phi$에 대한 Jacobian $\partial \hat{\epsilon}_\phi / \partial z_t$는 identity로 근사된다 — U-Net의 Jacobian norm이 $\approx 1$에 가깝다는 경험적 관찰에 근거한다. 이 근사 덕분에 gradient가 diffusion model을 통하지 않고 renderer만 거친다. $\square$
+</Proof>
+
+이 구조가 계산적으로 효율적인 이유는 명확하다. Diffusion model은 inference만 수행하고(frozen), 최적화 대상은 NeRF parameters뿐이다. U-Net(~860M params)을 전혀 건드리지 않고 NeRF(~10^5 params)만 업데이트한다.
+
+## Mode-Seeking: SDS가 만드는 아티팩트
+
+SDS는 $\mathrm{KL}(q_\theta \| p_\phi)$, 즉 **reverse-KL**을 최소화한다. Reverse-KL의 본질적 특성은 mode-seeking이다 — prior가 multimodal이어도 $q_\theta$는 하나의 dominant mode에 집중한다.
+
+<Callout type="warning" title="Over-Saturation의 원인">
+Diffusion prior $p_\phi$가 학습한 "원형적 이미지"는 색이 saturated하고 디테일이 선명하다. Reverse-KL로 최적화된 NeRF는 이 단일 원형에 수렴한다. Classifier-Free Guidance(CFG) scale $s > 1$은 effective prior를 $p \propto p(z|y)^{1+s}/p(z|\emptyset)^s$로 변환해 mode-seeking을 더욱 강화한다.
+</Callout>
+
+결과: cartoon-like appearance, 낮은 다양성, Janus problem(모든 방향에서 같은 얼굴). 이는 algorithm의 버그가 아니라 **reverse-KL의 수학적 귀결**이다.
+
+## VSD: 두 Score의 차이로 Mode-Covering 유도
+
+ProlificDreamer(Wang et al. 2023)는 score를 하나 더 도입해 이 문제를 해결한다.
+
+$$
+\mathcal{L}_{\text{VSD}} = \mathbb{E}_{t, \epsilon, \pi}\left[\left\|\hat{\epsilon}_\phi(z_t; y, t) - \hat{\epsilon}_\psi(z_t; y, t, \theta)\right\|^2\right]
+$$
+
+$\hat{\epsilon}_\phi$는 frozen global prior, $\hat{\epsilon}_\psi$는 현재 NeRF $\theta$에 맞춤화된 **particle-specific score**다. $\hat{\epsilon}_\psi$는 frozen U-Net에 LoRA adapter를 추가해 구현된다 — U-Net 전체(860M params)가 아니라 rank-128 adapter만 학습하므로 파라미터 효율적이다.
+
+$\mathcal{L}_{\text{VSD}} = 0$의 조건은 $\hat{\epsilon}_\psi^* = \hat{\epsilon}_\phi$, 즉 두 score가 같아지는 것이다. Score uniqueness에 의해 이는 $p_\psi(z|y) = p_\phi(z|y)$를 의미한다 — particle-specific score가 global prior 전체를 따르게 된다. Prior가 multimodal이면 여러 샘플이 여러 mode에 분산된다. Wasserstein gradient flow의 관점에서 mode-covering과 유사한 거동이 나타난다.
+
+## Multi-View 일관성: Janus를 제거하는 방법
+
+SDS/VSD의 또 다른 한계는 각 iteration에서 단일 view만 평가한다는 것이다. 같은 NeRF의 앞면과 뒷면이 독립적으로 평가되므로, diffusion이 매 각도에서 "얼굴"을 요구하면 물리적으로 불가능한 다면체가 만들어진다.
+
+해결책은 여러 view를 동시에 평가하는 것이다.
+
+**Zero-1-to-3**(Liu et al. 2023)는 relative camera pose를 조건부로 사용한다. Absolute frame 대신 "reference view로부터 45도 회전"이라는 상대적 개념으로 학습하므로 크기/위치에 무관하게 일반화된다.
+
+**MVDream**(Shi et al. 2024)은 4-view를 동시에 생성하면서 cross-view attention을 도입한다:
+
+$$
+\text{Attention}_{\text{cross}}(Q_i, K_j, V_j) = \text{softmax}\left(\frac{Q_i K_j^\top}{\sqrt{d}}\right) V_j, \quad i \neq j
+$$
+
+각 view의 denoising이 다른 view의 구조를 "인식"한다 — epipolar geometry가 soft constraint로 내재화된다.
+
+<Aside label="속도의 트레이드오프">
+Instant3D(Li et al. 2024)는 multi-view diffusion + Large Reconstruction Model(LRM) regression을 결합해 5초 내 3D를 생성한다. SDS/VSD의 1000+ iterations 대신 single feed-forward pass다. 대신 iterative refinement가 없으므로 fine-grained control이 어렵다 — "3D 생성이 optimization에서 regression으로 shift"하는 패러다임 변화의 사례다.
+</Aside>
+
+## 정리
+
+- Text-to-3D의 근본 선택은 **데이터 비대칭**에서 나온다. LAION 5.85B vs Objaverse 800K.
+- SDS는 frozen 2D diffusion을 scoring function으로 활용해 3D 데이터 없이 NeRF를 최적화한다.
+- SDS의 over-saturation은 reverse-KL의 mode-seeking 특성의 필연적 귀결이다.
+- VSD는 두 score의 차이를 최소화해 mode-covering 방향으로 유도하고, LoRA로 계산 효율을 확보한다.
+- Multi-view consistency(Zero-1-to-3, MVDream)는 Janus problem을 제거하는 핵심 열쇠다.
+
+2D 이미지 수십억 장이 쌓인 덕분에, 3D 데이터 없이도 3D를 만드는 것이 가능해졌다.
+
+<Reference
+  title="DreamFusion: Text-to-3D using 2D Diffusion"
+  authors="Poole et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2209.14988"
+/>
+
+<Reference
+  title="ProlificDreamer: High-Fidelity and Diverse Text-to-3D Generation with Variational Score Distillation"
+  authors="Wang et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.16213"
+/>

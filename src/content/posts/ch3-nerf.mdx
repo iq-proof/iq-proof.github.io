@@ -1,0 +1,138 @@
+---
+title: "NeRF는 왜 MLP 하나로 3D 장면 전체를 표현할 수 있는가"
+description: "View-independent density와 view-dependent color의 분리부터 spectral bias, hierarchical sampling, hash encoding까지 — NeRF 설계 철학의 일관된 맥락을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [nerf, neural-radiance-field, positional-encoding, volume-rendering, hash-encoding]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+NeRF(Neural Radiance Fields)의 핵심 아이디어는 단순하다 — 3D 공간의 모든 점에서 밀도와 색상을 예측하는 MLP 하나로 장면 전체를 표현한다. 그런데 "왜 하필 이 구조인가"라는 질문에는 물리학, 신호 처리, 최적화 이론이 층층이 쌓여 있다. 왜 ReLU MLP는 고주파 디테일을 학습하지 못하고, 왜 hierarchical sampling이 필요하며, 왜 해시 테이블이 이 모든 것을 5분 안에 해결하는가?
+
+## 두 가지 출력의 분리 — 물리적 prior를 네트워크에 부호화하기
+
+NeRF의 출력은 두 개다.
+
+$$F_\theta(\mathbf{x}, \mathbf{d}) \to (\sigma(\mathbf{x}),\; \mathbf{c}(\mathbf{x}, \mathbf{d}))$$
+
+밀도 $\sigma$는 위치 $\mathbf{x}$만의 함수다. 색상 $\mathbf{c}$는 위치와 시선 방향 $\mathbf{d}$ 모두의 함수다. 이 분리는 관습이 아니라 **rendering equation의 물리적 구조**를 그대로 반영한다.
+
+밀도는 기하학이다. 같은 3D 점을 어떤 방향에서 보든 불투명도는 동일해야 한다. 색상은 반사 특성이다. 광택 있는 표면(specular reflection)은 특정 각도에서만 밝게 보인다. 만약 $\sigma$도 시선 방향에 의존하게 두면, 같은 점을 다른 방향에서 볼 때 기하학이 달라지는 물리적으로 불가능한 상황이 생긴다. view-independent density 강제는 **physical prior를 파라미터 수 없이 부과하는** 가장 저렴한 방법이다.
+
+8층 × 256 너비의 아키텍처에서 5번째 층의 skip connection도 같은 논리다. ResNet(He 2015)과 동일한 동기 — gradient path를 단축해 깊어질수록 vanishing되는 위치 정보를 직접 재주입한다. Ablation 실험에서 skip connection 없는 버전은 동일한 단계에서 수렴 손실이 3배 이상 높다.
+
+## Spectral Bias — ReLU MLP가 고주파를 학습 못하는 이유
+
+NeRF 논문에서 positional encoding 없이 학습하면 PSNR이 10 dB까지 떨어진다. 같은 아키텍처로, positional encoding만 추가하면 30 dB가 된다. 20 dB 차이는 단순한 "trick"이 아니다.
+
+Rahaman et al.(2019)의 spectral bias 결과에 따르면, ReLU MLP의 Neural Tangent Kernel은 주파수 $\omega$에 대한 eigenvalue가 다음과 같이 감쇠한다.
+
+$$\lambda_\omega \approx C/\omega^2 \quad (\omega \gg 1)$$
+
+학습 속도는 eigenvalue에 비례하므로, 고주파 성분의 수렴 시간은 $\omega^2$에 비례해 지수적으로 느려진다. 에지, 텍스처, 날카로운 경계 — 이 모든 것이 고주파다.
+
+Tancik et al.(2020)의 해결책은 입력 변환이다.
+
+$$\gamma(p) = \left(\sin(2^0 \pi p),\, \cos(2^0 \pi p),\, \ldots,\, \sin(2^{L-1} \pi p),\, \cos(2^{L-1} \pi p)\right)$$
+
+입력 자체를 여러 주파수의 혼합으로 만들면, NTK가 각 주파수에 응답할 수 있는 기저를 얻는다. 결과적으로 모든 주파수 성분이 comparable magnitude의 eigenvalue를 갖게 된다. 위치에 $L=10$, 시선 방향에 $L=4$를 쓰는 이유는 공간 디테일이 시선 방향 변화보다 훨씬 고주파이기 때문이다.
+
+<Theorem kind="theorem" number="1" title="Spectral Bias (Rahaman et al. 2019)">
+ReLU MLP의 NTK에서 주파수 $\omega$에 해당하는 eigenvalue는 $\lambda_\omega \lesssim C/\omega^\alpha$ ($\alpha \approx 2$)로 감쇠한다. 따라서 주파수 $\omega$의 수렴 시간은 $t_\omega \propto \omega^2 / (\eta C)$로, 고주파는 지수적으로 느리게 학습된다.
+</Theorem>
+
+<Proof>
+Jacot et al.(2018)의 NTK 분석과 Rahaman et al.(2019)의 결합. ReLU $\sigma(u) = \max(0,u)$의 Fourier decomposition에서 $\hat{\sigma}(\omega)$는 $|\omega|^{-3}$으로 감쇠하고, 다층 합성에서 이 감쇠가 누적되어 전체 kernel의 고주파 eigenvalue가 다항식적으로 억제된다. $\square$
+</Proof>
+
+## Hierarchical Sampling — 중요한 곳에만 샘플하기
+
+volume rendering integral
+
+$$\hat{C}(\mathbf{r}) = \sum_{i=1}^N T_i(1 - e^{-\sigma_i \delta_i})\mathbf{c}_i$$
+
+을 계산할 때, uniform stratified sampling의 문제는 명확하다. 대부분의 샘플이 빈 공간(높은 transmittance)이나 이미 가려진 영역에 떨어진다. 계산은 하지만 렌더링에 기여하지 않는다.
+
+coarse network(64 샘플, uniform stratified)가 먼저 각 점의 weight를 추정한다.
+
+$$w_i^c = T_i(1 - e^{-\sigma_i \delta_i})$$
+
+fine network는 이 weight를 PDF로 삼아 inverse-CDF sampling으로 128개 샘플을 추가 배치한다 — weight가 높은 영역, 즉 실제 표면이 있는 곳에 집중해서. 이는 importance sampling의 직접 적용이다. 실험에서 coarse 32 + fine 128 조합은 uniform 160 샘플 대비 평균 렌더링 오차를 약 3배 줄인다.
+
+<Callout type="note" title="트레이드오프">
+hierarchical sampling은 coarse network라는 추가 forward pass 비용을 요구한다. 대신 같은 총 샘플 수로 더 정확한 렌더링을 얻는다. coarse network가 표면 위치를 잘못 예측하면 fine sampling도 suboptimal해진다 — 두 네트워크를 균형 있게 학습시키는 이유다.
+</Callout>
+
+## Loss와 수렴 — photometric L2가 충분한 이유
+
+NeRF의 loss는 놀랍도록 단순하다.
+
+$$\mathcal{L} = \sum_{\mathbf{r}} \left\| \hat{C}_c(\mathbf{r}) - C(\mathbf{r}) \right\|_2^2 + \left\| \hat{C}_f(\mathbf{r}) - C(\mathbf{r}) \right\|_2^2$$
+
+smoothness regularization도, depth consistency loss도, geometric constraint도 없다. 이것이 PSNR 30+ dB를 달성한다. 이유는 volume rendering equation 자체가 정적 장면의 완전한 물리적 기술이기 때문이다. photometric loss를 최소화하는 $(\sigma, \mathbf{c})$는 곧 true radiance field에 수렴한다 — 추가 제약이 implicit하게 내포되어 있다.
+
+학습률 스케줄(5×10⁻⁴ → 5×10⁻⁵)도 spectral bias와 연결된다. 초반 큰 step은 저주파 구조를 빠르게 학습하고, 후반 작은 step에서 고주파 디테일이 천천히 수렴한다. 100k-500k 이터레이션이 필요한 이유는 고주파 수렴 시간이 $\omega^2$에 비례하기 때문이다.
+
+<Aside label="과적합의 정당화">
+NeRF는 특정 장면에 완전히 과적합하도록 설계된다. cross-scene generalization은 없다. 이것이 약점처럼 보이지만, volume rendering equation이 정확히 정적 장면을 기술하는 한 — perfect overfitting = perfect reconstruction이다. 이것이 foundation model(LRM 등)의 등장을 촉발한 바로 그 한계이기도 하다.
+</Aside>
+
+## Mip-NeRF, Ref-NeRF, NeRF-W — 세 가지 한계의 targeted 해결
+
+vanilla NeRF의 한계는 세 갈래로 분기된다.
+
+**안티앨리어싱 부재**: pixel을 점 샘플(ray)로 모델링하면 고해상도에서 aliasing artifact가 생긴다. Mip-NeRF(Barron 2021)는 ray 대신 **cone**을 사용한다. 각 샘플이 frustum 영역을 나타내고, integrated positional encoding(IPE)이 frustum의 Gaussian 근사 위에서 PE의 기댓값을 계산한다.
+
+$$\mathbb{E}[\sin(2^l \pi x)] = \sin(2^l \pi \mu)\exp\!\left(-\tfrac{1}{2}(2^l \pi \sigma)^2\right)$$
+
+cone이 클수록 고주파 성분이 자동으로 억제된다 — 주파수 적응형 blur가 샘플링에 내재한다.
+
+**specular 학습 난이도**: Ref-NeRF(Verbin 2022)는 시선 방향 $\mathbf{d}$ 대신 **반사 벡터** $\mathbf{r} = 2(\mathbf{d} \cdot \mathbf{n})\mathbf{n} - \mathbf{d}$를 color branch의 입력으로 쓴다. specular lobe는 $\mathbf{d}$ 공간에서 고주파이지만, $\mathbf{r}$ 공간에서 저주파다. spectral bias 논리 그대로 — 저주파 함수가 더 빠르게 학습된다.
+
+**조명·날씨 변동**: NeRF-W(Martin-Brualla 2021)는 이미지별 학습 가능한 embedding $\mathbf{e}_i \in \mathbb{R}^{16}$을 color MLP에 추가한다. static geometry는 공유 네트워크가, 조명·날씨·transient object는 embedding이 흡수한다.
+
+## Instant-NGP — hash encoding이 1000배를 만드는 방법
+
+Müller et al.(2022)의 핵심 통찰은 positional encoding을 **학습 가능한 hash table**로 교체한다는 것이다. 16개 resolution level 각각에서, 3D 위치가 속한 셀의 8개 코너를 해시로 조회하고 trilinear interpolation으로 feature를 얻는다.
+
+$$h(\mathbf{g}) = \left(\sum_{i=0}^{2} p_i \cdot g_i\right) \bmod T$$
+
+메모리는 $L \cdot T \cdot F \cdot 4$ 바이트 — $L=16$, $T=2^{19}$, $F=2$이면 약 67 MB. 동일 해상도의 dense voxel($512^3$, 8D feature)은 67 GB가 필요하다. 해시 충돌은 피할 수 없지만 허용된다 — 동일 위치는 항상 동일 해시(deterministic)이고, SGD의 gradient averaging이 충돌 노이즈를 자연스럽게 평활화한다.
+
+positional encoding의 spectral bias 문제도 사라진다. feature는 fixed frequency schedule 없이 학습되며, resolution level이 암묵적으로 주파수를 결정한다. 작은 MLP(2층, 64 너비)와 CUDA fused kernel이 결합하면 학습 시간이 1-2일에서 5분으로 줄어든다. PSNR은 약 2 dB 낮지만, real-time 응용에서 이 trade-off는 압도적으로 합리적이다.
+
+## 정리
+
+- NeRF의 모든 설계 결정은 **volume rendering equation의 물리적 구조를 네트워크에 부호화하는** 일관된 철학에서 나온다.
+- $\sigma$와 $\mathbf{c}$의 분리는 geometric prior, positional encoding은 spectral bias 해결, hierarchical sampling은 importance sampling, photometric L2는 rendering equation의 completeness에 각각 근거한다.
+- Mip-NeRF·Ref-NeRF·NeRF-W는 vanilla NeRF의 세 한계(aliasing, specular, dynamic)를 같은 철학 위에서 targeted하게 수정한다.
+- Instant-NGP는 learned hash features로 spectral bias를 우회하며, 품질보다 속도를 택한 명시적 trade-off다.
+- scene-specific overfitting은 설계이자 한계다 — 이것이 LRM 같은 foundation model의 출발점이 된다.
+
+<Reference
+  title="NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+  authors="Mildenhall et al."
+  year={2020}
+  venue="ECCV"
+  url="https://arxiv.org/abs/2003.08934"
+/>
+
+<Reference
+  title="Instant Neural Graphics Primitives with a Multiresolution Hash Encoding"
+  authors="Müller et al."
+  year={2022}
+  venue="SIGGRAPH"
+  url="https://arxiv.org/abs/2201.05989"
+/>

@@ -1,0 +1,125 @@
+---
+title: "NeRF의 수식은 어디서 왔나"
+description: "Kajiya 1986의 rendering equation부터 Beer-Lambert law, volume rendering integral의 수치 적분까지, NeRF의 물리적 기반을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [nerf, volume-rendering, rendering-equation, radiative-transfer, 3d-gaussian-splatting]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+NeRF의 핵심 수식은 MLP가 아니다. MLP는 도구일 뿐이고, 실제 핵심은 **물리 광학에서 직접 유도된 volume rendering integral**이다. 이 적분이 어디서 왔는지 모르면, NeRF와 3D Gaussian Splatting이 왜 같은 형태의 alpha-compositing을 공유하는지 영원히 이해할 수 없다.
+
+## 모든 것의 출발점: Rendering Equation
+
+1986년 Kajiya는 광선이 표면에 도달했을 때 관찰되는 radiance를 단 하나의 방정식으로 표현했다.
+
+$$
+L_o(\mathbf{x}, \omega_o) = L_e(\mathbf{x}, \omega_o) + \int_\Omega f_r(\omega_i, \omega_o;\, \mathbf{x})\, L_i(\mathbf{x}, \omega_i)\cos\theta_i\, d\omega_i
+$$
+
+왼쪽은 관찰자 방향으로 나가는 빛, 오른쪽은 표면이 스스로 내는 방사($L_e$)와 반구 전체 방향에서 들어온 빛이 BRDF $f_r$을 통해 반사된 합이다. $\cos\theta_i$는 비스듬한 입사각에서 에너지가 넓은 면적으로 분산되는 foreshortening을 보정한다.
+
+이 방정식이 재귀적이라는 점이 핵심이다. $L_i$는 다른 표면의 $L_o$이고, 그 $L_o$는 또 다른 표면의 $L_i$를 참조한다. 이 재귀 구조를 반복 전개하면 Neumann series가 된다.
+
+<Theorem kind="theorem" number="1" title="Rendering Equation의 Neumann Series 전개">
+Reflection operator $T(L) = \int f_r L_i \cos\theta\, d\omega$로 정의하면, rendering equation의 해는 다음과 같다.
+
+$$L_o = \sum_{k=0}^{\infty} T^k(L_e) = L_e + T(L_e) + T^2(L_e) + \cdots$$
+
+각 항은 $k$회 반사에 대응한다.
+</Theorem>
+
+<Proof>
+에너지 보존 조건 $\int f_r \cos\theta\, d\omega \leq 1$이 성립하면 operator norm $\|T\| < 1$이다. 따라서 Neumann series $\sum T^k$가 수렴하고, 그 극한이 고정점 방정식 $L_o = L_e + T(L_o)$의 유일한 해가 된다. $\square$
+</Proof>
+
+Path tracing은 이 무한 급수를 Monte Carlo로 근사하는 방법이다. $k$-bounce 경로를 확률적으로 샘플링해 각 항을 추정한다.
+
+## 표면에서 볼륨으로: Radiative Transfer Equation
+
+Rendering equation은 **표면** 위의 현상을 기술한다. 안개, 구름, 연기처럼 매질 내부에서 빛이 흡수·산란되는 경우는 Chandrasekhar(1960)의 radiative transfer equation(RTE)이 필요하다.
+
+$$
+\frac{dL}{ds} = -\sigma_t L + \sigma_s \int_{S^2} p(\omega', \omega)\, L(s, \omega')\, d\omega' + \sigma_a L_e
+$$
+
+거리 $ds$를 이동할 때 빛은 세 가지 방식으로 변한다. extinction coefficient $\sigma_t = \sigma_a + \sigma_s$만큼 감쇠하고, 다른 방향에서 산란되어 들어오는 빛이 더해지고, 매질 자체의 emission이 더해진다. Phase function $p(\omega', \omega)$는 산란 방향 분포를 결정한다.
+
+<Callout type="note" title="Optical Depth와 Transmittance">
+거리 $a$에서 $b$까지의 optical depth $\tau(a,b) = \int_a^b \sigma_t\, ds$로 정의하면, 투과율(transmittance)은 Beer-Lambert law에 따라 $T(a,b) = e^{-\tau(a,b)}$다. 투과율은 구간을 쪼개도 곱셈으로 결합된다: $T(a,c) = T(a,b)\cdot T(b,c)$.
+</Callout>
+
+## NeRF Integral의 유도
+
+NeRF는 RTE에서 scattering을 제거하고 emission만 남긴 특수한 경우다. $\sigma_s = 0$으로 놓으면 RTE는 1차 선형 ODE로 단순화된다.
+
+$$
+\frac{dL}{ds} = -\sigma_a L + \sigma_a L_e
+$$
+
+이 방정식의 해를 광선 $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$를 따라 적분하면(Duhamel's principle), 카메라가 보는 최종 색상이 나온다.
+
+$$
+C(\mathbf{r}) = \int_{t_n}^{t_f} T(t)\,\sigma(\mathbf{r}(t))\,\mathbf{c}(\mathbf{r}(t), \mathbf{d})\, dt, \quad T(t) = \exp\!\left(-\int_{t_n}^t \sigma(\mathbf{r}(s))\, ds\right)
+$$
+
+$T(t)$는 광선이 $t$까지 이동하면서 누적된 투과율로, 앞쪽 물체가 뒤쪽을 가리는 occlusion을 자연스럽게 표현한다. NeRF의 MLP가 출력하는 $\sigma(\mathbf{x})$(density)와 $\mathbf{c}(\mathbf{x}, \mathbf{d})$(radiance)는 정확히 이 피적분함수의 두 인자다.
+
+<Aside label="NeRF와 3DGS의 공통점">
+3D Gaussian Splatting은 연속 volume 대신 이산 Gaussian으로 장면을 표현하지만, 최종 합산 형태는 $C = \sum_i \alpha_i T_i \mathbf{c}_i$로 동일하다. $T_i = \prod_{j < i}(1 - \alpha_j)$는 누적 투과율이고, $\alpha_i = 1 - e^{-\sigma_i \delta_i}$는 이산 alpha다. 물리적 기원이 같다.
+</Aside>
+
+## 수치 적분: Stratified Sampling
+
+MLP 출력은 closed form 적분이 불가능하므로, NeRF는 구간 $[t_n, t_f]$를 $N$개 bin으로 균등 분할하고 각 bin에서 한 점씩 샘플링하는 stratified sampling을 사용한다.
+
+$$
+\hat{C} = \sum_{i=1}^{N} T_i\,(1 - e^{-\sigma_i \delta_i})\,\mathbf{c}_i, \quad T_i = \prod_{j < i}(1 - \alpha_j)
+$$
+
+여기서 $\delta_i$는 bin 폭이고 $\alpha_i = 1 - e^{-\sigma_i \delta_i}$는 differential opacity다. $\sigma\delta$가 작을 때 $\alpha_i \approx \sigma_i \delta_i$가 되어 Riemann sum으로 환원되지만, exact form을 사용하면 $\sigma$ 값이 클 때도 수치적으로 안정적이다.
+
+Naive Monte Carlo는 $O(1/\sqrt{N})$ 수렴이지만, density $\sigma$가 piecewise constant라는 가정 아래 stratified sampling은 $O(1/N^2)$ 수렴을 달성한다. NeRF의 coarse-fine 계층 구조는 coarse network의 weight distribution $w_i = T_i \alpha_i$를 PDF로 사용해 fine network가 밀도 높은 영역에 더 많은 샘플을 집중시키는 importance sampling이다.
+
+## 트레이드오프
+
+<Callout type="note" title="가정과 한계">
+NeRF의 volume rendering은 scattering이 없는 emission-absorption만 가정한다. 실제 연기나 구름처럼 multi-scattering이 중요한 매질은 full RTE가 필요하다. 또한 $\sigma$의 단위가 역 길이(m⁻¹)이므로, 다른 scale의 장면에 적용할 때 scene scale에 대한 ambiguity가 발생한다. 3DGS는 연속 적분 대신 이산 Gaussian으로 대체해 실시간 렌더링을 달성하지만, 장면 표현의 연속성을 포기한다.
+</Callout>
+
+## 정리
+
+- Rendering equation(Kajiya 1986)은 표면 반사를 기술하며, Neumann series 전개가 path tracing의 수학적 근거다.
+- RTE(Chandrasekhar 1960)는 이를 volumetric media로 확장하고, scattering을 제거한 특수 경우가 NeRF의 volume rendering integral이다.
+- Beer-Lambert law $T = e^{-\tau}$는 RTE의 pure absorption 해이며, NeRF의 transmittance 항과 동일하다.
+- Stratified sampling의 discrete form $\hat{C} = \sum T_i(1 - e^{-\sigma_i\delta_i})\mathbf{c}_i$는 NeRF부터 3DGS까지 모든 neural rendering의 공통 구조다.
+
+수식 하나 뒤에 60년간의 물리 광학이 쌓여 있다.
+
+<Reference
+  title="The Rendering Equation"
+  authors="Kajiya, J. T."
+  year={1986}
+  venue="SIGGRAPH"
+  url="https://dl.acm.org/doi/10.1145/15922.15902"
+/>
+
+<Reference
+  title="NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+  authors="Mildenhall et al."
+  year={2020}
+  venue="ECCV"
+  url="https://arxiv.org/abs/2003.08934"
+/>

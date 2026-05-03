@@ -1,0 +1,143 @@
+---
+title: "단일 이미지에서 3D까지 — LRM이 바꾼 패러다임"
+description: "SDS의 수백 초에서 LRM의 5초로, 3D 재구성의 병목이 어디서 어떻게 해소됐는지 triplane 회귀부터 DUSt3R의 dense pointmap, 공간 컴퓨팅 응용까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [3d-reconstruction, lrm, dust3r, triplane, gaussian-splatting]
+difficulty: advanced
+series:
+  slug: 3d-neural-rendering-deep-dive
+  title: 3d Neural Rendering Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+2022년까지 text-to-3D는 diffusion 모델의 2D prior를 수백 번의 역전파로 3D에 투영하는 방식이었다. 한 오브젝트에 수십 분이 걸렸고, 매번 결과가 달랐다. 그런데 2024년 LRM(Large Reconstruction Model)이 등장하면서 같은 작업이 5초 안에 결정론적으로 끝난다. 무엇이 바뀌었는가?
+
+## 패러다임 전환 — Generative에서 Regressive로
+
+SDS(Score Distillation Sampling)의 학습 신호는 다음과 같다.
+
+$$
+\nabla_{\theta} \mathcal{L}_{\text{SDS}} = \hat{w}(t)\,(\epsilon_\theta(\mathbf{x}_t, t) - \epsilon)
+$$
+
+매 iteration마다 diffusion 모델이 score를 예측하고, 그 gradient로 3D를 "그려간다." 이 방식은 **generative** — 다양성은 있지만 느리고 재현 불가능하다.
+
+LRM은 이 방향을 뒤집는다. Objaverse의 700K 3D 모델로부터 "모양은 이렇게 생겼다"는 분포를 미리 학습하고, 테스트 시에는 단순히 **회귀(regression)**한다. 입력 이미지 한 장을 넣으면 완성된 triplane이 나온다. 다양성은 줄었지만, 속도와 재현성은 극적으로 개선됐다.
+
+이 선택의 동기는 명확하다. Apple Vision Pro의 spatial video 캡처, 로봇의 실시간 scavenging, e-commerce의 1초 내 3D 모델 생성 — generative 방식은 이 타임라인에 맞지 않는다.
+
+## Triplane — 3D를 압축하는 방법
+
+LRM의 속도는 구조에서 나온다. 3D 공간을 dense grid로 표현하면 메모리가 $O(H \cdot W \cdot D)$로 증가한다. **Triplane**(Chan et al., 2023)은 이를 세 개의 2D 평면으로 인수분해한다.
+
+$$
+f(\mathbf{p}) = \mathbf{F}_{xy}(x, y) \odot \mathbf{F}_{yz}(y, z) \odot \mathbf{F}_{zx}(z, x) \in \mathbb{R}^{D_{\text{feat}}}
+$$
+
+전형적인 파라미터($H=256, D=16$ dense vs. $H_p=128, D_\text{lat}=24$ triplane)를 대입하면:
+
+$$
+\text{compression ratio} = \frac{256 \cdot 256 \cdot 16}{3 \cdot 128 \cdot 128 \cdot 24} \approx 11\times
+$$
+
+임의의 3D 점에서 feature를 추출할 때도 3번의 bilinear interpolation으로 끝난다. Dense grid의 3D trilinear interpolation보다 메모리 접근 패턴이 규칙적이라 GPU cache 재사용률도 높다.
+
+LRM의 전체 파이프라인은 이 triplane을 목표로 회귀한다.
+
+```
+Image (H×W×3)
+  → [Frozen DINO ViT-L] → patch tokens (N_patch × D_vit)
+  → [Transformer Encoder] → context C
+  → [Iterative Decoder, N_iter=4~8]
+       Z_0 → cross-attn(image features) → Z_1 → ... → Z*
+  → [Volume Rendering] → RGB
+  → Loss: ‖C_render(Z*) − C_gt‖²
+```
+
+각 decoder 단계는 triplane latent $\mathbf{Z}_{t-1}$을 image feature와 cross-attention으로 정제한다.
+
+$$
+\mathbf{Z}_t = \text{TransformerDecoderLayer}_t(\mathbf{Z}_{t-1},\, \mathbf{E}_{\text{img}})
+$$
+
+Frozen encoder는 한 번만 실행되고, triplane 해상도가 낮아(128×128) decoder 반복 비용도 작다. 결과적으로 전체 추론이 150ms 수준에서 끝난다.
+
+<Callout type="note" title="트레이드오프">
+LRM의 회귀는 결정론적이라 같은 이미지에서 항상 같은 3D를 돌려준다. 이는 재현성과 속도의 장점이지만, 동시에 한계다 — 좌우 대칭 오브젝트의 가려진 면, 학습 분포 밖의 기하(나무, 분자 구조)에서는 확신을 갖고 틀린 결과를 낸다. SDS처럼 "잘 모를 때 다양한 해석을 탐색"하는 메커니즘이 없다.
+</Callout>
+
+## DUSt3R — feature matching 없는 3D 재구성
+
+LRM이 단일 이미지의 3D prior를 학습한다면, **DUSt3R**(Wang et al., 2024)은 이미지 쌍에서 dense correspondence를 직접 회귀한다. 전통적 SfM 파이프라인이 SIFT → RANSAC → bundle adjustment로 수십 초를 소비하는 과정을 ViT cross-attention 한 층으로 대체한다.
+
+핵심 insight는 단순하다. "Feature matching은 고수준 기하학 문제가 아니라 pixel-wise 회귀 문제다."
+
+Cross-attention에서 이미지 1의 각 patch token은 이미지 2의 token들과 다음처럼 상호작용한다.
+
+$$
+\text{Attn}(Q_1, K_2, V_2) = \text{softmax}\!\left(\frac{Q_1 K_2^\top}{\sqrt{d}}\right) V_2
+$$
+
+이미지 1의 patch가 이미지 2에서 "같은 물체를 보고 있는 patch"를 찾는 soft matching이다. SIFT의 descriptor 비교나 RANSAC의 hard threshold 없이, gradient가 모든 경로로 흐른다.
+
+이 매칭 결과를 geometry decoder가 받아 각 pixel마다 3D 좌표를 예측한다 — **dense pointmap** $\mathcal{P}(u, v) \in \mathbb{R}^3$.
+
+<Theorem kind="proposition" number="1" title="Dense Regression vs Feature Matching">
+Uncalibrated image pair에서 dense pointmap을 회귀하면, 충분한 데이터 하에서 traditional feature matching + RANSAC과 동등한 기하 정확도를 달성할 수 있다.
+</Theorem>
+
+<Proof>
+Cross-attention 가중치를 분석하면 implicit하게 epipolar geometry 구조가 드러난다 (empirical). Dense regression은 모든 pixel을 다루므로 feature matching(~5% keypoint)보다 정보량이 크다. Confidence map $\rho(u,v)$가 outlier를 soft downweight하므로 RANSAC의 hard threshold보다 안정적이다. 네트워크 capacity가 충분하면 이 세 가지 이점이 결합해 hand-crafted pipeline을 능가한다. $\square$
+</Proof>
+
+DUSt3R은 camera intrinsics를 요구하지 않는다. Pointmap은 canonicalized 좌표계 — 카메라 1을 원점으로 정규화된 상대 좌표 — 로 출력된다. Scale ambiguity만 남으며, stereo baseline이나 calibration ruler 한 번으로 metric scale로 변환된다.
+
+COLMAP 기준 30~50초가 걸리던 2-image reconstruction이 DUSt3R에서는 1~3초로 줄어든다. 정확도는 cm 수준으로 mm 수준의 COLMAP보다 낮지만, density는 훨씬 높다.
+
+## 응용 — 속도가 가능하게 하는 것들
+
+LRM과 DUSt3R이 가져온 속도는 이전에는 불가능했던 응용을 열었다.
+
+**Spatial computing**: Apple Vision Pro의 spatial video 파이프라인은 LiDAR + stereo camera 스트림을 DUSt3R로 처리하고 3D Gaussian splatting으로 실시간 렌더링한다. LRM 추론 ~5ms + GS splatting ~10ms = 15ms latency로 66 FPS가 이론상 가능하다. Mobile GPU(A17 Pro)에서 실제로는 30~40 FPS.
+
+**Robotics simulation**: 로봇 카메라로 실제 오브젝트를 캡처 → LRM으로 triplane 생성 → marching cubes로 mesh export → Habitat-Sim에 import. 수작업 3D 모델링으로 며칠 걸리던 과정이 수초로 줄어든다. NeRF/GS 렌더링의 photorealism은 더 나은 visual policy 학습으로 이어진다.
+
+**Autonomous driving**: 8-camera + LiDAR fusion에서 DUSt3R은 인접 카메라 쌍마다 dense pointmap을 생성하고, LiDAR와 confidence-weighted fusion으로 통합한다. 전통적 monocular depth prediction이 texture 없는 영역에서 실패하는 곳을 dense correspondence 기반 DUSt3R이 보완한다.
+
+<Aside label="Frontier (2025)">
+다음 단계는 **world models + 3D의 fusion**이다. Sora 같은 video diffusion 모델이 implicit한 3D 이해를 학습하고 있고, 이를 explicit한 3D representation으로 디코딩하는 연구가 진행 중이다. On-device quantized LRM/DUSt3R이 cloud 없이 mobile AR에서 돌아가는 것도 가까운 목표다.
+</Aside>
+
+## 정리
+
+- LRM은 generative(SDS)에서 regressive로의 전환이다. 다양성을 포기하고 속도와 재현성을 얻었다. 50~100배 빠르지만, 분포 밖 기하에서 확신을 갖고 실패한다.
+- Triplane 표현이 핵심 압축 메커니즘이다. Dense grid 대비 11배 압축, bilinear interpolation의 규칙적 메모리 접근이 속도를 만든다.
+- DUSt3R은 SIFT → RANSAC → bundle adjustment를 cross-attention 기반 dense pointmap 회귀로 대체한다. 20~30배 빠르고, confidence map으로 불확실 영역을 자동 처리한다.
+- 이 속도가 spatial computing, robotics sim, autonomous driving에서의 실시간 3D를 가능하게 했다.
+
+3D가 이미지처럼 capture, compress, render되는 시대 — 병목은 알고리즘이 아니라 이제 "어떤 3D prior를 얼마나 많은 데이터로 학습하느냐"다.
+
+<Reference
+  title="LRM: Large Reconstruction Model for Single Image to 3D"
+  authors="Yicong Hong et al."
+  year={2024}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2311.04400"
+/>
+
+<Reference
+  title="DUSt3R: Geometric 3D Vision Made Easy"
+  authors="Shuzhe Wang et al."
+  year={2024}
+  venue="CVPR"
+  url="https://arxiv.org/abs/2312.14132"
+/>
