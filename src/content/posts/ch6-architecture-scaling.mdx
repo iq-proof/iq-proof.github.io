@@ -1,0 +1,136 @@
+---
+title: "LLM 아키텍처 설계의 다섯 가지 선택"
+description: "깊이-너비 비율부터 KV 캐시, MoE 라우팅, 위치 인코딩, 활성화 함수까지 — LLM 아키텍처의 모든 설계 결정이 하나의 원칙으로 수렴하는 이유를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm, architecture, scaling-law, transformer, pretraining]
+difficulty: advanced
+series:
+  slug: llm-pretraining-deep-dive
+  title: Llm Pretraining Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 아키텍처 논문을 읽다 보면 이런 숫자들이 등장한다. LLaMA-7B는 32 레이어, hidden dimension 4096. GQA는 `n_kv=8`. Mixtral은 8개 expert 중 2개 활성화. 위치 인코딩 base frequency 500000. SwiGLU hidden width 2.67d. 이 숫자들은 각자 독립적으로 보이지만, 사실 모두 같은 질문에 대한 답이다 — **주어진 계산 예산 안에서 무엇을 어디에 쓸 것인가?**
+
+## 깊이와 너비: $N \approx 12Ld^2$의 의미
+
+Kaplan et al. (2020)의 핵심 발견은 단순하다. Transformer의 파라미터 수는 근사적으로 다음과 같다.
+
+$$N \approx 12Ld^2$$
+
+레이어당 attention ($4d^2$)과 FFN ($8d^2$)의 합이 $12d^2$이고, 이것이 $L$개 쌓인다. 여기서 나오는 질문이 "같은 $N$에서 $L$을 키울까, $d$를 키울까"다.
+
+경험적으로 최적점은 $d/L \approx 128$이다. LLaMA-7B(L=32, d=4096), LLaMA-13B(L=40, d=5120) 둘 다 이 비율을 따른다. 이 비율에서 벗어나면 어떻게 되는가?
+
+<Theorem kind="proposition" number="1" title="Depth-Width Trade-off">
+같은 파라미터 수 $N = 12Ld^2$ 제약 하에서, $d/L \ll 128$이면 gradient vanishing으로 최적화가 어려워지고, $d/L \gg 128$이면 과적합으로 generalization이 손실된다.
+</Theorem>
+
+<Proof>
+깊이 $L$이 과도하게 크면 backpropagation 경로가 길어져 residual connection이 있어도 gradient 신호가 감쇠한다. 너비 $d$가 과도하게 크면 각 레이어의 표현 공간이 커지고, 제한된 토큰 수로는 이 공간을 충분히 학습하지 못해 gradient norm이 증가한다. 실험적으로 $d/L \in [100, 150]$ 범위가 안정적이다. $\square$
+</Proof>
+
+깊이는 compositional reasoning에 기여한다. 레이어를 거칠수록 토큰 표현이 점점 더 복잡한 조합을 인코딩한다. 너비는 factual capacity에 기여한다 — 한 레이어에서 얼마나 많은 독립적 개념을 동시에 표현할 수 있는지가 $d$에 비례한다.
+
+## KV 캐시: 추론의 병목을 8배 줄이는 방법
+
+학습이 끝난 모델을 실제로 배포하면 새로운 병목이 등장한다. 매 토큰 생성마다 이전 모든 토큰의 K, V를 읽어야 하는 **메모리 대역폭** 문제다.
+
+Full Multi-Head Attention의 KV 캐시 크기는 다음과 같다.
+
+$$M_{\text{KV}}^{(\text{full})} = 2 \times n_{\text{head}} \times d_{\text{head}} \times L \times T \times b \times \text{bytes}$$
+
+LLaMA-2-70B 기준(n_head=64, d_head=128, L=80, T=4096, b=1, float32)으로 계산하면 약 512MB다. A100 GPU의 메모리 대역폭이 2TB/s이므로, 이 캐시를 읽는 데만 초당 약 3900 토큰이 한계다.
+
+GQA(Grouped Query Attention)는 64개 query head를 8개 그룹으로 묶어, 각 그룹이 하나의 KV head를 공유하게 한다.
+
+$$M_{\text{KV}}^{(\text{GQA})} = M_{\text{KV}}^{(\text{full})} \times \frac{n_{\text{kv}}}{n_{\text{head}}} = 512\text{ MB} \times \frac{8}{64} = 64\text{ MB}$$
+
+결과는 KV 캐시 8배 절감, 추론 처리량 8배 향상이다. 그리고 Shazeer(2019)의 실험에서 perplexity 손실은 1% 미만이다. 이유는 간단하다: 각 query head는 공유된 KV에서 서로 다른 linear projection을 통해 여전히 다양한 attention 패턴을 학습할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+MQA(`n_kv=1`)는 메모리를 극단적으로 절감하지만, query별 세밀한 attention이 불가능해 품질이 더 많이 떨어진다. GQA(`n_kv=n_head/8`)는 8배 절감과 품질 보존 사이의 균형점이다. LLaMA-2, Mistral이 GQA를 선택한 이유가 여기에 있다.
+</Callout>
+
+## MoE: 같은 계산으로 더 많은 파라미터
+
+Dense scaling law에서 같은 compute budget으로 더 좋은 성능을 내는 방법이 있다. **Mixture of Experts** — 모든 파라미터를 매 토큰마다 쓰지 않고, 일부만 선택적으로 활성화하는 방식이다.
+
+Clark et al. (2022)은 MoE에 대해 별도의 scaling law를 제안했다.
+
+$$L(N_a, N_t) \propto N_a^{-0.07} \times N_t^{-0.005}$$
+
+여기서 $N_a$는 active parameter, $N_t$는 total parameter다. Active parameter의 지수(-0.07)는 dense scaling law와 동일하지만, total parameter의 지수(-0.005)는 훨씬 작다. 즉, 총 파라미터를 늘리는 것은 active 파라미터를 늘리는 것보다 훨씬 비효율적이다.
+
+최적 sparsity ratio $s = N_a / N_t$는 경험적으로 $[0.05, 0.125]$ 범위다(Krajewski 2024). Mixtral(top-2, 8 experts)은 $s = 2/8 = 0.25$로 이 범위보다 높지만, gradient flow 안정성을 위해 top-1 대신 top-2 routing을 선택한 결과다.
+
+분산 학습에서 expert가 여러 GPU에 나뉘면 all-to-all 통신 오버헤드가 발생한다. GPU 클러스터에서 실측 오버헤드는 약 10-30%다. MoE의 이득이 이 비용을 충분히 상회해야 채택 가치가 있다.
+
+## 위치 인코딩: RoPE에서 YaRN까지
+
+Attention은 위치 정보를 내재적으로 갖지 않는다. 위치를 어떻게 주입하는가가 context length 확장성을 결정한다.
+
+RoPE(Su 2021)는 query와 key를 위치에 해당하는 각도로 회전시킨다.
+
+$$\vec{q}^{\prime T} \vec{k}^{\prime} = \vec{q}^T R_\theta^{(d)}(n-m) \vec{k}$$
+
+내적이 절대 위치가 아닌 **상대 위치 $(n-m)$에만 의존**하므로, 이론적으로 학습 길이 이상으로 extrapolation이 가능하다. Base frequency는 $\theta_i = b^{-2i/d}$이며 보통 $b=10000$이다.
+
+LLaMA-3이 $b=500000$으로 설정한 이유는 무엇인가? Base가 클수록 최저 frequency의 주기가 길어진다 — $b=10000$에서 최저 주기는 $2\pi \times 10000^2 \approx 6.3\times 10^8$이지만, $b=500000$에서는 $2\pi \times 500000^2 \approx 1.6\times 10^{12}$이다. 위치 신호가 훨씬 긴 범위에서 유지되므로, 처음부터 더 긴 context를 지원하도록 설계된 선택이다.
+
+YaRN(Peng 2023)은 학습 후 context를 확장할 때 쓴다. NTK(Neural Tangent Kernel) 분석에 기반해 base frequency를 다음과 같이 조정한다.
+
+$$b' = b \cdot s^{\frac{d}{d-2}}$$
+
+$s=4$(4배 확장), $d=4096$이면 $b'/b \approx 4^{1.0005} \approx 4$다. 이 조정으로 추가 학습 없이 또는 최소한의 fine-tuning으로 context를 4배 확장하면서 perplexity 손실을 2% 미만으로 유지한다.
+
+## 활성화 함수: SwiGLU가 표준이 된 이유
+
+FFN은 Transformer 계산량의 약 2/3을 차지한다. 활성화 함수 선택이 단순한 구현 세부사항이 아닌 이유다.
+
+$$\text{SwiGLU}(x, W, V) = \text{Swish}(xW) \odot \sigma(xV)$$
+
+Gate $\sigma(xV)$가 각 차원마다 0에서 1 사이의 "중요도"를 부여한다. Gate가 작은 뉴런은 사실상 비활성화된다 — ReLU의 hard zero 대신 **soft gating**이다. Shazeer(2020) 실험에서 ReLU 대비 SwiGLU는 동일 파라미터에서 4.5% perplexity 개선을 보였다.
+
+주의할 점이 하나 있다. SwiGLU는 value projection과 gate projection 두 개의 up-projection이 필요하므로, 동일한 파라미터 수($8d^2$)를 유지하려면 FFN hidden width를 $4d$에서 $\frac{8d}{3} \approx 2.67d$로 줄여야 한다.
+
+<Aside label="ReLU의 부활">
+Mirzadeh et al. (2023)은 structured sparsity와 결합한 ReLU가 MoE와 유사한 효율을 달성할 수 있음을 보였다. 전용 sparse hardware가 있다면 경쟁력 있는 선택이지만, 일반 GPU 환경에서는 여전히 SwiGLU가 우위다.
+</Aside>
+
+## 정리
+
+다섯 챕터를 관통하는 원칙은 하나다: **계산 예산의 최적 배분**.
+
+- 깊이-너비 비율 $d/L \approx 128$은 gradient flow와 표현 용량의 균형이다.
+- GQA의 `n_kv = n_head/8`은 품질 손실 1% 미만으로 추론 처리량을 8배 높인다.
+- MoE의 최적 sparsity $s \in [0.05, 0.125]$는 total parameter의 한계 효율이 낮다는 scaling law에서 나온다.
+- YaRN의 base frequency 조정은 NTK 분석으로 정당화된 context 확장 전략이다.
+- SwiGLU의 soft gating은 동일 파라미터에서 더 높은 expressiveness를 얻는 방법이다.
+
+각 결정이 독립적으로 보이지만, 모두 같은 물음에 답한다 — 이 파라미터가 정말 필요한 일을 하고 있는가?
+
+<Reference
+  title="Scaling Laws for Neural Language Models"
+  authors="Kaplan et al."
+  year={2020}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2001.08361"
+/>
+
+<Reference
+  title="GLU Variants Improve Transformer"
+  authors="Shazeer"
+  year={2020}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2002.05202"
+/>

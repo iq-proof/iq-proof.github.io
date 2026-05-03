@@ -1,0 +1,146 @@
+---
+title: "LLM 사전학습 데이터는 어떻게 설계되는가"
+description: "말뭉치 구성과 품질 필터링부터 MinHash 중복 제거, DoReMi 도메인 가중치 최적화, Data Mixing Laws까지 — LLM 사전학습 데이터 파이프라인의 핵심 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm, pretraining, data-pipeline, doremi, scaling-laws]
+difficulty: advanced
+series:
+  slug: llm-pretraining-deep-dive
+  title: Llm Pretraining Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM의 성능을 결정하는 것은 모델 구조나 최적화 기법만이 아니다. 어떤 데이터를, 어떻게 고르고, 얼마나 섞느냐 — 이 세 가지 결정이 학습 전에 이미 성능의 상당 부분을 결정한다. 그렇다면 1조 토큰짜리 말뭉치는 어떤 원칙으로 설계되는가?
+
+## 말뭉치의 구조: 왜 70%가 Common Crawl인가
+
+현대 LLM의 학습 데이터는 대략 다음 구성을 따른다.
+
+```
+Common Crawl (Web)  ~70%  저품질 혼합, 폭넓은 언어 커버리지
+Wikipedia           1-3%  고품질, 구조화된 사실 정보
+Books               5-10% 장형식 문서, 문맥 이해
+GitHub Code         5-15% 실행 가능한 구조, 논리 추론
+ArXiv / Math        1-5%  수식, 학술 표현
+```
+
+Common Crawl이 압도적으로 많은 이유는 단순히 가장 크기 때문이 아니다. 다양성이 가장 넓기 때문이다. 단, 이 다양성에는 스팸, 반복 텍스트, 저품질 페이지가 뒤섞여 있다.
+
+Code와 Math 영역은 corpus 비중 이상으로 **과대 표집(oversampling)**된다. 그 이유는 정량적으로 설명된다 — 짧은 토큰 시퀀스가 지배하는 말뭉치에서는 모델이 장거리 의존성을 학습하기 어렵고, 코드와 수학 문서는 논리 구조를 명시적으로 담고 있어 추론 능력 향상에 기여한다.
+
+## 품질 필터링: 양보다 밀도
+
+FineWeb(Penedo et al., 2024)의 실험은 이 직관을 수치로 보여준다. 750B 토큰의 Common Crawl에서 15B 토큰(2%)만 추출했는데, 성능이 오히려 향상됐다.
+
+필터링은 두 단계로 이뤄진다.
+
+**Gopher rules**(Rae et al., 2022)는 빠른 heuristic 필터다. 단어 수 50 미만, 줄 반복률 10% 초과, 알파벳 비율 60% 미만, NSFW 키워드 포함 — 이 조건을 하나라도 위반하면 제거한다. 약 50%를 걸러내고 perplexity를 6.5% 개선한다.
+
+**LLM classifier** 방식은 LLaMA-3 70B 같은 대형 모델로 각 문서에 품질 점수 $s(d) = \Pr[\text{high-quality} \mid d]$를 부여한다. 상위 2-4%만 선택한다. 정확하지만 비용이 비싸다.
+
+필터링 이후에는 중요도 가중치(importance weighting)를 적용한다.
+
+<Theorem kind="proposition" number="1" title="Importance Weighting Identity">
+선택 확률 $q(d)$로 샘플링하고 가중치 $w(d) = p(d)/q(d)$를 곱하면, 실제 분포 $p$에서 샘플링한 기대값과 동일하다.
+$$\mathbb{E}_{d \sim q}[w(d) \cdot f(d)] = \mathbb{E}_{d \sim p}[f(d)]$$
+</Theorem>
+
+<Proof>
+$$\mathbb{E}_{d \sim q}[w(d) f(d)] = \int \frac{p(d)}{q(d)} f(d) \, q(d) \, dd = \int p(d) f(d) \, dd = \mathbb{E}_{d \sim p}[f(d)] \quad \square$$
+</Proof>
+
+## 중복 제거: MinHash와 Jaccard
+
+Common Crawl의 15% 중복률은 학습 효율을 직접 갉아먹는다. Lee et al.(2022)의 측정에 따르면, 줄 단위 중복 제거로 실제 학습량 20%를 줄이면서도 perplexity를 9% 개선했다.
+
+문제는 수백억 문서를 모두 쌍으로 비교하면 $O(n^2)$라는 점이다. MinHash LSH가 이 문제를 $O(n \log n)$으로 줄인다.
+
+핵심 정리는 다음과 같다.
+
+<Theorem kind="theorem" number="2" title="MinHash-Jaccard Equivalence">
+두 집합 $A, B$와 랜덤 순열 $\pi$에 대해:
+$$\Pr[h_\pi(A) = h_\pi(B)] = J(A, B) = \frac{|A \cap B|}{|A \cup B|}$$
+</Theorem>
+
+<Proof>
+랜덤 순열 $\pi$에서 $A \cup B$의 원소 중 가장 먼저 등장하는 원소 $x$를 고를 때, $x \in A \cap B$일 확률은 $|A \cap B| / |A \cup B|$이다. 이 사건이 정확히 $h_\pi(A) = h_\pi(B)$이므로 동치. $\square$
+</Proof>
+
+$m = 128$개 순열로 만든 signature를 $b$개 band로 나누어 LSH 버킷에 배분하면, Jaccard 유사도 $s$인 pair가 candidate로 검출될 확률은 다음과 같다.
+
+$$\Pr[\text{candidate}] = 1 - (1 - s^r)^b$$
+
+$b = 32, r = 4$로 설정하면 $J = 0.5$인 pair를 약 99.7% 확률로 포착한다. b와 r 조합으로 false positive와 false negative의 균형을 직접 조절할 수 있다.
+
+## DoReMi: 도메인 가중치를 최적화하는 방법
+
+품질 필터링과 중복 제거가 끝나도 질문은 남는다. web 40%, code 25%, math 20%, book 15% — 이 비율이 최선인가? 어떻게 결정하는가?
+
+DoReMi(Xie et al., 2023)의 아이디어는 Group DRO(Distributionally Robust Optimization)에 기반한다.
+
+$$w^* = \arg\min_w \max_i \, \mathbb{E}_{p_i}[\ell_\theta(w)]$$
+
+"최악의 도메인도 괜찮도록" 가중치를 찾는 것이다. 알고리즘은 multiplicative weight update(MWU)로 구현된다.
+
+$$w_i^{(t+1)} = \frac{w_i^{(t)} \cdot \exp(\eta \, \epsilon_i^{(t)})}{\sum_j w_j^{(t)} \cdot \exp(\eta \, \epsilon_j^{(t)})}$$
+
+여기서 $\epsilon_i = \ell_i - \bar{\ell}$는 excess loss다. 어려운 도메인은 가중치가 올라가고, 쉬운 도메인은 내려간다. 수렴하면 모든 도메인의 loss 차이가 $O(\sqrt{\log K / T})$로 줄어든다.
+
+핵심은 **280M 소형 모델로 10-20회 반복 후 얻은 가중치를 8B 모델에 그대로 적용**한다는 점이다. 실증 결과 25% 내외의 loss 감소가 나타났다.
+
+<Callout type="note" title="트레이드오프">
+DoReMi는 도메인 수가 적을 때 효과적이다. 도메인이 많아지면 grid search 비용이 기하급수적으로 증가한다. 또한 280M과 8B 사이의 모델 스케일 차이가 가중치 전이 정확도에 영향을 줄 수 있다 — 경험적으로 optimal ratio의 순위(ranking)는 안정적이지만, 정확한 수치는 3-5% 오차 범위 내에 있다.
+</Callout>
+
+## Data Mixing Laws: 외삽으로 최적 비율 예측하기
+
+DoReMi가 반복 학습으로 가중치를 찾는다면, Data Mixing Laws(Ye et al., 2024)는 closed-form 예측을 목표로 한다.
+
+$$L(r_1, \ldots, r_K) = E + \sum_{i=1}^K \frac{A_i}{r_i^{\alpha_i}}$$
+
+각 도메인의 손실 기여가 비중 $r_i$에 대해 power law로 감소한다는 가정이다. Exponent $\alpha_i$가 클수록 해당 도메인이 중요하다 — $r_i$를 조금만 줄여도 loss가 급격히 오른다.
+
+최적 혼합비는 Lagrange multiplier로 구한다.
+
+$$\frac{A_i \alpha_i}{r_i^{\alpha_i + 1}} = \lambda \quad \Rightarrow \quad r_i^* \propto \left(\frac{A_i \alpha_i}{\lambda}\right)^{\frac{1}{\alpha_i + 1}}$$
+
+Ye et al.의 실험에서 280M 모델로 fitting한 $(E, A_i, \alpha_i)$를 7B 모델에 외삽하면 최적 비율 오차가 5% 미만으로 유지됐다. 25배 스케일 차이에도 $\alpha_i$는 안정적으로 유지되기 때문이다.
+
+<Aside label="DoReMi vs. Data Mixing Laws">
+DoReMi는 직접 최적화이고, Data Mixing Laws는 외삽 예측이다. 도메인 수가 적고 반복 실험이 가능하면 DoReMi가 정확하다. 도메인이 많고 대규모 학습 비용을 절감해야 한다면 Mixing Laws가 낫다. 둘을 결합해 DoReMi로 초기 가중치를 구하고 Mixing Laws로 스케일업하는 방식도 유효하다.
+</Aside>
+
+## 정리
+
+- 말뭉치 구성은 단순한 데이터 수집이 아니라 **설계 결정**이다. Common Crawl 70%는 다양성을 위한 선택이고, Code/Math 과대 표집은 추론 능력을 위한 투자다.
+- 품질은 양보다 중요하다. FineWeb은 원본의 2%로 동등하거나 더 나은 성능을 보였다.
+- MinHash LSH는 $\Pr[h_\pi(A) = h_\pi(B)] = J(A,B)$ 정리 위에 세워진 $O(n \log n)$ 중복 제거 알고리즘이다.
+- DoReMi는 소형 proxy 모델로 찾은 도메인 가중치를 대형 모델에 전이해 25% 내외의 loss 감소를 달성한다.
+- Data Mixing Laws는 $L(r) = E + \sum A_i r_i^{-\alpha_i}$ 형태로 최적 혼합비를 예측 — 반복 실험 없이 스케일업이 가능하다.
+
+데이터 파이프라인의 모든 단계는 결국 하나의 질문으로 귀결된다 — **같은 계산 예산 안에서 모델이 최대한 많이 배우려면, 무엇을 보여줘야 하는가**.
+
+<Reference
+  title="DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining"
+  authors="Xie et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.10429"
+/>
+
+<Reference
+  title="Data Mixing Laws: Optimizing Data Mixtures by Predicting Language Modeling Performance"
+  authors="Ye et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2403.16952"
+/>

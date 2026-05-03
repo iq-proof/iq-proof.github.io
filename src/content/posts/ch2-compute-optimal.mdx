@@ -1,0 +1,120 @@
+---
+title: "LLM 사전학습의 설계 결정들은 어디서 오는가"
+description: "C ≈ 6ND 유도부터 over-training의 경제학, μP의 width transfer, GNS 기반 배치 스케줄, WSD까지 — LLM 사전학습의 핵심 설계 결정을 하나의 프레임으로 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm, pretraining, scaling-law, flops, learning-rate]
+difficulty: advanced
+series:
+  slug: llm-pretraining-deep-dive
+  title: Llm Pretraining Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 사전학습의 설계 결정들 — 배치 크기, 학습률 스케줄, 파라미터 초기화 — 은 직관이나 경험칙처럼 보이지만, 사실 하나의 수학적 프레임에서 파생된다. 그 프레임의 출발점은 `C ≈ 6ND`라는 등식이다. 왜 하필 6인가, 그리고 이 상수가 현대 LLM의 과학적 선택들을 어떻게 정당화하는가?
+
+## FLOPs의 기하학: 왜 6ND인가
+
+Dense layer 하나의 행렬곱 $Y = XW$ (where $X \in \mathbb{R}^{B \times d_1}, W \in \mathbb{R}^{d_1 \times d_2}$)는 $2Bd_1d_2$ FLOPs를 소비한다. 스칼라 곱 하나당 multiply + add = 2 ops, 이를 $d_1 \times d_2$번 반복하기 때문이다.
+
+Transformer 한 레이어의 dense 연산을 합산하면 — Attention QKV projection, output projection, FFN의 gate/up/down — 토큰당 약 $12d^2$ FLOPs가 나온다. $L$개 레이어에 걸쳐 합산하면 $12Ld^2$이고, 이것이 곧 모델 파라미터 수 $N$과 근사적으로 같다. 따라서 forward pass의 FLOPs는 다음과 같다.
+
+$$\text{FLOPs}_\text{forward} = 2ND$$
+
+Backward pass는 두 계산으로 나뉜다. Activation gradient $\partial L / \partial x = W^\top \partial L / \partial y$는 forward와 같은 크기의 행렬곱이므로 $2ND$, weight gradient $\partial L / \partial W = x \otimes \partial L / \partial y$도 마찬가지로 $2ND$다. 합산하면:
+
+$$C = \text{FLOPs}_\text{forward} + \text{FLOPs}_\text{backward} = 2ND + 4ND = \boxed{6ND}$$
+
+<Aside label="Attention의 기여">
+Self-attention의 $QK^\top$ 계산은 $O(T^2)$이지만, dense layer 대비 비율은 $T^2 / (3d)$다. LLaMA-70B 기준으로 $d = 8192, T = 2048$일 때 약 4.3%에 불과하다. 따라서 $C \approx 6ND$에서 attention을 무시하는 것은 수학적으로 정당화된다.
+</Aside>
+
+## Over-training의 경제학
+
+Chinchilla(Hoffmann et al. 2022)는 고정 compute budget $C = 6ND$ 하에서 loss를 최소화하는 최적해로 $N^* \propto C^{0.45}, D^* \propto C^{0.55}$를 제시했다. 그런데 LLaMA-2(7B/2T), LLaMA-3(8B/15T)은 모두 Chinchilla 대비 14배~100배 over-training 상태다. 왜인가?
+
+Chinchilla는 pretraining cost만 최적화했다. 실제 비용 함수는 다음과 같다.
+
+$$C_\text{total} = 6ND + 2N \cdot n_\text{infer}$$
+
+추론 토큰 $n_\text{infer}$이 크면 inference cost가 지배적이 된다. 더 작은 모델은 토큰당 추론 비용($\approx 2N$)이 낮으므로, 같은 perplexity를 더 많은 데이터로 달성한 작은 모델이 총 비용에서 유리해진다.
+
+<Callout type="note" title="트레이드오프">
+LLaMA-2 7B/2T는 Chinchilla-optimal(50B/1.4T) 대비 pretraining loss가 약 0.3 nats 높다. 그러나 추론 비용은 토큰당 약 7배 저렴하다. $n_\text{infer} = 10^{13}$ 토큰 규모에서는 총 비용이 Chinchilla 대비 5배 이상 낮아진다. **Modern over-training은 실수가 아니라 inference-aware cost optimization의 수학적 귀결이다.**
+</Callout>
+
+## μP: width가 바뀌어도 학습이 같아야 한다
+
+$C = 6ND$를 최소화하는 실용적 전략은 작은 모델에서 hyperparameter를 튜닝하고 큰 모델에 그대로 전이하는 것이다. 그런데 표준 초기화에서는 이것이 불가능하다. 왜인가?
+
+표준 초기화에서 gradient norm은 width $n$에 선형 비례한다($\|\partial L / \partial W\| = O(n)$). Learning rate를 고정하면 update magnitude가 $O(n)$으로 증가해 큰 모델에서 학습이 불안정해진다.
+
+<Theorem kind="proposition" number="1" title="μP의 width-independent update">
+Hidden layer에 $\sigma_\text{init} = \sigma_0 / \sqrt{n}$, $\eta = \eta_0 / n$을 적용하면, forward activation norm과 weight update magnitude 모두 width에 무관하다.
+</Theorem>
+
+<Proof>
+Forward: $W \sim \mathcal{N}(0, \sigma_0^2 / n)$이므로 spectrum은 $O(1/n) \times n = O(1)$ → activation variance width-independent.
+
+Backward: gradient norm $\|g\|$은 $O(n)$이지만, learning rate $\eta = \eta_0 / n$을 적용하면 $\eta \|g\| = O(1)$ → update magnitude width-independent. $\square$
+</Proof>
+
+단, embedding layer와 output layer는 별도 scaling(`σ_0, η_0`)을 유지해야 한다. Embedding은 sparse update라서 μP scaling을 적용하면 rare token의 gradient가 소실되기 때문이다. Cerebras-GPT와 MiniCPM은 이 방식으로 소규모 prototype에서 튜닝한 hyperparameter를 대규모 모델에 직접 전이했다.
+
+## Gradient Noise Scale과 배치 크기
+
+배치 크기 선택은 GNS(Gradient Noise Scale) $B^*$를 기준으로 정당화된다.
+
+$$B^* = \frac{\mathrm{tr}(\Sigma)}{\|g^*\|^2}$$
+
+여기서 $\Sigma$는 gradient covariance, $g^*$는 true gradient다. $B \ll B^*$이면 noise-dominated(많은 step 필요), $B \gg B^*$이면 deterministic(추가 배치의 이득 없음)이다.
+
+훈련이 진행될수록 loss가 감소하면서 $\|g^*\|$는 빠르게 줄어들고 $B^*$는 증가한다. 이것이 Gopher와 GPT-3가 동적 배치 스케줄을 사용하는 수학적 이유다 — 초반에는 작은 배치(noise-limited 영역 최적화), 후반에는 큰 배치($B^*$ 증가에 맞춰)로 전환한다.
+
+경험적으로 $B^*(N) \propto N^{0.5}$의 scaling이 관찰된다. 작은 모델에서 측정한 $B^*$를 power law로 외삽하면 대규모 모델의 최적 배치를 추정할 수 있다.
+
+## LR 스케줄: Warmup, Cosine, WSD
+
+세 스케줄 모두 warmup(0-2%)으로 시작한다. 초기화 직후 activation이 작고 gradient direction이 불안정하기 때문이다. 작은 step으로 시작해 activation이 안정화되면 full learning rate로 전환한다.
+
+Cosine decay는 부드러운 감소로 Adam의 momentum과 호환성이 좋다. Step decay의 불연속은 누적된 momentum을 순간적으로 "쓸모없게" 만드는 반면, cosine은 momentum이 자연스럽게 적응한다.
+
+WSD(Warmup-Stable-Decay, Hu 2024)는 구조가 다르다.
+
+$$\text{Warmup (0-2\%)} \to \text{Stable (2-90\%, } \eta = \eta_\max\text{)} \to \text{Decay (90-100\%)}$$
+
+Stable phase에서 저장된 checkpoint는 continual training과 instruction tuning의 출발점으로 재사용할 수 있다. Stable phase의 가중치는 loss landscape의 flat region 근처에 있어 새 태스크에 대한 반응성이 높고, 이미 수렴 영역이므로 catastrophic forgetting도 최소화된다. MiniCPM과 DeepSeek는 이 방식으로 전체 compute의 약 10%만 추가해 instruction-following 능력을 획득했다.
+
+## 정리
+
+- $C = 6ND$는 "대략 6"이 아니라 forward(2ND) + backward activation(2ND) + backward weight(2ND)의 엄밀한 합산이다.
+- Modern over-training은 inference cost를 포함한 total cost 최소화의 결과다. 추론 규모가 클수록 작은 모델 + 많은 데이터가 유리하다.
+- μP는 작은 모델에서 튜닝한 learning rate와 초기화를 큰 모델에 직접 전이 가능하게 한다.
+- GNS $B^*$는 훈련 중 증가하므로 동적 배치 스케줄이 고정 배치보다 효율적이다.
+- WSD의 stable checkpoint는 continual training의 base로 재사용되어 sunk cost를 줄인다.
+
+이 결정들은 독립적 선택이 아니다 — 모두 "한 번의 pretraining, 수십억 번의 inference"라는 경제적 현실에서 파생된 수학의 다른 표현이다.
+
+<Reference
+  title="Training Compute-Optimal Large Language Models"
+  authors="Hoffmann et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2203.15556"
+/>
+
+<Reference
+  title="Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer"
+  authors="Yang et al."
+  year={2022}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2203.03466"
+/>

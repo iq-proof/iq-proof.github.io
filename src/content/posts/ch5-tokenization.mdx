@@ -1,0 +1,121 @@
+---
+title: "토큰화는 왜 모델의 성능을 결정하는가"
+description: "BPE의 탐욕 병합부터 Unigram LM의 전역 확률 최적화, 어휘 크기 스케일링 법칙까지 — 토큰화 설계 결정이 LLM 성능에 미치는 영향을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [tokenization, bpe, sentencepiece, vocab-scaling, llm]
+difficulty: advanced
+series:
+  slug: llm-pretraining-deep-dive
+  title: Llm Pretraining Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+토큰화는 "전처리"로 불리지만, 실제로는 모델이 세계를 인식하는 단위를 결정하는 설계 결정이다. BPE, WordPiece, Unigram LM은 표면적으로 비슷해 보이지만, 각자 다른 철학을 갖는다. 그리고 어휘 크기는 단순한 하이퍼파라미터가 아니다 — 모델 크기와 함께 스케일링해야 하는 핵심 변수다. 왜 LLaMA-3는 LLaMA-2 대비 어휘를 4배 늘렸는가?
+
+## 탐욕 병합의 정당성: BPE
+
+BPE(Byte Pair Encoding)는 단순하다. 문자 단위 어휘에서 시작해 가장 빈번한 인접 쌍을 반복적으로 병합한다.
+
+$$\text{pair}^* = \arg\max_{(t_a, t_b)} \text{count}(t_a, t_b)$$
+
+매 단계에서 전역 최적을 찾지 않는다는 점에서 탐욕 알고리즘이다. 그런데 왜 이것이 작동하는가? 정보 이론 관점에서 각 병합의 이득은 빈도에 정확히 비례한다. 문자 기반에서 `cost(t_a) = 1`, `cost(t_a + t_b) = 1`이므로 이득 = `count(t_a, t_b)`. 탐욕 선택이 곧 최대 압축 이득이다.
+
+GPT-2부터는 byte-level BPE를 사용한다. 초기 어휘를 256바이트로 설정하면 OOV가 구조적으로 불가능해진다 — 어떤 텍스트도 최악의 경우 바이트 단위로 분해될 수 있다. 대신 한국어처럼 UTF-8에서 한 글자가 3바이트를 차지하는 언어는 영어 중심 BPE에서 크게 손해를 본다. GPT-2로 한국어를 토큰화하면 압축률이 약 1.2 chars/token — 영어의 4.0에 비해 3배 이상 비효율적이다.
+
+## 빈도에서 확률로: WordPiece와 Unigram LM
+
+BPE의 핵심 약점은 **절대 빈도만 본다**는 점이다. `(the, quick)`이 100번 나타나도, `the`가 5,000번, `quick`이 500번 나타난다면 이 둘은 독립적이다 — 병합할 이유가 없다.
+
+WordPiece는 이를 상대 확률로 교정한다.
+
+$$\text{score}(t_a, t_b) = \frac{\text{count}(t_a, t_b)}{\text{count}(t_a) \times \text{count}(t_b)}$$
+
+이는 pointwise mutual information의 지수다. 점수가 크다는 것은 두 토큰이 독립적이지 않다, 즉 **의미적으로 연결돼 있다**는 신호다.
+
+Unigram LM(Kudo 2018)은 한 발 더 나아간다. 어휘가 고정된 상태에서 텍스트의 분해 방법이 여러 가지일 때, **전체 문장 확률을 최대화하는 분해**를 선택한다.
+
+$$p(s) = \prod_{i=1}^{m} p(t_i), \quad t^* = \arg\max_{\{t_1, \ldots, t_m\}} p(s)$$
+
+Viterbi 알고리즘으로 $O(m \cdot V)$에 최적 분해를 찾는다. `lowly`를 `low+ly`로 분해하려면 $p(\text{low}) > p(\text{lo}) \times p(\text{w})$이어야 한다 — 학습 코퍼스에서 "low"가 의미 단위로 충분히 자주 나타났다면 이 조건이 자연스럽게 충족된다.
+
+<Theorem kind="proposition" number="1" title="Unigram LM의 의미 경계 자동 선택">
+EM 알고리즘으로 학습된 Unigram LM에서, 의미 단위로 자주 함께 나타나는 토큰 수열은 분해 확률이 높아지고, 어휘에서 살아남는다.
+</Theorem>
+
+<Proof>
+M-step에서 토큰 $t_i$의 확률은 전체 코퍼스에서의 기대 출현 횟수로 업데이트된다. 자주 나타나는 의미 단위는 높은 확률을 유지하고, Viterbi에서 선택될 가능성이 높아진다. 수렴 후 어휘 pruning 단계에서 낮은 확률의 토큰이 제거되므로, 최종 어휘는 코퍼스에서 의미 있는 단위들로 구성된다.
+</Proof>
+
+SentencePiece(Kudo & Richardson 2018)는 공백을 `▁`(U+2581)로 명시적으로 인코딩해 언어 독립성을 확보한다. 공백이 없는 중국어나 일본어에도 동일한 알고리즘이 적용된다. LLaMA, Gemma, Mistral이 모두 SentencePiece를 채택한 것은 이 때문이다.
+
+## 다국어 압축률과 숫자 처리
+
+토큰화 방식의 선택은 언어별 압축률에 직접 반영된다.
+
+| 모델 | English | Korean | Chinese | Japanese |
+|------|---------|--------|---------|----------|
+| GPT-2 (50K BPE) | 4.0 | 1.2 | 1.5 | 1.3 |
+| LLaMA-3 (128K SP) | 4.3 | 2.5 | 2.8 | 2.8 |
+
+한국어 기준으로 압축률이 2배 이상 차이난다. 같은 1T 토큰 데이터를 학습하더라도 GPT-2 계열 토크나이저는 한국어 사용자에게 3배의 계산 비용을 요구하는 셈이다.
+
+숫자 처리도 설계 선택이다. LLaMA-3은 숫자를 한 자리씩 분해(digit split)한다.
+
+```
+"2024" → [2, 0, 2, 4]  (4 토큰, LLaMA-3)
+"2024" → [2024]         (1 토큰, GPT-2)
+```
+
+<Callout type="note" title="트레이드오프">
+Digit split은 시퀀스 길이를 늘리지만 어휘 크기를 거의 늘리지 않는다(0-9 추가). 반면 single token 방식은 7자리 숫자를 모두 어휘에 넣으려면 $10^7$ 엔트리가 필요하다. FLOPs 관점에서 embedding/softmax 비용($O(V)$)은 시퀀스 길이 비용($O(T)$)보다 더 빠르게 증가하므로, digit split이 산술 성능 향상까지 덤으로 얻는 현명한 선택이다.
+</Callout>
+
+## 어휘 크기 스케일링 법칙
+
+Tao et al. (2024)는 모델 크기 $N$과 최적 어휘 크기 $V^*$ 사이의 실증적 관계를 발견했다.
+
+$$\boxed{V^* \propto N^{0.27}}$$
+
+모델이 2배 커지면 어휘는 $2^{0.27} \approx 1.20$배, 즉 20%만 늘리면 된다. 어휘 크기 증가는 모델 크기 증가보다 훨씬 느리다.
+
+이 법칙의 직관은 두 비용의 균형이다. 어휘가 너무 작으면 단어를 더 잘게 분해해 시퀀스 길이가 늘어난다(attention/FFN 비용 증가). 어휘가 너무 크면 embedding/output 행렬이 커진다($2 \times V \times d_{\text{hidden}}$ 메모리). 최적점 $V^*$는 두 비용이 균형을 이루는 지점이다.
+
+LLaMA-3이 이론값(~33K)보다 훨씬 큰 128K를 선택한 것은 다국어 압축률 개선이라는 **실무적 요구**를 반영한다. Tao et al.의 공식은 단일 언어 하한에 가깝다. 다국어 모델에서는 $1.2$~$2.0 \times V^*_{\text{base}}$가 현실적인 선택이다.
+
+<Aside label="Chinchilla와의 통합">
+Ch2의 compute-optimal 관계 $D \approx 20N$과 어휘 스케일링을 함께 고려하면, 총 FLOPs는 $6ND + 2NVD$다. $V = V^*$를 대입하면 embedding/output 비용은 전체의 10% 수준에 머문다. 즉, 어휘 최적화는 기본 scaling law를 크게 교란하지 않으면서 성능을 개선한다.
+</Aside>
+
+## 정리
+
+- BPE는 탐욕 병합이지만 정보 이론적으로 정당하다. 한계는 빈도만 보고 의미를 무시한다는 것이다.
+- WordPiece는 상대 확률로, Unigram LM은 전역 문장 확률로 이 한계를 극복한다. 현대 LLM의 표준은 SentencePiece Unigram이다.
+- 다국어 압축률과 숫자 처리는 토큰화 선택의 실질적 결과다 — GPT-2와 LLaMA-3 사이의 한국어 압축률 2배 차이가 이를 보여준다.
+- 어휘 크기는 $V^* \propto N^{0.27}$로 스케일링해야 한다. 어휘 부족은 시퀀스 길이를 늘리고, 어휘 과잉은 embedding 비용을 늘린다.
+
+토큰화 방식 하나가 모델의 다국어 능력과 산술 성능, 그리고 학습 효율을 동시에 결정한다.
+
+<Reference
+  title="Neural Machine Translation of Rare Words with Subword Units"
+  authors="Sennrich et al."
+  year={2016}
+  venue="ACL"
+  url="https://arxiv.org/abs/1508.07909"
+/>
+
+<Reference
+  title="SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing"
+  authors="Kudo & Richardson"
+  year={2018}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/1808.06226"
+/>

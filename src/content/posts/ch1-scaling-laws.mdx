@@ -1,0 +1,150 @@
+---
+title: "LLM 학습 규모는 어떻게 결정되는가"
+description: "Kaplan의 power law부터 Chinchilla의 joint law, Broken Scaling Law, 그리고 scaling law의 본질적 한계까지 — LLM 사전학습의 수학적 의사결정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [scaling-law, llm-pretraining, chinchilla, kaplan, compute-optimal]
+difficulty: advanced
+series:
+  slug: llm-pretraining-deep-dive
+  title: Llm Pretraining Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM을 학습할 때 가장 먼저 결정해야 할 것은 모델 크기와 데이터 크기다. 직관이나 관습이 아니라 수학으로 이 결정을 내릴 수 있다면 어떨까? Kaplan et al. (2020)은 처음으로 이 질문에 power law로 답했고, Hoffmann et al. (2022)은 그 답을 뒤집었다. 두 논문이 정반대 결론에 도달한 이유는 무엇이고, 그 결론을 오늘의 LLM 개발에 어떻게 적용해야 하는가?
+
+## Power Law의 출발점
+
+Kaplan 2020은 세 가지 독립적인 관계를 실증했다.
+
+$$
+L(N) = a_N N^{-\alpha_N}, \quad L(D) = a_D D^{-\alpha_D}, \quad L(C) = a_C C^{-\alpha_C}
+$$
+
+여기서 $\alpha_N \approx 0.076$, $\alpha_D \approx 0.161$, $\alpha_C \approx 0.055$다. 핵심 직관은 exponent의 크기에 있다. $\alpha_D > \alpha_N$이면, 데이터를 2배 늘릴 때 loss 감소폭이 모델을 2배 키울 때보다 크다 — 즉 데이터가 더 "민감"해 보인다. 하지만 Kaplan은 이를 반대로 해석했다.
+
+compute budget $C = 6ND$를 고정하고 loss를 최소화하면:
+
+$$
+N^* \propto C^{\frac{\alpha_D}{\alpha_N + \alpha_D}} \approx C^{0.68}, \quad D^* \propto C^{\frac{\alpha_N}{\alpha_N + \alpha_D}} \approx C^{0.32}
+$$
+
+**"모델 크기가 데이터보다 중요하다"** — 이것이 Kaplan의 결론이었다.
+
+## Chinchilla의 반론: Joint Law
+
+Kaplan의 세 power law는 각 축을 고정하고 하나만 변화시킨 관찰이다. Hoffmann 2022는 $N$과 $D$가 동시에 변하는 실제 학습 환경에 맞는 joint law를 제안했다.
+
+$$
+L(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}
+$$
+
+$E = 1.69$, $A = 406.4$, $B = 410.7$, $\alpha = 0.34$, $\beta = 0.28$. $E$는 irreducible loss다 — $N, D \to \infty$여도 줄어들지 않는 데이터 자체의 불확실성이다.
+
+<Callout type="note" title="Gopher vs Chinchilla">
+같은 compute($\approx 1.4 \times 10^{21}$ FLOPs)로 학습한 두 모델의 결과: Gopher(280B params, 300B tokens) loss ≈ 2.50, Chinchilla(70B params, 1.4T tokens) loss ≈ 2.42. 파라미터를 4분의 1로 줄이고 데이터를 4.7배 늘렸더니 더 낮은 loss를 달성했다.
+</Callout>
+
+이 joint law에서 최적 비율은 Lagrangian으로 유도된다.
+
+## Lagrangian으로 최적 비율 유도
+
+constrained optimization 문제는 다음과 같다.
+
+$$
+\min_{N, D} \left[ E + \frac{A}{N^\alpha} + \frac{B}{D^\beta} \right] \quad \text{s.t.} \quad 6ND = C
+$$
+
+<Theorem kind="theorem" number="1" title="Compute-Optimal 비율">
+Chinchilla joint law 하에서, compute constraint $6ND = C$를 만족하는 최적 $(N^*, D^*)$는 다음 비율을 만족한다.
+
+$$
+\frac{N^*}{D^*} = \left(\frac{\alpha A}{\beta B}\right)^{\frac{1}{\alpha + \beta}}
+$$
+</Theorem>
+
+<Proof>
+Lagrangian $\mathcal{L} = L(N, D) + \lambda(6ND - C)$의 KKT 조건:
+
+$$
+\frac{\partial \mathcal{L}}{\partial N} = 0 \Rightarrow \frac{\alpha A}{N^{\alpha+1}} = 6\lambda D \quad \cdots (1)
+$$
+
+$$
+\frac{\partial \mathcal{L}}{\partial D} = 0 \Rightarrow \frac{\beta B}{D^{\beta+1}} = 6\lambda N \quad \cdots (2)
+$$
+
+$(1) \div (2)$:
+
+$$
+\frac{\alpha A}{\beta B} \cdot \frac{D^\beta}{N^\alpha} = 1 \quad \Rightarrow \quad \frac{N^\alpha}{D^\beta} = \frac{\alpha A}{\beta B}
+$$
+
+$\alpha = 0.34$, $\beta = 0.28$, $A = 406.4$, $B = 410.7$ 대입:
+
+$$
+\frac{N^*}{D^*} = \left(\frac{0.34 \times 406.4}{0.28 \times 410.7}\right)^{1/0.62} \approx 0.887
+$$
+
+즉 $D^* \approx 1.13 N^*$ — 데이터가 모델보다 약 13% 많아야 한다. $\square$
+</Proof>
+
+Kaplan($N \propto C^{0.73}$)과 Chinchilla($N \approx D$ 균등)의 결론이 정반대인 이유는 세 가지다: LR schedule 완료도(Kaplan은 cosine의 약 80%에서 중단), 파라미터 계산 방식(embedding 포함/제외), 데이터 반복 횟수. Hoffmann의 Appendix에서 Kaplan의 실험 설정을 그대로 재현하면 Kaplan의 결론이 나온다 — 즉, 이론적 모순이 아니라 **재현성 문제**였다.
+
+## Power Law가 깨지는 지점
+
+Chinchilla의 smooth power law가 설명하지 못하는 현상이 있다. 모델 크기가 증가할 때 특정 능력이 **갑자기** 나타나는 것처럼 보이는 "emergent abilities"다. Caballero et al. (2022)의 Broken Neural Scaling Law(BNSL)는 이를 break point로 모델링한다.
+
+$$
+L(x) = a + b\, x^{-c_0} \prod_{i=1}^k \left(1 + \left(\frac{x}{d_i}\right)^{1/f_i}\right)^{-c_i f_i}
+$$
+
+$x \ll d_i$일 때는 일반 power law처럼 동작하다가, $x \approx d_i$에서 추가적인 power law가 개입한다. 흥미로운 점은 loss curve 자체는 smooth해도, exact-match 같은 **비선형 metric**이 loss threshold를 통과하는 순간 성능이 계단식으로 뛰어 보인다는 것이다. Wei et al. (2022)가 관찰한 "갑작스러운 출현"의 상당 부분은 underlying loss가 아니라 **측정 방식의 비선형성**에서 온다.
+
+<Aside label="설계 직관">
+같은 loss curve를 exact-match로 보면 sudden jump, token-edit-distance로 보면 smooth — 모두 같은 BNSL을 따르면서도. 평가 metric을 먼저 정의한 뒤 scaling을 해석해야 하는 이유다.
+</Aside>
+
+## 트레이드오프: Scaling Law의 유효 범위
+
+<Callout type="warning" title="Scaling Law의 네 가지 한계">
+1. **데이터 품질 무시**: FineWeb-Edu($q \approx 1.8$)는 standard web의 56% 토큰으로 같은 loss를 달성한다. Chinchilla law에는 품질 계수 $q$가 없다.
+2. **Architecture 의존성**: Flash Attention은 effective compute를 약 30% 절감하고, MoE는 sparse activation으로 동일 파라미터 대비 더 낮은 loss를 달성한다. 아키텍처가 바뀌면 scaling law를 다시 측정해야 한다.
+3. **Perplexity ≠ Downstream 성능**: PPL과 MMLU의 상관관계 $R^2 \approx 0.92$이지만, GSM8K(reasoning)는 $R^2 \approx 0.48$에 불과하다.
+4. **Test-time compute**: o1/o3는 inference-time token을 늘릴수록 성능이 $T_{\text{infer}}^{0.04}$로 증가하는 새로운 scaling 축을 열었다. 이는 pretraining compute와 orthogonal하다.
+</Callout>
+
+현대 LLM은 Chinchilla-optimal을 훨씬 넘어서 over-train된다. LLaMA-3-70B는 15T 토큰으로 학습했다 — Chinchilla-optimal의 약 10배다. 이유는 단순하다: **training은 한 번, inference는 수십억 번**. 작은 모델을 더 많이 학습하면 inference cost가 줄어든다.
+
+## 정리
+
+- Kaplan(2020)은 $N \propto C^{0.73}$을 주장했지만, 이는 LR schedule 미완료와 데이터 반복 학습이라는 실험 설정의 산물이었다.
+- Chinchilla(2022)는 joint law $L(N, D) = E + A/N^\alpha + B/D^\beta$로 $N \approx D$ 균등 할당이 optimal임을 증명했다.
+- BNSL은 "emergent abilities"가 loss의 phase transition일 수도, metric의 비선형성일 수도 있음을 보인다.
+- Scaling law는 강력한 항법 도구지만, 데이터 품질·아키텍처 변화·downstream 성능·test-time compute라는 네 축은 법칙 밖에 있다.
+
+Perplexity를 최소화하는 것과 좋은 LLM을 만드는 것은 같은 문제가 아니다.
+
+<Reference
+  title="Training Compute-Optimal Large Language Models"
+  authors="Hoffmann et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2203.15556"
+/>
+
+<Reference
+  title="Scaling Laws for Neural Language Models"
+  authors="Kaplan et al."
+  year={2020}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2001.08361"
+/>
