@@ -26,7 +26,7 @@
  */
 
 import { getCollection } from 'astro:content';
-import { DEV_LAB_GROUPS, AI_LAB_LAYERS } from '@/consts';
+import { DEV_LAB_GROUPS, AI_LAB_LAYERS, NAV } from '@/consts';
 import Icon from '@/components/Icon.astro';
 
 type Category = 'dev' | 'ai' | 'agent';
@@ -183,6 +183,22 @@ const hasCurrentInCat: Record<Category, boolean> = {
   </button>
 
   <div class="sidebar-content" id="iq-sidebar-content">
+    {/* 모바일 전용 — Header nav 메뉴 (Home, Posts, Dev, AI, Agent, Projects, About) */}
+    <nav class="mobile-nav" aria-label="Primary mobile">
+      {NAV.map(({ href, label }) => {
+        const isActive = href === '/' ? Astro.url.pathname === '/' : Astro.url.pathname.startsWith(href);
+        let activeClass = '';
+        if (href === '/categories/dev') activeClass = 'nav-dev';
+        else if (href === '/categories/ai') activeClass = 'nav-ai';
+        else if (href === '/categories/agent') activeClass = 'nav-agent';
+        return (
+          <a href={href} class={`mobile-nav-link ${isActive ? `active ${activeClass}` : ''}`}>
+            {label}
+          </a>
+        );
+      })}
+    </nav>
+
     <div class="sidebar-meta">
       <span class="sidebar-meta-label">전체 글</span>
       <span class="sidebar-meta-count">{allPosts.length}</span>
@@ -603,6 +619,52 @@ const hasCurrentInCat: Record<Category, boolean> = {
   }
   .sidebar-content::-webkit-scrollbar-thumb:hover {
     background: var(--color-text-tertiary, #6b7280);
+  }
+
+  /* ──────────────────────────────────────────────────────────
+     모바일 전용 nav (Header의 nav가 모바일에서 hidden되므로 여기서 노출)
+     데스크톱에선 Header에 이미 있으니 hidden
+     ────────────────────────────────────────────────────────── */
+  .mobile-nav {
+    display: none;
+  }
+
+  @media (max-width: 1023px) {
+    .mobile-nav {
+      display: flex;
+      flex-direction: column;
+      padding: 0.5rem 0.75rem 0.75rem;
+      margin-bottom: 0.25rem;
+      border-bottom: 1px dashed var(--color-border-subtle, #374151);
+    }
+
+    .mobile-nav-link {
+      display: block;
+      padding: 0.55rem 0.75rem;
+      color: var(--color-text-secondary, #9ca3af);
+      font-size: 0.92rem;
+      font-weight: 500;
+      text-decoration: none;
+      border-radius: 5px;
+      transition: background 0.12s, color 0.12s;
+    }
+    .mobile-nav-link:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--color-text-primary, #f3f4f6);
+    }
+    .mobile-nav-link.active {
+      background: rgba(34, 211, 238, 0.08);
+      color: var(--color-accent-cyan, #22d3ee);
+      font-weight: 600;
+    }
+    .mobile-nav-link.active.nav-ai {
+      background: rgba(167, 139, 250, 0.08);
+      color: var(--color-accent-violet, #a78bfa);
+    }
+    .mobile-nav-link.active.nav-agent {
+      background: rgba(245, 158, 11, 0.08);
+      color: #f59e0b;
+    }
   }
 
   .sidebar-meta {
