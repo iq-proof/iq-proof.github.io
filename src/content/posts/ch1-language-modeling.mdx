@@ -1,0 +1,163 @@
+---
+title: "언어 모델이란 무엇인가 — 확률의 연쇄에서 ChatGPT까지"
+description: "Chain rule of probability로 언어 모델을 엄밀하게 정의하고, N-gram의 sparse data 문제부터 Kneser-Ney smoothing의 continuation count 통찰까지, NLP 기초 이론의 흐름을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [nlp, language-model, ngram, perplexity, kneser-ney]
+difficulty: advanced
+series:
+  slug: nlp-foundations-deep-dive
+  title: Nlp Foundations Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT, BERT, 번역기, 음성 인식기 — 겉모습은 전부 달라 보이지만 이 시스템들은 하나의 수식으로 수렴한다. $\hat{y} = \arg\max_y p(y \mid x)$. 언어 모델이란 그 $p$를 추정하는 일이다. 그렇다면 확률론의 가장 기초적인 정리 하나에서 ChatGPT까지의 거리는 얼마나 될까?
+
+## 언어 모델의 출발점 — Chain Rule
+
+문장 $w_{1:T}$의 결합 확률 $p(w_1, w_2, \ldots, w_T)$를 한꺼번에 모델링하는 것은 불가능하다. vocabulary $V = 50{,}000$, 길이 $T = 20$이면 가능한 문장 수는 $50000^{20} \approx 10^{94}$다.
+
+조건부 확률의 정의 $p(A \mid B) = p(A, B)/p(B)$를 반복 적용하면 이 문제가 사라진다.
+
+$$
+p(w_{1:T}) = \prod_{t=1}^{T} p(w_t \mid w_{<t})
+$$
+
+<Theorem kind="theorem" number="1.1" title="Chain Rule of Probability">
+이산 확률 변수 $W_1, \ldots, W_T$의 결합 분포는 다음을 만족한다.
+
+$$
+p(w_1, \ldots, w_T) = \prod_{t=1}^{T} p(w_t \mid w_{<t})
+$$
+</Theorem>
+
+<Proof>
+$p(w_1, w_2) = p(w_1) p(w_2 \mid w_1)$. 귀납적으로 $p(w_1, \ldots, w_{T-1})$이 성립하면, $p(w_1, \ldots, w_T) = p(w_1, \ldots, w_{T-1}) \cdot p(w_T \mid w_{<T}) = \prod_{t=1}^T p(w_t \mid w_{<t})$. $\square$
+</Proof>
+
+각 항 $p(w_t \mid w_{<t})$는 vocabulary 위의 categorical distribution이다. 이것이 GPT 계열의 학습 목적식 $\mathcal{L} = -\sum_t \log p_\theta(w_t \mid w_{<t})$와 정확히 같다. 이론과 실제의 거리가 수식 한 줄이다.
+
+<Aside label="conditional LM으로의 확장">
+기계 번역, 요약, QA는 모두 $p(y_{1:T_y} \mid x_{1:T_x}) = \prod_{t=1}^{T_y} p(y_t \mid y_{<t}, x_{1:T_x})$의 형태다. unconditional LM이 정확하면 Bayes rule $p(y \mid x) = p(x, y)/p(x)$로 모든 conditional task를 해결할 수 있다는 것이 "LM은 NLP의 충분 표현"이라는 주장의 근거다. GPT-3의 in-context learning은 이 정리의 대규모 실증이다.
+</Aside>
+
+## N-gram — 무한 context를 유한으로 자르기
+
+Chain rule은 이론적으로 정확하지만 $p(w_t \mid w_{<t})$의 conditioning context는 $t$가 커질수록 무한히 길어진다. **N-gram 모델**은 history를 마지막 $n-1$개 토큰으로 잘라낸다.
+
+$$
+p(w_t \mid w_{<t}) \approx p(w_t \mid w_{t-n+1:t-1})
+$$
+
+MLE 추정은 count ratio로 닫힌 형태가 된다.
+
+$$
+\hat{p}_{\text{MLE}}(w_t \mid w_{t-n+1:t-1}) = \frac{c(w_{t-n+1:t})}{c(w_{t-n+1:t-1})}
+$$
+
+문제는 sparse data다. Brown corpus($N = 10^6$, $V = 5 \times 10^4$)에서 4-gram coverage는 $10^{-13}$ 수준이다. test set trigram의 절반 이상이 훈련 데이터에 등장하지 않고, MLE는 unseen $n$-gram에 $p = 0$을 부여한다. 문장 전체의 likelihood가 0이 된다.
+
+<Callout type="warning" title="Sparse Data의 정량화">
+$n$-gram 모델의 free parameter 수는 $O(V^n)$이고, MLE가 수렴하려면 $N \gtrsim V^n$의 데이터가 필요하다. $V = 5 \times 10^4$, $n = 4$이면 $6 \times 10^{18}$ 토큰 — 지구상의 모든 텍스트를 합쳐도 부족하다. **Smoothing은 선택이 아니라 필수다.**
+</Callout>
+
+## Perplexity — 언어 모델의 척도
+
+모델의 품질을 어떻게 측정하는가? held-out likelihood는 문장 길이에 의존하므로 비교가 어렵다. **perplexity**는 per-token log-likelihood의 지수 변환으로 길이를 정규화한다.
+
+$$
+\mathrm{PPL}(q; \mathcal{D}) = \exp\!\left(-\frac{1}{T}\sum_{t=1}^{T}\log q(w_t \mid w_{<t})\right)
+$$
+
+직관은 "단어당 평균 branching factor"다. PPL = 100이라면 매 단어마다 100개 후보 중에서 고르는 것과 같다. uniform LM의 PPL은 정확히 $V$이고, 완벽한 LM의 PPL은 1이다.
+
+정보이론적으로 PPL은 cross-entropy의 지수다.
+
+$$
+\mathrm{PPL} = 2^{H(p, q)} = 2^{H(p) + D_{\mathrm{KL}}(p \,\Vert\, q)}
+$$
+
+이 분해가 중요하다. $H(p)$는 진짜 분포의 intrinsic uncertainty — 어떤 모델도 이 한계 아래로 내려갈 수 없다. Shannon(1951)의 추정에 따르면 영어의 entropy는 약 1.3 bit/char, 단어 단위로 약 5 bit/word이므로 PPL 하한은 $2^5 = 32$ 근처다. GPT-3의 WikiText-103 PPL이 ~9.0이라는 숫자는 이 관점에서 읽어야 한다. 나머지 gap인 $D_{\mathrm{KL}}(p \,\Vert\, q)$이 모델이 줄여야 할 부분이다.
+
+## Smoothing — 0을 없애는 방법들
+
+MLE의 0 확률 문제를 해결하는 smoothing의 일반 원리는 "seen event의 mass를 약간 줄이고 unseen에 분배"다. 
+
+**Laplace(Add-1)**는 모든 count에 1을 더한다.
+
+$$
+\hat{p}_{\text{Laplace}}(w \mid h) = \frac{c(h, w) + 1}{c(h) + |V|}
+$$
+
+Dirichlet$(1, \ldots, 1)$ prior와 multinomial likelihood의 posterior mean이라는 깔끔한 Bayesian 해석이 있지만, $V = 50{,}000$에서는 unseen $n$-gram이 전체 mass의 99.8%를 가져간다. seen data의 정보가 사실상 사라진다.
+
+**Good-Turing**은 더 정교한 통찰을 제공한다. "$r$번 본 사건의 진짜 확률은 $r$보다 약간 작다."
+
+$$
+r^* = (r + 1) \frac{N_{r+1}}{N_r}
+$$
+
+여기서 $N_r$은 정확히 $r$번 등장한 $n$-gram의 수다. $r = 1$인 singleton의 count를 줄이고, 그 mass를 unseen에 분배한다. 이것이 **absolute discount** $D \approx N_1/(N_1 + 2N_2) \approx 0.75$의 직접적 동기다.
+
+**Interpolation(Jelinek-Mercer)**은 trigram, bigram, unigram을 가중 평균한다.
+
+$$
+\hat{p}_{\text{interp}}(w \mid w_{t-2}, w_{t-1}) = \lambda_3 \hat{p}(w \mid w_{t-2}, w_{t-1}) + \lambda_2 \hat{p}(w \mid w_{t-1}) + \lambda_1 \hat{p}(w)
+$$
+
+$\lambda$는 held-out set 위 EM으로 학습한다. Brown bigram 기준으로 Laplace PPL ~1247, Add-0.01 PPL ~598, Good-Turing PPL ~350, Interpolation PPL ~280 — 순서가 있다.
+
+## Kneser-Ney — N-gram의 정점
+
+Laplace부터 Interpolation까지 모든 smoothing이 공유하는 숨겨진 가정이 있다. "lower-order distribution은 raw unigram frequency로 추정한다." **Kneser & Ney(1995)**는 이 가정이 틀렸음을 보였다.
+
+*Francisco*는 corpus에 1000번 등장하지만 거의 항상 *San* 다음이다. unseen bigram *(this, Francisco)*의 backoff로 raw unigram을 쓰면 *Francisco*의 확률이 과대 추정된다. *"이 단어가 얼마나 자주 나타나는가"*가 아니라 *"이 단어가 얼마나 다양한 context에 나타나는가"*가 올바른 prior다.
+
+$$
+\boxed{P_{\mathrm{CONT}}(w) = \frac{\lvert \{u : c(u, w) > 0\} \rvert}{\sum_{w'} \lvert \{u : c(u, w') > 0\} \rvert}}
+$$
+
+*Francisco*의 unique left context는 `{San}` — continuation count = 1. *glasses*는 `{eye, wine, sun, reading, ...}` — continuation count = 수백. raw frequency에서는 *Francisco* > *glasses*지만, continuation probability에서는 역전된다. KN은 이 직관을 absolute discount와 결합한다.
+
+$$
+p_{\mathrm{KN}}(w \mid h) = \frac{\max(c(h, w) - D, 0)}{c(h)} + \alpha(h) \cdot P_{\mathrm{CONT}}(w)
+$$
+
+**Modified KN(Chen & Goodman 1999)**은 $D$를 빈도별로 분리한다. $c = 1$인 singleton은 큰 discount $D_1$, $c \geq 3$인 frequent $n$-gram은 작은 discount $D_{3+}$. 이것이 Brown corpus 기준 PPL ~210으로 모든 smoothing 방법 중 최저를 달성하는 이유다.
+
+<Callout type="note" title="트레이드오프">
+Smoothing sophistication의 효과는 corpus 크기에 반비례한다. Brants et al.(2007)은 200B 토큰 corpus에서 discount를 0.4로 고정한 **Stupid Backoff**가 Modified KN과 비슷한 BLEU를 달성하면서 메모리를 1/5로 줄임을 보였다. Small corpus에서는 KN이 압도적이고, web-scale corpus에서는 단순함이 효율적이다. corpus 크기를 먼저 파악하고 smoothing 방법을 선택해야 한다.
+</Callout>
+
+## 정리
+
+- 언어 모델은 $p(w_{1:T}) = \prod_t p(w_t \mid w_{<t})$다. Chain rule의 직접 적용이고 GPT의 학습 목적식과 동일하다.
+- Perplexity는 $2^{H(p) + D_{\mathrm{KL}}(p \,\Vert\, q)}$다. $H(p)$는 줄일 수 없는 언어의 intrinsic uncertainty이고, KL 부분이 모델이 개선할 수 있는 영역이다.
+- N-gram의 MLE는 unseen에 $p = 0$을 부여한다. corpus가 아무리 커도 $n \geq 4$부터는 sparse data가 압도적이다.
+- Kneser-Ney의 핵심은 frequency가 아닌 **continuation count**다. "얼마나 자주"가 아니라 "얼마나 다양한 곳에"가 올바른 prior다.
+
+NLP의 흐름 — N-gram에서 Word2Vec, RNN, Transformer로 이어지는 진화 — 은 같은 문제의 다른 해법이다. sparse count table을 dense embedding으로 교체했을 뿐, "다음 토큰의 분포를 예측한다"는 목표는 변하지 않았다.
+
+<Reference
+  title="An Empirical Study of Smoothing Techniques for Language Modeling"
+  authors="Chen, S. F. and Goodman, J."
+  year={1999}
+  venue="Computer Speech and Language"
+  url="https://www.sciencedirect.com/science/article/pii/S0885230899901095"
+/>
+
+<Reference
+  title="Improved Backing-Off For M-gram Language Modeling"
+  authors="Kneser, R. and Ney, H."
+  year={1995}
+  venue="ICASSP"
+  url="https://ieeexplore.ieee.org/document/479394"
+/>

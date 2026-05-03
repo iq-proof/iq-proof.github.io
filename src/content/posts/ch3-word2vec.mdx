@@ -1,0 +1,153 @@
+---
+title: "Word2Vec은 왜 작동하는가 — PMI의 다른 이름"
+description: "Skip-gram과 CBOW의 설계 차이부터 Hierarchical Softmax·Negative Sampling의 수학적 유도, 그리고 SGNS의 optimal solution이 shifted PMI matrix임을 증명한 Levy & Goldberg 2014까지."
+pubDate: 2026-05-03
+category: ai
+tags: [word2vec, skip-gram, negative-sampling, pmi, distributional-semantics]
+difficulty: advanced
+series:
+  slug: nlp-foundations-deep-dive
+  title: Nlp Foundations Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Word2Vec은 "신경망 기반의 새로운 embedding"으로 불렸다. 그러나 Levy & Goldberg(2014)는 Skip-gram with Negative Sampling(SGNS)의 optimal solution이 정확히 shifted PMI matrix의 implicit factorization임을 증명했다. 이것이 의미하는 바는 무엇인가?
+
+## Skip-gram과 CBOW — 같은 아이디어, 다른 방향
+
+Word2Vec의 두 architecture는 같은 직관을 반대 방향에서 구현한다.
+
+**Skip-gram**은 center word로 context를 예측한다. center `cat`이 주어지면 `the`, `sat`을 예측하는 조건부 확률 $p(w_O \mid w_I)$를 학습한다. 각 (center, context) pair가 독립적인 training signal이 되므로, rare word도 자신의 context로부터 update를 받는다.
+
+**CBOW**는 반대다. context `the`, `sat`의 평균 embedding으로 center `cat`을 예측한다.
+
+$$
+\boldsymbol{v}_{\text{ctx}} = \frac{1}{2m} \sum_{j \neq 0} W_{\text{in}}[w_{t+j}, :]
+$$
+
+평균 연산이 gradient를 $1/(2m)$으로 희석하므로, rare word의 update 신호가 약해진다. 대신 token당 softmax 계산이 1회로 줄어 학습이 ~3배 빠르다.
+
+두 model 모두 hidden layer가 없다. Bengio 2003의 신경망 언어모델이 embedding lookup → hidden(tanh) → softmax였다면, Word2Vec은 hidden을 제거하고 embedding을 곧바로 softmax에 연결했다. 학습 속도가 약 10배 향상됐고, embedding quality는 동등하거나 더 나았다.
+
+<Callout type="note" title="비대칭 embedding">
+Skip-gram은 input embedding $W_{\text{in}}$과 output embedding $W_{\text{out}}$을 분리한다. center로서의 `cat`과 context로서의 `cat`은 다른 역할이고, 두 vector가 distributional asymmetry를 각각 모델링한다. Levy & Goldberg(2014)의 정리는 이 분리가 PMI matrix factorization의 두 인수에 정확히 대응함을 보인다.
+</Callout>
+
+## Full Softmax의 병목과 두 가지 우회
+
+Skip-gram의 conditional probability는 다음과 같다.
+
+$$
+p(w_O \mid w_I) = \frac{\exp(\boldsymbol{v}'^{\top}_{w_O} \boldsymbol{v}_{w_I})}{\sum_{w \in V} \exp(\boldsymbol{v}'^{\top}_w \boldsymbol{v}_{w_I})}
+$$
+
+분모의 합산이 문제다. $|V| = 10^5$이면 token당 100k dot product, 1B token corpus에서는 $10^{14}$ 연산 — 단일 CPU로 수십 년이 걸린다.
+
+**Hierarchical Softmax**는 vocabulary를 binary tree의 leaf로 배치하고, word prediction을 root → leaf의 binary decision 연쇄로 분해한다.
+
+$$
+p(w \mid w_I) = \prod_{j=1}^{L(w)-1} \sigma\!\left([\![\cdot]\!] \cdot \boldsymbol{\theta}^{\top}_{n(w,j)} \boldsymbol{v}_{w_I}\right)
+$$
+
+Huffman tree를 사용하면 frequent word의 path length가 짧아진다. 기대 path length는 분포의 entropy $H(W)$에 수렴하며, $|V| = 50{,}000$ 기준으로 full softmax 대비 약 3000배 빠르다.
+
+**Negative Sampling**은 더 단순하다. 매 (center, context) pair마다 $k$개의 random "negative" word를 sampling해 binary classification으로 대체한다.
+
+$$
+\ell_{\text{NS}} = -\log \sigma(\boldsymbol{v}'^{\top}_{w_O} \boldsymbol{v}_{w_I}) - \sum_{i=1}^{k} \mathbb{E}_{w_i \sim P_n}\!\left[\log \sigma(-\boldsymbol{v}'^{\top}_{w_i} \boldsymbol{v}_{w_I})\right]
+$$
+
+per-pair cost가 $O((k+1) \cdot d)$로 줄어든다. $k = 5$이면 full softmax 대비 약 10,000배 빠르다.
+
+noise distribution $P_n(w) \propto c(w)^{0.75}$의 지수 0.75는 Mikolov의 grid search 결과다. uniform($\alpha=0$)이면 rare word가 negative로 너무 자주 등장해 학습 신호가 약해지고, unigram($\alpha=1$)이면 `the`, `a` 같은 frequent word가 모든 pair의 negative로 수렴한다. 0.75는 mid-frequency를 강조하는 경험적 최적점이다.
+
+## SGNS의 optimal solution — PMI의 재발견
+
+<Theorem kind="theorem" number="1" title="Levy & Goldberg 2014">
+$P_n(c) = \#(c) / |D|$ (unigram)일 때, SGNS의 per-pair expected loss를 최소화하는 dot product는 다음과 같다.
+
+$$
+\boldsymbol{v}_w^{\top} \boldsymbol{v}'_c = \mathrm{PMI}(w, c) - \log k
+$$
+</Theorem>
+
+<Proof>
+pair $(w, c)$의 expected loss를 $x = \boldsymbol{v}_w^{\top} \boldsymbol{v}'_c$의 함수로 쓰면
+
+$$
+\ell(x) = \#(w,c) \log \sigma(x) + \frac{\#(w)\#(c)k}{|D|} \log \sigma(-x)
+$$
+
+$\partial \ell / \partial x = 0$을 구하면
+
+$$
+\#(w,c) \cdot \sigma(-x) = \frac{\#(w)\#(c)k}{|D|} \cdot \sigma(x)
+$$
+
+sigmoid identity $\sigma(-x)/\sigma(x) = e^{-x}$를 대입하면
+
+$$
+e^{-x} = \frac{\#(w)\#(c)k}{|D|\cdot\#(w,c)}
+$$
+
+양변에 $-\log$를 취하면
+
+$$
+x = \log \frac{|D|\cdot\#(w,c)}{\#(w)\#(c)} - \log k = \mathrm{PMI}(w,c) - \log k \qquad \square
+$$
+</Proof>
+
+행렬 관점으로 보면, 학습된 $W \in \mathbb{R}^{V \times d}$와 $C \in \mathbb{R}^{V \times d}$는 다음의 rank-$d$ factorization을 수행한다.
+
+$$
+WC^{\top} \approx M^{\text{SGNS}}, \quad M^{\text{SGNS}}_{wc} = \mathrm{PMI}(w,c) - \log k
+$$
+
+2013년까지 NLP 커뮤니티는 count 기반(PPMI + SVD)과 prediction 기반(Word2Vec)을 본질적으로 다른 방법으로 인식했다. 이 정리는 둘이 같은 PMI matrix의 서로 다른 factorization 알고리즘임을 보였다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**Hierarchical Softmax vs Negative Sampling**: 두 방법의 per-token cost는 각각 $O(\log|V| \cdot d)$와 $O(k \cdot d)$로 비슷한 수준이다. 실험적으로 CBOW + HS가 속도 우위이고, Skip-gram + NS가 품질 우위다. Levy 2015의 분석은 알고리즘 차이보다 **PMI의 어떤 변형을 factorize하느냐**가 품질을 결정한다고 본다.
+
+**$k$의 역할**: $\log k$가 PMI threshold로 작용한다. $k$가 크면 $\mathrm{PMI}(w,c) > \log k$인 pair만 meaningful representation을 얻는다. corpus가 작을수록 큰 $k$(15~20)가, 클수록 작은 $k$(2~5)가 권장된다.
+
+**Static embedding의 한계**: Word2Vec의 모든 설계는 one word = one vector를 전제한다. polysemy는 처리할 수 없고, 장거리 의존성도 window size에 갇힌다. 이 한계가 ELMo → BERT로의 전환을 낳았다.
+</Callout>
+
+<Aside label="통합적 의미">
+Levy & Goldberg의 정리는 "Word2Vec의 마법이 사라진다"로 읽힐 수 있지만, 더 정확한 독해는 "mystification의 해소 + 통합 framework의 제공"이다. SGNS는 새 알고리즘이 아니라 PMI를 SGD로 효율적으로 추출하는 엔지니어링이다. 같은 교훈이 modern self-supervised learning에도 이어진다 — InfoNCE, SimCLR, CLIP은 모두 NCE/NS의 idea를 일반화한 contrastive objective다.
+</Aside>
+
+## 정리
+
+- Skip-gram은 rare word에, CBOW는 frequent word에 강하다. 차이는 gradient의 분포에서 온다.
+- Full softmax의 $O(|V|)$ 병목을 HS는 tree 구조로, NS는 binary classification으로 우회한다.
+- SGNS의 optimal solution은 $\boldsymbol{v}_w^{\top}\boldsymbol{v}'_c = \mathrm{PMI}(w,c) - \log k$다. Word2Vec은 PMI matrix factorization의 다른 이름이다.
+- hyperparameter $k$는 학습 속도뿐 아니라 PMI threshold를 결정하는 의미론적 선택이다.
+
+Word2Vec 이후 GloVe, FastText, ELMo, BERT로 이어지는 진화는 이 distributional 통찰을 더 큰 context와 더 깊은 모델로 확장하는 과정이다.
+
+<Reference
+  title="Neural Word Embedding as Implicit Matrix Factorization"
+  authors="Levy, O. and Goldberg, Y."
+  year={2014}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/2014/hash/feab05aa91085b7a8012516bc3533958-Abstract.html"
+/>
+
+<Reference
+  title="Efficient Estimation of Word Representations in Vector Space"
+  authors="Mikolov, T. et al."
+  year={2013}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1301.3781"
+/>

@@ -1,0 +1,145 @@
+---
+title: "단어의 의미는 어떻게 숫자가 되는가"
+description: "Distributional hypothesis의 철학적 기반부터 PMI·LSA·SENNA까지, 현대 NLP 임베딩의 공통 토대를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [nlp, distributional-hypothesis, pmi, lsa, word-embedding]
+difficulty: advanced
+series:
+  slug: nlp-foundations-deep-dive
+  title: Nlp Foundations Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+*"You shall know a word by the company it keeps."* — Firth 1957. 단어의 의미를 정의하는 데 사전이 필요 없다. 그 단어가 어떤 단어들과 함께 등장하는지만 보면 된다. 이 직관이 PMI, LSA, Word2Vec, BERT까지 이어지는 현대 NLP 전체의 공통 토대다. 어떻게 하나의 철학이 30년간의 기술적 진화를 관통하는가?
+
+## 의미를 정량화하는 방법
+
+기계가 의미를 다루려면 의미를 어떻게든 숫자로 만들어야 한다. 두 경로가 있었다.
+
+첫 번째는 **기호적(symbolic) 접근**이다. WordNet처럼 사람이 직접 단어 간 관계를 정의한다. *cat*은 *animal*의 instance이고, *whisker*와 *part-of* 관계다. 정밀하지만 새 단어, 새 도메인, 다언어로 확장하려면 매번 수작업이 필요하다.
+
+두 번째는 **분포적(distributional) 접근**이다. 의미는 사용 패턴으로 정의된다. *cat*의 의미는 *cat*이 등장하는 모든 문장의 통계다. corpus만 있으면 자동으로, 어떤 언어에도 적용된다. Harris 1954와 Firth 1957이 이 접근의 철학적 근거를 제시했다. NLP는 두 번째 경로를 택했고, 이후 30년이 그 선택의 결과다.
+
+## 단어-문맥 행렬: 첫 번째 구현
+
+분포적 가설을 가장 직접적으로 구현한 것이 **단어-문맥 행렬(word-context matrix)**이다. $\lvert V \rvert \times \lvert C \rvert$ 크기의 행렬 $M$에서 각 항목은 단어 $w_i$와 문맥 $c_j$가 함께 등장한 횟수다.
+
+$$
+M_{ij} = f(w_i, c_j)
+$$
+
+이 행렬에서 *cat*의 행과 *dog*의 행은 비슷한 분포를 갖는다. 둘 다 *"the [\_]"*, *"I love [\_]s"*, *"[\_] is a pet"* 같은 문맥에서 등장하기 때문이다. cosine similarity로 두 행 벡터를 비교하면 의미적 유사도가 나온다.
+
+$$
+\text{sim}(w_i, w_j) = \frac{\boldsymbol{m}_i^\top \boldsymbol{m}_j}{\lVert \boldsymbol{m}_i \rVert \lVert \boldsymbol{m}_j \rVert}
+$$
+
+여기서 "문맥"을 어떻게 정의하느냐가 임베딩의 성격을 결정한다.
+
+- **좁은 슬라이딩 윈도우(±2)**: 문법적·기능적 유사도 포착 (*good ↔ excellent*)
+- **넓은 윈도우(±10)**: 의미적·주제적 유사도 포착 (*cat ↔ dog ↔ pet*)
+- **syntactic dependency**: 문법적 역할 기반 유사도 (*동사끼리, 명사끼리*)
+
+Levy & Goldberg 2014는 dependency context가 기능적 유사도에 강하고, 윈도우 기반이 주제적 유사도에 강함을 실험으로 보였다.
+
+## PMI: 빈도 편향을 제거하다
+
+raw count 행렬에는 치명적 문제가 있다. *the*는 모든 단어와 함께 자주 등장한다. 단순 빈도로 보면 *the*가 가장 중요한 문맥 단어처럼 보이지만, 실제로는 아무 의미적 정보도 없다.
+
+**Pointwise Mutual Information(PMI)**이 이 편향을 제거한다.
+
+$$
+\boxed{\mathrm{PMI}(w, c) = \log \frac{p(w, c)}{p(w)\, p(c)}}
+$$
+
+독립이면 PMI = 0이다. *the*는 모든 단어와 함께 나타나지만 그 비율이 *the*의 주변 빈도와 정확히 같으므로 PMI ≈ 0이다. 반면 *San*과 *Francisco*는 각자 그렇게 자주 등장하지 않지만 함께 나타날 때는 거의 항상 함께이므로 PMI가 매우 높다.
+
+<Theorem kind="proposition" number="1" title="PMI의 정보이론적 해석">
+$$
+\mathrm{PMI}(w, c) = h(c) - h(c \mid w)
+$$
+여기서 $h(\cdot) = -\log p(\cdot)$는 self-information이다.
+</Theorem>
+
+<Proof>
+$\mathrm{PMI}(w, c) = \log p(c \mid w) - \log p(c) = -\log p(c) - (-\log p(c \mid w)) = h(c) - h(c \mid w)$ $\square$
+</Proof>
+
+$w$를 알았을 때 $c$의 놀라움(surprise)이 얼마나 줄어드는가. PMI가 크다는 것은 $w$가 $c$의 강력한 예측자라는 뜻이다.
+
+음수 PMI는 "기대보다 덜 함께 나타남"을 의미하지만, 희소 말뭉치에서는 단순히 표본 부족일 가능성이 높다. 따라서 실제로는 **PPMI**($\max(\mathrm{PMI}, 0)$)가 표준이다. 대부분의 항목이 0이 되어 희소 행렬 구조도 유지된다.
+
+## LSA: 행렬 분해로 latent 의미를 꺼내다
+
+PPMI 행렬은 고차원이고 잡음이 많다. Deerwester et al. 1990의 **LSA(Latent Semantic Analysis)**는 SVD로 이 문제를 해결했다.
+
+$$
+X \approx U_k \Sigma_k V_k^\top, \qquad \boldsymbol{\phi}(w_i) = U_k[i, :] \cdot \Sigma_k
+$$
+
+<Theorem kind="theorem" number="2" title="Eckart-Young — 최적 rank-k 근사">
+$$
+X_k = U_k \Sigma_k V_k^\top = \arg\min_{\substack{Y \\ \operatorname{rank}(Y) \leq k}} \lVert X - Y \rVert_F
+$$
+오차는 $\lVert X - X_k \rVert_F^2 = \sigma_{k+1}^2 + \cdots + \sigma_r^2$이다.
+</Theorem>
+
+rank-$k$ 절단이 잡음을 제거하고 latent semantic 차원을 추출한다. *car*와 *auto*가 완전히 다른 문서에 나타났더라도 비슷한 문서 분포를 가지면 SVD 후 latent space에서 가까워진다. 동의어 문제가 자연스럽게 해결된다.
+
+<Callout type="note" title="트레이드오프">
+LSA는 문서 수준 문맥을 사용하므로 주제적 유사도에 강하지만, 좁은 슬라이딩 윈도우 기반의 Word2Vec보다 통사적 신호가 약하다. 계산 비용도 크다 — $V = 10^6$, $D = 10^7$ 규모에서 full SVD는 불가능하고 randomized SVD나 Word2Vec의 SGD 기반 학습이 현실적이다.
+</Callout>
+
+## SENNA: "from scratch" NLP의 시작
+
+2008년까지 NLP는 task마다 수십 개의 hand-crafted feature가 필요했다. POS 태깅에는 suffix, 대소문자, gazetteer. NER에는 별도 feature 집합. Collobert & Weston 2008은 이 패러다임을 깼다.
+
+**SENNA**는 공유 단어 임베딩 위에 하나의 CNN을 올리고, task별 헤드를 붙였다. POS, chunking, NER, SRL 다섯 가지 task를 동시에 학습한다. hand-crafted feature는 대소문자 정보 정도뿐이다.
+
+임베딩 학습에는 softmax 대신 **pairwise ranking loss**를 썼다.
+
+$$
+\mathcal{L}_{\text{LM}} = \sum_x \max(0, 1 - f(x) + f(x^-))
+$$
+
+$x$는 실제 문장의 윈도우, $x^-$는 중심 단어를 무작위 단어로 교체한 변형이다. 실제 문장이 변형보다 1 이상 높은 점수를 받으면 loss가 0이 된다. $O(\lvert V \rvert)$ softmax 없이 임베딩을 학습할 수 있었다. 이는 곧 등장할 Word2Vec의 negative sampling과 같은 아이디어다.
+
+<Aside label="계보">
+Collobert 2008의 ranking-based 임베딩 학습 → Mikolov 2013의 Word2Vec(negative sampling) → 2018년 BERT의 MLM. 세 방법 모두 "문맥으로부터 단어를 예측한다"는 distributional hypothesis의 직접적 구현이다.
+</Aside>
+
+## 정리
+
+이 챕터들이 공유하는 핵심 통찰은 하나다: **의미는 사용 패턴이고, 사용 패턴은 통계다.**
+
+- Distributional hypothesis는 단순한 직관이 아니라 PMI, LSA, Word2Vec, BERT 모두의 정당화 근거다.
+- PMI는 빈도 편향을 제거해 genuine association을 드러낸다. Levy & Goldberg 2014는 Word2Vec의 SGNS가 shifted PMI 행렬의 implicit 분해임을 증명했다 — count-based와 prediction-based가 사실은 같은 것의 다른 형태다.
+- LSA의 Eckart-Young 근사는 잡음을 제거하고 latent semantic 구조를 드러낸다. 계산 비용이 걸림돌이었을 뿐, 원리 자체는 여전히 유효하다.
+- SENNA는 hand-crafted feature에서 learned representation으로의 전환을 처음 실증했다. "almost from scratch"의 'almost'가 정직한 표현이지만, NLP의 ImageNet moment였다.
+
+그리고 Levy 2015의 결론이 남긴 교훈은 지금도 유효하다 — 알고리즘의 우위보다 hyperparameter와 데이터 처리 방식이 결과를 더 많이 결정한다.
+
+<Reference
+  title="Improving Distributional Similarity with Lessons Learned from Word Embeddings"
+  authors="Levy, Goldberg, Dagan"
+  year={2015}
+  venue="TACL"
+  url="https://aclanthology.org/Q15-1016"
+/>
+
+<Reference
+  title="Natural Language Processing (Almost) from Scratch"
+  authors="Collobert, Weston, Bottou, Karlen, Kavukcuoglu, Kuksa"
+  year={2011}
+  venue="JMLR"
+  url="https://jmlr.org/papers/v12/collobert11a.html"
+/>

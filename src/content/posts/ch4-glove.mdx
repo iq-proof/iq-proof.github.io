@@ -1,0 +1,153 @@
+---
+title: "GloVe는 왜 두 패러다임의 통합인가"
+description: "LSA의 global matrix와 Word2Vec의 vector arithmetic이 왜 따로는 불완전한지, GloVe의 ratio formulation이 두 강점을 어떻게 하나의 objective로 결합하는지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [glove, word-embedding, co-occurrence, pmi, vector-arithmetic]
+difficulty: advanced
+series:
+  slug: nlp-foundations-deep-dive
+  title: Nlp Foundations Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+2014년 distributional embedding 진영은 둘로 나뉘어 있었다. LSA는 corpus 전체를 한 번에 보지만 vector arithmetic이 약하고, Word2Vec은 vector arithmetic이 강하지만 global statistics를 충분히 활용하지 못한다. GloVe는 이 두 약점을 동시에 공략한다. 어떻게 단일 objective가 두 진영의 강점을 모두 흡수할 수 있는가?
+
+## 두 진영의 각기 다른 약점
+
+LSA는 term-document matrix를 SVD로 분해한다. corpus 전체의 통계를 한 번에 활용하므로 sample-efficient하지만, document 수준의 coarse-grained context를 쓰고 SVD의 $O(VD^2)$ 비용이 대규모 corpus에서 비현실적이다. 무엇보다 vector arithmetic이 약하다 — *king - man + woman ≠ queen*.
+
+Word2Vec은 local sliding window의 `(center, context)` pair를 SGD로 학습한다. scalable하고 vector arithmetic이 강하다. 그러나 매 step에서 단 하나의 pair만 보므로 global co-occurrence 분포를 부분적으로밖에 활용하지 못한다.
+
+Pennington et al. (2014)의 핵심 통찰은 이 둘이 사실 **같은 distributional signal의 다른 추출**이라는 점이다. 두 방법 모두 본질적으로 PMI 또는 PMI-like matrix를 분해하고 있다. GloVe는 이를 명시적으로 만든다.
+
+## Ratio Formulation — 왜 확률보다 비율인가
+
+GloVe의 출발점은 두 단어 $w_i$, $w_j$ 의 의미 차이를 인코딩하는 방법에 관한 질문이다. Pennington이 제시한 예를 보자. *ice*와 *steam*을 probe word $k$로 비교할 때:
+
+| Probe $k$ | $P(k \mid \text{ice})$ | $P(k \mid \text{steam})$ | Ratio |
+|-----------|------------------------|--------------------------|-------|
+| solid     | $1.9 \times 10^{-4}$ | $2.2 \times 10^{-5}$ | **8.9** |
+| gas       | $6.6 \times 10^{-5}$ | $7.8 \times 10^{-4}$ | **0.085** |
+| water     | $3.0 \times 10^{-3}$ | $2.2 \times 10^{-3}$ | **1.36** |
+| fashion   | $1.7 \times 10^{-5}$ | $1.8 \times 10^{-5}$ | **0.96** |
+
+각 조건부 확률 자체보다 **ratio** $P_{ik}/P_{jk}$가 두 단어의 의미 차이를 훨씬 명확하게 드러낸다. solid는 ice에 관련되고(ratio ≫ 1), gas는 steam에 관련되며(ratio ≪ 1), water와 fashion은 구별력이 없다(ratio ≈ 1).
+
+이 관찰로부터 GloVe는 함수 $F$를 정의한다.
+
+$$
+F(\boldsymbol{w}_i, \boldsymbol{w}_j, \tilde{\boldsymbol{w}}_k) = \frac{P_{ik}}{P_{jk}}
+$$
+
+그리고 vector space의 linear structure를 활용해 인자를 단순화한다.
+
+$$
+F\!\left((\boldsymbol{w}_i - \boldsymbol{w}_j)^\top \tilde{\boldsymbol{w}}_k\right) = \frac{P_{ik}}{P_{jk}}
+$$
+
+## Homomorphism이 $\exp$를 강제한다
+
+$F$의 형태는 가정 하나로 결정된다. additive group에서 multiplicative group으로의 homomorphism 조건이다.
+
+$$
+F(a - b) = \frac{F(a)}{F(b)}
+$$
+
+<Theorem kind="theorem" number="1" title="Homomorphism의 unique solution">
+연속 함수 $F: \mathbb{R} \to \mathbb{R}_{>0}$가 모든 $a, b$에 대해 $F(a - b) = F(a)/F(b)$를 만족하면 $F(x) = \exp(\alpha x)$이다.
+</Theorem>
+
+<Proof>
+$g(x) = \log F(x)$로 정의하면 $g(a - b) = g(a) - g(b)$가 된다. 이는 Cauchy의 함수 방정식 변형이다. 연속성 조건 하에서 유일한 해는 $g(x) = \alpha x$이므로 $F(x) = \exp(\alpha x)$이다. GloVe에서 $\alpha = 1$로 흡수된다. $\square$
+</Proof>
+
+$F = \exp$를 대입하면 $\boldsymbol{w}_i^\top \tilde{\boldsymbol{w}}_k = \log P_{ik} + \text{const}(k)$가 나온다. 상수를 bias term $b_i$, $\tilde{b}_k$로 흡수하면 다음 등식이 된다.
+
+$$
+\boldsymbol{w}_i^\top \tilde{\boldsymbol{w}}_k + b_i + \tilde{b}_k = \log X_{ik}
+$$
+
+이를 weighted least squares regression으로 만들면 GloVe의 final objective다.
+
+$$
+J = \sum_{i,j} f(X_{ij})\!\left(\boldsymbol{w}_i^\top \tilde{\boldsymbol{w}}_j + b_i + \tilde{b}_j - \log X_{ij}\right)^2
+$$
+
+## Weighting Function과 $\alpha = 0.75$의 의미
+
+raw objective의 문제는 명확하다. *(the, of)* 같은 super-frequent pair가 squared error를 지배하고, $X_{ij} = 1$인 single observation은 noise가 많다. $f(X_{ij})$가 이 두 문제를 동시에 해결한다.
+
+$$
+f(x) = \begin{cases} (x / x_{\max})^\alpha & x < x_{\max} \\ 1 & x \geq x_{\max} \end{cases}
+\qquad \alpha = 3/4,\quad x_{\max} = 100
+$$
+
+세 가지 설계 조건 — $f(0) = 0$으로 unseen pair 자동 제외, non-decreasing으로 frequent pair 우선, cap으로 super-frequent dominance 방지 — 이 함께 mid-frequency pair를 학습 signal의 중심에 놓는다.
+
+<Callout type="note" title="0.75라는 exponent">
+Word2Vec의 negative sampling distribution $P_n \propto U(w)^{0.75}$와 GloVe의 $\alpha = 0.75$는 같은 exponent다. 두 논문이 독립적인 grid search로 같은 값에 도달했다. frequency의 fractional power로 weight를 조절하는 방식이 distributional learning의 공통 heuristic임을 시사한다.
+</Callout>
+
+## Vector Arithmetic의 수학적 토대
+
+GloVe objective를 학습하면 다음이 성립한다.
+
+$$
+(\boldsymbol{w}_i - \boldsymbol{w}_j)^\top \tilde{\boldsymbol{w}}_k \approx \log \frac{P_{ik}}{P_{jk}} = \mathrm{PMI}(i,k) - \mathrm{PMI}(j,k)
+$$
+
+bias term은 $i, j$ 차이에서 cancel out된다. *king - man*이 모든 probe $k$에 대해 $\log[P(k|\text{king})/P(k|\text{man})]$의 패턴을 인코딩하고, 이 패턴이 *queen - woman*과 일치하므로 다음이 성립한다.
+
+$$
+\boldsymbol{w}_{\text{king}} - \boldsymbol{w}_{\text{man}} + \boldsymbol{w}_{\text{woman}} \approx \boldsymbol{w}_{\text{queen}}
+$$
+
+이것은 발견이 아니라 **objective의 설계에서 나오는 수학적 귀결**이다. Word2Vec도 Levy & Goldberg (2014)가 보였듯 같은 이유로 작동한다 — 둘 다 결국 PMI factorization이기 때문이다.
+
+<Aside label="통합 framework">
+LSA (TF-IDF SVD), Word2Vec SGNS (shifted PMI), GloVe (log co-occurrence weighted least squares) — 세 방법 모두 본질적으로 PMI-like matrix의 low-rank factorization이다. 알고리즘 차이보다 hyperparameter 차이가 성능을 더 크게 결정한다는 Levy (2015)의 발견이 이를 뒷받침한다.
+</Aside>
+
+## 트레이드오프
+
+GloVe의 한계는 설계에서 직접 따라온다.
+
+<Callout type="warning" title="트레이드오프">
+**Static embedding**: 단어당 하나의 vector이므로 polysemy를 표현하지 못한다. *bank*의 금융 의미와 강변 의미가 하나의 vector에 섞인다. **메모리**: word-word matrix $X \in \mathbb{R}^{V \times V}$는 $V = 50{,}000$일 때 dense 저장 시 약 20GB다 — sparse representation이 필수다. **Bias**: corpus의 statistical regularity를 충실히 학습하므로 gender bias, occupational stereotype도 함께 인코딩된다. Bolukbasi (2016)이 보였듯 *"man : programmer :: woman : homemaker"* 같은 analogy가 학습된 embedding에서 나타난다.
+</Callout>
+
+Word2Vec과의 공정한 비교에서 같은 hyperparameter를 쓰면 성능 차이가 거의 없다는 점도 중요하다. Pennington의 *"GloVe가 Word2Vec을 능가"* 주장은 hyperparameter 차이의 영향이었다. GloVe의 진정한 기여는 성능 우위가 아니라 **ratio formulation으로부터 vector arithmetic을 명시적으로 정당화한 이론적 투명성**이다.
+
+## 정리
+
+- GloVe의 word-word co-occurrence matrix는 LSA의 global statistics를 계승하고, ratio formulation은 Word2Vec의 vector arithmetic을 수학적으로 정당화한다.
+- $F = \exp$는 가정이 아니라 homomorphism 조건의 유일한 연속 해다.
+- weighting function $f(X_{ij}) = (X/x_{\max})^{0.75}$의 cap과 exponent는 mid-frequency pair를 학습 signal의 중심에 놓기 위한 설계다.
+- LSA, Word2Vec, GloVe는 다른 알고리즘이지만 같은 PMI signal의 다른 추출이다 — 통합 framework로 이해할 수 있다.
+
+수식 하나 뒤에는 "두 진영의 강점을 동시에 가져야 한다"는 구체적인 엔지니어링 요구가 있다.
+
+<Reference
+  title="GloVe: Global Vectors for Word Representation"
+  authors="Pennington, Socher, Manning"
+  year={2014}
+  venue="EMNLP"
+  url="https://aclanthology.org/D14-1162"
+/>
+
+<Reference
+  title="Improving Distributional Similarity with Lessons Learned from Word Embeddings"
+  authors="Levy, Goldberg, Dagan"
+  year={2015}
+  venue="TACL"
+  url="https://aclanthology.org/Q15-1016"
+/>

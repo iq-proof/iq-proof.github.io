@@ -1,171 +1,99 @@
 ---
-title: "LLM 평가는 왜 어려운가"
-description: "Perplexity의 정보이론적 의미부터 벤치마크 오염, emergent ability 논쟁, test-time compute까지 — LLM 능력 측정의 근본적 한계를 추적한다."
+title: "Embedding 평가는 왜 두 가지가 필요한가"
+description: "Intrinsic 벤치마크의 Spearman 상관이 downstream F1을 보장하지 않는 이유부터, 다언어 전이와 Static embedding의 한계까지, NLP 평가 철학의 전체 지형을 추적한다."
 pubDate: 2026-05-03
 category: ai
-tags: [llm, evaluation, perplexity, benchmarks, scaling]
-difficulty: advanced
+tags: [nlp, word-embedding, evaluation, multilingual, bert]
+difficulty: intermediate
 series:
-  slug: llm-pretraining-deep-dive
-  title: Llm Pretraining Deep Dive
+  slug: nlp-foundations-deep-dive
+  title: Nlp Foundations Deep Dive
   order: 7
 draft: false
 featured: false
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
-import Theorem from '@/components/mdx/Theorem.astro';
-import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-LLM을 학습하고 나면 무조건 마주치는 질문이 있다 — "이 모델이 얼마나 좋은가?" 그런데 이 질문에 답하는 방법은 생각보다 훨씬 불안정하다. Perplexity를 낮추면 다운스트림 성능이 좋아질까? 벤치마크 점수는 진짜 능력을 측정하는가? LLM 평가는 왜 이렇게 어려운가?
+Word2Vec과 GloVe가 WordSim-353에서 높은 Spearman 상관을 보인다고 해서, NER F1도 높을 것이라 기대할 수 있을까? Schnabel(2015)의 분석은 그 기대가 틀렸음을 보여준다. 그렇다면 embedding을 어떻게 평가해야 하는가?
 
-## 출발점: Perplexity는 무엇을 측정하는가
+## Intrinsic 평가의 약속과 한계
 
-사전학습의 목표는 다음 토큰 예측이고, 이를 요약하는 숫자가 perplexity다.
+Intrinsic evaluation은 embedding 자체의 성질을 측정한다. WordSim-353의 353개 단어 쌍에 대해 모델의 cosine 유사도와 인간 평점 사이의 Spearman 상관을 계산하거나, Google Analogy의 19,544개 문항에서 `king - man + woman = ?` 같은 벡터 산술의 정확도를 측정한다.
 
-$$
-\mathrm{PPL} = \exp\left(-\frac{1}{T}\sum_{t=1}^T \log p_\theta(x_t \mid x_{<t})\right) = \exp(\mathcal{L}_{\mathrm{CE}})
-$$
+이 평가가 유용한 이유는 명확하다. 빠르고, 표준화되어 있으며, 재현 가능하다. 하이퍼파라미터를 바꿀 때마다 전체 NER 파이프라인을 재학습할 필요 없이, window size나 차원 수의 효과를 즉시 확인할 수 있다.
 
-정보이론적으로 PPL은 "모델이 다음 토큰을 평균 몇 개의 선택지에서 고르는 것처럼 행동하는가"에 해당한다. log를 밑 2로 바꾸면 bits/token 단위로 읽힌다 — 모델이 다음 토큰을 인코딩하는 데 평균 몇 bit가 필요한가.
+그러나 한계도 명확하다. **WordSim-353에서의 높은 상관이 NER F1의 높은 수치를 보장하지 않는다.** 감성 분류처럼 단어 의미가 직접 신호인 태스크에서는 두 지표가 어느 정도 상관하지만, NER처럼 대문자 표기와 형태소가 중요한 태스크에서는 단어 유사도 벤치마크가 예측력을 잃는다. 단일 벤치마크 수치만으로 embedding을 선택하는 것이 왜 위험한지가 여기서 드러난다.
 
-Hoffmann et al. (2022)의 Chinchilla scaling law에 따르면 이 PPL에는 하한이 존재한다.
+## 어떤 태스크에 어떤 embedding이 맞는가
 
-$$
-L(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}
-$$
+Extrinsic evaluation은 실제 태스크의 성능으로 embedding을 판단한다. 같은 corpus로 학습한 Word2Vec, GloVe, FastText, ELMo, BERT를 CoNLL-2003 NER, Penn Treebank POS, IMDB 감성 분류에 각각 투입해 F1과 정확도를 비교하면 다음과 같은 경향이 나타난다.
 
-$E$는 irreducible loss — 언어 자체의 엔트로피다. 모델을 아무리 크게 키워도 $\mathrm{PPL} \geq e^E$ 를 넘을 수 없다. GPT-3 스케일에서 $E \approx 1.69$ nats이면 $\mathrm{PPL}_{\min} \approx 5.4$이고, 이것은 언어 그 자체의 불확실성이지 모델의 한계가 아니다.
+| Embedding | NER (CoNLL-03 F1) | POS (PTB Acc) | IMDB Sentiment |
+|-----------|-------------------|---------------|----------------|
+| Random init | 80.5 | 96.5 | 85.0 |
+| GloVe | 87.5 | 97.3 | 88.0 |
+| FastText | 88.2 | 97.4 | 88.5 |
+| ELMo | 92.0 | 97.7 | 92.0 |
+| BERT-base | 92.5 | 97.9 | 94.5 |
 
-문제는 여기서 시작된다. PPL이 낮아진다고 해서 모델이 실제로 "더 잘한다"는 보장이 없다.
+**Pretrained > random**은 항상 성립한다. 그러나 태스크마다 최적 embedding이 다르다는 점이 중요하다. NER은 형태소와 대문자 표기가 결정적이라 char n-gram을 다루는 FastText가 GloVe를 앞선다. 감성 분류는 단어의 분포적 의미가 직접 신호라 GloVe도 경쟁력이 있다. POS는 이미 97% 수준에서 포화 상태라 embedding 선택의 영향이 작다.
 
-## 벤치마크는 PPL의 공백을 채우는가
-
-PPL의 한계를 보완하기 위해 MMLU, HellaSwag, HumanEval 같은 구조화된 벤치마크가 등장했다. 각각 측정 방식이 다르다.
-
-**MMLU**는 57개 과목에서 4지선다. 정답 선택지의 log-likelihood를 비교한다.
-
-$$
-\text{score} = \arg\max_c \log p(c \mid \text{prompt})
-$$
-
-**HellaSwag**는 일상 상황 완성 문제인데, 선택지 길이가 10~50 토큰으로 길어서 **길이 정규화**가 필수다.
-
-$$
-\text{score} = \arg\max_c \frac{\log p(c \mid \text{context})}{|c|}
-$$
-
-길이 정규화 없이 scoring하면 짧은 선택지가 항상 유리하다 — 토큰이 적을수록 연쇄 확률 곱이 크기 때문이다.
-
-**HumanEval**은 코드 생성 후 실제 테스트 케이스 실행 결과로 측정한다.
-
-$$
-\text{pass@}k = \mathbb{E}\left[1 - \frac{\binom{N-c}{k}}{\binom{N}{k}}\right]
-$$
-
-$N$개 샘플 중 $c$개가 통과했을 때, 랜덤으로 $k$개를 뽑으면 적어도 1개는 통과할 확률이다. 단순 성공 비율이 아니라 초기하분포로 계산하는 이유는 샘플링 없이 추론 가능한 불편 추정량이기 때문이다.
-
-<Callout type="note" title="트레이드오프">
-Log-likelihood 기반 평가(MMLU, HellaSwag)는 빠르고 재현 가능하지만 실제 생성 능력과 괴리가 생긴다. Sampling 기반 평가(HumanEval)는 실제 디코딩을 반영하지만 분산이 크고 비용이 높다. 어느 쪽도 단독으로 충분하지 않다.
+<Callout type="note" title="Frozen vs Fine-tuning">
+학습 데이터가 1천 건 미만이면 embedding을 고정(frozen)하는 편이 안전하다. 과적합 방지 효과가 크기 때문이다. 10만 건 이상이면 embedding까지 낮은 학습률로 함께 미세조정하면 추가 이득을 얻을 수 있다. Catastrophic forgetting을 막으려면 embedding 레이어에 별도의 낮은 학습률을 적용한다.
 </Callout>
 
-## 벤치마크 점수가 "emergent"처럼 보이는 이유
+## 언어를 넘어선 전이 — 다언어 embedding
 
-Wei et al. (2022)은 모델이 특정 크기를 넘으면 능력이 갑자기 나타난다고 주장했다. 작은 모델에서 0%, 큰 모델에서 갑자기 50% 이상. Schaeffer et al. (2023)은 이것이 **metric artifact**일 수 있다고 반박했다.
+영어로 학습한 NER 모델이 한국어 문장에 직접 적용될 수 있을까? mBERT(104개 언어 Wikipedia MLM)가 이를 부분적으로 가능하게 만들었다. 명시적 교차언어 신호 없이 multilingual MLM만으로 emergent cross-lingual representation이 형성된다.
 
-핵심 수학은 단순하다. 각 토큰을 맞을 확률이 $p$이고 정답이 $L$개 토큰으로 구성된다면:
+그 메커니즘은 세 가지로 설명된다. 첫째, 공유 서브워드 어휘(110k WordPiece)가 라틴 문자 기반 언어 사이에서 토큰 수준의 공유를 만들어낸다. 둘째, Wikipedia의 다언어 문서들이 같은 주제를 다루므로 분포적 학습이 교차언어 힌트를 포착한다. 셋째, 하나의 Transformer가 모든 언어를 처리해야 하므로 공유 표현 공간으로의 수렴이 강제된다.
 
-$$
-P(\text{exact-match}) = p^L
-$$
+영어로 fine-tune한 mBERT를 한국어 NER에 zero-shot으로 적용하면 F1 70 수준이 나온다(무작위 기준선 30). XLM-R은 CommonCrawl 2.5TB의 대규모 데이터로 학습해 한국어 zero-shot F1 75에 도달한다.
 
-$$
-M_{\text{token-edit}} = p
-$$
+<Callout type="warning" title="Curse of Multilinguality">
+언어를 많이 추가할수록 언어당 품질이 낮아진다. 고정된 모델 용량을 더 많은 언어가 나눠 쓰기 때문이다. XLM-R은 더 큰 모델과 더 많은 데이터로 이를 부분 완화한다. 근본적 해결책은 언어별 adapter(Pfeiffer 2020)로, 베이스 모델을 공유하면서 언어 특화 표현을 별도로 학습한다.
+</Callout>
 
-$p$가 선형으로 증가할 때, exact-match는 $p^L$로 지수적으로 뛰고, token-edit-distance는 $p$로 선형 증가한다. 같은 모델, 같은 능력 향상인데 **측정 방식만 달라도 "emergent"처럼 보이거나 "smooth"처럼 보인다**.
+## Static Embedding이 답할 수 없는 질문들
 
-<Theorem kind="proposition" number="1" title="Metric Nonlinearity와 Step Function">
-토큰별 정확도 $p(N)$이 모델 크기 $N$에 따라 smooth하게 증가할 때, exact-match 메트릭 $M_{\text{em}}(N) = p(N)^L$은 $L$이 클수록 step function에 가까워진다.
-</Theorem>
+Word2Vec, GloVe, FastText는 세 가지 근본적 한계를 공유한다.
 
-<Proof>
-$p(N) = 1 - e^{-\alpha N}$이라 하자. 그러면 $M_{\text{em}}(N) = (1 - e^{-\alpha N})^L$이다. $L \to \infty$일 때 이 함수는 $N$의 threshold 근방에서 0에서 1로 급격히 전환된다 — $p(N)$이 smooth해도 $p^L$은 sharp transition을 만든다. 반면 token-edit-distance $M_{\text{ted}}(N) = p(N)$은 $p$와 동일한 smooth curve를 따른다. $\square$
-</Proof>
+**첫째, 다의어(polysemy)다.** *bank*는 강둑과 은행이라는 두 의미를 가지지만, static embedding은 코퍼스 빈도로 가중된 단 하나의 벡터를 할당한다. *"deposit money at the bank"*에서 *bank*의 벡터는 여전히 강둑 의미의 노이즈를 포함한다.
 
-단, 모든 emergent ability가 artifact는 아니다. In-context learning — prompt에 예시를 넣었을 때 정확도가 올라가는 현상 — 은 exact-match와 token-edit-distance 모두에서 동시에 관찰된다. 이것은 metric-agnostic이므로 진짜 emergence에 가깝다.
+**둘째, 문맥 무감각(context-blindness)이다.** *"I am running"*과 *"running for office"*의 *running*은 의미가 다르지만 항상 같은 벡터를 받는다.
 
-## 벤치마크 오염: 측정 도구가 오염되면
+**셋째, 문장 표현의 부재다.** 단어 벡터의 평균은 어순과 통사 구조를 버린다. *"The cat sat on the mat"*과 *"The mat sat on the cat"*은 같은 평균 벡터를 갖는다.
 
-GPT-3의 MMLU 성능 70%는 진짜 능력인가, 아니면 훈련 데이터에서 이미 본 문제라서인가? OpenAI는 자체 분석(Appendix C)에서 13-gram overlap으로 MMLU의 약 4%가 오염되어 있음을 발견했다. 평균 4%라도 특정 도메인(세계사, 미국사)에서는 10~20%까지 올라간다.
+ELMo는 BiLSTM으로 문맥 의존 벡터를 제공해 첫 번째와 두 번째 한계를 부분 해결했다. BERT는 Transformer + Masked LM으로 진정한 양방향 문맥을 통합해 GLUE 평균 82점(ELMo 71점)으로 도약했다. GPT 계열의 Causal LM은 생성에 친화적인 대안이다. Kaplan(2020)의 스케일링 법칙은 모델 크기, 데이터, 연산량이 증가할수록 손실이 멱함수로 감소함을 보였고, 이것이 GPT-3(175B)와 그 이후의 LLM을 이끈 근거다.
 
-N-gram contamination의 공식적 정의는 다음과 같다.
-
-$$
-\text{Contamination}(\mathcal{T}, \mathcal{D}, n) = \frac{|\text{N-gram}(\mathcal{T}, n) \cap \text{N-gram}(\mathcal{D}, n)|}{|\text{N-gram}(\mathcal{T}, n)|}
-$$
-
-13-gram을 쓰는 이유는 타협점이기 때문이다. 4-gram은 자연 문장에서 너무 자주 나타나 false positive가 많고, 50-gram은 부분적 오염을 못 잡는다. 13-gram은 보통 한 문장 분량으로, 의도치 않은 일치를 걸러내기에 적당하다.
-
-현대적 대응으로는 **canary string** 삽입 — 절대 자연스럽게 나타나지 않을 고유 식별자를 테스트 데이터에 심어두고, 모델 출력에 이 string이 나타나면 오염 확정 — 과 MMLU-Pro, Dynabench 같은 지속 업데이트 벤치마크가 있다.
-
-## Test-Time Compute: 세 번째 축
-
-2024년까지의 LLM 능력 공식은 다음과 같았다.
-
-$$
-\text{Capability} = f(N_{\text{params}},\, D_{\text{data}})
-$$
-
-OpenAI o1은 세 번째 축을 추가했다.
-
-$$
-\text{Capability} = f(N_{\text{params}},\, D_{\text{data}},\, C_{\text{inference}})
-$$
-
-같은 base 모델이라도 inference 중 "생각하는 토큰 수"를 늘리면 수학·코드 문제에서 성능이 logarithmically 향상된다.
-
-$$
-\text{Acc}(T_r) \propto \log T_r
-$$
-
-reasoning token을 2배로 늘리면 정확도가 log 단위로 오른다. 이것은 diminishing return이지만 0이 아니다.
-
-self-consistency — $K$번 샘플링 후 majority voting — 도 같은 축에 있다. 정답 확률 $p$인 모델에서 $K$개 샘플의 majority vote 오류율은 다음과 같이 감소한다.
-
-$$
-P_{\text{error}} \lesssim \exp\left(-2K(p - 1/2)^2\right)
-$$
-
-$K$를 늘리면 오류가 지수적으로 줄지만, $K$배의 inference 비용이 든다.
-
-<Aside label="새로운 비용 구조">
-이전에는 training compute가 dominant했고 inference는 거의 무시됐다. test-time compute가 성능의 축이 되면서 inference compute도 설계 변수가 됐다. 같은 $N, D$에서 어떻게 inference budget을 쓸 것인가가 모델 성능을 결정하는 새로운 차원이다.
+<Aside label="Static embedding의 현재 위치">
+2024년 기준으로 production NLU는 대부분 BERT 계열이 담당한다. 그러나 레이턴시가 중요한 엣지 서비스나 수백만 클래스 분류처럼 속도가 우선인 경우 FastText는 여전히 선택지다. Word2Vec과 GloVe는 개념 학습과 빠른 프로토타이핑에서 교육적 가치를 유지한다.
 </Aside>
 
 ## 정리
 
-- PPL은 언어 모델의 건강 지표지만, 다운스트림 성능과 1:1 대응하지 않는다. PPL gap이 작아도 reasoning 능력 차이는 클 수 있다.
-- 벤치마크 메트릭 선택이 "emergent"처럼 보이는 패턴을 만들어낼 수 있다. exact-match는 step function, token-edit-distance는 smooth curve — 같은 모델이다.
-- 13-gram contamination 검사는 훈련 데이터 구성의 기본이다. 오염된 벤치마크 점수는 능력 측정이 아니라 기억 측정이다.
-- test-time compute는 모델 능력의 세 번째 축이다. Chinchilla scaling law는 base model 설계에 여전히 유효하지만, inference에서의 reasoning depth가 추가 성능 차원을 연다.
+- Intrinsic(WordSim, Google Analogy)과 extrinsic(NER, POS, 감성) 평가는 측정 대상이 다르다. 하나로 다른 하나를 대체할 수 없다.
+- 태스크마다 최적 embedding이 다르다. NER은 FastText, 감성은 GloVe도 충분하고, 품질이 최우선이면 BERT다.
+- 다언어 embedding은 zero-shot 전이를 가능하게 하지만, 저자원 언어의 품질 격차는 스케일만으로 완전히 해소되지 않는다.
+- Static embedding의 세 한계(다의어, 문맥 무감각, 문장 표현 부재)가 ELMo → BERT → LLM으로의 전환을 필연으로 만들었다.
 
-평가 도구의 한계를 모르고 숫자만 보면, 수치가 좋아질수록 모델이 좋아진다고 착각하게 된다.
+다음 단계는 이 한계들을 구체적으로 해결한 ELMo, BERT, GPT의 architecture 설계와 pretraining objective의 수학적 유도다.
 
 <Reference
-  title="Emergent Abilities of Large Language Models"
-  authors="Wei et al."
-  year={2022}
-  venue="TMLR"
-  url="https://arxiv.org/abs/2206.07682"
+  title="Evaluation methods for unsupervised word embeddings"
+  authors="Schnabel et al."
+  year={2015}
+  venue="EMNLP"
+  url="https://aclanthology.org/D15-1036"
 />
 
 <Reference
-  title="Are Emergent Abilities of Large Language Models a Mirage?"
-  authors="Schaeffer et al."
-  year={2023}
-  venue="NeurIPS"
-  url="https://arxiv.org/abs/2304.15004"
+  title="Unsupervised Cross-lingual Representation Learning at Scale"
+  authors="Conneau et al."
+  year={2020}
+  venue="ACL"
+  url="https://arxiv.org/abs/1911.02116"
 />
