@@ -1,0 +1,159 @@
+---
+title: "REINFORCE는 왜 분산이 높은가"
+description: "Log-derivative trick부터 score function의 zero-mean 성질, REINFORCE의 unbiasedness와 variance 폭발 메커니즘, reparameterization과의 tradeoff까지 policy gradient의 수학적 토대를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [policy-gradient, reinforce, score-function, variance, reparameterization]
+difficulty: advanced
+series:
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Policy gradient는 $J(\theta) = \mathbb{E}_{\tau \sim p_\theta}[R(\tau)]$를 직접 미분해서 policy를 개선한다. 그런데 $R(\tau)$는 이산 행동, 환경의 확률성 때문에 $\theta$에 대해 미분 불가능할 수 있다. 이 문제를 한 줄의 항등식으로 우회하는 것이 log-derivative trick이다. 그렇다면 이 trick은 왜 작동하고, 왜 분산이 폭발하는가?
+
+## Gradient를 기대값 안으로 옮기는 방법
+
+$\mathbb{E}_{x \sim p_\theta}[f(x)]$를 $\theta$로 미분하려면 $\nabla_\theta p_\theta(x)$가 필요하다. 연쇄 법칙에서 다음 항등식이 즉시 나온다.
+
+$$
+\nabla_\theta p_\theta(x) = p_\theta(x) \cdot \nabla_\theta \log p_\theta(x)
+$$
+
+이를 기대값에 대입하면,
+
+$$
+\nabla_\theta \mathbb{E}_{x \sim p_\theta}[f(x)] = \mathbb{E}_{x \sim p_\theta}\bigl[f(x) \cdot \nabla_\theta \log p_\theta(x)\bigr]
+$$
+
+gradient가 기대값 안으로 들어갔다. $f(x)$는 이제 미분되지 않는다 — 샘플만 되면 된다. 이것이 **likelihood ratio method** 또는 **score function estimator**라고 불리는 이유다.
+
+이산 분포에서도 동일하게 성립한다. $p_\theta(a)$가 categorical softmax이면 $\nabla_\theta \log p_\theta(a) = \mathbf{1}(a) - p_\theta$이고, 합의 미분은 유한한 경우 자명하다.
+
+## Score Function의 두 가지 핵심 성질
+
+$s_\theta(x) := \nabla_\theta \log p_\theta(x)$를 score function이라 부른다. 이것의 두 성질이 policy gradient 전체를 떠받친다.
+
+**Zero-mean**: $\mathbb{E}_{x \sim p_\theta}[s_\theta(x)] = 0$.
+
+$$
+\mathbb{E}[s] = \int \nabla_\theta \log p_\theta(x) \cdot p_\theta(x)\,dx = \int \nabla_\theta p_\theta(x)\,dx = \nabla_\theta \int p_\theta(x)\,dx = \nabla_\theta 1 = 0
+$$
+
+**Fisher Information**: $F(\theta) = \mathbb{E}[s \cdot s^T] = -\mathbb{E}[\nabla^2 \log p_\theta]$.
+
+<Theorem kind="theorem" number="1" title="Fisher = −E[Hessian of log p]">
+정규 조건(dominated convergence) 하에,
+
+$$
+F(\theta) = \mathbb{E}_{x \sim p_\theta}[s_\theta(x)\, s_\theta(x)^T] = -\mathbb{E}_{x \sim p_\theta}[\nabla^2_\theta \log p_\theta(x)]
+$$
+</Theorem>
+
+<Proof>
+$\nabla^2 \log p = \frac{\nabla^2 p}{p} - (\nabla \log p)(\nabla \log p)^T$임을 정리하면 $(\nabla \log p)(\nabla \log p)^T = \frac{\nabla^2 p}{p} - \nabla^2 \log p$. 기대값을 취할 때 $\mathbb{E}[\nabla^2 p / p] = \nabla^2_\theta \int p_\theta\,dx = 0$이므로 $F = -\mathbb{E}[\nabla^2 \log p]$. $\square$
+</Proof>
+
+Zero-mean 성질은 **baseline의 정당화**로 직결된다. 임의의 함수 $b(s)$에 대해 $\mathbb{E}[b(s) \cdot s_\theta] = 0$이므로,
+
+$$
+\mathbb{E}[(f + b) \cdot s_\theta] = \mathbb{E}[f \cdot s_\theta]
+$$
+
+baseline을 빼도 기대값(=gradient)이 보존된다.
+
+## REINFORCE: Trajectory로의 확장
+
+trajectory $\tau = (s_0, a_0, r_0, \ldots)$의 분포는 다음과 같다.
+
+$$
+p_\theta(\tau) = \rho_0(s_0)\prod_{t} \pi_\theta(a_t|s_t)\,P(s_{t+1}|s_t,a_t)
+$$
+
+log를 취하면 환경 dynamics 항은 $\theta$에 무관하므로,
+
+$$
+\nabla_\theta \log p_\theta(\tau) = \sum_{t} \nabla_\theta \log \pi_\theta(a_t|s_t)
+$$
+
+score는 policy 항만 남는다. Log-derivative trick을 $J(\theta) = \mathbb{E}_\tau[R(\tau)]$에 적용하면,
+
+$$
+\boxed{\nabla_\theta J(\theta) = \mathbb{E}_\tau\!\left[\sum_t G_t \cdot \nabla_\theta \log \pi_\theta(a_t|s_t)\right]}
+$$
+
+여기서 $G_t = \sum_{l \geq 0} \gamma^l r_{t+l}$는 time $t$ 이후의 discounted return이다. 과거 reward $r_l$ ($l < t$)는 zero-mean score 덕분에 gradient에 기여하지 않는다(causality reduction). 이 추정량 $\hat{g}(\tau)$는 **unbiased**: $\mathbb{E}[\hat{g}] = \nabla J(\theta)$.
+
+Williams(1992)의 "reinforcement" 해석: $G_t > 0$이면 $\log \pi(a_t|s_t)$가 증가하여 해당 행동이 강화된다. $G_t < 0$이면 억제된다.
+
+## 분산 폭발의 메커니즘
+
+Unbiasedness는 수렴을 보장하지만 분산을 제어하지 않는다.
+
+$$
+\text{Var}[G_t] = \sum_{l=0}^{\infty} \gamma^{2l}\,\sigma_r^2 = \frac{\sigma_r^2}{1-\gamma^2}
+$$
+
+$\gamma \to 1$일 때 이 값은 $\frac{\sigma_r^2}{2(1-\gamma)}$으로 발산한다. Gradient 분산은 이 위에 score variance까지 곱해진다.
+
+$$
+\text{Var}[\hat{g}] = O\!\left(\frac{\sigma_r^2}{(1-\gamma)^3}\right)
+$$
+
+<Callout type="warning" title="Sparse Reward에서의 분산 폭발">
+보상이 $r = 1$을 확률 $p_s$로, $r = 0$을 확률 $1-p_s$로 주는 환경에서는 $\text{Var}[R] \approx p_s R^2$이고 유효 sample 수는 $\approx 1/p_s$이다. $p_s = 0.01$이면 유용한 gradient signal을 얻기까지 10,000번의 episode가 필요할 수 있다.
+</Callout>
+
+Horizon이 길어질수록, discount가 1에 가까울수록, reward가 희박할수록 분산은 지수적으로 커진다. Baseline $b(s_t)$를 도입하면 advantage $A_t = G_t - b(s_t)$의 분산이 낮아지면서도 unbiasedness는 유지된다. GAE(Generalized Advantage Estimation)는 이를 $\lambda$-parameterized trade-off로 확장한다.
+
+## Score Function vs. Reparameterization
+
+연속 행동 공간에서는 다른 gradient 경로가 있다.
+
+**Reparameterization**: $a = g_\theta(\epsilon)$, $\epsilon \sim p(\epsilon)$ ($\theta$ 무관 분포)으로 표현하면,
+
+$$
+\nabla_\theta \mathbb{E}[f(a)] = \mathbb{E}_\epsilon[\nabla_\theta f(g_\theta(\epsilon))]
+$$
+
+chain rule로 $f$를 직접 미분한다. $f$(reward)의 amplitude가 gradient 크기에 곱해지지 않으므로 **분산이 score function 방식보다 훨씬 낮다**.
+
+<Callout type="note" title="트레이드오프">
+**Score function**: discrete·continuous 모두 적용. $f$ 미분 불필요. 분산 높음. REINFORCE, PPO, A3C에 사용.
+
+**Reparameterization**: continuous만 적용. $f$가 미분 가능해야 함. 분산 낮음. DDPG, SAC에 사용.
+
+Discrete action에서 reparameterization을 쓰려면 Gumbel-Softmax처럼 연속 근사가 필요하고, 이는 temperature hyperparameter와 근사 bias를 도입한다.
+</Callout>
+
+이산 행동에서 $a = g_\theta(\epsilon)$를 step function으로 정의하면 $\partial g_\theta / \partial \theta = 0$ (almost everywhere)이 되어 gradient가 죽는다. Score function은 이 제약이 없다 — softmax의 $\nabla \log p$는 명확히 정의된다.
+
+<Aside label="설계 철학">
+두 방법의 분기점은 "reward에 미분을 요구하는가"다. Score function은 reward를 블랙박스로 취급하고 policy의 log-prob만 미분한다. Reparameterization은 reward까지 미분 경로를 열어 분산을 낮추는 대신 환경 미분가능성을 요구한다. 행동 공간의 구조가 알고리즘 선택을 결정한다.
+</Aside>
+
+## 정리
+
+- $\nabla_\theta p_\theta = p_\theta \cdot \nabla_\theta \log p_\theta$ 항등식이 gradient를 기대값 안으로 이동시키고, $f$를 미분하지 않아도 되게 만든다.
+- Score function의 zero-mean 성질 $\mathbb{E}[s_\theta] = 0$이 baseline 불편성과 Fisher Information의 수학적 토대다.
+- REINFORCE는 unbiased이지만 $\text{Var}[\hat{g}] = O((1-\gamma)^{-3})$으로 horizon과 함께 폭발한다. 이것이 baseline, GAE, natural gradient의 공통 동기다.
+- Reparameterization은 연속 행동에서 분산을 낮추는 대안이지만 이산 행동에는 적용할 수 없다.
+
+분산 문제는 알고리즘의 결함이 아니라 log-derivative trick이 요구하는 구조적 대가다.
+
+<Reference
+  title="Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning"
+  authors="Williams, R. J."
+  year={1992}
+  venue="Machine Learning"
+  url="https://link.springer.com/article/10.1007/BF00992696"
+/>

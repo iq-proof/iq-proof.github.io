@@ -1,0 +1,191 @@
+---
+title: "Policy Gradient의 분산은 어떻게 줄이는가"
+description: "Baseline subtraction의 unbiasedness 증명부터 control variate 이론, Actor-Critic의 bootstrapping bias, entropy regularization까지 — variance reduction의 통일된 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [policy-gradient, baseline, actor-critic, entropy, variance-reduction]
+difficulty: advanced
+series:
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+REINFORCE는 unbiased gradient estimator다. 그러나 episode마다 return $G_t$가 극단적으로 흔들리며, 이 variance가 학습을 방해한다. 이 문제를 해결하는 도구들 — baseline subtraction, optimal baseline, Actor-Critic bootstrapping, entropy regularization — 은 각각 독립적인 트릭처럼 보이지만, 모두 **하나의 통계적 원리**에서 나온다. 왜 $b(s)$를 빼도 gradient의 기대값이 변하지 않는가?
+
+## Score function의 zero-mean 성질
+
+모든 variance reduction 기법의 뿌리는 score function의 성질에 있다. 정책 $\pi(a|s)$를 $a$에 대해 적분하면 1이므로, 양변을 $\theta$로 미분하면:
+
+$$
+\int_a \nabla_\theta \pi(a|s) \, da = 0
+$$
+
+따라서:
+
+$$
+\mathbb{E}_{a \sim \pi}\bigl[\nabla_\theta \log \pi(a|s)\bigr] = 0
+$$
+
+Score function은 policy $\pi$ 하에서 **평균이 0**이다. 이 성질이 baseline subtraction을 가능하게 한다.
+
+<Theorem kind="theorem" number="1" title="State-dependent baseline의 unbiasedness">
+$b(s)$가 action $a$에 독립적이면:
+
+$$
+\mathbb{E}_{a \sim \pi(\cdot|s)}\bigl[\nabla_\theta \log \pi_\theta(a|s) \cdot b(s)\bigr] = 0
+$$
+</Theorem>
+
+<Proof>
+$$
+\begin{align}
+\mathbb{E}_a[\nabla \log \pi \cdot b(s)]
+&= b(s) \cdot \mathbb{E}_a[\nabla \log \pi] \\
+&= b(s) \cdot \int_a \pi(a|s) \cdot \frac{\nabla \pi(a|s)}{\pi(a|s)} \, da \\
+&= b(s) \cdot \nabla \int_a \pi(a|s) \, da \quad \text{(Leibniz rule)} \\
+&= b(s) \cdot \nabla 1 = 0 \quad \square
+\end{align}
+$$
+</Proof>
+
+따름 정리: $\mathbb{E}[\nabla \log \pi \cdot (G_t - b(s))] = \mathbb{E}[\nabla \log \pi \cdot G_t]$. Baseline이 있든 없든 **gradient의 기대값은 동일**하다.
+
+반면 $b(s, a)$ (action-dependent baseline)은 $\nabla \log \pi$와 상관될 수 있어 이 등식이 깨진다. $b(s, a) = G_t \cdot \mathbb{1}_{a=a^*}$로 놓으면 두 번째 항이 $\nabla \log \pi(a^*|s) \cdot G_t \neq 0$이 되어 즉각 bias가 발생한다.
+
+## Variance를 최소화하는 baseline
+
+Baseline이 unbiased임을 알았다. 그렇다면 **어떤 baseline을 선택해야 variance가 가장 작은가?**
+
+이것은 통계학의 control variate 문제다. 추정 대상 $f = \nabla \log \pi \cdot G$와 보조 변수 $g = \nabla \log \pi$ (zero-mean)에 대해, $f - c \cdot g$의 분산을 최소화하는 $c^*$는:
+
+$$
+c^* = \frac{\text{Cov}(f, g)}{\text{Var}[g]}
+$$
+
+On-policy sampling에서 $\mathbb{E}[\nabla \log \pi] = 0$이므로 $\text{Cov}(f, g) = \mathbb{E}[(\nabla \log \pi)^2 G]$. 따라서 optimal baseline은:
+
+$$
+b^*(s) = \frac{\mathbb{E}[(\nabla \log \pi)^2 G \mid s]}{\mathbb{E}[(\nabla \log \pi)^2 \mid s]}
+$$
+
+Variance reduction의 크기는 상관계수로 결정된다:
+
+$$
+\text{Var}[\nabla \log \pi \cdot (G - b^*)] = \text{Var}[\nabla \log \pi \cdot G] \cdot (1 - \rho^2)
+$$
+
+$\rho = \text{Corr}(\nabla \log \pi, G)$가 1에 가까울수록 분산이 거의 0으로 수렴한다. 실전에서 $\rho \approx 0.9$이면 80% 이상의 variance 감소가 가능하다.
+
+<Aside label="실전 근사">
+$b^*(s) \approx V^\pi(s)$. Score function의 크기 $(\nabla \log \pi)^2$이 상태마다 크게 다르지 않으면, optimal baseline은 value function으로 잘 근사된다. Actor-Critic이 $V_\phi(s)$를 baseline으로 쓰는 이유가 여기 있다.
+</Aside>
+
+## Actor-Critic: bootstrapping으로 분산을 압축하다
+
+Value function $V^\pi(s)$를 직접 학습해 baseline으로 쓰는 것이 Actor-Critic 구조다. **Critic**이 advantage를 추정하고, **Actor**가 그것으로 policy를 업데이트한다.
+
+TD advantage estimator:
+
+$$
+\hat{A}_t^{\text{TD}} = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)
+$$
+
+이것의 variance가 얼마나 작은지 보자. MC return의 분산은 $T$-step에 걸친 noise의 누적이다:
+
+$$
+\text{Var}[\hat{A}^{\text{MC}}] \approx \frac{\sigma_r^2}{1 - \gamma^2}
+$$
+
+반면 1-step TD error의 분산은 단 하나의 reward noise에 불과하다:
+
+$$
+\text{Var}[\hat{A}^{\text{TD}}] \approx \sigma_r^2
+$$
+
+$\gamma = 0.99$, $T = 1000$이면 **100배 이상의 분산 감소**다.
+
+<Callout type="warning" title="Bootstrapping bias">
+TD advantage는 $V_\phi$가 부정확하면 bias가 생긴다. Actor update의 bias는 $O(\|\epsilon_\phi\|)$ — critic 오차에 비례한다. 초기 학습에서 critic이 불안정할 때 TD의 bias가 MC의 variance보다 클 수 있다. GAE($\lambda$)는 이 trade-off를 $\lambda \in [0,1]$로 연속적으로 보간한다.
+</Callout>
+
+Konda & Tsitsiklis (2000)의 two-timescale convergence 정리는 critic이 actor보다 빠른 학습률을 가질 때 ($\beta_k > \alpha_k$) 수렴을 보장한다. Critic이 먼저 현재 policy의 $V^\pi$에 수렴하고, actor가 그것을 정확한 advantage로 사용하는 구조다.
+
+## Entropy regularization: 탐험을 목적함수 안에 넣다
+
+Actor-Critic이 분산 문제를 해결해도, **policy collapse**가 남아있다. 학습이 진행되면서 $\pi(a^*|s) \to 1$로 수렴해 다른 action을 더 이상 시도하지 않는다. 이는 local optimum에 갇히는 경로다.
+
+Entropy bonus는 이 문제를 목적함수 수준에서 해결한다:
+
+$$
+J_{\text{reg}}(\theta) = J(\theta) + \beta \cdot H(\pi_\theta), \quad H(\pi) = -\sum_a \pi(a|s) \log \pi(a|s)
+$$
+
+Entropy gradient를 계산하면:
+
+$$
+\nabla_\theta H = -\mathbb{E}_{a \sim \pi}\bigl[(\log \pi_\theta(a|s) + 1) \nabla_\theta \log \pi_\theta(a|s)\bigr]
+$$
+
+따라서 entropy-regularized PG theorem은:
+
+$$
+\nabla J_{\text{reg}} = \mathbb{E}\bigl[(\nabla \log \pi) \cdot (A^\pi + \beta(\log \pi + 1))\bigr]
+$$
+
+$\log \pi(a|s)$는 낮은 확률의 action에서 크게 음수이므로, entropy term은 잘 선택되지 않는 action에도 gradient를 부여한다. Policy가 uniform으로 당겨지는 힘이 $\beta$로 조절된다.
+
+최대 엔트로피 RL에서 optimal policy의 형태는 Boltzmann distribution이다 (Ziebart et al. 2008):
+
+$$
+\pi^*(a|s) \propto \exp\left(\frac{Q^*(s, a)}{\alpha}\right)
+$$
+
+높은 $Q$ action은 높은 확률, 낮은 $Q$ action도 양의 확률을 유지한다. SAC(Soft Actor-Critic)는 이 프레임워크를 temperature $\alpha$까지 학습 가능하게 확장했다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프 요약">
+| 기법 | Variance | Bias | 구현 복잡도 |
+|:---|:---|:---|:---|
+| No baseline (REINFORCE) | 매우 높음 | 없음 | 최소 |
+| State-dependent baseline $b(s)$ | 낮음 | 없음 | 낮음 |
+| TD bootstrapping (Actor-Critic) | 매우 낮음 | $O(\|\epsilon_\phi\|)$ | 중간 |
+| Action-dependent baseline (Stein) | 더 낮음 | 없음 (Stein 보정 시) | 높음 (Hessian 필요) |
+| Entropy regularization | — | 간접 bias | 낮음 |
+
+Stein control variate는 이론적으로 우월하지만 Hessian 연산 비용 때문에 실전에서 거의 쓰이지 않는다. State-dependent $V(s)$가 대부분의 경우 충분하다.
+</Callout>
+
+## 정리
+
+- Score function의 zero-mean 성질이 모든 baseline subtraction의 수학적 기반이다.
+- Optimal baseline은 $b^*(s) = \mathbb{E}[(\nabla \log \pi)^2 G \mid s] / \mathbb{E}[(\nabla \log \pi)^2 \mid s]$ — 이것이 control variate의 optimal weight다.
+- TD bootstrapping은 variance를 100배 이상 줄이지만, critic 오차만큼의 bias를 도입한다.
+- Entropy regularization은 policy collapse를 막고, 최대 엔트로피 최적 정책을 Boltzmann 분포로 특성화한다.
+
+분산 감소의 네 챕터는 별개의 트릭이 아니다 — 모두 "signal을 noise에서 분리하라"는 하나의 요청에 대한 다른 답이다.
+
+<Reference
+  title="Policy Gradient Methods for Reinforcement Learning with Function Approximation"
+  authors="Sutton, McAllester, Singh, Mansour"
+  year={2000}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf"
+/>
+
+<Reference
+  title="Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor"
+  authors="Haarnoja, Zhou, Abbeel, Levine"
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1801.01290"
+/>

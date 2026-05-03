@@ -1,0 +1,152 @@
+---
+title: "GAE는 왜 λ 하나로 bias-variance를 제어할 수 있는가"
+description: "TD residual의 bootstrapping bias부터 GAE의 지수적 가중 평균 유도, λ의 두 극한, 역순 O(T) 구현까지 — advantage estimation의 핵심 설계를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [policy-gradient, gae, advantage-estimation, td-lambda, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+REINFORCE의 gradient $\nabla \log \pi(a|s) \cdot G_t$는 이론적으로 올바르지만, return $G_t$의 분산이 너무 크다. baseline $V(s)$를 빼도 분산의 대부분은 남는다. 그렇다면 1-step TD residual $\delta_t^V$를 쓰면 어떨까? 분산은 줄지만, $V$가 부정확한 만큼 bias가 생긴다. 이 tension을 단 하나의 파라미터로 제어하는 것이 Generalized Advantage Estimation(GAE)이다 — 어떻게 가능한가?
+
+## TD Residual과 n-step Advantage
+
+1-step TD residual은 다음과 같이 정의된다.
+
+$$
+\delta_t^V := r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+$V = V^\pi$이면 $\delta_t^V$는 advantage $A^\pi(s_t)$의 불편 추정량이 된다. 하지만 학습 중에는 $V$가 항상 부정확하므로 bias가 개입한다. 1-step만 보는 대신 n-step까지 확장하면 다음이 성립한다.
+
+$$
+\hat{A}_t^{(n)} := \sum_{l=0}^{n-1} \gamma^l \delta_{t+l}^V = \sum_{l=0}^{n-1} \gamma^l r_{t+l} + \gamma^n V(s_{t+n}) - V(s_t)
+$$
+
+이 등식은 telescoping으로 쉽게 확인된다. $n=1$이면 $\delta_t^V$이고, $n \to \infty$이면 bootstrap 없는 Monte Carlo return $G_t - V(s_t)$에 수렴한다. 따라서 n에는 spectrum이 존재한다.
+
+$$
+n \text{ 작음} \;\Rightarrow\; \text{biased, low variance} \qquad n \text{ 큼} \;\Rightarrow\; \text{unbiased, high variance}
+$$
+
+n-step의 bias는 $\gamma^n \bigl(\mathbb{E}[V(s_{t+n})] - V^\pi(s_{t+n})\bigr)$에 비례한다. n이 커질수록 $\gamma^n$이 줄어 bias는 감소하지만, 더 많은 reward 항이 합산되어 분산은 증가한다.
+
+## GAE 유도 — 세 가지 동치 형태
+
+Schulman et al. (2016)은 n-step spectrum 전체를 지수적으로 가중 평균한다.
+
+$$
+\hat{A}_t^{\text{GAE}(\gamma, \lambda)} := (1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} \hat{A}_t^{(n)}
+$$
+
+<Theorem kind="theorem" number="1" title="GAE의 세 형태 동치성">
+다음 세 표현은 모두 동일하다.
+
+$$
+(1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} \hat{A}_t^{(n)} = \sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l}^V = \delta_t + \gamma\lambda \hat{A}_{t+1}
+$$
+</Theorem>
+
+<Proof>
+**지수 평균 → 직접 형**: $\hat{A}_t^{(n)} = \sum_{l=0}^{n-1} \gamma^l \delta_{t+l}^V$를 대입하고 합산 순서를 바꾼다.
+
+$$
+(1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} \sum_{l=0}^{n-1} \gamma^l \delta_{t+l}^V = (1-\lambda) \sum_{l=0}^{\infty} \gamma^l \delta_{t+l}^V \sum_{n=l+1}^{\infty} \lambda^{n-1}
+$$
+
+내부 합은 $\sum_{n=l+1}^{\infty} \lambda^{n-1} = \frac{\lambda^l}{1-\lambda}$이므로,
+
+$$
+= \sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l}^V \quad \square
+$$
+
+**직접 형 → 재귀 형**: 첫 항을 분리하면
+
+$$
+\sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l}^V = \delta_t + \gamma\lambda \sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+1+l}^V = \delta_t + \gamma\lambda \hat{A}_{t+1} \quad \square
+$$
+</Proof>
+
+재귀 형 $\hat{A}_t = \delta_t + \gamma\lambda \hat{A}_{t+1}$은 단순히 수학적 등가물이 아니다 — 이것이 $O(T)$ 구현의 근거다.
+
+## λ의 두 극한과 bias-variance 제어
+
+<Theorem kind="corollary" number="2" title="극한 케이스">
+$$
+\lambda = 0 \;\Rightarrow\; \hat{A}_t = \delta_t^V \quad \text{(1-step TD, biased, low variance)}
+$$
+$$
+\lambda = 1 \;\Rightarrow\; \hat{A}_t = G_t - V(s_t) \quad \text{(Monte Carlo, unbiased, high variance)}
+$$
+</Theorem>
+
+$\lambda = 1$의 경우 $\sum_{l=0}^{\infty} \gamma^l \delta_{t+l}^V$에서 telescoping이 일어나 $G_t - V(s_t)$가 된다.
+
+λ가 클수록 분산이 커지는 이유는 i.i.d. reward를 가정하면 정량적으로 확인된다. reward 분산을 $\sigma_r^2$라 하면,
+
+$$
+\text{Var}[\delta_t] \approx \sigma_r^2, \qquad \text{Var}[G_t] \approx \frac{\sigma_r^2}{1 - \gamma^2}
+$$
+
+즉, Monte Carlo 분산은 1-step TD 분산의 약 $\frac{1}{1-\gamma}$배다. $\gamma = 0.99$이면 이 비율이 50배를 넘는다.
+
+<Callout type="note" title="트레이드오프">
+λ는 bias-variance를 연속적으로 제어한다. $V$가 부정확한 훈련 초기에는 λ를 낮춰 bias 누적을 억제하고, $V$가 안정된 이후에는 λ를 높여 분산을 감수하면서 불편성을 확보하는 전략이 실전에서 권장된다. Schulman et al. (2016)은 연속 제어 환경 대부분에서 λ = 0.95가 sweet spot임을 보였다.
+</Callout>
+
+## 역순 O(T) 구현
+
+재귀 형 $\hat{A}_t = \delta_t + \gamma\lambda \hat{A}_{t+1}$을 앞에서부터 계산하면 $\hat{A}_0$를 구하기 위해 $\hat{A}_1, \hat{A}_2, \ldots$를 모두 먼저 알아야 하므로 $O(T^2)$이 된다. 뒤에서부터 계산하면 각 step이 $O(1)$이므로 전체 $O(T)$로 끝난다.
+
+```python
+def compute_gae(rewards, values, gamma, lambda_, dones):
+    """
+    rewards: (T,), values: (T+1,), dones: (T,)
+    returns: advantages (T,)
+    """
+    T = len(rewards)
+    deltas = rewards + gamma * values[1:] - values[:-1]   # (T,)
+
+    advantages = [0.0] * T
+    gae = 0.0
+    for t in reversed(range(T)):
+        gae = deltas[t] + gamma * lambda_ * gae
+        gae = gae * (1 - dones[t])   # episode 경계에서 reset
+        advantages[t] = gae
+    return advantages
+```
+
+episode 경계(`dones[t] = 1`)에서 `gae`를 0으로 reset하지 않으면 서로 다른 episode 간에 spurious correlation이 발생한다. terminal state에서 $V(\text{terminal}) = 0$이므로 $\delta_{T-1} = r_{T-1} - V(s_{T-1})$로 자연스럽게 처리된다.
+
+<Aside label="TD(λ)와의 관계">
+GAE는 value function learning의 TD(λ)를 advantage estimation에 그대로 전용한 것이다. TD(λ)의 eligibility trace 업데이트 $e_t = \gamma\lambda e_{t-1} + \nabla_\phi V(s_t)$와 GAE의 재귀 형은 수학적으로 동일한 구조다. GAE는 "TD(λ) return에서 $V(s_t)$를 뺀 것", 즉 advantage 형태의 TD(λ) return이다.
+</Aside>
+
+## 정리
+
+- TD residual $\delta_t^V$는 분산을 극적으로 줄이지만 $V$ 오차만큼 bias를 가진다.
+- n-step advantage들의 지수적 가중 평균이 GAE이고, 이는 $\sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l}^V$와 재귀 형 $\delta_t + \gamma\lambda \hat{A}_{t+1}$로 동치다.
+- λ = 0은 1-step TD(biased, low variance), λ = 1은 Monte Carlo(unbiased, high variance)이며, λ ∈ (0, 1)은 이 spectrum을 연속적으로 보간한다.
+- 역순 반복으로 $O(T)$ 계산이 가능하고, episode 경계에서 gae를 반드시 reset해야 한다.
+
+수식 한 줄 $(1-\lambda)\sum \lambda^{n-1} \hat{A}_t^{(n)}$ 뒤에는, "어떤 n도 완벽하지 않다면 모든 n을 함께 쓰자"는 구체적인 엔지니어링 판단이 있다.
+
+<Reference
+  title="High-Dimensional Continuous Control Using Generalized Advantage Estimation"
+  authors="Schulman et al."
+  year={2016}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1506.02438"
+/>

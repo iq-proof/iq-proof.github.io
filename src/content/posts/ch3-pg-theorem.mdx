@@ -1,0 +1,143 @@
+---
+title: "Policy Gradient Theorem의 세 가지 얼굴"
+description: "PG Theorem의 정확한 서술부터 PDL 기반·Direct Unrolling 두 증명, Q→A 치환의 근거, Deterministic PG까지, 하나의 gradient 공식이 어떻게 현대 RL 알고리즘 전체를 설계하는가."
+pubDate: 2026-05-03
+category: ai
+tags: [policy-gradient, reinforcement-learning, actor-critic, dpg, variance-reduction]
+difficulty: advanced
+series:
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+강화학습에서 "정책을 어떻게 개선하는가"라는 질문에 대한 답은 하나의 공식으로 수렴한다.
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{s \sim d^\pi,\, a \sim \pi}\!\left[\nabla_\theta \log \pi_\theta(a \mid s) \cdot Q^{\pi_\theta}(s, a)\right]
+$$
+
+이 공식은 어디서 왔는가? 그리고 왜 이 공식이 REINFORCE부터 PPO, DDPG까지 거의 모든 현대 RL 알고리즘의 기초가 되는가?
+
+## 세 핵심 양이 함께 만드는 의미
+
+공식 안에는 세 가지 구성 요소가 있다.
+
+**Score function** $\nabla_\theta \log \pi_\theta(a \mid s)$는 파라미터를 어느 방향으로 바꿀지 결정한다. 정규화 조건 $\sum_a \pi(a \mid s) = 1$을 미분하면 $\mathbb{E}_{a \sim \pi}[\nabla \log \pi] = 0$이 자동으로 성립한다. Score function은 항상 중심화되어 있다.
+
+**Q-value** $Q^\pi(s, a)$는 각 행동의 절대적 가치다. Score function에 Q-value를 곱함으로써 좋은 행동만 강화하고 나쁜 행동은 억제한다.
+
+**Discounted state distribution** $d^\pi(s)$는 정책 $\pi$를 따를 때 상태 $s$를 방문할 확률의 discounted 가중 합이다.
+
+$$
+d^\pi(s) := (1 - \gamma)\sum_{t=0}^{\infty} \gamma^t \Pr(s_t = s \mid \pi_\theta, \rho_0)
+$$
+
+$(1-\gamma)$ 정규화 항이 있기 때문에 $\sum_s d^\pi(s) = 1$이 성립한다. 이 세 양을 합치면 하나의 직관이 된다: "정책이 자주 방문하는 상태에서, 현재 정책이 선택하는 행동 중 좋은 것은 더 자주, 나쁜 것은 덜 자주 하도록 파라미터를 업데이트하라."
+
+## 두 증명이 보여주는 서로 다른 직관
+
+Policy Gradient Theorem은 두 가지 경로로 증명된다. 결론은 같지만 직관이 다르다.
+
+**PDL 기반 증명** (Kakade & Langford 2002)은 두 정책의 성능 차에서 출발한다.
+
+$$
+J(\pi') - J(\pi) = \frac{1}{1-\gamma}\mathbb{E}_{s \sim d^{\pi'},\, a \sim \pi'}[A^\pi(s, a)]
+$$
+
+여기서 $\pi' = \pi_{\theta + \epsilon}$으로 두고 $\epsilon \to 0$ 극한을 취한다. Leibniz 규칙으로 기대값과 미분을 교환하면, $d^{\pi'}$가 $d^\pi$로 바뀌고 log-derivative trick을 통해 PG Theorem이 나온다. 이 경로의 핵심은 $\epsilon$이 유한할 때 우변이 **surrogate objective**가 된다는 점이다. TRPO와 PPO는 이 surrogate를 최대화하되 $\pi'$와 $\pi$의 KL divergence를 제한하는 구조다.
+
+**Direct Unrolling 증명**은 Bellman 재귀에서 $\nabla V^\pi$를 전개한다.
+
+$$
+\nabla V^\pi(s) = \sum_a [\nabla \pi(a \mid s)] Q^\pi(s, a) + \gamma \sum_a \pi(a \mid s) \sum_{s'} P(s' \mid s, a)\, \nabla V^\pi(s')
+$$
+
+이 재귀를 무한히 unroll하면 geometric series가 나타나고, 그 합이 정확히 $d^\pi$로 환원된다.
+
+$$
+\nabla J(\theta) = \sum_{t=0}^\infty \gamma^t \mathbb{E}_{s_t \sim P_t(\cdot \mid \rho_0, \pi)}\!\left[\sum_a \nabla\pi(a \mid s_t)\, Q^\pi(s_t, a)\right]
+= \frac{1}{1-\gamma}\sum_s d^\pi(s)\sum_a \nabla\pi(a \mid s)\,Q^\pi(s,a)
+$$
+
+이 경로는 $d^\pi$가 단순한 가중치 분포가 아니라 Bellman 재귀의 기하학적 구조에서 자연스럽게 등장함을 보여준다.
+
+<Aside label="두 증명의 역할">
+PDL 증명은 surrogate objective로의 다리를 놓는다 — TRPO/PPO의 동기를 이해하려면 이 경로가 필수다. Direct Unrolling은 $d^\pi$의 기하학적 의미를 명확히 한다 — on-policy 샘플링이 왜 $d^\pi$를 자연스럽게 구현하는지 보여준다.
+</Aside>
+
+## $Q^\pi$를 $A^\pi$로 바꿀 수 있는 이유
+
+<Theorem kind="proposition" number="1" title="State-Dependent Baseline의 Unbiasedness">
+임의의 정책 $\pi$와 state function $b(s)$에 대해:
+$$\mathbb{E}_{a \sim \pi(\cdot \mid s)}\!\left[\nabla_\theta \log \pi(a \mid s) \cdot b(s)\right] = 0$$
+</Theorem>
+
+<Proof>
+정규화 $\sum_a \pi(a \mid s) = 1$을 $\theta$로 미분하면 $\sum_a \frac{\partial \pi}{\partial \theta} = 0$. Log-derivative trick $\partial \pi = \pi \,\partial \log \pi$를 적용하면 $\mathbb{E}_{a \sim \pi}[\nabla \log \pi(a \mid s)] = 0$. $b(s)$는 $a$에 무관하므로 기대값 밖으로 나올 수 있고, $b(s) \cdot 0 = 0$. $\square$
+</Proof>
+
+이 명제의 귀결이 Actor-Critic의 이론적 정당화다. $b(s) = V^\pi(s)$로 설정하면:
+
+$$
+\mathbb{E}[\nabla \log \pi \cdot Q^\pi] = \mathbb{E}[\nabla \log \pi \cdot A^\pi]
+$$
+
+두 기대값은 동일하다. 반면 **action-dependent baseline** $b(s, a)$는 이 논리가 깨진다. $b(s, a)$와 $\nabla \log \pi(a \mid s)$가 상관될 수 있기 때문이다. Softmax 정책에서 $b(s, a) = w_a^T \phi(s)$로 설정하면 $\mathbb{E}[\phi(s) \cdot w_a^T \phi(s)] = \operatorname{tr}(w_a\, \mathbb{E}[\phi\phi^T]) \neq 0$이 되어 편향이 발생한다.
+
+<Callout type="note" title="트레이드오프">
+$A^\pi$ 대신 $Q^\pi$를 쓰면 unbiased이지만 variance가 크다. $b(s) = V^\pi(s)$를 빼면 variance를 줄이면서 unbiasedness를 유지할 수 있다. 이론적으로 최적 baseline은 $b^*(s) = \mathbb{E}[(\nabla\log\pi)^2 Q] / \mathbb{E}[(\nabla\log\pi)^2]$이지만 계산 불가능하므로, 실전에서는 학습된 $V(s)$로 근사한다.
+</Callout>
+
+## Deterministic PG — action 적분을 없애다
+
+Stochastic PG는 action에 대한 기대값을 계산해야 한다. 연속 행동 공간에서 이것은 high-variance의 원인이 된다. Silver (2014)의 Deterministic Policy Gradient는 정책을 $\mu_\theta: \mathcal{S} \to \mathcal{A}$로 고정함으로써 이 적분을 제거한다.
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{s \sim d^\mu}\!\left[\nabla_\theta \mu_\theta(s) \cdot \nabla_a Q^\mu(s, a)\big|_{a = \mu(s)}\right]
+$$
+
+$V^\mu(s) = Q^\mu(s, \mu(s))$이므로 chain rule을 직접 적용할 수 있다. Action에 대한 기대값이 사라지고, state distribution에 대한 기대값만 남는다.
+
+| 속성 | Stochastic PG | Deterministic PG |
+|---|---|---|
+| Action sampling | 필요 | 불필요 |
+| Score function | $\nabla \log \pi$ 필요 | 불필요 |
+| Variance | 높음 | 낮음 |
+| Discrete action | 자연스러움 | 어려움 |
+| Off-policy | 복잡 | 용이 |
+
+DPG의 variance가 낮은 이유는 action에 내재된 불확실성($H(a \mid s) > 0$)이 gradient에 전파되지 않기 때문이다. 탐험은 noise injection으로 분리되고, gradient 경로는 상태 → 정책 → 행동 → Q-value의 단일 경로만 남는다. 이것이 DDPG, TD3의 토대다. SAC는 reparameterization trick을 통해 stochastic 정책을 유지하면서 DPG와 유사한 low-variance gradient를 얻는다.
+
+## 정리
+
+- $d^\pi$는 "정책이 자주 방문하는 상태"를 가중치로 표현하며, Bellman 재귀의 geometric series에서 자연스럽게 등장한다.
+- PDL 기반 증명은 surrogate objective로의 다리를 놓고 (TRPO/PPO의 동기), Direct Unrolling은 $d^\pi$의 기하학적 의미를 명확히 한다.
+- 정규화 조건 $\sum_a \pi = 1$에서 score function의 기대값이 0임이 도출되고, 이것이 $Q^\pi \to A^\pi$ 치환의 유일한 근거다.
+- Deterministic PG는 action 적분을 제거함으로써 continuous action space에서의 variance 문제를 해결한다.
+
+하나의 gradient 공식 뒤에는 "어떤 상태에서, 어떤 행동을, 얼마나 강화할 것인가"라는 설계 결정 전체가 압축되어 있다.
+
+<Reference
+  title="Policy Gradient Methods for Reinforcement Learning with Function Approximation"
+  authors="Sutton, McAllester, Singh, Mansour"
+  year={2000}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/1999/hash/464d828b85b0bed98e80ade0a5c43b0f-Abstract.html"
+/>
+
+<Reference
+  title="Deterministic Policy Gradient Algorithms"
+  authors="Silver, Lever, Heess, Degris, Wierstra, Riedmiller"
+  year={2014}
+  venue="ICML"
+  url="https://proceedings.mlr.press/v32/silver14.html"
+/>

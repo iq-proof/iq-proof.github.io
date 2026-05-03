@@ -1,13 +1,13 @@
 ---
-title: "Actor-Critic은 왜 둘이 같이 학습해야 하는가"
-description: "GPI의 비동기 구현으로서의 Actor-Critic 프레임워크를 출발점으로, Baseline의 수학적 정당성, Softmax 정책의 기하학, Linear FA의 수렴 조건과 Deadly Triad까지, 협력 체계의 작동 원리를 추적한다."
+title: "Actor-Critic은 어떻게 진화했는가"
+description: "Basic AC의 two-timescale 수렴부터 A3C의 비동기 병렬화, A2C의 동기 배치, PPO의 clipped surrogate, IMPALA의 V-trace 오프-폴리시 보정까지, 하나의 설계 철학이 어떻게 확장되는지 추적한다."
 pubDate: 2026-05-03
 category: ai
-tags: [reinforcement-learning, actor-critic, policy-gradient, function-approximation, advantage]
+tags: [policy-gradient, actor-critic, ppo, impala, reinforcement-learning]
 difficulty: advanced
 series:
-  slug: model-free-rl-deep-dive
-  title: Model Free Rl Deep Dive
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
   order: 6
 draft: false
 featured: false
@@ -19,135 +19,104 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-Q-Learning과 SARSA는 가치 함수 하나로 정책을 암묵적으로 표현한다. Actor-Critic은 그것을 **명시적으로 둘로 쪼갠다** — 행동을 선택하는 Actor와 그 행동을 평가하는 Critic. 왜 이 분리가 필요하며, 둘이 서로 다른 속도로 학습해야만 수렴이 보장되는가?
+Actor-Critic 계열 알고리즘의 역사는 하나의 반복되는 질문으로 요약된다: **어떻게 하면 같은 경험에서 더 많이 배울 수 있는가?** REINFORCE는 Monte Carlo return의 분산 때문에 느리게 배운다. Basic AC는 TD bootstrapping으로 분산을 낮추지만 bias를 도입한다. A3C는 비동기 병렬화로 throughput을 높이고, A2C는 동기 배치로 재현성을 회복하며, PPO는 importance sampling으로 같은 데이터를 여러 번 쓰고, IMPALA는 V-trace로 진정한 오프-폴리시 분산 학습을 가능하게 한다. 이 다섯 단계는 독립적인 알고리즘이 아니라 하나의 설계 문제에 대한 연속적인 응답이다. 그 응답들이 어떤 공통 구조를 공유하는가?
 
-## GPI의 비동기 구현
+## 출발점: bias-variance 트레이드오프의 구조화
 
-Generalized Policy Iteration(GPI)의 고전 도식은 순차적이다. Policy Evaluation이 $V^\pi$로 완전히 수렴한 후, Policy Improvement가 $\pi'$를 만들고, 다시 Evaluation이 시작된다. 하지만 Actor-Critic은 이 반복을 **매 시간 스텝마다** 동시에 실행한다.
+REINFORCE의 policy gradient는 다음 분산을 갖는다.
 
-```
-Critic (TD):  V(s) ← V(s) + α_c [r + γV(s') - V(s)]
-Actor (PG):   θ ← θ + α_a ∇_θ log π_θ(a|s) A(s,a)
-```
+$$\mathrm{Var}[\nabla \log \pi(a \mid s) \cdot G_t] = \mathbb{E}[(\nabla \log \pi)^2 G_t^2] - \mathbb{E}[\nabla \log \pi \cdot G_t]^2$$
 
-각 경험 $(s, a, r, s')$마다 Critic이 한 스텝 TD 업데이트를 하고, Actor가 그 TD 오차를 Advantage로 삼아 정책 파라미터를 조금 움직인다. 이것이 GPI의 **비동기 버전**이다. 정책이 고정된 채로 가치가 수렴하기를 기다리지 않는다.
+$G_t$가 에피소드 전체의 discounted return이므로 분산이 크다. Actor-Critic의 핵심 아이디어는 이 $G_t$ 자리에 TD residual을 넣는 것이다.
 
-이 협력의 핵심 수식은 다음과 같다.
+$$\hat{A}_t = \delta_t^V = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$$
 
-$$
-\theta_{t+1} = \theta_t + \alpha_a \underbrace{\delta_t}_{\text{advantage}} \nabla_\theta \log \pi_\theta(a_t \mid s_t)
-$$
+분산은 줄어들지만 $V_\phi \neq V^\pi$인 동안 bias가 생긴다. 이 교환이 수렴해야 의미가 있는데, 그 보증이 **two-timescale** 조건이다. Critic 학습률 $\alpha_c$가 Actor 학습률 $\alpha$보다 크면, Critic은 Actor가 거의 정지한 것처럼 보이는 빠른 시간축에서 수렴하고, Actor는 이미 수렴한 Critic의 advantage를 신뢰할 수 있다.
 
-$$
-w_{t+1} = w_t + \alpha_c \delta_t \nabla_w V_w(s_t), \quad \delta_t = r_t + \gamma V_w(s_{t+1}) - V_w(s_t)
-$$
+<Theorem kind="theorem" number="1" title="Two-Timescale Convergence (Konda & Tsitsiklis, 2000)">
+$\alpha_c > \alpha$이고 적절한 감소 조건 하에서, Actor-Critic 알고리즘의 파라미터는 거의 확실하게 수렴한다.
 
-TD 오차 $\delta_t$는 단순한 예측 오류가 아니다. $V_w$가 $V^\pi$에 충분히 가까울 때, $\delta_t$의 기댓값은 정확히 Advantage $A^\pi(s_t, a_t) = Q^\pi(s_t, a_t) - V^\pi(s_t)$와 일치한다. Critic이 제공하는 것은 "이 행동이 평균보다 얼마나 좋았는가"라는 **상대적 신호**다.
+$$\theta_t \to \theta^*, \quad \phi_t \to \phi^*$$
 
-## Baseline이 Gradient를 Unbiased로 유지하는 이유
-
-Policy Gradient Theorem의 원형은 $Q^\pi(s,a)$를 직접 사용한다.
-
-$$
-\nabla_\theta J(\pi_\theta) = \mathbb{E}_{s \sim d^\theta,\, a \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(a \mid s)\, Q^\pi(s,a)]
-$$
-
-$Q^\pi$는 에피소드 전체의 누적 보상이므로 분산이 극히 높다. 여기서 임의의 상태 의존 함수 $b(s)$를 빼도 gradient의 기댓값이 변하지 않는다는 사실이 핵심이다.
-
-<Theorem kind="proposition" number="1" title="Baseline Unbiasedness">
-임의의 상태 의존 baseline $b(s)$에 대해,
-
-$$
-\mathbb{E}_{a \sim \pi_\theta(\cdot \mid s)}\bigl[\nabla_\theta \log \pi_\theta(a \mid s)\, b(s)\bigr] = 0
-$$
+여기서 $\theta^*$는 $J(\theta)$의 local optimum이다.
 </Theorem>
 
 <Proof>
-$\sum_a \pi(a \mid s) = 1$을 $\theta$로 미분하면 $\sum_a \nabla_\theta \pi(a \mid s) = 0$이다. 따라서
-
-$$
-\mathbb{E}_{a \mid s}[\nabla_\theta \log \pi(a \mid s)] = \sum_a \pi(a \mid s) \cdot \frac{\nabla_\theta \pi(a \mid s)}{\pi(a \mid s)} = \sum_a \nabla_\theta \pi(a \mid s) = 0
-$$
-
-$b(s)$가 $a$에 무관하므로 이를 기댓값 밖으로 꺼낼 수 있고, $b(s) \cdot 0 = 0$. $\square$
+(스케치) Critic이 빠른 시간축($t = O(1/\alpha_c)$)에서 $V_\phi \to V^\pi$로 수렴하면, Actor의 관점에서 Critic은 quasi-static이다. Critic이 고정된 상태에서 Actor는 standard policy gradient로 local optimum에 수렴한다. Critic의 잔여 오차를 perturbation으로 처리하면 전체 시스템이 안정적임을 보일 수 있다. $\square$
 </Proof>
 
-분산을 최소화하는 최적 baseline은 $b^*(s) \approx V^\pi(s)$임이 알려져 있다(Greensmith et al. 2004). 따라서 $A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)$를 사용하는 것은 **이론적으로 최선에 가까운 분산 감소**다. $\mathbb{E}_{a \mid s}[A^\pi(s,a)] = 0$이기 때문에 gradient는 절대적인 보상 수준이 아니라 **상대적 우수성**만 담게 된다.
+## 병렬화: 비동기와 동기 사이의 선택
 
-## Softmax 정책의 기하학
+Basic AC가 단일 스트림이라면, A3C는 여러 Worker가 동시에 다른 환경을 탐험한다. 핵심은 Hogwild! 스타일 lock-free 업데이트다.
 
-Actor의 파라미터 업데이트는 log-derivative를 통해 이루어진다. Softmax 정책 $\pi_\theta(a \mid s) = \exp(\theta_a / \tau) / Z$에서,
+```python
+# 각 Worker는 global θ에 lock 없이 gradient를 누적한다
+while True:
+    τ = sample_trajectory(env_i, π_θ)
+    g_i = compute_gradient(τ)
+    θ += α * g_i  # Concurrent write, no synchronization
+```
 
-$$
-\nabla_\theta \log \pi_\tau(a \mid s) = \frac{1}{\tau}(e_a - \pi_\tau(a \mid s))
-$$
+일부 업데이트가 "잃어버려지지만" 이 손실은 stochastic gradient noise의 범위 안에 있어서 수렴을 방해하지 않는다 (Recht et al. 2011). 더 중요한 효과는 **sample diversity**다. 16개 Worker가 서로 다른 환경 seed에서 수집한 trajectory들은 자기상관이 낮아, replay buffer 없이도 DQN 수준의 sample decorrelation을 달성한다.
 
-이 수식의 기하학은 직관적이다. $e_a$는 행동 $a$에 대한 one-hot 벡터이고, $\pi_\tau(a \mid s)$는 현재 정책 분포다. 그 차이는 "선택된 행동 방향으로의 이동 벡터"다. Advantage $\delta_t > 0$이면 해당 행동의 확률을 올리고, $\delta_t < 0$이면 내린다.
+<Callout type="note" title="A3C vs A2C의 실질적 차이">
+Wu et al. (2017)은 비동기성이 본질이 아님을 보였다. 충분한 수의 동기 Worker로도 같은 sample diversity가 달성되고, 동기화 barrier 하나만 추가하면 stale gradient 문제가 사라진다. A2C의 등장 이후 Stable-Baselines3 같은 주요 라이브러리가 A2C를 표준으로 채택한 이유는 성능이 아니라 **재현성과 GPU 효율**이다.
 
-온도 파라미터 $\tau$는 탐험-활용 균형을 제어한다. $\tau \to 0$이면 softmax는 argmax로 수렴하고($\pi_\tau \to \delta_{a^*}$), $\tau \to \infty$이면 균등 분포가 된다. 연속 행동 공간에서는 Gaussian 정책 $\pi(a \mid s) = \mathcal{N}(\mu_\theta(s), \sigma^2_\theta(s))$를 사용하며, Actor update는 동일한 형태로 작동한다.
-
-$$
-\mu \leftarrow \mu + \alpha_\mu\, A(s, a) \cdot \frac{a - \mu(s)}{\sigma^2(s)}
-$$
-
-이 일반성이 Actor-Critic이 이산·연속 행동 공간 모두에서 동일한 알고리즘 구조를 유지하는 이유다.
-
-## Two-Timescale과 수렴 조건
-
-Actor와 Critic이 같은 학습률로 동시에 움직이면 수렴이 불안정해진다. Critic이 수렴하기 전에 Actor가 정책을 바꾸면, Critic은 계속 움직이는 타겟을 쫓아야 한다. Konda & Tsitsiklis(2000)의 핵심 기여는 이 문제를 **two-timescale stochastic approximation**으로 형식화한 것이다.
-
-$$
-\lim_{t \to \infty} \frac{\alpha_{a,t}}{\alpha_{c,t}} = 0, \quad \sum_t \alpha_{c,t} = \infty, \quad \sum_t \alpha_{c,t}^2 < \infty
-$$
-
-Critic의 학습률이 충분히 크고 Actor의 학습률이 상대적으로 작을 때, Critic dynamics는 Actor가 "frozen"된 것처럼 빠르게 $V^{\pi_\theta}$로 수렴하고, Actor는 이미 수렴한 Critic을 바탕으로 정확한 gradient 방향으로 움직인다. 실전에서는 $\alpha_c \approx 10 \times \alpha_a$ 정도가 기본값이다.
-
-<Callout type="warning" title="트레이드오프: 학습률 설정">
-$\alpha_a \approx \alpha_c$이면 Actor와 Critic이 동시에 빠르게 움직여 gradient 방향이 계속 변하고 수렴이 불안정해진다. $\alpha_a \ll \alpha_c$이면 Critic이 먼저 수렴하지만, 전체 학습이 느려진다. 학습률 스케줄 선택이 Actor-Critic의 안정성을 실질적으로 결정한다.
+| 특성 | A3C | A2C |
+|------|-----|-----|
+| Stale gradient | 있음 | 없음 |
+| 재현성 | ✗ | ✓ |
+| GPU batch 효율 | 낮음 | 높음 |
+| 구현 복잡도 | 높음 | 낮음 |
 </Callout>
 
-## Linear FA와 Deadly Triad
+## Sample Efficiency: PPO의 Clipped Surrogate
 
-Critic을 선형 함수 $\hat{V}(s; w) = w^\top \phi(s)$로 근사하면 이론이 깔끔해진다. Tsitsiklis & Van Roy(1997)는 on-policy linear TD(0)가 almost surely 수렴함을 증명했다. 수렴점 $w^*$는 참값 $V^\pi$가 아니라 **linear 부분공간으로의 orthogonal projection**, 즉 $\hat{V}(s; w^*) = \Pi_\Phi V^\pi(s)$다.
+A2C는 수집한 trajectory를 한 번 쓰고 버린다. PPO의 핵심 질문은 "왜 한 번만 쓰는가?"다.
 
-그러나 세 조건이 동시에 충족되면 수렴 보장이 사라진다.
+같은 배치를 여러 epoch 재사용하려면 현재 policy $\pi_\theta$가 데이터를 수집한 $\pi_{\theta_\text{old}}$와 달라지는 문제를 해결해야 한다. Importance ratio $r_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_\text{old}}(a_t \mid s_t)$로 보정할 수 있지만, ratio가 너무 커지면 gradient가 폭발한다.
 
-```
-Off-policy  +  Bootstrapping  +  Function Approximation
-    ↑               ↑                     ↑
-다른 정책 샘플   TD로 미래 추정       파라미터 공유
-```
+PPO의 clipped surrogate loss는 이 ratio를 `(1-ε, 1+ε)` 범위로 제한한다.
 
-이것이 **Deadly Triad**(Baird 1995, Sutton & Barto 2018)다. Baird의 counterexample은 7개 상태와 선형 FA만으로 off-policy TD가 $\|w_t\| \to \infty$로 발산함을 보인다. Semi-gradient 업데이트는 target $\gamma w^\top \phi(s')$의 $w$ 의존성을 무시하는데, 이 근사가 on-policy에서는 무해하지만 off-policy에서는 importance ratio와 결합해 음의 피드백 없이 발산을 허용한다.
+$$L^{\mathrm{CLIP}}(\theta) = \mathbb{E}_t \left[\min\!\left(r_t(\theta)\,\hat{A}_t,\; \mathrm{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\,\hat{A}_t\right)\right]$$
 
-DQN이 experience replay와 target network를 도입한 이유가 여기에 있다. 이론적 보장은 아니지만, 상관관계를 줄이고 gradient를 평활화해 경험적으로 Deadly Triad를 완화한다.
+min을 취하는 이유는 보수적 업데이트를 강제하기 위해서다. $\hat{A}_t > 0$일 때 ratio가 $1+\epsilon$을 넘으면 clipped version이 작아지므로 min이 clipped를 선택한다. 이 구조가 TRPO의 KL constraint를 단순한 clipping으로 근사하면서도 비슷한 안정성을 달성한다. GAE의 $\lambda$ 파라미터와 결합하면 bias-variance 트레이드오프까지 제어할 수 있어, PPO는 현재까지 가장 널리 쓰이는 on-policy 알고리즘으로 남아 있다.
 
-<Aside label="설계 철학">
-Actor-Critic의 모든 장치 — two-timescale, advantage baseline, on-policy 제약 — 는 하나의 문제에 대한 답이다. **움직이는 두 개의 타겟이 서로를 불안정하게 만들지 않도록 협력의 속도와 범위를 제어하라**. 이 철학이 A3C, PPO, SAC 등 이후 알고리즘들에도 이어진다.
-</Aside>
+## 규모 확장: IMPALA와 V-trace
+
+PPO도 한계가 있다. On-policy 특성상 데이터를 수집한 policy가 빠르게 교체되면 replay가 불가능하고, Worker 수를 100개 이상으로 늘리면 중앙 파라미터 서버의 lock contention이 병목이 된다.
+
+IMPALA (Espeholt et al. 2018)는 Learner와 Actor를 물리적으로 분리한다. CPU Actor들은 경험을 수집해 버퍼에 쌓고, GPU Learner는 배치를 가져와 학습한다. Actor의 policy가 Learner보다 항상 뒤처진다는 off-policy lag가 생기는데, 이를 **V-trace**로 보정한다.
+
+$$V_{\text{trace}}(s_t) = V(s_t) + \sum_{l=0}^{\infty} \gamma^l \underbrace{\mathrm{clip}(\rho_l, 0, \bar{\rho})}_{\bar{\rho}_l} \cdot \delta_{t+l}$$
+
+여기서 $\rho_l = \pi_\text{new}(a_l|s_l) / \pi_\text{old}(a_l|s_l)$이다. Truncation threshold $\bar{\rho}$는 rare action에서 ratio가 폭발하는 것을 막아 분산을 제어한다.
+
+<Callout type="note" title="트레이드오프: V-trace의 bias-variance 선택">
+$\bar{\rho} = 1$로 설정하면 분산은 최소화되지만 rare action에서 작은 bias가 남는다. $\bar{\rho} \to \infty$는 unbiased이지만 분산이 폭발한다. 실전에서는 $\bar{\rho} = 1.0$이 대부분의 환경에서 충분하다. PPO의 clipping이 policy loss에서만 작동하는 반면, V-trace는 **value function 추정 자체를 오프-폴리시 보정**한다는 점이 구조적 차이다.
+</Callout>
 
 ## 정리
 
-- Actor-Critic은 GPI의 비동기 구현이다. 매 스텝마다 Policy Evaluation과 Improvement가 동시에 한 발씩 진행된다.
-- TD 오차 $\delta_t$는 Advantage $A^\pi(s,a)$의 편향된 추정치다. Critic이 정확해질수록 편향이 줄어든다.
-- Baseline $V^\pi(s)$를 빼면 gradient는 unbiased를 유지하면서 분산이 극적으로 감소한다.
-- Two-timescale($\alpha_a \ll \alpha_c$)이 없으면 수렴 보장이 성립하지 않는다.
-- On-policy linear FA는 수렴이 보장되지만, Off-policy + Bootstrapping + FA의 Deadly Triad는 발산을 허용한다.
+- Basic AC는 TD bootstrapping으로 분산을 낮추지만 two-timescale 조건($\alpha_c > \alpha$)이 있어야 수렴이 보장된다.
+- A3C의 비동기 병렬화는 sample diversity를 달성하지만 stale gradient를 도입하고 재현성을 깨뜨린다. A2C는 동기 barrier 하나로 같은 효과를 얻으면서 이 문제를 해결한다.
+- PPO의 clipped surrogate loss는 같은 배치를 여러 epoch 재사용할 수 있게 해, on-policy 알고리즘 중 가장 높은 sample efficiency를 달성한다.
+- IMPALA의 V-trace는 off-policy lag를 n-step return 수준에서 보정해, 100개 이상의 Actor를 GPU Learner 하나로 공급하는 분산 아키텍처를 가능하게 한다.
 
-이 체계 위에 entropy regularization, GAE, parallel rollout을 얹은 것이 A3C와 PPO다. 다음 시리즈에서는 이 확장들을 추적한다.
+다섯 알고리즘을 관통하는 공통 구조는 "advantage 추정의 bias-variance 교환을 어느 축에서 제어하는가"다. 다음 시리즈에서는 이 교환을 기하학적으로 해석하는 Natural Policy Gradient로 넘어간다.
 
 <Reference
-  title="Actor-Critic Algorithms"
-  authors="Konda, V. R. and Tsitsiklis, J. N."
-  year={2000}
-  venue="NeurIPS"
-  url="https://papers.nips.cc/paper/1999/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html"
+  title="Asynchronous Methods for Deep Reinforcement Learning"
+  authors="Mnih et al."
+  year={2016}
+  venue="ICML"
+  url="https://arxiv.org/abs/1602.01783"
 />
 
 <Reference
-  title="An Analysis of Temporal-Difference Learning with Function Approximation"
-  authors="Tsitsiklis, J. N. and Van Roy, B."
-  year={1997}
-  venue="IEEE Transactions on Automatic Control"
-  url="https://ieeexplore.ieee.org/document/580874"
+  title="IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures"
+  authors="Espeholt et al."
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1802.01561"
 />

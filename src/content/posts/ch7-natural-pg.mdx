@@ -1,0 +1,133 @@
+---
+title: "NPG에서 TRPO까지 — Policy Gradient가 진화하는 이유"
+description: "Vanilla PG의 step size 민감성 문제부터 Fisher metric, 계산 가능성의 병목, 그리고 TRPO의 신뢰 영역 제약까지, natural gradient가 현대 RL의 이론적 뼈대가 되는 과정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [policy-gradient, natural-gradient, trpo, fisher-information, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: policy-gradient-deep-dive
+  title: Policy Gradient Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+`$\theta \leftarrow \theta + \alpha \nabla J(\theta)$` — Policy Gradient의 기본 업데이트 식이다. 직관적이고 구현이 쉽다. 그런데 이 한 줄 안에는 하나의 암묵적 가정이 숨어 있다. Parameter 공간이 Euclidean하다는 것. Policy 공간은 그렇지 않다. 왜 이 불일치가 TRPO와 PPO라는 현대 RL의 주류를 만들어냈는가?
+
+## Vanilla PG가 실패하는 구조적 이유
+
+Softmax policy `$\pi_\theta(a|s) = \text{softmax}(f_\theta(s,a))$`에서 parameter update `$\Delta\theta$`와 policy 변화 `$D_{\text{KL}}(\pi_\theta \| \pi_{\theta+\Delta\theta})$`는 비례하지 않는다. 같은 `$\|\Delta\theta\|$`를 취해도 어떤 region에서는 policy가 급격히 바뀌고, 다른 region에서는 거의 변하지 않는다.
+
+이 mismatch의 직접적인 결과가 **softmax saturation**이다. Action $a^*$가 dominant해지면 (`$\pi(a^*|s) \to 1$`), score function이 0에 수렴한다.
+
+$$
+\nabla_\theta \log \pi_\theta(a^*|s) = \nabla_\theta f_\theta(s, a^*) - \mathbb{E}_{a'}[\nabla_\theta f_\theta(s, a')] \approx 0
+$$
+
+Policy가 이미 좋은 action을 확실히 선택하는 상태에서, gradient는 "이미 다 됐다"고 말하며 사라진다. 고정된 learning rate `$\alpha$`는 어떤 값이어도 모든 region에서 동시에 최적일 수 없다. 너무 크면 optimum 근처에서 zigzag 진동이 생기고, 너무 작으면 valley에서 수렴이 극히 느려진다.
+
+## Fisher Matrix — Curved Policy Space의 Metric
+
+Kakade(2001)는 이 문제를 Information Geometry의 언어로 포착했다. Policy parameter 공간은 Euclidean이 아니라 Fisher metric을 갖는 **Riemannian manifold**다.
+
+$$
+F(\theta) := \mathbb{E}_{s \sim d^\pi, a \sim \pi_\theta}\left[(\nabla_\theta \log \pi_\theta(a|s))(\nabla_\theta \log \pi_\theta(a|s))^T\right]
+$$
+
+Fisher matrix가 "metric tensor"인 이유는 KL divergence의 2차 Taylor 전개에서 직접 나온다.
+
+<Theorem kind="theorem" number="1" title="Fisher = Hessian of KL">
+$$
+D_{\text{KL}}(\pi_\theta \| \pi_{\theta + d\theta}) = \frac{1}{2}(d\theta)^T F(\theta)(d\theta) + O(\|d\theta\|^3)
+$$
+</Theorem>
+
+<Proof>
+Score function의 zero-mean property — `$\mathbb{E}_{a \sim \pi_\theta}[\nabla_\theta \log \pi_\theta] = 0$` — 에 의해 KL의 1차 항은 소멸한다. 2차 항을 전개하면 `$\mathbb{E}[(\nabla \log \pi)(\nabla \log \pi)^T] = F(\theta)$`가 남는다. $\square$
+</Proof>
+
+따라서 같은 `$\|\Delta\theta\|_2$`라도 Fisher matrix의 eigenvalue 구조에 따라 KL 변화가 방향마다 크게 다르다. Natural Gradient는 이 metric을 반영해 방향을 보정한다.
+
+$$
+\theta_{t+1} = \theta_t + \alpha F(\theta_t)^{-1} \nabla J(\theta_t)
+$$
+
+이 업데이트는 **parametrization-invariant**다. Softmax를 Gaussian으로 바꾸거나 parameter를 rescaling해도, `$F$`가 자동으로 재계산되어 policy 공간에서 같은 trajectory를 따른다.
+
+<Callout type="note" title="트레이드오프">
+Natural Gradient는 이론적으로 우아하지만, `$F \in \mathbb{R}^{d \times d}$`를 저장하고 역산하는 비용이 `$O(d^2)$` 메모리, `$O(d^3)$` 시간이다. 현대 신경망에서 `$d \sim 10^6$`이면 수 TB 메모리가 필요하다. 이론과 실전 사이의 간극이 여기서 시작된다.
+</Callout>
+
+## Fisher의 계산 가능성 — 두 가지 우회
+
+`$F^{-1}g$`를 직접 계산하지 않고 우회하는 방법은 두 가지다.
+
+**K-FAC** (Martens & Grosse 2015)는 각 layer의 Fisher를 Kronecker product로 근사한다.
+
+$$
+F_\ell \approx A_\ell \otimes G_\ell
+$$
+
+`$A_\ell$`은 input activation의 covariance, `$G_\ell$`은 output gradient의 covariance다. Kronecker product의 역산 공식 `$(A \otimes G)^{-1} = A^{-1} \otimes G^{-1}$`을 이용하면 전체 Fisher 역산이 `$O(n^3 + m^3)$`으로 줄어든다. 근사 오차는 경험적으로 5~20% 수준이다.
+
+**Conjugate Gradient**는 `$F$` 자체를 저장하지 않고, matrix-vector product `$Fv$`만으로 `$F^{-1}g$`를 반복적으로 근사한다. Condition number `$\kappa$`에 대해 수렴 속도는 `$O(\sqrt{\kappa})$`이며, TRPO 구현에서는 보통 10~20회 iteration으로 충분하다. Pearlmutter trick을 쓰면 Hessian 전체를 저장하지 않고도 `$Fv$`를 두 번의 역전파로 계산할 수 있다.
+
+## TRPO — Trust Region으로 진화
+
+NPG는 "충분히 작은 `$\alpha$`에서 monotonic improvement가 보장된다"고 말하지만, 얼마가 충분히 작은지를 알려주지 않는다. Schulman et al.(2015)의 TRPO는 이 질문에 답한다. Step size를 고정하는 대신, **policy space에서의 이동 반경 자체를 제약**으로 만든다.
+
+$$
+\max_\theta \; L_{\theta_{\text{old}}}(\theta) \quad \text{s.t.} \quad \bar{D}_{\text{KL}}(\theta_{\text{old}} \| \theta) \leq \delta
+$$
+
+여기서 `$L_{\theta_{\text{old}}}(\theta)$`는 importance sampling으로 표현된 surrogate objective다. Old policy의 state distribution에서 샘플을 모아 new policy의 advantage를 추정한다.
+
+이 constrained problem을 2차 Taylor 전개 후 Lagrangian으로 풀면 closed form이 나온다.
+
+<Theorem kind="theorem" number="2" title="TRPO = NPG + Trust Region">
+Lagrangian `$\mathcal{L}(\theta, \lambda^*)$`의 1차 최적성 조건에서 `$d\theta \propto F^{-1}g$`가 유도된다. 즉 TRPO의 update 방향은 NPG와 동일하며, step size만 trust region `$\delta$`에 의해 adaptive하게 결정된다.
+</Theorem>
+
+TRPO의 monotonic improvement bound(Schulman 2015)는:
+
+$$
+J(\pi_{\text{new}}) \geq J(\pi_{\text{old}}) + \frac{1}{1-\gamma}L_{\theta_{\text{old}}}(\pi_{\text{new}}) - \frac{2\gamma\delta}{(1-\gamma)^3}\max_{s,a}|A^{\theta_{\text{old}}}(s,a)|
+$$
+
+Error term의 `$(1-\gamma)^3$` 분모는 long-horizon에서 state distribution shift가 누적되는 효과다. `$\gamma \to 1$`일수록 trust region `$\delta$`를 더 엄격하게 잡아야 한다.
+
+<Aside label="이론과 실전의 간극">
+TRPO는 이론적으로 monotonic improvement를 보장하지만, 실제 훈련에서는 performance가 간헐적으로 떨어진다. Taylor 근사는 policy가 충분히 가까울 때만 유효하고, line search도 surrogate improvement만 체크한다. PPO(2017)는 이 복잡한 constrained optimization을 clipped ratio로 단순화한다. 이론적 엄밀함을 일부 포기하는 대신 구현 단순성과 실전 robustness를 얻었다.
+</Aside>
+
+## 정리
+
+- Vanilla PG의 step size 민감성은 버그가 아니라 구조적 결함이다. Parameter 공간의 Euclidean metric이 policy 공간의 curved geometry를 반영하지 못한다.
+- Fisher matrix는 KL divergence의 local metric이며, Natural Gradient는 이를 반영해 parametrization-invariant한 업데이트 방향을 제공한다.
+- K-FAC과 Conjugate Gradient는 `$O(d^2)$` Fisher 역산을 `$O(d)$`로 우회하는 두 가지 전략이다.
+- TRPO는 NPG의 이론적 기반 위에서, step size를 `$\delta$`-bounded KL 제약으로 치환해 실용적인 monotonic improvement 보장을 만든다.
+
+NPG, K-FAC, TRPO, PPO는 각각 독립된 아이디어가 아니다. "Parameter space의 Euclidean 가정을 어떻게 고칠 것인가"라는 하나의 질문에 대한 연속된 대답이다.
+
+<Reference
+  title="A Natural Policy Gradient"
+  authors="Kakade, S."
+  year={2001}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/2001/hash/4b86abe48d358ecf194c56c69108433e-Abstract.html"
+/>
+
+<Reference
+  title="Trust Region Policy Optimization"
+  authors="Schulman, J., Levine, S., Moritz, P., Jordan, M., Abbeel, P."
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1502.05477"
+/>
