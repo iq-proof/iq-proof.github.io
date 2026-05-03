@@ -1,0 +1,169 @@
+---
+title: "Score 함수에서 SDE까지 — Diffusion의 통합 이론"
+description: "Langevin MCMC의 mode mixing 한계부터 VP/VE-SDE의 연속 시간 통합까지, score 기반 생성 모델의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [diffusion-model, score-matching, langevin, sde]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+데이터 분포 $p(x)$를 직접 모델링하기는 어렵다. 하지만 그 로그 확률의 그래디언트, 즉 **score** $s(x) = \nabla_x \log p(x)$는 "어느 방향으로 움직이면 확률이 높아지는가"를 직접 가리킨다. DDPM부터 NCSN, Score-SDE까지 — 이 챕터들은 모두 하나의 질문을 다른 각도에서 추적한다. score를 어떻게 배우고, 어떻게 쓸 것인가?
+
+## Score와 Langevin: 아이디어의 기원
+
+Score 함수의 물리적 직관은 간단하다. 에너지 $U(x) = -\log p(x)$를 정의하면, score는 에너지 내리막 방향 $-\nabla U(x)$다. Langevin 알고리즘은 이 방향으로 조금씩 이동하면서 열 요동(thermal noise)을 섞는다.
+
+$$
+x_{k+1} = x_k + \eta \, s(x_k) + \sqrt{2\eta} \, \epsilon_k, \quad \epsilon_k \sim \mathcal{N}(0, I)
+$$
+
+<Theorem kind="theorem" number="1" title="Langevin의 정상 분포 (Roberts & Tweedie 1996)">
+$\eta \to 0$ 극한에서 위 반복의 정상 분포는 $p(x)$로 수렴한다.
+</Theorem>
+
+<Proof>
+연속시간 극한 $dx = s(x)\,dt + \sqrt{2}\,dW$의 Fokker-Planck 방정식은
+
+$$
+0 = \nabla \cdot (\pi s + \nabla \pi)
+$$
+
+를 정상 조건으로 요구한다. $\nabla \log \pi = s$이면 이 식이 자동으로 0이 되므로 $\pi = p$다. $\square$
+</Proof>
+
+문제는 고차원이다. 두 mode가 에너지 장벽 $\Delta E$로 분리되어 있으면 mode 전환 빈도는 $\propto e^{-\Delta E/\eta}$로 지수적으로 억제된다. 단일 noise 스케일로는 전역 탐색과 국소 정밀도를 동시에 달성할 수 없다.
+
+## Denoising Score Matching: 정규화 상수 없이 배우기
+
+Score를 직접 추정하려면 정규화 상수 $Z = \int e^{-E(x)} dx$가 필요하다. 이것이 계산 불가능하므로, Vincent (2011)은 다른 방법을 제안했다. 깨끗한 $x$에 Gaussian 노이즈를 더해 $\tilde{x} = x + \sigma\epsilon$을 만들면, 조건부 score는 닫힌 형태로 계산된다.
+
+<Theorem kind="lemma" number="2" title="Gaussian 조건부 Score">
+$q(\tilde{x} \mid x) = \mathcal{N}(\tilde{x} \mid x, \sigma^2 I)$일 때,
+
+$$
+\nabla_{\tilde{x}} \log q(\tilde{x} \mid x) = -\frac{\tilde{x} - x}{\sigma^2} = -\frac{\epsilon}{\sigma}
+$$
+</Theorem>
+
+그리고 핵심 항등식이 있다.
+
+<Theorem kind="theorem" number="3" title="Vincent의 Score Matching 항등식">
+$$
+\mathbb{E}\bigl[\|s_\theta(\tilde{x}) - \nabla\log q(\tilde{x}|x)\|^2\bigr] = \mathbb{E}\bigl[\|s_\theta(\tilde{x}) - \nabla\log q_\sigma(\tilde{x})\|^2\bigr] + C
+$$
+($C$는 $\theta$에 무관한 상수)
+</Theorem>
+
+즉, **조건부 score를 학습 목표로 삼아도 진짜 데이터 분포의 score로 수렴**한다. DSM 손실은 결국
+
+$$
+L_{\text{DSM}}(\theta) = \mathbb{E}_{x, \epsilon}\left[\left\| s_\theta(x + \sigma\epsilon) + \frac{\epsilon}{\sigma} \right\|^2\right]
+$$
+
+이고, DDPM의 noise prediction 손실 $\mathbb{E}[\|\epsilon_\theta(x_t, t) - \epsilon\|^2]$과 정확히 동등하다($s_\theta = -\epsilon_\theta / \sigma_t$ 관계를 대입하면 상수 배 차이만 남는다).
+
+## NCSN: Multi-scale로 Mode Mixing 완화
+
+단일 $\sigma$의 DSM은 저확률 영역(tail)에서 훈련 데이터가 희박해 score 추정이 부정확하다. Song & Ermon (2019)의 NCSN은 $\sigma_1 > \sigma_2 > \cdots > \sigma_L$의 noise schedule을 도입하고, 조건부 신경망 $s_\theta(x, \sigma)$를 동시에 훈련한다.
+
+$$
+L_{\text{NCSN}}(\theta) = \sum_{i=1}^{L} \sigma_i^2 \, \mathbb{E}_{x, \epsilon}\left[\left\| s_\theta(x + \sigma_i\epsilon,\, \sigma_i) + \frac{\epsilon}{\sigma_i} \right\|^2\right]
+$$
+
+가중치 $\lambda_i = \sigma_i^2$는 고차원에서 기울기 크기를 정규화한다. 생성 시에는 **annealed Langevin sampling** — 큰 $\sigma$에서 시작해 점진적으로 줄이며 Langevin을 반복하는 전략 — 을 사용한다. 큰 $\sigma$에서 전역 mode를 포착하고, 작은 $\sigma$에서 세부 구조를 채우는 방식이다.
+
+<Callout type="note" title="트레이드오프">
+$\sigma$ 스케일이 많을수록 score 추정이 촘촘해지지만 훈련 비용이 선형 증가한다. 각 $\sigma$ 단계에서 Langevin 스텝 수도 수렴과 비용 사이의 균형점이다 — 너무 적으면 정상 분포에 도달하기 전에 다음 스케일로 넘어가고, 너무 많으면 계산 비용과 누적 오차가 커진다.
+</Callout>
+
+## Score-SDE: 이산 알고리즘들의 통합
+
+이산 step들(DDPM의 $T$개 step, NCSN의 $L$개 $\sigma$ 스케일)을 연속시간 SDE로 보면, 모든 이산 알고리즘이 특수한 이산화로 통합된다. Song (2021)의 프레임워크는 forward SDE를 다음과 같이 정의한다.
+
+$$
+dx = f(x,t)\,dt + g(t)\,dW_t
+$$
+
+그리고 Anderson (1982)의 역방향 SDE를 사용해 생성한다.
+
+$$
+dx = \bigl[f(x,t) - g(t)^2 \nabla_x \log p_t(x)\bigr]dt + g(t)\,d\bar{W}_t
+$$
+
+여기서 $\nabla_x \log p_t(x) \approx s_\theta(x, t)$가 학습한 score다. 같은 marginal 경로 $\{p_t\}$를 따르는 **probability flow ODE**도 존재한다.
+
+$$
+\frac{dx}{dt} = f(x,t) - \frac{1}{2}g(t)^2 \nabla_x \log p_t(x)
+$$
+
+ODE는 확정적(deterministic)이므로 likelihood 계산이 가능하고 더 빠른 샘플링이 허용된다. DDIM은 이 ODE sampler의 특수한 이산화다.
+
+## VP-SDE와 VE-SDE: 두 가지 철학
+
+연속 SDE 프레임워크 안에서 두 가지 구체적인 설계 철학이 등장한다.
+
+**VP-SDE** (Variance-Preserving, DDPM의 연속 극한):
+
+$$
+dx = -\frac{1}{2}\beta(t)\,x\,dt + \sqrt{\beta(t)}\,dW_t
+$$
+
+적분하면 $x_t = \sqrt{\bar{\alpha}(t)}\,x_0 + \sqrt{1-\bar{\alpha}(t)}\,\epsilon$이 되어 분산이 $1$ 근방에 유지된다.
+
+**VE-SDE** (Variance-Exploding, NCSN의 연속 극한):
+
+$$
+dx = \sqrt{\frac{d\sigma^2(t)}{dt}}\,dW_t
+$$
+
+drift가 없어 $x_t = x_0 + \sigma(t)\epsilon$이고 분산이 $\|x_0\|^2 + \sigma(t)^2$로 성장한다.
+
+두 접근의 핵심 차이는 다음과 같다.
+
+| | VP-SDE | VE-SDE |
+|---|---|---|
+| 분산 안정성 | 유지 (~1) | 폭발적 증가 |
+| Likelihood 계산 | 안정적 | 수치 불안정 가능 |
+| 저확률 영역 탐색 | 상대적으로 약함 | Multi-scale 전략으로 강함 |
+| 대응 알고리즘 | DDPM | NCSN |
+
+<Aside label="통합의 의미">
+VP-SDE, VE-SDE, Sub-VP-SDE는 모두 하나의 SDE 프레임워크 안에서 $f$와 $g$를 어떻게 선택하느냐의 차이다. DDPM과 NCSN이 별개의 알고리즘처럼 보였던 이유는 이 연속시간 관점이 없었기 때문이다.
+</Aside>
+
+## 정리
+
+- Score $s(x) = \nabla_x \log p(x)$는 정규화 상수 없이 "고확률 방향"을 가리킨다.
+- DSM은 조건부 score $-\epsilon/\sigma$를 학습 목표로 삼아 intractable한 정규화를 우회한다. 이것이 DDPM noise prediction과 수학적으로 동등하다.
+- NCSN은 multi-scale $\sigma$와 annealed Langevin으로 mode mixing 문제를 완화한다.
+- Score-SDE는 DDPM, NCSN, DDIM을 $dx = f\,dt + g\,dW$의 특수한 이산화로 통합하고, probability flow ODE로 deterministic 샘플링과 likelihood 계산을 가능하게 한다.
+
+score라는 단순한 아이디어 하나가, 노이즈 스케줄 선택과 SDE 설계 전체를 관통한다.
+
+<Reference
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
+/>
+
+<Reference
+  title="Generative Modeling by Estimating Gradients of the Data Distribution"
+  authors="Song & Ermon"
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1907.05600"
+/>

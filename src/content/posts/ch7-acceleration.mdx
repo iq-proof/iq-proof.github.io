@@ -1,0 +1,143 @@
+---
+title: "Diffusion 샘플링 가속은 어떻게 가능한가"
+description: "수백 스텝이 필요한 reverse process를 1-4 스텝으로 줄이는 세 가지 전략 — Consistency Model, Rectified Flow, Flow Matching, Distillation — 의 공통 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [diffusion, consistency-model, flow-matching, distillation, ode]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Diffusion model의 고질적 문제는 샘플링 속도다. 학습은 한 번이지만, 이미지 한 장을 얻으려면 수백 번의 reverse step을 거쳐야 한다. 이를 1-4 스텝으로 줄이는 방법이 2022-2024년 사이 집중적으로 등장했다. 그런데 이 방법들 — Consistency Model, Rectified Flow, Flow Matching, Distillation — 은 서로 다른 이름을 달고 있지만, 같은 질문을 다른 각도에서 공격한다. **ODE trajectory를 얼마나 직접적으로, 얼마나 적은 스텝으로 통과할 수 있는가?**
+
+## 문제의 기하학: 굽은 경로와 많은 스텝
+
+Diffusion의 reverse process는 probability flow ODE를 따른다.
+
+$$
+\frac{\mathrm{d}x_t}{\mathrm{d}t} = \mu_t(x) - \frac{\sigma_t^2}{2}\nabla \log p_t(x)
+$$
+
+이 ODE를 수치적으로 풀려면 이산화가 필요하고, 경로가 굽어있을수록 더 많은 스텝이 필요하다. 샘플링 가속 문제는 결국 두 가지 질문으로 환원된다. 첫째, **경로 자체를 직선으로 만들 수 있는가?** 둘째, **경로가 굽어있더라도 임의의 시점에서 바로 종점을 예측할 수 있는가?**
+
+## Consistency Model: 어느 시점에서든 $x_0$으로
+
+Song (2023)의 Consistency Model은 두 번째 질문에 정면으로 답한다. ODE trajectory 위의 **모든 점이 같은 $x_0$으로 매핑**되도록 강제하는 consistency property를 학습하는 것이다.
+
+$$
+f_\theta(x_{t_1}, t_1) = f_\theta(x_{t_2}, t_2) = x_0
+$$
+
+이 함수 $f_\theta$를 배우면, 순수 노이즈 $z \sim \mathcal{N}(0, I)$에서 바로 $x_0 \approx f_\theta(z, T)$를 계산할 수 있다. 학습 목표는 인접한 두 시점의 예측값이 일치하도록 강제하는 것이다.
+
+$$
+\mathcal{L}_{CT} = \mathbb{E}_{x_0, t_1, t_2} \left\| f_\theta(x_{t_1}, t_1) - f_{\phi}(x_{t_2}, t_2) \right\|^2
+$$
+
+<Theorem kind="proposition" number="1" title="Consistency는 Multi-step과 1-step을 연결한다">
+ODE의 유일성에 의해, 같은 $x_T$에서 출발하는 trajectory는 단 하나다. Consistency training이 서로 다른 $t$에서의 예측을 일치시키므로, `$f_\theta(x_T, T)$`는 full reverse process와 동일한 분포에서 샘플을 추출한다.
+</Theorem>
+
+<Proof>
+Probability Flow ODE의 초기값 문제는 Lipschitz 조건 하에서 유일해를 가진다. 따라서 고정된 $x_T$에 대해 trajectory는 유일하고, 모든 중간 점 $(x_t, t)$는 같은 $x_0$으로 수렴한다. Consistency property는 이 수렴을 $f_\theta$가 명시적으로 학습하도록 강제하므로, 1-step 출력의 분포는 multi-step의 분포와 일치한다.
+</Proof>
+
+CIFAR-10에서 1-step FID ~9는 DDIM 50-step과 비슷한 수준이다. Scratch에서 학습하는 CT와 teacher가 필요한 CD(Consistency Distillation) 두 변형을 모두 지원한다.
+
+## Rectified Flow: 경로 자체를 직선으로
+
+Liu (2022)의 Rectified Flow는 첫 번째 질문을 택한다. Forward process를 처음부터 직선으로 정의한다.
+
+$$
+x_t = (1-t)x_0 + tz, \quad z \sim \mathcal{N}(0, I), \quad t \in [0,1]
+$$
+
+이 직선 경로에서 velocity field는 이상적으로 상수다.
+
+$$
+v_{\text{ideal}}(x_t, t) = z - x_0
+$$
+
+학습 목표는 이 velocity를 신경망으로 매칭하는 것이다.
+
+$$
+\mathcal{L} = \mathbb{E}_{(x_0, z) \sim \pi, t} \left\| v_\theta(x_t, t) - (z - x_0) \right\|^2
+$$
+
+그런데 독립 coupling $(x_0, z)$에서 시작하면 실제 경로는 여전히 굽어있다. 여기서 **reflow** 메커니즘이 등장한다. 학습된 ODE solver로 $(x_0, z)$ 쌍을 새 쌍 $(x_0', z')$으로 정제하고, 이 쌍으로 다시 velocity matching을 반복한다. Monge-Kantorovich 정리에 의해, 반복 reflow는 optimal transport에 수렴하며 velocity는 점점 상수에 가까워진다. Stable Diffusion 3는 이 구조를 backbone으로 사용한다.
+
+## Flow Matching: 두 접근의 통일
+
+Lipman (2023)의 Flow Matching은 Consistency Model과 Rectified Flow가 사실 같은 프레임워크의 특수 사례임을 보인다. Continuous Normalizing Flow의 velocity field를 **score estimation 없이** 직접 매칭하는 일반 프레임워크다.
+
+$$
+\mathcal{L}_{\text{FM}} = \mathbb{E}_{t, x_1, x \sim p_t(\cdot | x_1)} \left\| v_\theta(x, t) - u_t(x | x_1) \right\|^2
+$$
+
+여기서 probability path $p_t(x | x_1)$를 어떻게 선택하느냐에 따라 서로 다른 모델이 나온다.
+
+- $p_t(x | x_0, z) = \delta(x - ((1-t)x_0 + tz))$ → Rectified Flow
+- $p_t(x) = \mathcal{N}(x; \alpha_t x_1, \sigma_t^2 I)$ → VP-SDE (표준 diffusion)
+
+<Aside label="통일의 의미">
+VP-SDE, VE-SDE, Rectified Flow는 모두 특정 probability path를 선택한 Flow Matching의 인스턴스다. Score estimation은 이 velocity matching의 특수한 경우일 뿐이다. 이 관점이 생기면 새로운 샘플러를 설계할 때 "어떤 경로를 선택할 것인가"라는 하나의 질문으로 환원된다.
+</Aside>
+
+## Distillation: Teacher로부터 스텝 압축
+
+위 세 방법이 모두 학습 방식을 바꾸는 접근이라면, Distillation은 다른 전략을 쓴다. 이미 좋은 teacher model이 있을 때, student가 teacher의 다중 스텝을 단일 스텝으로 에뮬레이트하도록 학습시킨다.
+
+Salimans & Ho (2022)의 **Progressive Distillation**은 teacher 2-step을 student 1-step으로 매칭하는 과정을 반복한다. 1024 → 512 → 256 → ... → 4 스텝으로 점진적으로 압축한다.
+
+$$
+\mathcal{L}_{\text{student}} = \mathbb{E}_{x_0, i} \left\| \tilde{x}_{t_{i+1}} - x_{t_{i+1}} \right\|^2
+$$
+
+Sauer (2024)의 **Adversarial Diffusion Distillation(ADD)**은 여기에 GAN loss를 추가한다. MSE만으로는 pixel-level matching에 그치지만, discriminator는 perceptual similarity를 강제하여 더 자연스러운 샘플을 만든다.
+
+$$
+\mathcal{L}_G = \mathbb{E}\left[ -D(\tilde{x}_{\text{student}}) \right] + \lambda \left\| \tilde{x}_{\text{student}} - x_{\text{teacher}} \right\|^2
+$$
+
+SDXL-Turbo와 SD Lightning은 이 방식으로 실제 서비스에 배포됐다.
+
+<Callout type="note" title="트레이드오프">
+각 방법은 서로 다른 전제와 비용을 가진다. **Consistency Model(CT)**은 cold-start 가능하지만 학습이 까다롭다. **Rectified Flow**는 직선 경로의 우아함을 가지지만 reflow 반복이 필요하다. **Distillation**은 가장 실용적이지만 좋은 teacher 없이는 시작할 수 없고, 스텝을 줄일수록 지식 손실이 누적된다. 1-step 샘플은 언제나 multi-step보다 품질이 낮다는 trade-off는 어떤 방법도 완전히 극복하지 못한다.
+</Callout>
+
+## 정리
+
+- 샘플링 가속의 핵심은 ODE trajectory를 얼마나 적은 스텝으로 통과하느냐다.
+- Consistency Model은 "어느 시점에서든 $x_0$을 예측"하는 trajectory-invariant function을 학습한다.
+- Rectified Flow는 경로 자체를 직선으로 만들어 velocity를 상수에 수렴시킨다.
+- Flow Matching은 두 접근을 통합하는 프레임워크로, VP-SDE와 Rectified Flow를 모두 포함한다.
+- Distillation은 기존 teacher를 활용해 student가 few-step으로 동일한 품질을 내도록 압축한다.
+
+결국 이 네 방법은 하나의 물음을 공유한다 — *좋은 생성 분포를 학습하는 것과, 그 분포에서 빠르게 샘플링하는 것은 분리될 수 있는가?* 그 대답이 2024년 이후 실시간 이미지 생성을 가능하게 했다.
+
+<Reference
+  title="Consistency Models"
+  authors="Song et al."
+  year={2023}
+  venue="ICML"
+  url="https://arxiv.org/abs/2303.01469"
+/>
+
+<Reference
+  title="Flow Matching for Generative Modeling"
+  authors="Lipman et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2210.02747"
+/>

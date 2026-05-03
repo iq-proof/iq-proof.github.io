@@ -1,0 +1,168 @@
+---
+title: "Classifier Guidance에서 Negative Prompt까지, 조건부 생성의 수학"
+description: "외부 분류기의 gradient로 시작해 CFG의 implicit classifier, cross-attention, negative prompt의 compositional score까지 — 조건부 diffusion의 통일된 수학 구조를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [diffusion, classifier-free-guidance, cross-attention, score-function]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+기본 diffusion model은 $p(x)$를 학습한다. "이 클래스의 이미지"나 "이 텍스트에 맞는 이미지"를 생성하려면 $p(x|y)$로 넘어가야 한다. 이 챕터에서 다루는 네 주제 — classifier guidance, CFG, cross-attention, negative prompt — 는 모두 같은 질문에 대한 답이다. **score function을 어떻게 조건부 방향으로 조종하는가?**
+
+## 출발점: Bayes' rule과 score 분해
+
+Classifier guidance (Dhariwal & Nichol 2021)의 핵심은 Bayes' rule을 score 공간으로 끌어오는 것이다.
+
+$$
+\nabla_{x_t} \log p(x_t | y) = \nabla_{x_t} \log p(x_t) + \nabla_{x_t} \log p(y | x_t)
+$$
+
+첫 항은 unconditional score, 둘째 항은 분류기의 gradient다. 이를 reverse SDE에 대입하면 augmented score를 얻는다.
+
+$$
+\tilde{s}_\theta(x_t, y, t) = s_\theta(x_t, t) + s \cdot \nabla_{x_t} \log p_\phi(y | x_t)
+$$
+
+여기서 $s > 0$는 guidance scale이다. 직관적으로, 각 denoising step에서 두 힘이 동시에 작용한다. 무조건 score는 데이터 분포 전반으로, 분류기 gradient는 클래스 $y$에 유리한 방향으로.
+
+<Callout type="warning" title="Classifier Guidance의 한계">
+분류기 $p_\phi(y|x_t)$는 **noisy 이미지**에서 학습해야 한다. clean image classifier를 그대로 쓰면 high-noise regime ($t$ 클 때)에서 gradient가 신뢰할 수 없어진다. 또한 diffusion model과 분류기를 별도로 학습해야 하는 비용이 따른다.
+</Callout>
+
+## CFG: 분류기 없는 암묵적 guidance
+
+Ho & Salimans (2022)는 분류기를 없애는 대신 **모델 자신이 두 분포를 동시에 학습**하도록 했다. 학습 중 확률 $\pi_{\text{drop}}$로 조건 $c$를 null token $\emptyset$으로 교체한다. 그러면 inference에서 두 예측의 차이가 implicit classifier 역할을 한다.
+
+$$
+\tilde{\epsilon}_\theta(x_t, c, w) = (1+w)\,\epsilon_\theta(x_t, c) - w\,\epsilon_\theta(x_t, \emptyset)
+$$
+
+<Theorem kind="proposition" number="1" title="CFG = Implicit Classifier Guidance">
+Conditioning dropout으로 학습된 모델에서 CFG scale $w$의 noise 예측은, implicit classifier의 guidance scale $s = 1+w$와 동치이다.
+</Theorem>
+
+<Proof>
+Score 형태에서 시작한다. Conditioning dropout에 의해 모델은 $p_\theta(x_t|c)$와 $p_\theta(x_t)$ 두 분포를 학습한다. Bayes' rule을 적용하면:
+
+$$
+s_\theta(x_t, c) - s_\theta(x_t, \emptyset) = \nabla_{x_t} \log p_\theta(c | x_t)
+$$
+
+따라서:
+
+$$
+\tilde{s}_\theta = (1+w)\,s_\theta(x_t, c) - w\,s_\theta(x_t, \emptyset) = s_\theta(x_t, \emptyset) + (1+w)\,\nabla \log p_\theta(c|x_t)
+$$
+
+이는 classifier guidance에서 $s = 1+w$로 설정한 것과 동일하다. $\square$
+</Proof>
+
+CFG의 실질적 이점은 명확하다. 분류기를 별도로 학습할 필요가 없고, Stable Diffusion처럼 text-to-image 모델에 직접 적용 가능하다. 대신 inference 시 unconditional과 conditional을 모두 forward해야 하므로 계산량이 약 2배가 된다.
+
+## Cross-Attention: 텍스트를 score에 통합하는 구조
+
+CFG가 "언제 조건을 얼마나 반영할지"를 결정한다면, cross-attention은 "어떻게 조건을 모델 내부에 통합할지"를 결정한다. Stable Diffusion의 UNet은 이미지 feature를 Query로, 텍스트 embedding을 Key/Value로 사용한다.
+
+$$
+Q = W_Q h_{\text{img}}, \quad K = W_K c_{\text{txt}}, \quad V = W_V c_{\text{txt}}
+$$
+
+$$
+\text{CrossAttn}(h_{\text{img}}, c_{\text{txt}}) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right) V
+$$
+
+각 이미지 위치(pixel)가 텍스트 토큰 전체를 "look up"하는 구조다. "red dog on grass"를 조건으로 주면, 붉은 영역은 "red" 토큰에, 개 영역은 "dog" 토큰에 높은 attention weight를 할당한다.
+
+<Aside label="Text Encoder 선택">
+CLIP (77 tokens, 768D)은 compact하고 강하지만 긴 prompt를 truncate한다. T5 (256+ tokens)는 의미를 더 풍부하게 포착한다. Imagen은 둘을 병렬로 사용하고, SD3는 CLIP + T5 + Llama를 함께 쓴다.
+</Aside>
+
+Conditioning dropout은 cross-attention 레이어에서도 그대로 작동한다. 학습 시 null embedding(영벡터 또는 학습된 null token)으로 교체하면, inference에서 $\epsilon_\theta(x_t, \emptyset)$를 계산하는 unconditional branch를 그대로 CFG에 사용할 수 있다.
+
+## Quality–Diversity 트레이드오프와 Distribution Sharpening
+
+$w$를 크게 설정할수록 조건과의 일치도(quality)는 높아지지만 생성 분포의 다양성(diversity)은 줄어든다. 이는 실험적 관찰이 아니라 수학적 귀결이다.
+
+<Theorem kind="proposition" number="2" title="CFG의 Distribution Sharpening">
+CFG scale $w > 0$는 조건부 분포를 temperature $\tau = 1/(1+w)$로 sharpening한다:
+
+$$
+p^{(w)}(x|c) \propto p(x|c)^{1+w} \cdot p(x)^{-w}
+$$
+</Theorem>
+
+<Proof>
+Augmented score를 따르는 trajectory가 수렴하는 분포의 에너지를 계산하면:
+
+$$
+\log p^{(w)}(x|c) = (1+w)\log p(x|c) - w\log p(x) + \text{const}
+$$
+
+조건부 likelihood가 $(1+w)$배 증폭되고 무조건 가능도가 차감되는 구조다. $w \to \infty$이면 $\tau \to 0$이 되어 argmax 근방에 집중한다. $\square$
+</Proof>
+
+<Callout type="note" title="트레이드오프 요약">
+- $w \uparrow$ → FID 개선(quality↑), Recall 저하(diversity↓)
+- $w \in [3, 15]$가 실용 범위 (Stable Diffusion default: 7.5)
+- $w > 10$에서는 latent 값이 학습 범위를 벗어날 수 있어 Imagen의 **dynamic thresholding** (percentile clipping) 적용을 권장한다
+</Callout>
+
+## Negative Prompt: Score의 반대 부호 활용
+
+같은 수학 구조에서 "원하지 않는 것"도 표현 가능하다. Negative prompt $y_-$에 대해 부호를 반전하면 된다.
+
+$$
+\tilde{\epsilon}_\theta = \epsilon_\theta(x, \emptyset) + w_+ \bigl[\epsilon_\theta(x, y_+) - \epsilon_\theta(x, \emptyset)\bigr] - w_- \bigl[\epsilon_\theta(x, y_-) - \epsilon_\theta(x, \emptyset)\bigr]
+$$
+
+이를 score 공간에서 해석하면, 생성 분포가 다음에 비례하게 된다.
+
+$$
+p^{(w_+, w_-)}(x) \propto p(x|y_+)^{w_+} \cdot p(x|y_-)^{-w_-} \cdot p(x)^{1-w_+-w_-}
+$$
+
+$w_- > 0$이면 $p(x|y_-)$가 높은 영역의 확률이 억제된다. Liu et al. (2022)의 Compositional Diffusion은 이 아이디어를 K개의 조건으로 일반화한다.
+
+$$
+\tilde{\epsilon} = \sum_{k=1}^{K} w_k \,\epsilon_\theta(x, c_k) + \left(1 - \sum_{k} w_k\right) \epsilon_\theta(x, \emptyset)
+$$
+
+$w_k > 0$이면 positive, $w_k < 0$이면 negative 조건이다. 주의할 점은 이 방식이 **조건들 사이의 상호작용을 무시**한다는 것이다. "a red dog"와 "a blue dog"를 동시에 주면 보라색 개가 나올 수 있다.
+
+## 정리
+
+- Classifier guidance는 Bayes' rule로 score를 분해한다. $\nabla \log p(x|y) = \nabla \log p(x) + \nabla \log p(y|x)$.
+- CFG는 conditioning dropout으로 분류기를 implicit하게 만든다. 수학적으로 $s = 1+w$의 classifier guidance와 동치다.
+- Cross-attention은 텍스트 토큰을 Key/Value로 삼아 각 이미지 위치가 선택적으로 참조하는 구조다. CFG와 직교하는 메커니즘이다.
+- $w$를 키우면 분포가 temperature $1/(1+w)$로 sharpening된다. Quality와 diversity는 본질적으로 상충한다.
+- Negative prompt는 score의 부호를 반전하는 것이다. 이론적으로 깔끔하지만 조건 간 독립성 가정이 실제로 성립하지 않을 때 예상치 못한 결과가 나온다.
+
+이 챕터의 모든 수식은 결국 하나로 수렴한다 — **score function의 선형 결합**. 어떤 조건을 얼마나, 어떤 부호로 더하느냐가 전부다.
+
+<Reference
+  title="Diffusion Models Beat GANs on Image Synthesis"
+  authors="Dhariwal & Nichol"
+  year={2021}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2105.05233"
+/>
+
+<Reference
+  title="Classifier-Free Diffusion Guidance"
+  authors="Ho & Salimans"
+  year={2022}
+  venue="NeurIPS Workshop"
+  url="https://arxiv.org/abs/2207.12598"
+/>

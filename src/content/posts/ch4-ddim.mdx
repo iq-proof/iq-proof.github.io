@@ -1,0 +1,128 @@
+---
+title: "DDIM은 왜 1000 step을 10 step으로 줄일 수 있는가"
+description: "DDPM 샘플링 병목의 근본 원인부터 Non-Markovian forward process, DDIM sampling 공식, Probability Flow ODE와 DPM-Solver의 고차 수렴까지, 확산 모델 가속의 수학적 구조를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [diffusion-model, ddim, sampling, ode, dpm-solver]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DDPM은 1000 step의 역확산을 거쳐 이미지를 생성한다. 매 step마다 UNet forward pass가 필요하므로, 512×512 이미지 한 장에 수십 초가 걸린다. DDIM(Song et al., 2021)은 같은 학습된 모델로 10–50 step 안에 동등한 품질을 달성한다. 어떻게 가능한가? 그리고 DPM-Solver는 왜 DDIM보다도 적은 step으로 더 정확한가?
+
+## DDPM 샘플링이 느린 이유
+
+DDPM의 역확산은 Markov chain이다.
+
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}}\epsilon_\theta(x_t, t)\right) + \sigma_t \epsilon, \quad t = T, \ldots, 1$$
+
+각 step은 직전 상태 $x_t$에만 의존하므로, step을 건너뛰면 chain이 끊긴다. $T=1000$이라면 UNet을 정확히 1000번 호출해야 한다.
+
+문제의 핵심은 **Markovian 구조**다. 역확산 경로가 매 step의 전이 확률 $p_\theta(x_{t-1}|x_t)$로 결정되기 때문에, 중간 상태를 생략할 방법이 없다. 학습은 빠른데 추론이 느린 구조적 비대칭이 여기서 생긴다.
+
+## Non-Markovian Forward와 동일 Marginal
+
+DDIM의 출발점은 간단한 질문이다: **forward process가 반드시 Markovian이어야 하는가?**
+
+Song(2021)은 다음을 보인다. 매개변수 $\sigma_t \geq 0$에 대해 조건부 분포를
+
+$$q_\sigma(x_{t-1}|x_t, x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_{t-1}}x_0 + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\,\frac{x_t - \sqrt{\bar\alpha_t}x_0}{\sqrt{1-\bar\alpha_t}},\; \sigma_t^2 I\right)$$
+
+로 정의하면, **어떤 $\sigma_t$를 선택하더라도 marginal은 동일하다.**
+
+<Theorem kind="theorem" number="1" title="Non-Markovian Forward의 Marginal 동일성">
+정의 위의 $q_\sigma$에서, 모든 $\sigma$에 대해
+
+$$q_\sigma(x_t \mid x_0) = \mathcal{N}(\sqrt{\bar\alpha_t}\,x_0,\;(1-\bar\alpha_t)I)$$
+
+이 성립한다. 즉 marginal은 $\sigma$에 무관하다.
+</Theorem>
+
+<Proof>
+귀납법으로 증명한다. $t=T$에서는 정의에 의해 성립. $t$에서 성립한다고 가정하면,
+
+$$q_\sigma(x_{t-1}|x_0) = \int q_\sigma(x_{t-1}|x_t, x_0)\, q_\sigma(x_t|x_0)\, dx_t$$
+
+조건부의 평균이 $x_t$에 선형이므로 귀납 가정 $\mathbb{E}[x_t|x_0]=\sqrt{\bar\alpha_t}x_0$을 대입하면 $\mathbb{E}[x_{t-1}|x_0]=\sqrt{\bar\alpha_{t-1}}x_0$. 분산은
+
+$$\operatorname{Var}[x_{t-1}|x_0] = \sigma_t^2 + (1-\bar\alpha_{t-1}-\sigma_t^2) = 1-\bar\alpha_{t-1}$$
+
+로 $\sigma_t$가 소거된다. $\square$
+</Proof>
+
+이 결과가 중요한 이유: 학습된 $\epsilon_\theta$는 marginal $q(x_t|x_0)$에서의 노이즈를 예측하도록 훈련됐다. marginal이 $\sigma$와 무관하므로, **어떤 forward 경로를 선택해도 동일한 $\epsilon_\theta$를 재사용할 수 있다.**
+
+## DDIM Sampling 공식
+
+$\sigma_t=0$으로 설정하면 forward process가 완전히 결정론적(deterministic)이 된다. 이때 reverse step은 다음과 같다.
+
+우선 $x_t$와 $\epsilon_\theta$로부터 $x_0$를 추정한다.
+
+$$\hat x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta(x_t, t)}{\sqrt{\bar\alpha_t}}$$
+
+그 다음 $x_{t-1}$로 이동한다.
+
+$$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0 + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\,\epsilon_\theta(x_t, t) + \sigma_t\,\epsilon_t$$
+
+$\sigma_t=0$이면 마지막 항이 사라져 순수 ODE가 된다. 이 공식에는 두 가지 자유도가 있다.
+
+1. **$\sigma_t$ 조정**: 0이면 deterministic(재현 가능), 크면 다양성 증가
+2. **Sub-sampling schedule**: 전체 $\{1,\ldots,T\}$ 중 $S \ll T$개의 step $\tau_1 > \tau_2 > \cdots > \tau_S$만 사용
+
+<Callout type="note" title="트레이드오프">
+Deterministic ($\sigma_t=0$)은 같은 $x_T$에서 항상 같은 결과를 생성한다. 잠재 공간 보간(interpolation)이나 이미지 편집에 유리하다. 반면 $\sigma_t>0$인 stochastic 모드는 경로 다양성이 커져 분포 커버리지가 좋아지지만, 재현성이 없다. step 수를 극도로 줄이면($S < 10$) 예측 오차가 누적되어 품질이 떨어진다.
+</Callout>
+
+## Probability Flow ODE와 DPM-Solver
+
+DDIM deterministic은 사실 **Probability Flow ODE**의 1차 Euler discretization과 동치다.
+
+$$\frac{dx}{dt} = f(x, t) - \frac{1}{2}g(t)^2 \nabla \log p_t(x)$$
+
+여기서 score $\nabla \log p_t(x) \approx -\epsilon_\theta(x,t)/\sqrt{1-\bar\alpha_t}$로 근사된다. DDPM forward를 $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$로 쓰고 미분하면, ODE의 우변이 $x$와 $\epsilon_\theta(x,t)$의 선형 결합으로 정리된다.
+
+$$\frac{dx}{dt} = \lambda(t)\,x + \mu(t)\,\epsilon_\theta(x, t)$$
+
+이것이 **semi-linear 구조**다. Lu et al.(2022)의 DPM-Solver는 이 구조를 활용한다. 선형 부분 $\lambda(t)x$는 닫힌 형태(closed form)로 정확히 적분하고, 비선형 부분 $\epsilon_\theta$만 수치적으로 근사한다. 지수 가중 구적법(exponentially weighted quadrature)을 사용하면 $k$차 solver가 $O((\Delta t)^{k+1})$ 오차를 달성한다.
+
+<Aside label="수렴 비교">
+Euler(DDIM)는 1차 수렴 $O(\Delta t^2)$. DPM-Solver-2는 2차 수렴 $O(\Delta t^3)$. 20 step 기준으로 Euler 오차가 $\sim 1/50$인 구간에서 DPM-Solver-2는 $\sim 1/400$ 수준을 달성한다. 같은 step 예산에서 훨씬 정확한 ODE 추적이 가능하다.
+</Aside>
+
+실용적으로는 DPM-Solver-2로 20 step, DPM-Solver-3으로 15 step이면 DDIM 50 step과 유사한 품질을 낸다. Stable Diffusion의 `dpm++ 2m` sampler가 이 방식이다.
+
+## 정리
+
+- DDPM 샘플링의 병목은 Markovian reverse chain — step을 건너뛸 수 없다.
+- DDIM은 Non-Markovian forward를 도입해 **marginal을 유지하면서 forward 경로를 자유롭게 선택**한다. 학습된 $\epsilon_\theta$를 그대로 재사용할 수 있는 근거가 여기에 있다.
+- $\sigma_t=0$으로 설정하면 reverse가 ODE가 되어 sub-sampling이 가능해지고, 1000 step을 10–50 step으로 줄인다.
+- DPM-Solver는 ODE의 semi-linear 구조를 이용해 고차 수렴을 달성하며, 현재 fast high-quality sampling의 실질적 표준이다.
+
+수식 한 줄의 $\sigma_t=0$ 선택 뒤에는 "marginal이 같으면 경로는 자유다"라는 통찰이 있다.
+
+<Reference
+  title="Denoising Diffusion Implicit Models"
+  authors="Song et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2010.02502"
+/>
+
+<Reference
+  title="DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps"
+  authors="Lu et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2206.00927"
+/>

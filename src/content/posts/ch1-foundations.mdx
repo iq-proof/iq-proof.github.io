@@ -1,13 +1,13 @@
 ---
-title: "Object Detection의 수학적 출발점 — 왜 출력이 집합인가"
-description: "Detection 출력이 가변 크기 집합이라는 사실이 NMS, mAP, Hungarian matching을 모두 도출한다. task formalization부터 IoU loss 진화, mAP 계산, NMS의 한계까지 하나의 설계 철학으로 추적한다."
+title: "Diffusion Model의 수학적 기원 — 물리에서 생성으로"
+description: "브라운 운동과 Fokker-Planck 방정식에서 시작해 DDPM의 posterior closed-form까지, 확산 모델의 설계 철학을 관통하는 단일 원리를 추적한다."
 pubDate: 2026-05-03
 category: ai
-tags: [object-detection, iou, nms, map, bbox]
+tags: [diffusion-model, score-matching, sde, ddpm, markov-chain]
 difficulty: advanced
 series:
-  slug: object-detection-deep-dive
-  title: Object Detection Deep Dive
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
   order: 1
 draft: false
 featured: false
@@ -19,119 +19,109 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-Object detection의 모든 설계 결정 — NMS, anchor, Hungarian matching, mAP — 은 단 하나의 사실에서 나온다. **출력이 고정 크기 벡터가 아니라 가변 크기 집합이다.** 이 집합 구조를 출발점으로 삼으면 왜 NMS가 필요하고, 왜 IoU loss가 L1보다 나으며, 왜 DETR이 NMS를 제거할 수 있는지가 자연스럽게 도출된다. 그 연쇄를 지금부터 추적한다.
+Diffusion Model의 모든 수식은 하나의 물음에서 출발한다 — **노이즈로 무너진 것을 어떻게 복원하는가?** 이 질문은 1905년 Einstein의 브라운 운동 논문에도 있었고, 1982년 Anderson의 Reverse SDE에도 있었으며, 2020년 Ho의 DDPM에서야 비로소 실용적 생성 모델로 착지했다. 물리학의 언어가 머신러닝의 언어로 번역되기까지 무엇이 필요했는가?
 
-## Detection의 출력 공간
+## 물리적 직관 — 브라운 운동과 확산
 
-분류는 이미지 한 장을 하나의 라벨로 매핑한다. Segmentation은 픽셀마다 라벨을 붙인다. Detection은 "어디에 뭐가 몇 개 있는가"를 답해야 하므로, 출력의 크기가 이미지마다 달라진다.
+1D 브라운 운동 $X_t = B_t$는 시간에 비례해 분산이 증가한다.
 
-모델 $f_\theta$의 출력을 정식화하면:
+$$\mathbb{E}[X_t^2] = t$$
 
-$$
-\hat{Y} = \{(\hat{b}_j,\, \hat{c}_j,\, \hat{s}_j)\}_{j=1}^{\hat{N}}, \quad \hat{s}_j \in [0, 1]
-$$
+이 단순한 사실이 forward diffusion의 토대다. 이미지 $x_0$에 매 스텝 작은 가우시안 노이즈를 더하면, $t$가 커질수록 원본 신호는 희미해지고 결국 순수한 노이즈 $\mathcal{N}(0, I)$로 수렴한다. 이것이 물리학에서 말하는 "계가 평형 상태로 완화(relaxation)되는" 과정이다.
 
-여기서 $\hat{N}$은 모델이 결정하는 예측 개수이고, ground-truth의 개수 $N$과 일반적으로 다르다. 이 **variable-size set** 이라는 성질 하나가 아래의 모든 문제를 만든다.
+역방향으로 생각하면 생성이 된다. 노이즈 $x_T$에서 시작해 각 스텝의 노이즈를 "되감으면" 데이터 $x_0$가 복원된다. 문제는 역방향 과정을 어떻게 수학적으로 기술하느냐다.
 
-Bounding box 표기법은 두 가지가 공존한다. Center-size form $(c_x, c_y, w, h)$는 regression target에 자연스럽고, corner form $(x_1, y_1, x_2, y_2)$는 IoU 계산에 자연스럽다. 두 표기법은 $w, h > 0$ 조건에서 bijective이므로 정보 손실 없이 변환된다. 단, numerical stability와 loss formulation 편의에 따라 선택이 갈린다.
+## Forward Process — Markov Chain과 분산 보존
 
-## IoU — 평가와 학습의 간극
+DDPM의 forward process는 다음 Markov chain으로 정의된다.
 
-Detection 품질은 IoU로 측정한다.
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(\sqrt{1-\beta_t}\, x_{t-1},\, \beta_t I\right)$$
 
-$$
-\text{IoU}(A, B) := \frac{|A \cap B|}{|A \cup B|} \in [0, 1]
-$$
+여기서 $\beta_t \in (0, 1)$는 사전에 정해진 noise schedule이다. 이 형태가 특별한 이유는 **분산 보존** 때문이다. 초기 데이터 분포가 unit variance를 가지면, 모든 $t$에서 $\mathbb{E}[\|x_t\|^2] \approx d$가 유지된다.
 
-그런데 IoU를 **loss function**으로 그대로 쓰면 심각한 문제가 있다.
+$$\mathbb{E}[\|x_t\|^2] = (1-\beta_t)\,\mathbb{E}[\|x_{t-1}\|^2] + \beta_t d \approx d$$
 
-<Theorem kind="proposition" number="1" title="IoU loss의 disjoint plateau">
-$A \cap B = \emptyset$인 모든 box pair에서 $\text{IoU}(A, B) = 0$이고, 거의 모든 disjoint 영역에서 $\nabla_{\hat{b}}\,\text{IoU} = 0$이다.
+이 안정성 덕분에 학습이 수치적으로 발산하지 않는다. Schedule의 선택도 중요하다. Ho 2020의 linear schedule은 구현이 단순하지만, Nichol-Dhariwal 2021의 cosine schedule은 초반 정보 손실을 늦춰 더 나은 이미지 품질을 얻는다.
+
+## Closed-Form — $O(T)$를 $O(1)$로
+
+Markov chain을 따라 $t$번 반복 계산하는 것은 학습 중 너무 느리다. 핵심 통찰은 여러 번의 독립 가우시안 노이즈를 **하나의 가우시안으로 합칠 수 있다**는 것이다.
+
+$\alpha_t := 1 - \beta_t$, $\bar{\alpha}_t := \prod_{s=1}^t \alpha_s$로 정의하면 다음 closed-form이 성립한다.
+
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar{\alpha}_t}\, x_0,\, (1 - \bar{\alpha}_t) I\right)$$
+
+<Theorem kind="theorem" number="1" title="Forward Closed-Form (귀납법)">
+Forward Markov chain $x_t = \sqrt{1-\beta_t}\, x_{t-1} + \sqrt{\beta_t}\, \epsilon_t$에서, 임의의 $t$에 대해 다음이 성립한다.
+
+$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
 </Theorem>
 
 <Proof>
-$|A \cap B| = 0$이면 정의에 의해 IoU = 0. 작은 perturbation $\hat{b} + \epsilon$이 여전히 disjoint하면 IoU는 계속 0으로 유지된다. 따라서 거의 모든 disjoint 영역에서 gradient가 0이다. $\square$
+$t=1$: $x_1 = \sqrt{\alpha_1} x_0 + \sqrt{1-\alpha_1} \epsilon_1 = \sqrt{\bar{\alpha}_1} x_0 + \sqrt{1-\bar{\alpha}_1} \epsilon_1$. 성립.
+
+$t-1$에서 $x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} x_0 + \sqrt{1-\bar{\alpha}_{t-1}} \epsilon'$가 성립한다고 가정하자. 그러면
+
+$$x_t = \sqrt{\alpha_t}\, x_{t-1} + \sqrt{\beta_t}\, \epsilon_t = \sqrt{\alpha_t \bar{\alpha}_{t-1}}\, x_0 + \sqrt{\alpha_t(1-\bar{\alpha}_{t-1})}\, \epsilon' + \sqrt{\beta_t}\, \epsilon_t$$
+
+두 독립 가우시안의 합의 분산은 $\alpha_t(1-\bar{\alpha}_{t-1}) + \beta_t = 1 - \alpha_t \bar{\alpha}_{t-1} = 1 - \bar{\alpha}_t$이므로, 합쳐서 단일 $\epsilon_{\text{new}} \sim \mathcal{N}(0,I)$로 표현된다. 따라서
+
+$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\, \epsilon_{\text{new}} \qquad \square$$
 </Proof>
 
-학습 초기에는 예측 box와 GT box가 겹치지 않는 경우가 흔하다. 이 영역에서 학습 신호가 0이면 모델은 이동 방향을 알 수 없다. GIoU (Rezatofighi et al. 2019)는 이를 해결하기 위해 두 box를 모두 감싸는 최소 외접 사각형 $C$를 도입한다.
+이 결과 덕분에 학습 중 임의의 시각 $t$를 샘플링하고 $x_t$를 단번에 생성할 수 있다. 샘플링 비용이 $O(T)$에서 $O(1)$로 줄어드는 것이 DDPM 학습의 실용성을 결정한다.
 
-$$
-\text{GIoU}(A, B) := \text{IoU}(A, B) - \frac{|C \setminus (A \cup B)|}{|C|} \in [-1, 1]
-$$
+## Reverse Process — Score를 학습한다
 
-$A \cap B = \emptyset$일 때 GIoU는 $-1 + (|A| + |B|)/|C|$로, 두 box가 멀수록 더 큰 패널티를 부과한다. gradient가 0이 아니므로 학습이 가능하다.
+Reverse process는 다음 문제로 귀결된다. "지금 $x_t$를 보고 있을 때, 어느 방향으로 노이즈를 빼야 $x_{t-1}$에 가까워지는가?" 이 방향이 바로 **score function**이다.
 
-DIoU (Zheng et al. 2020)는 한 box가 다른 box 내부에 완전히 포함될 때 GIoU = IoU라서 추가 신호가 없다는 한계를 center distance penalty로 보완한다. CIoU는 여기에 aspect ratio 차이까지 더한다. 현대 detector(YOLOv5/v8)가 CIoU를 기본값으로 쓰는 이유는 수렴 속도와 최종 IoU 모두 개선되기 때문이다.
+$$s(x_t, t) := \nabla_{x_t} \log p(x_t, t)$$
+
+Anderson(1982)은 forward SDE에 대응하는 역방향 SDE가 다음과 같음을 보였다.
+
+$$dx_t = \left[ f(t)\, x_t - g^2(t)\, \nabla_x \log p(x_t, t) \right] dt + g(t)\, d\bar{W}_t$$
+
+Score는 density의 gradient이므로, 확률이 높은 쪽(데이터 분포)을 향한다. 신경망 $\epsilon_\theta(x_t, t)$가 이 score를 근사하도록 학습되는데, score와 noise 예측은 다음 관계로 연결된다.
+
+$$\nabla_{x_t} \log q(x_t \mid x_0) = -\frac{\epsilon}{\sqrt{1-\bar{\alpha}_t}}$$
+
+즉, **noise를 예측하는 것과 score를 학습하는 것은 수학적으로 동치**다. DDPM이 noise prediction loss를 쓰는 이유가 여기 있다 — noise는 항상 unit variance이므로 gradient flow가 안정적이다.
+
+## Posterior와 학습 타깃
+
+역과정의 학습 타깃은 true posterior $q(x_{t-1} \mid x_t, x_0)$이다. Bayes' rule과 가우시안의 곱 성질 덕분에 이 posterior 역시 가우시안이다.
+
+$$q(x_{t-1} \mid x_t, x_0) = \mathcal{N}(\tilde{\mu}_t, \tilde{\beta}_t I)$$
+
+$$\tilde{\mu}_t = \frac{\sqrt{\bar{\alpha}_{t-1}}\, \beta_t}{1 - \bar{\alpha}_t}\, x_0 + \frac{\sqrt{\alpha_t}(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t}\, x_t, \qquad \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t}\, \beta_t$$
 
 <Callout type="note" title="트레이드오프">
-**L1/Smooth-L1**: 안정적이고 단순하지만 평가 metric(IoU)과 직접 연결되지 않는다. **GIoU**: disjoint plateau를 해결하지만 포함 관계에서 추가 신호가 없다. **DIoU/CIoU**: 더 풍부한 gradient를 제공하지만 `arctan` 계산에서 numerical 위험이 있고 `alpha` term에 stop-gradient가 필요하다. DETR은 L1 + GIoU를 조합해 set prediction matching cost로 사용한다.
+**Discrete vs Continuous**: DDPM의 $T=1000$ 이산 근사는 구현이 단순하고 DDIM 가속이 가능하다. 반면 Song et al.(2021)의 Score-SDE는 수학적 엄밀성과 exact likelihood를 얻는 대신 ODE solver가 필요하다. 실무에서는 discrete DDPM, 이론 분석에는 continuous SDE가 쓰인다. **Fixed schedule의 한계**: $\beta_t$를 미리 고정하면 closed-form이 존재하지만 문제마다 최적 schedule이 다를 수 있다. Cosine schedule은 이 간극을 고정 + 단순한 방식으로 좁혔다.
 </Callout>
 
-## mAP — 집합 평가 metric
-
-평가 metric도 출력이 집합이라는 사실을 반영해야 한다. confidence threshold $\theta$를 변화시키면서 precision과 recall을 측정하면 PR curve가 만들어지고, AP는 그 곡선 아래 면적이다.
-
-$$
-\text{AP} := \int_0^1 p_{\text{interp}}(r)\, dr, \quad p_{\text{interp}}(r) = \max_{\tilde{r} \geq r} P(\tilde{r})
-$$
-
-envelope $p_{\text{interp}}$를 사용하는 이유는 raw PR curve가 zigzag를 가질 수 있기 때문이다 — FP 다음 TP가 연속으로 발생하면 recall이 증가하면서 precision이 잠깐 올라간다. Monotone 보정 후 적분한다.
-
-PASCAL VOC 2007의 11-point 근사와 COCO의 all-point 적분은 **같은 PR curve에서 다른 숫자를 준다**. 옛 논문과 현대 논문의 mAP를 직접 비교하면 안 되는 이유다. COCO의 표준 metric은 IoU threshold 10개의 평균이다.
-
-$$
-\text{mAP}_{\text{COCO}} = \frac{1}{|\mathcal{T}|} \frac{1}{C} \sum_{\tau \in \mathcal{T}} \sum_{c=1}^{C} \text{AP}_c(\tau), \quad \mathcal{T} = \{0.50, 0.55, \ldots, 0.95\}
-$$
-
-mAP@.5 = 0.7인데 mAP@[.5:.95] = 0.3인 모델은 class는 맞추지만 **localization이 부정확**한 모델이다. CIoU loss 도입이나 FPN으로 해상도를 높이는 것이 처방이 된다.
-
-## NMS — 집합 구조가 강제하는 후처리
-
-출력이 집합이라는 사실이 NMS를 필연적으로 만든다.
-
-<Theorem kind="proposition" number="2" title="중복 예측의 FP 강제">
-detector가 같은 object에 대해 두 예측 $(\hat{b}_1, c, \hat{s}_1)$, $(\hat{b}_2, c, \hat{s}_2)$를 출력하고 $\text{IoU}(\hat{b}_1, \hat{b}_2) > \tau_{\text{eval}}$이면, 둘 중 하나는 반드시 FP가 된다.
-</Theorem>
-
-<Proof>
-GT box $b$가 하나뿐이고 $\hat{b}_1, \hat{b}_2$ 모두 $b$와 IoU $\geq \tau$라 하자. TP/FP 매칭 규칙은 GT당 하나의 예측만 TP로 인정한다. confidence sort 후 첫 번째만 매칭되고, 두 번째는 자동으로 FP가 된다. $\square$
-</Proof>
-
-Anchor-based / one-stage detector는 dense prediction을 통해 같은 object에 여러 grid cell이 응답하도록 학습한다. 이는 positive sample 다양성을 높여 학습을 안정화시키지만, inference에서는 반드시 중복 제거가 필요하다. Greedy NMS는 confidence 내림차순으로 정렬 후, 선택된 box와 IoU $\geq \tau$인 나머지를 제거하는 $O(N^2)$ 알고리즘이다.
-
-Greedy NMS의 근본 한계는 **crowded scene**에 있다. 두 사람이 가까이 서 있어 IoU = 0.6이면, $\tau = 0.5$로 설정할 경우 두 번째 사람의 예측이 제거되어 FN이 발생한다. Soft-NMS (Bodla et al. 2017)는 hard removal 대신 score decay를 적용한다.
-
-$$
-s_j \leftarrow s_j \cdot \exp(-\text{IoU}^2 / \sigma)
-$$
-
-Gaussian decay는 모든 IoU에서 score를 단조비증가로 유지하면서, 가까운 박스를 제거하는 대신 confidence를 낮춰 최종 threshold에서 자연스럽게 걸러낸다. COCO에서 약 +1.7 mAP의 개선을 준다.
-
-<Aside label="NMS의 미래">
-DETR은 Hungarian matching 기반 set prediction loss로 training-time에 중복 예측 자체를 억제해 NMS를 완전히 제거한다. 그러나 500 epoch의 느린 수렴과 small object 어려움이 따른다. 현재는 scene complexity와 latency 요구에 따라 NMS-based(YOLO 계열)와 NMS-free(RT-DETR) 중 선택하는 양상이다.
-</Aside>
+$t$가 클수록 $\tilde{\mu}_t$에서 $x_t$의 가중치가 커지고 $x_0$의 가중치는 줄어든다. 직관적으로, 노이즈가 많이 쌓인 상태에서는 원본 정보보다 현재 관찰이 더 신뢰할 만하다.
 
 ## 정리
 
-- Detection 출력은 **variable-size set**이다. 이 사실 하나가 NMS, set prediction loss, mAP, anchor 책임 할당을 모두 도출한다.
-- IoU loss는 disjoint 영역에서 gradient가 0이다. GIoU → DIoU → CIoU는 각각 enclosing box 패널티, center distance, aspect ratio를 더해 학습 신호를 풍부하게 했다.
-- mAP@.5와 mAP@[.5:.95]는 다른 정보를 측정한다. 논문 숫자를 비교할 때 반드시 metric을 확인해야 한다.
-- NMS는 dense prediction의 필연적 귀결이고, Soft-NMS는 crowded scene의 FN을 부드럽게 완화한다. NMS를 없애려면 loss 설계 자체를 바꿔야 한다.
+- Diffusion Model의 설계는 브라운 운동의 분산 증가 → forward process, Anderson(1982)의 Reverse SDE → score matching, DDPM의 closed-form → $O(1)$ 샘플링이라는 세 번의 번역을 거쳐 완성된다.
+- $\bar{\alpha}_t = \prod \alpha_s$는 단순한 표기가 아니라 "여러 가우시안 노이즈를 하나로 합칠 수 있다"는 사실의 압축이다.
+- Noise prediction과 score matching은 같은 목적함수의 두 이름이다.
+- True posterior의 closed-form이 존재하기 때문에 DDPM의 학습 타깃이 명확하다. 이 closed-form이 없었다면 학습 시간은 $T$배 늘어났을 것이다.
 
-출발점의 수학이 명확하지 않으면, 각 설계 결정이 왜 그 형태인지 알 수 없다.
+다음 글에서는 이 posterior로부터 ELBO를 어떻게 분해하는지, 그리고 DDPM의 simplified loss가 왜 이론적으로 정당화되는지 추적한다.
 
 <Reference
-  title="Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression"
-  authors="Rezatofighi et al."
-  year={2019}
-  venue="CVPR"
-  url="https://arxiv.org/abs/1902.09630"
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho, Jain, Abbeel"
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
 />
 
 <Reference
-  title="Soft-NMS — Improving Object Detection With One Line of Code"
-  authors="Bodla et al."
-  year={2017}
-  venue="ICCV"
-  url="https://arxiv.org/abs/1704.04503"
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song, Sohl-Dickstein, Kingma, Kumar, Ermon, Poole"
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
 />

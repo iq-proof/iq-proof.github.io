@@ -1,0 +1,144 @@
+---
+title: "Diffusion Model의 손실함수는 어떻게 만들어지는가"
+description: "VAE의 ELBO에서 출발해 노이즈 예측 parameterization을 거쳐 L_simple과 Improved DDPM의 세 가지 개선까지, 손실함수 설계의 핵심 결정들을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [diffusion-model, ddpm, elbo, noise-prediction, variance-schedule]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Diffusion Model의 손실함수는 단순한 MSE처럼 보인다. 그런데 그 MSE가 어디서 왔는지 추적하면, Jensen 부등식 → KL 분해 → 노이즈 예측 → 가중치 제거까지 일련의 설계 결정이 쌓여 있다. 이론과 실무가 이렇게 선명하게 갈리는 손실함수가 또 있을까?
+
+## VLB — 왜 하한인가
+
+생성 모델의 목표는 $\log p_\theta(x_0)$를 최대화하는 것이다. 하지만 이 값은 직접 계산할 수 없다. 잠재 변수 $x_{1:T}$에 대한 적분이 intractable하기 때문이다.
+
+해결책은 보조 분포 $q(x_{1:T} \mid x_0)$를 도입하는 것이다. 이 분포는 가우시안 잡음을 단계적으로 더하는 순방향 과정으로 고정된다.
+
+$$q(x_{1:T} \mid x_0) = \prod_{t=1}^{T} \mathcal{N}(x_t;\, \sqrt{1-\beta_t}\, x_{t-1},\, \beta_t \mathbf{I})$$
+
+<Theorem kind="proposition" number="1" title="VLB는 로그 확률의 상한">
+
+$$-\log p_\theta(x_0) \leq L_{\mathrm{vlb}} := \mathbb{E}_{q(x_{1:T}\mid x_0)}\!\left[-\log \frac{p_\theta(x_{0:T})}{q(x_{1:T}\mid x_0)}\right]$$
+
+</Theorem>
+
+<Proof>
+
+$$-\log p_\theta(x_0) = -\log \mathbb{E}_{q}\!\left[\frac{p_\theta(x_{0:T})}{q(x_{1:T}\mid x_0)}\right]$$
+
+$-\log$는 오목 함수이므로 Jensen 부등식을 적용하면 기댓값과 로그를 교환할 수 있고, 부등호 방향이 뒤집힌다.
+
+$$\geq -\mathbb{E}_{q}\!\left[\log \frac{p_\theta(x_{0:T})}{q(x_{1:T}\mid x_0)}\right] = L_{\mathrm{vlb}} \qquad \square$$
+
+</Proof>
+
+T=1로 두면 이 식은 정확히 VAE의 ELBO와 같다 — reconstruction 항과 KL 정규화 항의 합. Diffusion Model은 VAE를 T>1로 확장한 것이다. Markov 가정은 이 확장을 계산 가능하게 만드는 핵심 전제다.
+
+## ELBO 3항 분해
+
+$L_{\mathrm{vlb}}$를 시간 단계별로 전개하면 세 항이 나타난다.
+
+$$L_{\mathrm{vlb}} = \underbrace{L_T}_{\text{상수}} + \underbrace{\sum_{t=2}^{T} L_{t-1}}_{\text{핵심 학습}} + \underbrace{L_0}_{\text{데이터 복구}}$$
+
+$L_T = \mathrm{KL}(q(x_T \mid x_0) \| p(x_T))$는 T가 충분히 크면 $q(x_T \mid x_0) \approx \mathcal{N}(0, \mathbf{I})$이 되어 0에 수렴한다. 학습할 필요가 없다.
+
+$L_{t-1}$은 posterior $q(x_{t-1} \mid x_t, x_0)$와 학습된 역방향 분포 $p_\theta(x_{t-1} \mid x_t)$ 사이의 KL이다. 두 분포가 모두 가우시안이므로 closed-form으로 계산된다.
+
+$$L_{t-1} = \frac{1}{2\sigma_t^2} \mathbb{E}_{q(x_t \mid x_0)}\!\left[\|\tilde{\mu}_t(x_t, x_0) - \mu_\theta(x_t, t)\|^2\right] + \text{const}$$
+
+결국 역방향 평균 $\mu_\theta$가 posterior 평균 $\tilde{\mu}_t$를 얼마나 잘 근사하는가가 핵심이다.
+
+## 노이즈 예측 — 표현 방식의 선택
+
+$\mu_\theta$를 어떻게 parameterize할 것인가? 세 가지 선택지가 있다.
+
+| 표현 방식 | 예측 대상 | 수치 안정성 |
+|:---|:---|:---|
+| Noise prediction | $\epsilon_\theta \in \mathbb{R}^d$ | 높음 (unit variance) |
+| X0 prediction | $x_{0,\theta}$ 직접 예측 | 낮음 (큰 범위) |
+| Velocity prediction | $v_\theta = \dot{x}_t$ | 중간 |
+
+세 표현은 이론적으로 동등하다. $x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\, \epsilon$이라는 관계로 서로 일대일 변환이 가능하기 때문이다. 그러나 신경망 근사 관점에서는 noise prediction이 압도적으로 선호된다 — $\epsilon \sim \mathcal{N}(0, \mathbf{I})$이므로 스케일이 항상 일정하고, batch normalization 없이도 학습이 안정적이다.
+
+Noise prediction을 사용하면 $L_{t-1}$은 다음과 같이 단순화된다.
+
+$$L_{t-1} = \frac{\beta_t^2}{2\sigma_t^2 \alpha_t(1-\bar{\alpha}_t)} \mathbb{E}\!\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+
+## $L_{\mathrm{simple}}$ — 이론을 버리고 얻은 것
+
+위 식에서 가중치 $w_t = \frac{\beta_t^2}{2\sigma_t^2 \alpha_t(1-\bar{\alpha}_t)}$는 역 SNR에 비례한다.
+
+$$w_t \propto \frac{1-\bar{\alpha}_t}{\bar{\alpha}_t} = \frac{1}{\mathrm{SNR}(t)}$$
+
+즉, 잡음이 많고 신호가 약한 초기 시간 단계에 더 큰 가중치를 부여한다. 그런데 Ho et al. (2020)은 이 가중치를 **전부 제거**하는 것이 실제로 더 좋은 이미지를 생성한다고 보고했다.
+
+$$L_{\mathrm{simple}} = \mathbb{E}_{t,\, x_0,\, \epsilon}\!\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]$$
+
+<Callout type="note" title="트레이드오프">
+이론적으로 최적인 손실(가중 MSE)이 실무에서 최적이 아닌 이유: 초기 저SNR 단계에서는 신호가 너무 약해 정확한 예측이 어렵다. 가중치를 높여봤자 신경망은 학습하기 힘든 항에 용량을 낭비한다. 가중치를 제거하면 신경망이 고SNR 영역(시각적으로 의미있는 구조)에 자연스럽게 집중하게 된다. 이론적 타당성은 낮지만, 지각 품질(perceptual quality)은 높아진다.
+</Callout>
+
+## Improved DDPM의 세 가지 결정
+
+Nichol & Dhariwal (2021)은 $L_{\mathrm{simple}}$을 기반으로 세 가지를 추가한다.
+
+**코사인 분산 스케줄.** 선형 스케줄은 초기 시간 단계에서 SNR이 급격히 떨어진다. 코사인 스케줄은 초기에 완만하게, 후기에 급격히 감소한다.
+
+$$\bar{\alpha}_t = \frac{f(t)}{f(0)}, \qquad f(t) = \cos^2\!\left(\frac{t/T + s}{1+s} \cdot \frac{\pi}{2}\right)$$
+
+SNR 분포가 균등해져 학습이 안정된다. 현재 사실상 업계 표준이다.
+
+**학습 가능한 분산.** 역방향 분산 $\Sigma_\theta(t)$를 고정값 대신 신경망이 예측하도록 한다. $\beta_t$와 posterior 분산 $\tilde{\beta}_t$ 사이를 보간하는 스칼라 $v \in [0,1]$를 학습한다.
+
+$$\Sigma_\theta(t) = \exp\!\left(v \log \beta_t + (1-v) \log \tilde{\beta}_t\right)$$
+
+샘플 품질(FID)은 소폭 향상되고, 로그 우도(NLL)는 유의미하게 향상된다.
+
+**하이브리드 손실.** 두 목표를 동시에 달성하기 위해 $L_{\mathrm{simple}}$과 $L_{\mathrm{vlb}}$를 섞는다.
+
+$$L_{\mathrm{hybrid}} = L_{\mathrm{simple}} + \lambda\, L_{\mathrm{vlb}}, \qquad \lambda = 0.001$$
+
+$\lambda$가 작은 이유는 명확하다 — $L_{\mathrm{vlb}}$를 지나치게 강조하면 FID가 악화된다. 0.001은 로그 우도를 개선하면서 샘플 품질을 유지하는 균형점이다.
+
+<Aside label="설계 철학">
+Improved DDPM의 세 결정은 모두 같은 방향을 가리킨다 — 이론적으로 도출된 형태를 그대로 쓰기보다, SNR 분포를 균등하게 만들고, 신경망이 학습하기 쉬운 표현을 선택하고, 두 목표 사이의 가중치를 실험으로 찾는다. 수학은 프레임워크를 제공하고, 엔지니어링이 디테일을 결정한다.
+</Aside>
+
+## 정리
+
+- VLB는 Jensen 부등식으로 얻은 계산 가능한 하한이다. T=1이면 VAE ELBO와 같다.
+- ELBO 3항 분해에서 $L_T$는 상수, 학습의 실질적 대상은 $L_{t-1}$과 $L_0$이다.
+- Noise prediction은 이론적으로 x0/velocity prediction과 동등하지만, unit variance 덕분에 수치 안정성이 높다.
+- $L_{\mathrm{simple}}$은 이론 가중치를 제거했지만, 신경망을 고SNR 구조에 집중시켜 지각 품질을 높인다.
+- Improved DDPM의 코사인 스케줄 + 학습 분산 + 하이브리드 손실은 이후 모든 주요 구현의 기준이 됐다.
+
+다음 글에서는 $\epsilon_\theta$가 실제로 무엇을 근사하는지 — score function $\nabla_{x_t} \log p(x_t)$와의 연결, 그리고 이것이 연속시간 SDE 관점에서 어떻게 통합되는지 추적한다.
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho, J., Jain, A., Abbeel, P."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
+/>
+
+<Reference
+  title="Improved Denoising Diffusion Probabilistic Models"
+  authors="Nichol, A., Dhariwal, P."
+  year={2021}
+  venue="ICML"
+  url="https://arxiv.org/abs/2102.09672"
+/>
