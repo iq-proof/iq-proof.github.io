@@ -1,7 +1,7 @@
 ---
-title: "RNN에서 Mamba까지: 시퀀스 모델 진화의 단일 원리"
-description: "병렬성 한계에서 출발한 RNN의 구조적 결함부터 Linear Attention, SSM, Mamba의 하드웨어 인식 설계까지 — 시퀀스 모델 진화를 관통하는 하나의 원리를 추적한다."
-pubDate: 2026-04-28
+title: "RNN이 Transformer에 밀린 이유, 그리고 Mamba가 돌아온 이유"
+description: "GPU 병렬성 한계부터 선택적 상태 공간 모델까지, 시퀀스 아키텍처 30년의 진화를 관통하는 하나의 질문을 추적한다."
+pubDate: 2026-05-03
 category: ai
 tags: [rnn, transformer, mamba, state-space-model, sequence-modeling]
 difficulty: advanced
@@ -19,115 +19,128 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-2017년 Transformer가 등장한 이후 NLP 아키텍처의 역사는 단순해 보인다 — RNN이 있었고, Transformer가 대체했다. 그런데 2023년 Mamba가 나타나 RNN과 닮은 구조로 Transformer를 능가하는 결과를 보였다. 왜 우리는 한 바퀴를 돌아 다시 순환 구조로 돌아왔는가?
+RNN은 순차적으로 작동한다. GPU는 병렬적으로 작동한다. 이 둘이 만나면 무슨 일이 벌어지는가? 그리고 왜 2023년, 선형 재귀를 앞세운 Mamba가 다시 RNN-like 구조로 돌아왔는가?
 
-## 문제의 핵심: Sequential Dependency
+## 순차 의존의 벽
 
-모든 이야기는 하나의 수식에서 시작한다.
+RNN의 forward pass는 다음 점화식으로 정의된다.
 
 $$
 h_t = f(h_{t-1}, x_t)
 $$
 
-RNN의 forward pass는 이 의존 관계를 $T$번 반복한다. $h_t$를 계산하려면 $h_{t-1}$이 먼저 있어야 하고, $h_{t-1}$은 $h_{t-2}$를 기다린다. 이 chain의 길이가 정확히 $T$다.
+$h_t$를 계산하려면 $h_{t-1}$이 반드시 먼저 완료되어야 한다. 이 의존 사슬의 깊이는 정확히 $T$ — 시퀀스 길이. GPU가 수만 개의 코어를 가지고 있어도, 매 스텝 하나의 연산만 통과할 수 있다.
 
 <Theorem kind="proposition" number="1" title="RNN의 Critical Path">
 RNN forward pass의 critical path length는 시퀀스 길이 $T$와 같다.
 </Theorem>
 
 <Proof>
-$h_T = f(h_{T-1}, x_T) = f(f(h_{T-2}, x_{T-1}), x_T) = \cdots$ — 깊이 $T$의 의존 체인이 형성된다. $\square$
+$h_T = f(h_{T-1}, x_T) = f(f(h_{T-2}, x_{T-1}), x_T) = \cdots$ — 깊이 $T$의 의존 사슬. $h_t$는 $h_{t-1}$ 없이 계산 불가능하므로 parallelization의 여지가 없다. $\square$
 </Proof>
 
-GPU는 수천 개의 코어가 동시에 같은 연산을 다른 데이터에 적용하는 SIMT 구조다. RNN의 sequential dependency는 이 구조와 정면으로 충돌한다. $T = 1000$일 때 각 스텝에서 나머지 수천 개 코어는 대기한다. 이론적 GPU utilization은 $O(1/T)$다.
+GPU utilization의 관점에서 이 문제는 치명적이다. H100의 약 16K 코어에서 $T = 1000$의 RNN을 돌리면, 스텝당 utilization은 100%에 가깝지만 wall-clock 시간은 $T$에 선형으로 늘어난다. 사실상 코어를 단 하나씩 쓰는 것과 다름없다.
 
-## Transformer의 해법과 그 대가
+## Transformer의 답: $O(T^2)$ 비용으로 완전 병렬화
 
-Transformer의 self-attention은 이 문제를 정면 돌파한다.
+Self-attention은 모든 $(i, j)$ 쌍의 유사도를 *동시에* 계산한다.
 
 $$
 \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
 $$
 
-$QK^\top$ 행렬의 모든 $(i, j)$ 쌍은 서로 독립적으로 계산 가능하다. Critical path는 matmul 내부의 tree reduction에 해당하는 $O(\log T)$로 줄어든다. Vaswani 2017의 실험이 이를 실증한다 — WMT'14 En→De 학습에서 Google NMT(LSTM) 16일 대비 Transformer-Big은 3.5일, 약 5배 빠르고 BLEU도 높았다.
+$T \times T$ attention matrix의 모든 entry가 독립적으로 계산 가능하다. 거대한 행렬곱 하나가 GPU 코어 전체를 채운다. Critical path는 행렬곱 내부의 reduction tree에 해당하므로 $O(\log T)$다.
 
-그러나 이 병렬성에는 명확한 대가가 따른다.
+Vaswani 2017의 실측값이 이를 뒷받침한다. WMT'14 En→De 학습에서 Google NMT(LSTM 기반)는 8 GPU로 16일, Transformer-Big은 동일 하드웨어로 3.5일 — 약 5배 빠르면서 BLEU도 높았다.
 
-<Callout type="warning" title="Transformer의 메모리 트레이드오프">
-Attention matrix는 $O(T^2)$ 메모리를 요구한다. $T = 10{,}000$이면 한 레이어에서 400 MB, $T = 100{,}000$이면 40 GB다. 이것이 long context의 구조적 한계다.
+대가는 명확하다. $O(T^2)$ 메모리. $T = 10{,}000$이면 한 레이어의 attention matrix 하나가 400 MB(fp32)를 차지한다. $T = 100{,}000$이면 40 GB — 단일 레이어에서.
+
+<Callout type="warning" title="트레이드오프">
+RNN: $O(TH^2)$ 시간, $O(TH)$ 메모리, critical path $T$ — sequential.  
+Transformer: $O(T^2 H)$ 시간, $O(T^2)$ 메모리, critical path $O(\log T)$ — parallel.  
+Mamba: $O(TH)$ 시간, $O(TH)$ 메모리, critical path $O(\log T)$ — parallel scan.  
+세 아키텍처 중 어느 하나가 모든 조건에서 우월하지 않다.
 </Callout>
 
-CNN 기반 접근(WaveNet, TCN)도 같은 방향을 시도했다. Dilated convolution을 $1, 2, 4, \ldots, 2^{L-1}$로 쌓으면 receptive field가 $O(2^L)$로 증가하고, 모든 포지션을 동시에 처리할 수 있다. Bai 2018의 TCN이 여러 시퀀스 태스크에서 LSTM을 능가했지만, receptive field가 아키텍처로 고정된다는 한계와 global attention의 부재로 Transformer에 자리를 내줬다.
+## CNN의 우회로: WaveNet과 TCN
 
-## Linear Attention: 연산 순서의 재발견
-
-Transformer의 $O(T^2)$ 병목을 해결하는 핵심 통찰은 Katharopoulos 2020("Transformers are RNNs")에서 나왔다. Softmax를 kernel feature map $\phi$로 근사하면 연산 순서를 바꿀 수 있다.
+Transformer 이전에도 RNN의 sequential 한계를 우회하려는 시도가 있었다. WaveNet(van den Oord 2016)은 *causal dilated convolution*으로 이를 달성했다.
 
 $$
-\text{Attn}(Q, K, V) \approx \phi(Q)\,\bigl(\phi(K)^\top V\bigr)
+y_t = \sum_{i=0}^{k-1} w_i \cdot x_{t - d \cdot i}
 $$
 
-괄호의 위치가 전부다. $\phi(K)^\top V$를 먼저 계산하면 $d \times d$ 행렬이 되고 $T \times T$ 행렬은 사라진다. 그리고 이 구조는 정확히 RNN의 update rule과 동형이다.
+dilation rate $d$를 $1, 2, 4, \ldots, 2^{L-1}$로 쌓으면, $L$개 레이어로 $O(2^L)$의 receptive field를 만든다. $L = 10, k = 2$이면 RF = 1024. 각 레이어 내의 모든 출력 위치는 독립적으로 계산되므로 critical path는 레이어 수 $L = \log_2 T$에 불과하다.
+
+Bai 2018의 TCN(Temporal Convolutional Network)은 이를 일반화해 sequential MNIST, adding problem 등 다양한 벤치마크에서 LSTM을 능가했다. 그러나 receptive field가 architecture로 *고정된다*는 본질적 한계가 있다. 더 긴 의존성이 필요하면 레이어를 추가해야 하고, Transformer의 전역 attention과 달리 RF 밖의 토큰은 직접 볼 수 없다.
+
+## Linear Attention: 결합법칙의 이동
+
+Transformer의 $O(T^2)$ 문제를 다른 방향에서 공격한 것이 Katharopoulos 2020의 linear attention이다. 핵심 아이디어는 softmax를 kernel feature map으로 근사한 뒤 *연산 순서를 바꾸는* 것이다.
 
 $$
-S_t = S_{t-1} + \phi(k_t)\,v_t^\top
+\text{Attn} = \underbrace{\phi(Q) \underbrace{(\phi(K)^\top V)}_{\in \mathbb{R}^{d \times d}}}_{\text{$O(Td^2)$ 전체}}
 $$
 
-$S_t$가 recurrent state다. Inference 시 KV-cache($O(T \cdot d)$) 대신 $S \in \mathbb{R}^{d \times d}$ 하나만 유지하면 된다. GPT-3 규모에서 $T = 2048$ KV-cache가 약 19 GB인 데 비해 linear attention state는 0.6 GB이며 $T$에 무관하다.
+$T \times T$ matrix가 사라지고 $d \times d$ matrix만 남는다. 더 중요한 것은, causal linear attention이 정확히 RNN의 update rule로 환원된다는 점이다.
 
-RWKV(Peng 2023)는 이 원리를 실제 LLM으로 구현했다. Time-mixing block이 지수적 시간 감쇠를 적용한 recurrent state를 유지하면서 Transformer-quality 학습을 달성했다.
+$$
+S_t = S_{t-1} + \phi(k_t) v_t^\top, \quad \text{output}_t = \phi(q_t) S_t
+$$
 
-<Aside label="왜 RNN이 돌아왔는가">
-Linear attention은 RNN의 sequential dependency를 재발명한 것이 아니다. *비선형 게이트를 제거하고* linear recurrence만 남김으로써, 병렬 처리가 가능한 형태로 만든 것이다. RNN이 느렸던 이유는 순환 구조 자체가 아니라 non-linearity가 associativity를 깼기 때문이다.
+inference 시 KV-cache 대신 $d \times d$ 상태 하나만 유지하면 된다. GPT-3 규모(96레이어, 96헤드, $d=128$)에서 $T = 2048$ 기준 KV-cache는 약 19 GB지만, linear attention 상태는 약 0.6 GB다.
+
+RWKV(Peng 2023)는 이 정신을 LLM 스케일로 밀어붙였다. time-decay 파라미터 $w$와 bonus $u$로 gating을 추가한 RWKV-14B는 비슷한 규모의 GPT 계열과 경쟁력 있는 벤치마크를 보여줬다.
+
+표현력의 대가는 있다. Linear attention은 $d_\phi$-rank 근사 — softmax attention이 가능한 sharp, sparse한 attention pattern을 표현하기 어렵다. in-context learning에서 Transformer 대비 약함이 경험적으로 관찰된다.
+
+## Mamba: 선택적 상태 공간과 병렬 스캔
+
+S4(Gu 2022)는 제어이론의 연속 상태 공간 모델을 deep learning에 도입했다.
+
+$$
+\dot{x}(t) = Ax(t) + Bu(t), \quad y(t) = Cx(t)
+$$
+
+이를 이산화하면($\Delta$ 샘플링):
+
+$$
+\bar{A} = \exp(\Delta A), \quad \bar{B} = (\bar{A} - I)A^{-1}B
+$$
+
+$$
+x_t = \bar{A} x_{t-1} + \bar{B} u_t, \quad y_t = C x_t
+$$
+
+S4의 $A$는 *input-independent* — 모든 토큰에 같은 dynamics. Mamba(Gu & Dao 2023)의 핵심 혁신은 이를 *selective*로 만드는 것이다.
+
+$$
+\Delta_t, B_t, C_t = f(x_t)
+$$
+
+입력에 따라 dynamics가 바뀐다. $A_t \approx I$이면 과거 상태를 보존(long memory), $A_t \approx 0$이면 리셋(forget). attention의 content-dependent selection과 기능적으로 동등한 효과를 $O(T)$에 달성한다.
+
+학습 시에는 병렬 스캔(Blelloch 1990)으로 $O(\log T)$ depth를 실현한다. 선형 재귀
+
+$$
+h_t = A h_{t-1} + B u_t
+$$
+
+는 결합법칙을 만족하는 이항 연산의 prefix sum으로 볼 수 있다. up-sweep(쌍별 reduction) → down-sweep(전파)의 트리 구조로 $O(T)$ work, $O(\log T)$ depth.
+
+LRA(Long Range Arena) benchmark의 Path-X task — 16K 토큰 시퀀스에서 두 점이 같은 연결 경로에 있는지 판별 — 에서 vanilla Transformer, linear attention, 심지어 S4조차 랜덤 수준(50%)에 머물렀다. Mamba가 처음으로 의미 있는 성능(~70-80%)을 기록했다.
+
+<Aside label="Mamba 부활의 역설">
+LSTM이 Transformer에 밀린 이유는 sequential dependency였다. Mamba도 재귀 구조인데 왜 다른가? LSTM의 gate는 *비선형* — $h_t = f(\sigma(\cdot), \tanh(\cdot))$. 비선형 재귀는 병렬화 불가. Mamba의 selective SSM은 본질적으로 *선형* 재귀다. 선형 연산은 결합법칙을 만족하므로 parallel scan이 가능하다. sequential dependency의 본질적 원인은 재귀 자체가 아니라 *비선형성*이었다.
 </Aside>
-
-## SSM: 이론적 토대
-
-State Space Model(SSM)은 제어이론의 고전적 개념을 딥러닝으로 흡수한 결과다.
-
-$$
-\dot x(t) = A\,x(t) + B\,u(t), \qquad y(t) = C\,x(t)
-$$
-
-HiPPO(Gu 2020)의 핵심 통찰은 이 ODE의 최적 해가 Legendre polynomial projection과 일치한다는 것이다 — 즉 특정 $A$ 행렬 구조가 "지금까지 본 입력의 최적 압축"을 보장한다.
-
-S4(Gu 2022)는 이를 효율적으로 학습 가능하게 만들었다. $A$를 diagonal + low-rank로 구조화하면 Cauchy kernel을 통해 길이 $T$의 convolution kernel을 $O(N \log T)$에 계산할 수 있다. 학습은 FFT 기반 convolution, inference는 $O(N)$ recurrence — 두 모드를 동시에 지원한다.
-
-Mamba(Gu & Dao 2023)는 S4의 남은 한계를 해결한다. S4의 $A, B, C$는 input-independent — 모든 토큰에 같은 dynamics가 적용된다. Mamba는 이를 selective하게 만든다.
-
-$$
-A_t,\, B_t,\, C_t = f(x_t)
-$$
-
-관련 있는 정보는 $A_t \approx I$로 state에 보존하고, 무관한 정보는 $A_t \approx 0$으로 잊는다. 이것이 attention의 selectivity를 $O(T)$ 복잡도로 구현하는 방식이다. 그리고 linear recurrence는 associative binary operation이므로 Blelloch 1990의 parallel scan으로 $O(\log T)$ depth에 병렬 실행된다.
-
-LRA Path-X 벤치마크(16K context, path connectivity 판별)에서 vanilla Transformer와 S4가 모두 random chance(50%)에 머무를 때 Mamba가 처음으로 의미 있는 성능을 기록했다.
-
-## 트레이드오프
-
-각 아키텍처의 강점과 한계는 명확하다.
-
-| Architecture | Time | Memory | Critical Path | In-context Learning |
-|---|---|---|---|---|
-| **RNN/LSTM** | $O(TH^2)$ | $O(TH)$ | $T$ | 약함 |
-| **Transformer** | $O(T^2H)$ | $O(T^2)$ | $O(\log T)$ | 강함 |
-| **S4** | $O(TN \log T)$ | $O(TN)$ | $O(\log T)$ | 약함 |
-| **Mamba** | $O(TN)$ | $O(TN)$ | $O(\log T)$ | 중간 |
-
-<Callout type="note" title="No Silver Bullet">
-Mamba는 long context efficiency에서 Transformer를 능가하지만, in-context learning(few-shot)에서는 attention의 sharp selectivity를 완전히 대체하지 못한다. 이 때문에 Jamba(AI21 2024)처럼 Mamba 레이어와 attention 레이어를 혼합한 hybrid architecture가 현재의 주류 방향이다.
-</Callout>
-
-Linear attention의 한계도 명확하다. Softmax attention이 임의의 attention pattern을 표현할 수 있는 데 비해, linear attention은 feature map dimension $d_\phi$으로 제한된 low-rank approximation이다. Sharp, sparse attention pattern 표현이 어렵고 이것이 in-context learning의 약점으로 이어진다.
 
 ## 정리
 
-- RNN의 sequential dependency는 GPU utilization을 $O(1/T)$로 만든다. Transformer는 $O(T^2)$ 메모리 비용으로 이 한계를 돌파했다.
-- Linear attention은 연산 순서 변경으로 $O(T^2) \to O(T)$를 달성하며, 이 구조가 RNN-like recurrence와 동형임을 보였다.
-- SSM(S4, Mamba)은 제어이론적 토대 위에서 selective state evolution과 hardware-aware parallel scan을 결합해 long context의 실질적 해법이 됐다.
-- 아키텍처 진화의 원동력은 일관되다 — *어떻게 sequential dependency를 없애면서 selective한 정보 보존을 유지할 것인가*.
-
-이 챕터들이 보여주는 것은 아키텍처의 단순한 대체 역사가 아니다. RNN의 비선형 게이트를 제거하면 병렬화가 가능해지고, Transformer의 $T^2$ 항을 kernel trick으로 우회하면 RNN 형태가 돌아온다. 같은 문제의 다른 표현이 서로를 수렴시키고 있다.
+- RNN의 sequential bottleneck은 $h_t = f(h_{t-1}, x_t)$의 의존 사슬에서 온다. GPU의 수천 코어가 있어도 한 번에 하나의 스텝만 통과한다.
+- Transformer는 $O(T^2)$ 비용을 지불하고 완전 병렬화를 달성했다. 2017년 이후 NLP의 표준이 된 이유는 더 좋은 알고리즘이 아니라 더 잘 맞는 하드웨어 활용이었다.
+- Linear attention과 RWKV는 kernel 근사로 $O(T)$ inference를 달성했지만 표현력의 trade-off를 피하지 못했다.
+- Mamba는 선형 재귀 + 선택적 dynamics + parallel scan의 조합으로 "RNN의 효율성과 Transformer의 품질"을 처음으로 동시에 달성했다. sequential dependency의 근본 원인이 재귀가 아닌 비선형성이었다는 통찰이 핵심이다.
+- 현재 추세는 단일 아키텍처의 지배가 아니라 Mamba + Transformer 레이어의 hybrid(Jamba 등)다. 아키텍처 다양성이 새로운 norm이다.
 
 <Reference
   title="Mamba: Linear-Time Sequence Modeling with Selective State Spaces"
@@ -138,9 +151,9 @@ Linear attention의 한계도 명확하다. Softmax attention이 임의의 atten
 />
 
 <Reference
-  title="Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"
-  authors="Katharopoulos, A. et al."
-  year={2020}
-  venue="ICML"
-  url="https://arxiv.org/abs/2006.16236"
+  title="Attention Is All You Need"
+  authors="Vaswani, A. et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
 />

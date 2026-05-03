@@ -1,9 +1,9 @@
 ---
-title: "RNN은 왜 sequence를 이해할 수 있는가"
-description: "가변 길이 sequence 처리의 정식화부터 N-gram의 sparsity 한계, Bengio 2003의 embedding 통찰, RNN의 parameter sharing과 hidden state bottleneck까지 sequence 학습의 진화를 추적한다."
-pubDate: 2026-04-28
+title: "RNN은 왜 sequence를 기억하는가"
+description: "N-gram의 sparsity 한계부터 RNN의 parameter sharing과 hidden state 병목, teacher forcing의 exposure bias까지 — sequence 학습의 설계 결정을 관통하는 하나의 논리를 추적한다."
+pubDate: 2026-05-03
 category: ai
-tags: [rnn, language-model, sequence-learning, embedding, n-gram]
+tags: [rnn, sequence-modeling, language-model, n-gram, lstm]
 difficulty: advanced
 series:
   slug: rnn-lstm-deep-dive
@@ -19,120 +19,115 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-"cat"과 "was" 사이에 9개의 단어가 끼어 있어도 문장은 문법적으로 일치해야 한다. N-gram은 이 의존성을 볼 수 없고, fixed-window 신경망은 창 밖을 볼 수 없다. RNN은 어떻게 임의 길이의 history를 단 하나의 벡터에 압축하면서, 그 정보로 다음 토큰을 예측할 수 있는가?
+Sequence 학습의 역사는 하나의 질문을 중심으로 전개된다 — **"얼마나 먼 과거를 봐야 하는가"**. N-gram은 창문 크기를 고정하고, Neural LM은 embedding으로 sparsity를 완화하고, RNN은 창문을 아예 없앤다. 각 선택에는 구체적인 수학적 이유가 있고, 각 해결책은 다음 한계를 만들어낸다. 이 연쇄가 어디서 시작해 어디로 향하는가?
 
-## Sequence 학습이란 무엇인가
+## 시작: N-gram의 두 가지 저주
 
-일반 supervised learning은 $x \to y$ 매핑이지만, sequence 학습은 입출력 길이 자체가 데이터마다 다르다. 이를 정식화하면 다음과 같다.
-
-$$
-\mathcal{D} = \{(x^{(n)}_{1:T_n},\, y^{(n)}_{1:S_n})\}_{n=1}^N, \qquad \max_\theta \sum_n \log p_\theta(y^{(n)}_{1:S_n} \mid x^{(n)}_{1:T_n})
-$$
-
-task 유형에 따라 출력 형태가 결정된다. 감정 분석처럼 $T > 1, S = 1$이면 many-to-one이고 마지막 hidden state $h_T$만 분류기에 넣는다. POS tagging처럼 $T = S$이면 many-to-many synced이고 모든 $h_t$를 사용한다. 번역처럼 $T \neq S$이면 seq2seq이고 encoder-decoder 구조가 필요하다.
-
-어느 유형이든 loss는 동일한 원칙으로 정의된다. padding이 있는 mini-batch라면 mask $m^{(n)}_t$를 적용해 padding 위치의 cross-entropy가 합산되지 않도록 해야 한다.
-
-$$
-\mathcal{L} = -\frac{\sum_{n,t} m^{(n)}_t \log p_\theta(y^{(n)}_t \mid \cdot)}{\sum_{n,t} m^{(n)}_t}
-$$
-
-분모 normalization이 없으면 짧은 sequence일수록 padding loss가 더 많이 합산되어 학습이 편향된다.
-
-## N-gram의 한계: sparsity와 Markov 장벽
-
-N-gram LM은 sequence 모델의 출발점이다. Markov 가정으로 무한한 history를 $n-1$개 단어로 줄인다.
+N-gram LM의 기본 가정은 단순하다. 직전 $n-1$개의 단어만 보면 다음 단어를 예측할 수 있다.
 
 $$
 p(w_t \mid w_1, \ldots, w_{t-1}) \approx p(w_t \mid w_{t-n+1}, \ldots, w_{t-1})
 $$
 
-이 단순화로 $O(|V|^n)$개의 가능한 context를 표현해야 하는데, PTB 기준으로 가능한 trigram은 $10^{12}$개이지만 실제로 관찰된 건 $10^7$개뿐이다. 0.001%만 커버된다. unseen n-gram이 나타나면 MLE는 확률 0을 부여하고, log-likelihood는 $-\infty$로 발산한다.
+Maximum likelihood estimate은 $\hat p_{\text{MLE}}(w_t \mid \text{ctx}) = c(\text{ctx}, w_t) / c(\text{ctx})$. 문제는 두 곳에서 동시에 터진다.
 
-Kneser-Ney smoothing은 이 문제를 가장 잘 해결한 통계적 방법이다. 단어의 빈도 대신 **continuation count** — 얼마나 다양한 context에서 등장하는가 — 를 backoff 확률로 쓴다.
+첫째, **sparsity**. Vocab $|V| = 10^4$이면 가능한 trigram 수는 $10^{12}$. 실제로 corpus에서 관찰되는 건 $10^7$ 수준 — 0.001%다. $c(\text{ctx}, w_t) = 0$이면 $p = 0$이 되고 전체 sentence의 log-likelihood는 $-\infty$로 내려간다.
 
-$$
-\hat{p}_{\mathrm{KN}}(w \mid h) = \frac{\max(c(h,w) - d,\, 0)}{c(h)} + \lambda(h)\, \frac{N_{1+}(\bullet, w)}{\sum_{w'} N_{1+}(\bullet, w')}
-$$
+둘째, **표현력 한계**. "The cat which Mary saw yesterday at the park was hungry"에서 "cat"과 "was"의 수 일치는 9단어 거리에 있다. Trigram은 "park was hungry"만 본다. 이 의존성은 $n$을 아무리 늘려도 표현 비용이 $O(|V|^n)$으로 폭증하므로 현실적으로 해결되지 않는다.
 
-"Francisco"는 거의 항상 "San" 뒤에만 나타난다. unigram count는 높지만 continuation count는 1이므로, KN은 "San Francisco"가 아닌 context에서 이 단어의 backoff 확률을 낮게 유지한다. 이는 단어를 **맥락의 다양성**으로 정의한다는 통찰로, 이후 word2vec의 distributional hypothesis와 동일한 철학이다.
+Kneser-Ney smoothing은 단순 count 대신 **continuation count** — 단어가 등장한 distinct context의 수 — 를 backoff 확률로 쓴다. "Francisco"는 count는 높지만 거의 "San" 뒤에만 나타난다. Continuation count는 그 협소함을 인코딩한다. 이 통찰은 word embedding의 distributional hypothesis와 같은 뿌리다.
 
-그러나 Kneser-Ney도 $n$-gram 표현력의 한계를 해결하지는 못한다. 의존성 거리가 $n$을 넘으면 모델링이 불가능하다.
+## Bengio 2003: embedding이 sparsity를 우회하는 방식
 
-## Bengio 2003: embedding이 sparsity를 우회하는 원리
-
-Bengio 2003의 Neural Probabilistic Language Model은 두 가지 문제를 동시에 해결했다. 첫째, one-hot 대신 dense vector로 단어를 표현해 단어 간 similarity를 인코딩한다. 둘째, 분포를 count가 아닌 **함수**로 표현해 unseen n-gram에도 generalize한다.
+Bengio 2003의 Neural Probabilistic Language Model은 sparsity를 smoothing이 아니라 **표현 공간의 변환**으로 해결한다.
 
 $$
-x = [C[w_{t-n+1}]; \ldots; C[w_{t-1}]], \quad h = \tanh(Hx + b_h), \quad p(w_t \mid \text{ctx}) = \mathrm{softmax}(Uh + Wx + b)
+x = [C[w_{t-n+1}];\ldots;C[w_{t-1}]], \quad h = \tanh(Hx + b_h), \quad p(w_t \mid \text{ctx}) = \text{softmax}(Uh + Wx + b)
 $$
 
-파라미터 수는 $O(|V|d + ndH + |V|H)$다. 같은 $n$의 N-gram이 모든 context를 저장하면 $O(|V|^n)$ — $|V|=10^4$, $n=5$이면 $10^{20}$ entries다. NLM은 약 $7 \times 10^6$개의 파라미터로 이 공간을 함수로 압축한다.
+$C \in \mathbb{R}^{|V| \times d}$는 embedding 행렬. One-hot의 $|V|$차원 직교 공간 대신, 각 단어가 $\mathbb{R}^d$의 dense vector로 표현된다. 핵심은 **unseen n-gram에 대한 일반화**다.
 
-<Theorem kind="proposition" number="1" title="Embedding의 Generalization">
-NLM은 unseen n-gram $(w_1, \ldots, w_n)$에 대해, 비슷한 embedding을 가진 seen n-gram $(w_1', \ldots, w_n')$이 있으면 비슷한 확률을 부여한다. 즉 LM 분포는 embedding space에서 Lipschitz continuous다.
+<Theorem kind="proposition" number="1" title="Curse of Dimensionality 완화">
+N-gram의 parameter 수는 $O(|V|^n)$. NLM의 parameter 수는 $O(|V|d + ndH + |V|H)$ — vocab size와 context length가 분리된다.
 </Theorem>
 
 <Proof>
-$|p_{\text{NLM}}(w_n \mid w_{1:n-1}) - p_{\text{NLM}}(w_n' \mid w_{1:n-1}')| \le L \sum_i \|C[w_i] - C[w_i']\|$. $L$은 $H, U$에 의존하는 Lipschitz 상수. NLM이 smooth function이기 때문에 비슷한 embedding의 context는 비슷한 출력 분포를 만든다. $\square$
+NLM은 $|V|^n$개의 가능한 context마다 별도 분포를 저장하지 않는다. Embedding의 합성 함수 $H, U$가 분포를 근사한다. 학습된 함수는 unseen n-gram에도 embedding 유사도를 통해 일반화된다. $|V| = 10^4$, $n = 4$, $d = 100$, $H = 200$ 기준: N-gram $10^{16}$ entries vs NLM $\approx 3 \times 10^6$ parameters. $\square$
 </Proof>
 
-그러나 NLM도 fixed window다. window 밖의 의존성은 볼 수 없다.
+그러나 NLM도 창문을 고정한다. $n = 5$면 4개 이전까지만 본다. "cat ... was" 같은 장거리 의존성은 여전히 모델링 불가능하다.
 
-## RNN: parameter sharing과 hidden state의 원리
+## RNN: 창문을 없애는 대신 state를 만든다
 
-RNN의 핵심 아이디어는 단순하다. 매 time step에서 **동일한 파라미터**로 새 입력과 직전 hidden state를 결합해 새 hidden state를 만든다.
+RNN의 recurrent 구조는 fixed window를 state machine으로 대체한다.
 
 $$
-h_t = \tanh(W_{hh}\, h_{t-1} + W_{xh}\, x_t + b_h), \qquad |\theta| = H^2 + HD + HO + H + O
+h_t = \tanh(W_{hh}\, h_{t-1} + W_{xh}\, x_t + b_h), \quad y_t = W_{hy}\, h_t + b_y
 $$
 
-파라미터 수는 sequence 길이 $T$와 무관하다. 이것이 N-gram, NLM과 근본적으로 다른 점이다. 길이 50으로 학습한 RNN을 길이 500짜리 sequence에 그대로 적용할 수 있다.
+두 가지 이점이 동시에 생긴다.
 
-```
-        x₁         x₂         x₃               x_T
-         │          │          │                  │
-         ▼          ▼          ▼                  ▼
-  h₀ → RNN  → h₁ → RNN  → h₂ → RNN  → h₃  →  RNN  → h_T
-```
+**첫째, parameter sharing.** $W_{hh}$와 $W_{xh}$는 모든 time step에서 공유된다. Parameter 수는 $H^2 + HD + HO + H + O$ — sequence length $T$와 무관하다. 길이 50으로 학습한 모델을 길이 500에 그대로 적용할 수 있다.
 
-unrolled graph를 보면 RNN은 가중치를 공유하는 $T$-layer feed-forward network와 동치다. forward 비용은 $O(T(H^2 + HD))$이고, backward를 위해 모든 $h_t$를 메모리에 보존해야 하므로 $O(TH)$ 메모리가 필요하다.
+**둘째, 이론적 무한 lookback.** $h_t$는 $x_1, \ldots, x_t$ 전체의 압축이다. Elman (1990)의 hidden state connection이 Jordan (1986)의 output connection보다 표준이 된 이유는 hidden dimension이 output dimension에 제약받지 않아 더 풍부한 표현이 가능하기 때문이다.
 
-$\tanh$ activation은 $\|h_t\|_\infty < 1$을 항상 보장한다. hidden state가 폭발하지 않는다는 의미다. 단, saturation 구간에서 gradient가 소멸한다는 다른 문제를 낳는다.
+그런데 "이론적 무한"에는 대가가 있다.
 
-## 트레이드오프: hidden state bottleneck과 학습의 한계
+<Theorem kind="lemma" number="2" title="Hidden State Bottleneck">
+$h_t$가 $x_{1:t}$의 정보를 lossless하게 보존하려면 $H \ge t \log_2 |\mathcal{X}|$가 필요하다 — 시간에 따라 선형 증가.
+</Theorem>
 
-RNN이 이론상 Turing-complete(Siegelmann & Sontag 1991)라는 사실과, 실제 학습에서 long-range dependency를 잡지 못한다는 사실은 공존한다. 표현력과 학습성은 다른 문제다.
+<Proof>
+Distinct sequence 수 $|\mathcal{X}|^t$를 구별하려면 $\log_2 |\mathcal{X}|^t$ bits가 필요하다. $h_t \in \mathbb{R}^H$의 finite precision에서 표현 가능한 sequence 수는 $2^H$에 비례한다. 따라서 lossless 보존에 $H \ge t \log_2 |\mathcal{X}|$. $\square$
+</Proof>
 
-<Callout type="warning" title="트레이드오프">
-Hidden state $h_t \in \mathbb{R}^H$가 $x_{1:t}$ 전체를 lossless하게 보존하려면 $H \ge t \log_2 |\mathcal{X}|$ bits가 필요하다 — $t$에 선형 비례. 고정된 $H$로는 시간이 길어질수록 정보 손실이 불가피하다. RNN은 **task-relevant 정보를 우선 보존**하도록 학습하지만, 거리가 먼 의존성은 학습 신호가 전달되기 전에 vanishing gradient로 소멸한다. 이것이 LSTM이 필요한 이유다.
+고정된 $H$는 결국 lossy compression이다. 학습이 task에 중요한 정보를 우선 보존하도록 유도할 뿐이다. 그리고 이 한계보다 실용적으로 더 치명적인 문제가 있다 — vanishing gradient. 이것이 LSTM의 동기가 되지만 그건 다음 이야기다.
+
+## 손실 함수의 설계 결정들
+
+sequence 학습의 task별 설계 결정을 관통하는 하나의 수식이 있다.
+
+$$
+\mathcal{L} = -\frac{\sum_{n,t} m^{(n)}_t \log p_\theta(y^{(n)}_t \mid x^{(n)}_{1:t})}{\sum_{n,t} m^{(n)}_t}
+$$
+
+$m^{(n)}_t \in \{0, 1\}$은 mask — padding 위치를 제외한다. 분모가 실제 token 수이므로 짧은 sequence의 loss가 padding으로 희석되는 편향이 사라진다.
+
+Many-to-one (감정 분석)은 $h_T$ 하나만 분류기에 넣는다. Many-to-many synced (POS tagging)는 매 step $h_t$를 분류한다. Seq2seq (번역)는 decoder의 autoregressive factorization을 따른다.
+
+$$
+p_\theta(y_{1:S} \mid x_{1:T}) = \prod_{s=1}^{S} p_\theta(y_s \mid y_{<s}, x_{1:T})
+$$
+
+이 factorization은 chain rule에서 직접 나온다 — 임의의 joint distribution에 적용되는 항등식이다. Autoregressive 모델은 이것을 학습하고, non-autoregressive 모델은 여기에 conditional independence 가정을 추가로 도입한다.
+
+<Callout type="warning" title="Teacher Forcing의 Exposure Bias">
+Training에서는 ground truth prefix $y^{\text{true}}_{<s}$를 쓰고, inference에서는 모델 예측 $\hat{y}_{<s}$를 쓴다. 오류가 누적되면 prefix가 점점 training distribution에서 멀어지고, 모델이 본 적 없는 영역에서 generalization이 무너진다. Scheduled sampling (Bengio 2015)은 학습 중 ground truth 비율을 1에서 0으로 점진적으로 낮춰 이를 완화한다.
 </Callout>
 
-Perplexity는 이 모든 모델을 동일한 척도로 비교할 수 있는 지표다.
+## 트레이드오프
 
-$$
-\mathrm{PP}(W) = \exp\!\left(-\frac{1}{T}\sum_{t=1}^T \log p_\theta(w_t \mid w_{<t})\right)
-$$
+이 장을 통틀어 나타나는 trade-off는 **표현력 vs 학습성**이다.
 
-N-gram 시대부터 사용된 이 지표는 $\log_2 \mathrm{PP} = H(p_{\text{emp}}, p_\theta)$로, 모델 분포와 데이터 분포 사이의 cross-entropy와 동일하다. unigram uniform 모델의 perplexity는 정확히 $|V|$다. 잘 학습된 LM은 $\mathrm{PP} \ll |V|$로, context가 가능한 단어를 좁혔다는 의미다.
+RNN의 universality — Siegelmann & Sontag (1991)의 Turing-completeness — 는 "표현 가능성"의 상한이지 "학습 가능성"의 보장이 아니다. Vanishing gradient가 long-range dependency의 학습을 차단하고, fixed precision이 information bottleneck을 실질적으로 만든다. MLP의 universal approximation theorem, Transformer의 universality도 같은 구조다: 표현력은 upper bound, 학습성은 별개의 문제다.
 
-<Aside label="진화의 흐름">
-N-gram → KN smoothing은 count 기반의 한계 안에서 최선이다. Bengio 2003은 embedding으로 sparsity를 우회했지만 window를 고정했다. RNN은 window를 열었지만 vanishing이 실질적 lookback을 제한했다. 이 세 한계가 각각 LSTM, Transformer, 그리고 현대 pretraining의 동기로 이어진다.
+<Aside label="설계 철학">
+N-gram → NLM → RNN의 진화는 각 단계에서 "이전 한계를 우회하는 더 강한 귀납 편향"을 도입한다. N-gram은 Markov 가정, NLM은 distributed representation, RNN은 parameter sharing과 recurrence. 그리고 매번 새로운 한계가 등장한다. LSTM은 RNN의 학습성 한계를 게이팅으로 우회한다.
 </Aside>
 
 ## 정리
 
-- Sequence 학습의 유형(many-to-one, many-to-many, seq2seq)이 출력 형태와 loss 설계를 결정한다. padding masking은 선택이 아니라 정확성의 필수 조건이다.
-- N-gram은 Markov 가정으로 tractable하지만 $O(|V|^n)$ sparsity와 고정 window라는 두 한계를 안고 있다. Kneser-Ney는 continuation count로 통계적 한계를 최대한 밀어붙였다.
-- Bengio 2003의 NLM은 embedding이 word similarity를 자동으로 인코딩한다는 통찰로 unseen n-gram에 generalize했다. 파라미터 수는 $O(|V|^n)$에서 $O(|V|d + ndH)$로 줄었다.
-- RNN의 parameter sharing은 모델 크기를 sequence 길이와 분리했다. 그러나 hidden state bottleneck과 vanishing gradient는 long-range dependency 학습을 실질적으로 막는다.
+- N-gram의 sparsity는 Kneser-Ney smoothing으로 완화되지만 표현력 한계 ($O(|V|^n)$ 비용)는 해결되지 않는다.
+- Bengio 2003 NLM은 embedding으로 parameter 수를 $O(|V|d + ndH)$로 줄이고 unseen n-gram 일반화를 얻지만 fixed window는 유지된다.
+- RNN은 parameter sharing으로 가변 길이를 처리하고 이론상 무한 lookback을 갖지만, hidden state는 lossy compression이고 vanishing gradient가 실질적 학습 범위를 제한한다.
+- Autoregressive factorization $\prod_s p(y_s \mid y_{<s}, x)$는 chain rule의 항등식이다. Teacher forcing은 이를 효율적으로 학습하지만 inference와의 distribution mismatch — exposure bias — 를 만든다.
 
-다음 글에서는 BPTT(Backpropagation Through Time)가 이 vanishing gradient를 어떻게 발생시키는지, 그리고 gradient norm이 time step에 따라 지수적으로 감소하는 메커니즘을 추적한다.
+다음 글에서는 BPTT (Backpropagation Through Time)가 어떻게 RNN의 gradient를 계산하는지, 그리고 그 계산 그래프에서 vanishing이 어떻게 발생하는지 수학적으로 추적한다.
 
 <Reference
   title="A Neural Probabilistic Language Model"
-  authors="Bengio, Y., Ducharme, R., Vincent, P., and Jauvin, C."
+  authors="Bengio et al."
   year={2003}
   venue="JMLR"
-  url="https://www.jmlr.org/papers/v3/bengio03a.html"
+  url="https://www.jmlr.org/papers/volume3/bengio03a/bengio03a.pdf"
 />

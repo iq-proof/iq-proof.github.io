@@ -1,9 +1,9 @@
 ---
-title: "Seq2Seq에서 Attention까지, 무엇이 달라졌나"
-description: "고정 벡터 병목부터 Bahdanau의 soft alignment, Luong의 효율화, Coverage와 Pointer Network까지 — RNN 기반 attention 계보의 설계 결정을 추적한다."
-pubDate: 2026-04-28
+title: "Attention은 어떻게 Seq2Seq의 병목을 뚫었는가"
+description: "Sutskever 2014의 고정 벡터 압축 문제부터 Bahdanau·Luong 어텐션의 설계 결정, 커버리지 메커니즘과 Pointer Network까지, 시퀀스 변환 아키텍처의 진화를 추적한다."
+pubDate: 2026-05-03
 category: ai
-tags: [seq2seq, attention, bahdanau, luong, pointer-network]
+tags: [seq2seq, attention, encoder-decoder, lstm, transformer]
 difficulty: advanced
 series:
   slug: rnn-lstm-deep-dive
@@ -19,121 +19,96 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-Sutskever 2014의 Seq2Seq는 번역·요약·대화를 하나의 틀로 묶었다. Encoder가 입력 전체를 하나의 벡터로 압축하고, Decoder가 그 벡터에서 출력을 뽑아낸다. 단순하고 우아하다. 그런데 문장이 30단어를 넘어서는 순간 BLEU가 무너지기 시작한다. 왜 이 구조는 긴 문장 앞에서 취약한가, 그리고 Attention은 이 문제를 어떻게 다르게 접근했는가?
+Sutskever 2014는 번역·요약·대화 같은 가변 길이 입출력 문제를 하나의 프레임워크로 통일했다. Encoder LSTM이 입력 전체를 고정 벡터 하나로 압축하고, Decoder LSTM이 그 벡터에서 출력을 autoregressive하게 생성한다. 그런데 이 설계에는 처음부터 균열이 있었다. 문장이 길어질수록 BLEU가 단조 감소한다는 사실을 Cho 2014b가 정량화했고, Bahdanau 2015가 어텐션으로 그 균열을 메웠다. 왜 고정 벡터 하나가 충분하지 않은가?
 
-## 고정 벡터의 병목
+## 고정 벡터의 압축 한계
 
-Encoder의 마지막 hidden state $v = h_T^{\text{enc}} \in \mathbb{R}^H$ 하나가 입력 전체의 정보를 담아야 한다. 이론적으로는 가능하다 — float32 기준 $H=1024$이면 약 32,768비트, 50단어 문장의 정보량($50 \times \log_2 30{,}000 \approx 750$ 비트)을 충분히 수용한다.
+Seq2Seq의 Encoder는 $x_{1:T}$ 전체를 $v = h_T^{\text{enc}} \in \mathbb{R}^H$ 한 벡터에 담는다. 이론적 capacity는 다음과 같다.
 
-문제는 용량이 아니라 최적화다. BPTT가 $h_1$에서 $h_T$까지 $T$ 스텝을 거슬러야 하는 탓에, 첫 번째 토큰의 정보가 $v$까지 도달하는 경로가 너무 길다. Cho 2014b는 이를 실증으로 보여줬다.
+$$
+T \log_2 |V| \quad \text{vs} \quad H \cdot \log_2(\text{precision})
+$$
 
-<Callout type="warning" title="Long Sentence Curse (Cho 2014b)">
-WMT'14 En→Fr에서 문장 길이가 30단어를 넘는 순간 BLEU가 급감한다. 길이 10 근방에서 BLEU 30이던 것이 길이 60에서 10 아래로 떨어진다. 이론적 용량이 아니라 학습 dynamics가 병목이다.
+$T = 50$, $|V| = 30{,}000$, $H = 1024$라면 입력 정보량은 약 750 bits, 벡터의 이론적 한계는 32,768 bits. 숫자만 보면 여유롭다. 그러나 Cho 2014b가 WMT'14 En→Fr에서 확인한 것은 이론이 아닌 현실이었다. 30단어를 넘기는 순간 BLEU가 급감하기 시작한다.
+
+<Callout type="warning" title="Long Sentence Curse">
+Capacity 자체는 충분하다. 병목은 정보이론적 한계가 아니라 최적화 한계다. BPTT의 vanishing gradient가 초반 토큰의 정보를 마지막 hidden state에 보존하지 못한다.
 </Callout>
 
-Decoder의 구조적 한계도 더해진다. 매 출력 스텝 $s_t$가 같은 $v$만 참조하므로, "번역의 첫 단어는 입력의 첫 단어 정보가 필요하다"는 단서를 활용할 수 없다. 용량은 충분하나 접근이 균등하다.
+Decoder의 모든 step이 같은 $v$ 하나만 참조한다는 점도 문제다. $s_1$이 필요한 정보와 $s_5$가 필요한 정보가 다르지만, 두 step은 동일한 벡터에서 정보를 꺼낸다. 위치별 선택적 접근이 불가능하다.
 
-Sutskever가 제안한 **역순 입력(reverse input trick)**은 이 문제의 일부를 해결한다. 입력을 $x_T, x_{T-1}, \ldots, x_1$ 순서로 넣으면 $v$가 원래 $x_1$에 가장 가까이 위치하게 되어, 번역의 첫 단어와 입력의 첫 단어 사이 경로가 단축된다. Sutskever 2014의 실험에서 +4.7 BLEU가 여기서 나왔다. 그러나 이것은 해결이 아니라 workaround다.
+## Bahdanau 어텐션 — 병목을 우회하는 구조
 
-## Bahdanau Attention — 병목을 우회하다
-
-Bahdanau 2015는 구조를 바꾼다. Encoder의 마지막 hidden만 쓰는 대신, **모든 encoder hidden state $\{h_1, \ldots, h_T\}$를 보존**하고, Decoder가 매 스텝마다 필요한 위치에 집중한다.
+Bahdanau 2015의 해법은 간단하다. Encoder의 마지막 hidden만 쓰지 말고, 모든 $h_1, \ldots, h_T$를 보존한 채 Decoder가 매 step마다 필요한 위치를 직접 골라 읽게 한다.
 
 $$
-e_{ij} = v^\top \tanh(W_1 h_i + W_2 s_j)
+e_{ij} = v^\top \tanh(W_1 h_i + W_2 s_j), \quad \alpha_{ij} = \mathrm{softmax}(e_{ij}), \quad c_j = \sum_i \alpha_{ij} h_i
 $$
 
-$$
-\alpha_{ij} = \frac{\exp(e_{ij})}{\sum_{k=1}^{T} \exp(e_{kj})}, \quad c_j = \sum_{i=1}^{T} \alpha_{ij} h_i
-$$
+capacity가 $H$에서 $T \cdot H$로 바뀐다. 더 중요한 것은 alignment를 별도로 레이블링할 필요 없이 end-to-end로 학습된다는 점이다. $\alpha_{ij}$는 학습의 부산물로 만들어지는 소프트 alignment 행렬이다.
 
-핵심은 capacity의 변화다. Vanilla Seq2Seq의 용량은 $O(H)$로 고정이지만, Attention의 유효 용량은 $O(T \cdot H)$다 — 문장이 길어질수록 함께 늘어난다.
-
-<Theorem kind="proposition" number="1" title="Attention의 용량 스케일링">
-Bahdanau attention에서 Decoder의 각 스텝은 모든 encoder state $\{h_i\}_{i=1}^T$에 접근 가능하다. 유효 용량은 $T \cdot H$로 입력 길이에 선형 비례한다.
+<Theorem kind="proposition" number="1" title="Soft Alignment의 미분 가능성">
+Softmax weighted sum $c_j = \sum_i \alpha_{ij} h_i$는 $\alpha_{ij}$와 $h_i$ 모두에 대해 미분 가능하므로, alignment 레이블 없이 번역 손실만으로 $W_1, W_2, v$를 학습할 수 있다.
 </Theorem>
 
 <Proof>
-Decoder step $j$의 context vector $c_j = \sum_i \alpha_{ij} h_i$는 $\alpha$의 값에 따라 임의의 $h_i$를 임의의 가중치로 조합할 수 있다. 따라서 $T$개의 $H$-차원 벡터 전체가 정보원이 된다. $\square$
+$\alpha_{ij} = \exp(e_{ij}) / \sum_k \exp(e_{kj})$이고 $e_{ij}$는 $W_1, W_2, v$의 연속 함수다. Weighted sum과 softmax는 모두 미분 가능하므로 chain rule이 $c_j$까지 연결된다. $\square$
 </Proof>
 
-또 다른 핵심은 **alignment가 학습된다는 점**이다. IBM 통계 번역 모델은 alignment를 별도 단계에서 EM으로 추정했다. Bahdanau는 $v, W_1, W_2$가 번역 손실 자체로 end-to-end 학습된다. "J'aime"를 출력할 때 "love"에 높은 $\alpha$를 부여하는 패턴이 alignment label 없이 나타난다.
+실증적으로 WMT'14 En→Fr에서 vanilla Seq2Seq + reverse trick의 BLEU 28.5가 Bahdanau attention으로 36.2까지 올랐다. 특히 50단어 이상 문장에서 회복 폭이 크다.
 
-WMT'14 En→Fr에서 Vanilla Seq2Seq + reverse 대비 +7.7 BLEU. 긴 문장에서의 개선이 특히 크다.
+## Luong 어텐션 — 효율과 Transformer로의 가교
 
-## Luong Attention — 효율화와 Transformer로의 다리
-
-Bahdanau의 additive attention은 표현력이 높지만 per-pair `tanh` 연산이 들어간다. Luong 2015는 세 가지 scoring 함수를 체계적으로 비교한다.
-
-$$
-e_{ij} = \begin{cases} h_i^\top s_j & \text{dot} \\ h_i^\top W_a s_j & \text{general} \\ v^\top \tanh(W_a [h_i; s_j]) & \text{concat} \end{cases}
-$$
-
-WMT'15 En→De 실험에서 **general scoring이 BLEU 25.9로 최우수**였다 — concat(Bahdanau 방식)과 동등하거나 약간 우월하면서도 계산이 빠르다. encoder state $W_K h_i$를 미리 계산해 재사용할 수 있기 때문이다.
-
-더 중요한 것은 Transformer와의 연결이다. Luong general을 저랭크 분해하면:
+Luong 2015는 scoring function을 체계적으로 비교했다.
 
 ```
-W = W_K^T W_Q 라 하면
-
-e_{ij} = h_i^T W_K^T W_Q s_j
-       = (W_K h_i)^T (W_Q s_j)
-       = K_i^T Q_j
+dot:      e_{ij} = h_i^T s_j
+general:  e_{ij} = h_i^T W s_j
+concat:   e_{ij} = v^T tanh(W [h_i; s_j])   ← Bahdanau
 ```
 
-여기에 $\sqrt{d_K}$ 정규화를 추가하면 정확히 Transformer의 scaled dot-product attention이 된다. Luong general은 Query/Key 분리의 직전 단계였다.
+WMT'15 En→De에서 general이 BLEU 25.9로 최우수였다. 그리고 이 general scoring은 Transformer로 이어지는 직접적 경로다.
+
+$$
+e_{ij} = h_i^\top W s_j \;\xrightarrow{\text{분해}}\; (W_K h_i)^\top (W_Q s_j) = K_i^\top Q_j \;\xrightarrow{\text{스케일}}\; \frac{K_i^\top Q_j}{\sqrt{d_K}}
+$$
+
+$W$를 $W_K^\top W_Q$로 저랭크 분해하면 query와 key가 분리되고, $\sqrt{d_K}$ 스케일링을 붙이면 Vaswani 2017의 scaled dot-product attention이 된다. Luong general은 Transformer attention의 수학적 전신이다.
 
 <Aside label="설계 계보">
-Bahdanau → Luong → Transformer의 각 스텝은 동일한 문제의 다른 해답이다. Bahdanau는 "병목 제거", Luong은 "효율화", Transformer는 "순차 의존성 자체를 제거". Reverse input trick이 workaround였다면, Attention은 fundamental fix였고, Transformer는 architectural rethink였다.
+Bahdanau additive → Luong multiplicative → Transformer scaled dot-product. 각 단계가 이전의 한계(비효율, 분산 폭발, 단일 헤드)를 명시적으로 해결한다. ML 아키텍처의 진화는 workaround에서 fundamental fix로, 그리고 구조적 재설계로 이어진다.
 </Aside>
 
-## Coverage와 Pointer — Attention의 두 확장
+## Coverage와 Pointer — 어텐션의 두 확장
 
-Attention이 도입되자 새로운 문제가 드러났다. 같은 source position을 반복해서 attend하면 번역이 반복된다. Tu 2016의 **Coverage mechanism**은 이력을 추적한다.
+어텐션이 표준이 된 이후에도 두 가지 문제가 남았다.
 
-$$
-c_j^{\text{cov}} = \sum_{j'=1}^{j} \alpha_{:,j'} \in \mathbb{R}^T
-$$
-
-누적된 coverage가 높은 위치는 scoring 시 패널티를 받는다. 이미 번역된 구간을 다시 번역하지 않도록 attention이 새 위치를 탐색하게 된다. WMT'14에서 +1.5 BLEU.
-
-Vinyals 2015의 **Pointer Network**는 다른 방향의 확장이다. TSP나 정렬 같은 조합 최적화에서는 출력이 입력의 인덱스다. 어휘 크기가 고정되지 않고 입력 길이 $T$에 따라 바뀐다.
+**반복 문제**: Decoder가 같은 source 위치를 계속 attend하면 동일 구절이 출력에 반복된다. Tu 2016의 coverage mechanism은 누적 어텐션을 추적해 이미 많이 본 위치에 페널티를 준다.
 
 $$
-p(y_t = i \mid y_{<t}, x) = \alpha_{ti}
+c_j^{\text{cov}} = \sum_{j'=1}^{j} \alpha_{:,j'}, \quad \mathcal{L}_{\text{cov}} = \sum_j \sum_i \min(\alpha_{ij},\, c_{i,j-1}^{\text{cov}})
 $$
 
-Attention weight 자체가 출력 확률이 된다. 입력이 5개이면 출력 어휘도 5개, 20개이면 20개 — 가변 크기를 자연스럽게 처리한다.
-
-See 2017의 **Pointer-Generator**는 둘을 결합한다. 추상적 요약에서 일반 단어는 어휘에서 생성하고, 고유명사나 희귀어는 source에서 직접 복사한다.
+**OOV 문제**: 고유명사·희귀어는 vocabulary에 없어 생성이 불가능하다. Vinyals 2015의 Pointer Network는 어텐션 가중치 자체를 출력 분포로 쓴다. $p(y_t = i) = \alpha_{ti}$이므로 출력 vocabulary가 입력 길이에 따라 동적으로 결정된다. See 2017의 Pointer-Generator는 이를 생성과 복사의 혼합으로 확장한다.
 
 $$
-p(y_t = w) = p_{\text{gen}} \cdot p_{\text{vocab}}(w) + (1 - p_{\text{gen}}) \cdot \sum_{i: x_i = w} \alpha_{it}
+p(y_t = w) = p_{\text{gen}} \cdot p_{\text{vocab}}(w) + (1 - p_{\text{gen}}) \cdot \sum_{i:\, x_i = w} \alpha_{it}
 $$
 
-$p_{\text{gen}}$은 학습이 자동으로 결정한다. CNN/Daily Mail 데이터셋에서 ROUGE-1 기준 +5. 이 copy mechanism의 정신은 현대 RAG(Retrieval-Augmented Generation)로 직접 이어진다 — 단일 문서에서 외부 지식 저장소 전체로 스케일이 바뀌었을 뿐이다.
+$p_{\text{gen}}$이 0에 가까우면 source에서 직접 복사하고, 1에 가까우면 vocabulary에서 생성한다. 이 아이디어는 현대 RAG(Retrieval-Augmented Generation)의 직계 조상이다. 외부 document store에서 passage를 retrieve해 LLM에 prepend하는 방식은 "단일 document에서의 copy"를 "수십억 토큰 규모의 retrieval"로 스케일업한 것이다.
 
-## 트레이드오프
-
-<Callout type="note" title="아키텍처별 트레이드오프">
-- **Vanilla Seq2Seq**: 단순하지만 긴 문장에서 정보 손실. Reverse trick은 workaround.
-- **Bahdanau**: 용량 $O(T \cdot H)$, 표현력 높음, additive per-pair 연산이 느림.
-- **Luong general**: Bahdanau와 동등한 품질, 행렬 pre-compute로 30-50% 빠름.
-- **Coverage**: 반복 번역 제거, 추가 파라미터와 loss term 필요.
-- **Pointer Network**: 가변 출력 어휘, 조합 최적화에 강함, 제약 조건 처리는 약함.
-- **Pointer-Generator**: OOV 해결, copy/generate 혼합으로 복잡도 증가.
+<Callout type="note" title="트레이드오프">
+소프트 어텐션은 미분 가능하고 학습이 안정적이지만, hard alignment constraint를 직접 표현하기 어렵다. Coverage는 반복을 줄이지만 creative generation task에서는 오히려 다양성을 억제할 수 있다. Pointer Network는 가변 크기 출력을 자연스럽게 처리하지만, 수백 도시 이상의 조합 최적화에서는 RL 기반 보강이 필요하다.
 </Callout>
-
-Luong의 Local attention은 또 다른 축이다. 전체 $T$ 위치 대신 예측된 중심 $p_j$ 주변 윈도우만 attend하면 복잡도가 $O(T^2 S)$에서 $O(T S D)$로 줄어든다($D \ll T$). BLEU는 약 0.5 손실되지만 긴 문서에서 속도 이득이 크다. Transformer 이후 Longformer, BigBird 등의 sliding window attention이 같은 아이디어를 계승한다.
 
 ## 정리
 
-- Seq2Seq의 고정 벡터 병목은 이론적 용량 문제가 아니라 최적화 문제다 — 경로가 길어 gradient가 소실된다.
-- Bahdanau attention은 용량을 $O(H)$에서 $O(T \cdot H)$로 늘리고, alignment를 end-to-end로 학습한다.
-- Luong general은 Bahdanau와 동등한 품질을 더 빠르게 달성하고, Query/Key 분리를 통해 Transformer의 직전 단계가 된다.
-- Coverage는 attention 이력으로 반복을 억제하고, Pointer-Generator는 copy mechanism으로 OOV를 해결한다. 두 아이디어는 현대 RAG 아키텍처에 계승된다.
+- Seq2Seq의 고정 벡터 병목은 information-theoretic 한계가 아니라 BPTT vanishing gradient라는 최적화 한계다.
+- Bahdanau 어텐션은 capacity를 $H$에서 $T \cdot H$로 늘리고 동시에 vanishing을 우회한다. Alignment는 학습의 부산물이다.
+- Luong general scoring은 저랭크 분해를 거쳐 Transformer의 query/key 분리로 이어진다.
+- Coverage와 Pointer-Generator는 어텐션의 두 가지 실용적 확장이며, 후자의 copy mechanism은 현대 RAG까지 이어진다.
 
-이 계보에서 각 논문은 이전 논문의 "정확한 진단" 위에서 나왔다. Cho가 병목을 진단하고 Bahdanau가 해결했고, Luong이 효율화하고 Vaswani가 RNN 자체를 교체했다. 문제를 정확히 이름 붙이는 것이 해결의 절반이다.
+각 아키텍처 변경의 배경에는 명확하게 진단된 문제가 있었다. 진단의 정확함이 해법의 속도를 결정했다.
 
 <Reference
   title="Neural Machine Translation by Jointly Learning to Align and Translate"
@@ -141,4 +116,12 @@ Luong의 Local attention은 또 다른 축이다. 전체 $T$ 위치 대신 예�
   year={2015}
   venue="ICLR"
   url="https://arxiv.org/abs/1409.0473"
+/>
+
+<Reference
+  title="Sequence to Sequence Learning with Neural Networks"
+  authors="Sutskever, Vinyals, Le"
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1409.3215"
 />

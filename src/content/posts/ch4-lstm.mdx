@@ -1,9 +1,9 @@
 ---
-title: "LSTM은 어떻게 기억하는가 — CEC에서 GRU까지"
-description: "Vanishing gradient의 근본 원인부터 Constant Error Carousel의 수학적 증명, forget bias 초기화의 결정적 효과, GRU의 단순화까지 — LSTM 설계 철학의 전체 흐름을 추적한다."
-pubDate: 2026-04-28
+title: "LSTM은 어떻게 vanishing gradient를 피하는가"
+description: "Hochreiter 1997의 CEC 비전부터 forget gate 초기화, GRU의 단순화, variants의 ablation 결과까지 — LSTM 설계 철학의 핵심을 추적한다."
+pubDate: 2026-05-03
 category: ai
-tags: [lstm, rnn, vanishing-gradient, gru, sequence-modeling]
+tags: [lstm, rnn, vanishing-gradient, gru, sequence-model]
 difficulty: advanced
 series:
   slug: rnn-lstm-deep-dive
@@ -19,21 +19,28 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-Plain RNN의 gradient는 시간을 거슬러 올라갈수록 지수적으로 사라진다. Hochreiter & Schmidhuber 1997은 이 문제의 근본 원인이 **곱셈적 Jacobian 누적**이라는 것을 진단했고, 그 해법으로 LSTM을 설계했다. 왜 additive update가 vanishing을 막는가? 그리고 이 원리가 GRU와 현대 아키텍처로 어떻게 이어지는가?
+Plain RNN의 gradient는 시간 축을 거슬러 올라갈수록 행렬 곱의 거듭제곱으로 소멸한다. LSTM은 이 구조를 부수는 대신, 곱셈적 누적을 덧셈적 누적으로 바꾼다. 어떻게? 그리고 그 선택이 만든 trade-off는 무엇인가?
 
-## Plain RNN의 문제 — 곱이 쌓인다
+## 문제의 뿌리: 행렬 곱의 지수적 붕괴
 
-BPTT에서 $T$ step을 거슬러 올라가는 gradient는 다음 형태를 띤다.
+Plain RNN의 BPTT gradient는 다음 형태를 가진다.
 
 $$
-\frac{\partial h_T}{\partial h_0} = \prod_{t=1}^{T} W_{hh}^\top \,\mathrm{diag}(\sigma'(z_t))
+\frac{\partial h_T}{\partial h_0} = \prod_{j=1}^{T} W_{hh}^\top \mathrm{diag}(\sigma'(z_j))
 $$
 
-각 step마다 $W_{hh}$의 spectral radius $\rho$가 곱해진다. $\rho < 1$이면 gradient는 $\rho^T$로 지수 감쇠하고, $\rho > 1$이면 폭발한다. $\rho = 1$은 이론적으로 균형점이지만 학습으로 유지하기 불가능에 가깝다.
+spectral radius $\rho < 1$이면 $T$가 커질수록 이 곱은 지수적으로 0에 수렴한다. $\rho = 0.9$, $\sigma' \approx 0.5$라면 $T = 100$ 후 gradient norm은 $(0.9 \times 0.5)^{100} \approx 10^{-30}$이다. float32의 정밀도 한계($10^{-8}$)를 훨씬 밑돈다.
 
-핵심 통찰은 단순하다. **곱셈적 누적이 문제라면, 덧셈적 누적으로 바꾸면 된다.**
+핵심 통찰은 단순하다. 곱셈적 누적이 문제라면, **덧셈적 누적**으로 바꾸면 된다.
 
-## Constant Error Carousel — 덧셈으로 gradient를 보존하다
+$$
+c_t = c_{t-1} + (\text{new info})
+\implies \frac{\partial c_t}{\partial c_{t-1}} = 1
+$$
+
+이것이 Hochreiter & Schmidhuber 1997의 **Constant Error Carousel(CEC)** 비전이다.
+
+## CEC: 덧셈이 gradient를 보존한다
 
 LSTM의 cell state update는 다음과 같다.
 
@@ -41,85 +48,93 @@ $$
 c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t
 $$
 
-이 수식의 핵심은 $c_{t-1}$이 **직접** 더해진다는 점이다. $f_t$, $i_t$, $\tilde{c}_t$는 모두 $h_{t-1}$과 $x_t$의 함수이지 $c_{t-1}$을 직접 참조하지 않는다.
+여기서 $f_t, i_t, \tilde{c}_t$는 모두 $h_{t-1}$과 $x_t$의 함수이며, $c_{t-1}$에 **직접** 의존하지 않는다. 따라서 direct partial derivative는 다음과 같이 단순화된다.
 
-<Theorem kind="theorem" number="1" title="CEC — Direct Partial Derivative">
-LSTM cell update $c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$에서 $c_{t-1}$에 대한 direct partial derivative는 다음과 같다.
+<Theorem kind="theorem" number="1" title="Cell-to-Cell Direct Partial">
 
 $$
-\frac{\partial c_t}{\partial c_{t-1}}\bigg|_{\text{direct}} = f_t
+\frac{\partial c_t}{\partial c_{t-1}}\bigg|_{\text{direct}} = f_t \quad \text{(element-wise)}
 $$
 
-(element-wise scalar)
 </Theorem>
 
 <Proof>
-$f_t = \sigma(W_f [h_{t-1}; x_t] + b_f)$, $i_t$, $\tilde{c}_t$는 모두 $h_{t-1}$과 $x_t$만을 직접 참조한다. $c_{t-1}$에 직접 의존하는 항은 $f_t \odot c_{t-1}$뿐이다. 따라서 $\partial(f_t \odot c_{t-1})/\partial c_{t-1} = f_t$이고, 나머지 항의 direct partial은 0이다. $\square$
+
+$c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$에서 $f_t, i_t, \tilde{c}_t$는 $c_{t-1}$에 직접 의존하지 않는다. 따라서 $\partial(i_t \odot \tilde{c}_t)/\partial c_{t-1}\big|_{\text{direct}} = 0$이고, 첫 항의 direct partial만 남는다.
+
+$$
+\frac{\partial(f_t \odot c_{t-1})}{\partial c_{t-1}} = f_t \qquad \square
+$$
+
 </Proof>
 
-Chain rule을 $T$ step에 적용하면 cell path의 gradient는 matrix product가 아닌 **element-wise scalar product**로 단순화된다.
+chain rule을 $T$ step 전체에 적용하면 cell path의 gradient product는 행렬 곱이 아닌 element-wise scalar 곱이 된다.
 
 $$
 \frac{\partial c_T}{\partial c_0}\bigg|_{\text{cell path}} = \prod_{t=1}^{T} f_t
 $$
 
-$f_t \approx 1$이면 이 곱도 $\approx 1$이다. Hochreiter는 이것을 **Constant Error Carousel(CEC)**이라 불렀다 — 정보가 carousel처럼 cell 안을 순환하며 보존된다.
-
-Plain RNN과의 차이는 극단적이다. $\rho = 0.9$, $\sigma' = 0.5$인 plain RNN은 100 step 후 gradient가 $(0.45)^{100} \approx 10^{-35}$로 사라진다. $f = 0.99$인 LSTM cell은 같은 시점에 $0.99^{100} \approx 0.37$을 유지한다.
+$f_t \approx 1$이면 이 곱은 $1^T = 1$이다. 어떤 $T$에서도 gradient가 보존된다. Plain RNN의 $10^{-30}$과 LSTM($f = 0.99$)의 $0.99^{100} \approx 0.37$의 차이는 $10^{29}$배다.
 
 <Aside label="주의">
-LSTM의 **hidden state** $h_t = o_t \odot \tanh(c_t)$는 여전히 matrix를 통한 recurrent path를 갖는다. Vanishing은 cell path에서만 해결된다. hidden path는 여전히 spectral radius의 영향을 받는다. LSTM의 효과는 cell이 long-term을, hidden이 short-term context를 분담하는 **분업 구조**에서 온다.
+이 결과는 cell state **직접 경로**에만 성립한다. hidden state $h_t = o_t \odot \tanh(c_t)$의 경로는 여전히 행렬 곱을 통과하므로 vanishing이 잔존할 수 있다. LSTM의 효과는 cell이 장기 기억을, hidden이 단기 맥락을 분담하는 구조에서 나온다.
 </Aside>
 
-## 4개의 Gate — 왜 이 형태인가
+## 4개 gate의 역할 분담
 
-순수한 additive update $c_t = c_{t-1} + W x_t$는 CEC를 만족하지만 세 가지 문제를 갖는다. 모든 입력이 무조건 누적되고, 오래된 정보를 지울 수 없으며, cell이 unbounded하게 성장한다.
-
-LSTM은 sigmoid gate 3개로 이를 해결한다.
+단순한 additive update만으로는 부족하다. "선택성"이 없으면 모든 입력이 무한 누적되고, 불필요한 정보를 지울 수도 없다. LSTM은 여기에 gate를 도입한다.
 
 $$
 \begin{aligned}
-f_t &= \sigma(W_f [h_{t-1}; x_t] + b_f) & \text{forget: 이전 cell 보존?} \\
-i_t &= \sigma(W_i [h_{t-1}; x_t] + b_i) & \text{input: 새 정보 받아들임?} \\
-\tilde{c}_t &= \tanh(W_c [h_{t-1}; x_t] + b_c) & \text{candidate: 어떤 새 정보?} \\
-o_t &= \sigma(W_o [h_{t-1}; x_t] + b_o) & \text{output: cell의 어느 부분 노출?} \\
+f_t &= \sigma(W_f [h_{t-1}; x_t] + b_f) & \text{(forget: 이전 cell 보존?)} \\
+i_t &= \sigma(W_i [h_{t-1}; x_t] + b_i) & \text{(input: 새 정보 수용?)} \\
+\tilde{c}_t &= \tanh(W_c [h_{t-1}; x_t] + b_c) & \text{(candidate: 어떤 새 정보?)} \\
+o_t &= \sigma(W_o [h_{t-1}; x_t] + b_o) & \text{(output: cell을 얼마나 노출?)}
+\\
 c_t &= f_t \odot c_{t-1} + i_t \odot \tilde{c}_t \\
 h_t &= o_t \odot \tanh(c_t)
 \end{aligned}
 $$
 
-sigmoid는 $[0, 1]$으로 "양(degree)"을 제어하고, tanh는 $[-1, 1]$로 "값(value)"을 표현한다. 정보의 선택과 내용이 분리된다.
+sigmoid gate는 "얼마나"(degree)를, tanh는 "어떤 값"(signed magnitude)을 담당한다. 두 역할이 분리되어야 gate가 정보의 양과 내용을 독립적으로 제어할 수 있다.
 
-Greff et al. 2017의 대규모 ablation 실험은 이 구조가 놀랍도록 robust함을 보인다. NIG(no input gate)와 NOG(no output gate)만이 큰 성능 손실을 유발했고, 나머지 변형(peephole, coupled gates 등)은 모두 marginal했다.
+파라미터 수는 $4H(D + H + 1)$로 plain RNN의 4배다. 학습 비용이 늘지만, 이 비용이 long-range dependency 해결 능력을 산다.
 
-<Callout type="note" title="트레이드오프">
-Vanilla LSTM은 RNN 대비 **4배의 파라미터** ($4H(D+H+1)$)를 요구한다. 이 비용은 long-range dependency 학습 능력으로 돌아온다. 단, cell state path만 vanishing이 해결되고 hidden path는 여전히 취약하다는 점, 그리고 sequential 처리로 GPU 병렬화가 제한된다는 점은 명확한 한계다.
-</Callout>
+## Forget Bias 초기화: 학습 시작의 결정적 차이
 
-## Forget Bias = 1 — 학습의 cold start를 막다
+CEC는 수학적으로 gradient 보존을 보장하지만, **학습 초기**에도 그 보장이 작동해야 한다. 여기서 Jozefowicz et al. 2015의 핵심 발견이 등장한다.
 
-CEC의 수학이 옳더라도 **학습이 시작되는 시점**이 critical하다. PyTorch의 기본값은 $b_f = 0$으로, 이때 $f_t \approx \sigma(0) = 0.5$다. 100 step 후 initial gradient는 $0.5^{100} \approx 10^{-30}$ — float32 정밀도의 한계($10^{-8}$)를 훨씬 밑돌아 학습이 사실상 멈춘다.
+학습 시작 시 weight가 small random값이라면 $W_f \cdot [h, x] \approx 0$이므로 forget gate는 bias에 의해 결정된다.
 
-$b_f = 1$로 설정하면 초기 $f_t \approx \sigma(1) = 0.73$이 되고, 같은 100 step에서 gradient는 $0.73^{100} \approx 10^{-13}$으로 측정 가능한 수준을 유지한다. 비율은 $1.46^{100} \approx 10^{17}$배다.
+| $b_f$ | $\sigma(b_f)$ | $T=100$ 후 cell gradient |
+|-------|---------------|--------------------------|
+| **0** (PyTorch default) | 0.500 | $\approx 10^{-30}$ |
+| **1** (Jozefowicz 권장) | 0.731 | $\approx 10^{-13}$ |
+| **2** | 0.881 | $\approx 10^{-5.5}$ |
 
-Jozefowicz et al. 2015는 이 단순한 변경이 $T = 200$ Adding Problem에서 학습 가능 여부를 **binary**하게 결정함을 보였다. PyTorch에서 적용하는 방법은 다음과 같다.
+$b_f = 0$이면 초기 forget gate가 0.5 — plain RNN과 거의 같은 vanishing이 발생한다. $b_f = 1$은 이를 $10^{16}$배 개선하여 cold start를 회피한다. 설정 방법은 간단하다.
 
 ```python
-def set_forget_bias(lstm, value=1.0):
-    for layer in range(lstm.num_layers):
-        bias_ih = getattr(lstm, f'bias_ih_l{layer}')
-        bias_hh = getattr(lstm, f'bias_hh_l{layer}')
-        H = bias_ih.size(0) // 4
+def set_forget_bias(lstm_module, value=1.0):
+    for i in range(lstm_module.num_layers):
+        H = lstm_module.hidden_size
+        bias_ih = getattr(lstm_module, f'bias_ih_l{i}')
+        bias_hh = getattr(lstm_module, f'bias_hh_l{i}')
         with torch.no_grad():
+            # PyTorch order: i, f, g, o
             bias_ih[H:2*H].fill_(value)
             bias_hh[H:2*H].fill_(0.0)
 ```
 
-PyTorch의 LSTM bias 순서는 `[i, f, g, o]`이므로 forget gate는 인덱스 `H:2H`에 해당한다.
+<Callout type="warning" title="PyTorch default의 함정">
+`nn.LSTM`의 forget bias default는 0이다. 이 값은 long-range task에서 학습 실패의 원인이 된다. LSTM을 쓰는 모든 코드에 `set_forget_bias(lstm, 1.0)`을 추가하는 것이 best practice다.
+</Callout>
 
-## GRU — 같은 정신, 더 단순한 형태
+## GRU: 75%의 파라미터로 같은 역할
 
-Cho et al. 2014의 GRU는 LSTM의 핵심 정신을 2개의 gate로 압축한다.
+Cho et al. 2014의 GRU는 질문 하나에서 출발한다. "4개 gate가 모두 필요한가?"
+
+GRU는 cell state와 hidden state를 통합하고, forget/input gate를 coupled update gate $z_t$로 단순화한다.
 
 $$
 \begin{aligned}
@@ -130,33 +145,51 @@ h_t &= (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t
 \end{aligned}
 $$
 
-update gate $z_t$는 LSTM의 forget gate와 input gate를 **coupled**한 형태다 — $f_t = 1 - z_t$, $i_t = z_t$에 해당한다. cell state와 hidden state의 분리도 없앴다.
+$z_t = 0$이면 $h_t = h_{t-1}$ (완전 보존), $z_t = 1$이면 $h_t = \tilde{h}_t$ (완전 교체). GRU의 $1 - z_t$는 LSTM의 forget gate에, $z_t$는 input gate에 대응한다. 단지 두 gate가 합이 1이 되도록 coupled되어 있을 뿐이다.
 
-cell path의 direct gradient는 $\partial h_t / \partial h_{t-1}|_{\text{direct}} = 1 - z_t$로, LSTM의 $f_t$와 정확히 대응한다. CEC의 원리가 동일하게 적용된다.
+reset gate $r_t$는 LSTM에 없는 메커니즘이다. candidate를 계산할 때 이전 hidden의 일부를 무시하는 "fresh start" 능력을 제공한다. 이는 topic shift나 문장 경계처럼 context를 끊어야 하는 상황에서 유리하다.
 
-파라미터는 LSTM의 75%($3H(D+H+1)$)이고, Chung et al. 2014의 체계적 비교에서 폴리포닉 음악 모델링 등 여러 task에서 동등한 성능을 보였다. universal 우열은 없고 task에 따라 선택이 달라진다.
+결과는 파라미터 수 $3H(D+H+1)$ — LSTM의 75%다. Chung et al. 2014의 empirical 비교는 GRU와 LSTM이 대부분의 task에서 comparable 성능을 보임을 보였다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프 요약">
+
+| | Plain RNN | LSTM | GRU |
+|---|---|---|---|
+| **Gradient** | 행렬 곱, exponential 소멸 | element-wise 곱, 보존 가능 | element-wise, LSTM과 유사 |
+| **파라미터** | $H(D+H+1)$ | $4\times$ RNN | $3\times$ RNN |
+| **Long-range** | 사실상 불가 | 가능 ($f \approx 1$ 유지 시) | 가능 (comparable) |
+| **속도** | 빠름 | 느림 | LSTM보다 ~30% 빠름 |
+| **해석성** | 낮음 | cell/hidden 분리로 높음 | 통합 state로 낮음 |
+
+</Callout>
+
+Greff et al. 2017의 *LSTM: A Search Space Odyssey*는 8가지 LSTM variant를 ablation한 결과, 놀랍게도 vanilla LSTM이 가장 robust했다고 보고한다. input gate를 제거하면 PTB perplexity가 84.7에서 92.3으로 오른다. forget gate 제거는 88.5, output gate 제거는 89.1. 반면 peephole이나 coupled gate(CIFG)는 marginal 차이만 낸다.
+
+이 결과는 역설처럼 보인다 — vanilla LSTM이 내부적으로 optimal이라면 왜 Transformer가 이를 대체했는가? 답은 scale이 다른 문제다. Greff 2017은 **RNN family 내부**의 비교다. Transformer는 RNN framework 자체를 버리고 sequential dependency를 attention으로 대체했다. $O(T)$ sequential 계산을 $O(\log T)$ parallel 계산으로 바꾼 것이 2017 이후의 패러다임 전환이다.
 
 ## 정리
 
-- Plain RNN의 vanishing은 Jacobian의 **matrix product 누적**이 근본 원인이다.
-- LSTM의 cell update는 이를 **element-wise scalar product**로 바꾼다. $\partial c_t / \partial c_{t-1} = f_t$ — CEC의 핵심.
-- $f_t \approx 1$이 되도록 **forget bias = 1**로 초기화하면 cold start를 막고 long-range gradient를 학습 초기부터 살린다.
-- GRU는 같은 additive update 철학을 2개의 gate로 구현하며, 파라미터를 25% 절약한다.
+- Plain RNN의 gradient는 행렬 곱의 지수적 소멸로 무너진다. LSTM의 cell state는 이를 element-wise 곱으로 바꿔 보존한다.
+- CEC의 보장은 수학적이지만, 실제 학습에서는 forget bias $b_f = 1$ 초기화가 cold start를 막는 결정적 조건이다.
+- GRU는 LSTM의 75% 파라미터로 comparable 성능을 낸다. resource 제약이 있거나 데이터가 적을 때 GRU가 합리적 선택이다.
+- vanilla LSTM의 4-gate 구조는 RNN family 내에서 remarkably robust하다. Transformer의 우위는 다른 차원의 문제다.
 
-LSTM의 모든 설계 결정은 하나의 원칙으로 수렴한다 — **곱셈을 덧셈으로 바꿔 gradient를 시간 축에서 보존하라**. ResNet의 residual connection, Transformer의 layer-wise additive update, Mamba의 selective SSM까지, 이 원칙의 변주가 현대 아키텍처 전반에 흐른다.
+LSTM과 Transformer의 관계는 '더 나은 같은 것'이 아니라 '다른 것'이다. 그리고 2023년 Mamba의 등장은 linear recurrence라는 이름으로 LSTM의 핵심 통찰이 다시 살아났음을 보여준다.
 
 <Reference
   title="Long Short-Term Memory"
-  authors="Hochreiter, S. & Schmidhuber, J."
+  authors="Hochreiter, S. and Schmidhuber, J."
   year={1997}
   venue="Neural Computation"
   url="https://www.bioinf.jku.at/publications/older/2604.pdf"
 />
 
 <Reference
-  title="An Empirical Exploration of Recurrent Network Architectures"
-  authors="Jozefowicz, R., Zaremba, W. & Sutskever, I."
-  year={2015}
-  venue="ICML"
-  url="http://proceedings.mlr.press/v37/jozefowicz15.pdf"
+  title="An Empirical Evaluation of Gated Recurrent Neural Networks on Sequence Modeling"
+  authors="Chung, J., Gulcehre, C., Cho, K., and Bengio, Y."
+  year={2014}
+  venue="NIPS 2014 Workshop"
+  url="https://arxiv.org/abs/1412.3555"
 />
