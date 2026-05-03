@@ -1,0 +1,177 @@
+---
+title: "Pipeline Bubble은 어떻게 줄어드는가"
+description: "Naive pipeline의 (P-1)/P idle ratio부터 GPipe, 1F1B, Interleaved, Chimera까지 — bubble 감소 4세대의 수학적 전개와 메모리 트레이드오프를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [pipeline-parallelism, distributed-training, bubble, megatron-lm]
+difficulty: advanced
+series:
+  slug: distributed-training-deep-dive
+  title: Distributed Training Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+단일 GPU 메모리를 초과하는 모델을 학습하려면 레이어를 여러 GPU에 분할해야 한다. 문제는 레이어 간에 의존성이 존재한다는 것 — GPU 0이 끝나야 GPU 1이 시작할 수 있다. 이 순차 의존성이 만들어내는 idle time을 **bubble**이라 부른다. 4세대에 걸친 스케줄링 알고리즘이 이 bubble을 어떻게 줄여왔는가?
+
+## Naive Pipeline의 Bubble
+
+$P$개 GPU에 레이어를 균등 분할하고 단일 mini-batch를 순차 처리하면, 매 시점에 정확히 하나의 GPU만 활성화된다.
+
+```
+Time:  0  1  2  3  4  5  6  7   (P=4)
+GPU 0: F  .  .  .  B  .  .  .
+GPU 1: .  F  .  .  .  B  .  .
+GPU 2: .  .  F  .  .  .  B  .
+GPU 3: .  .  .  F  .  .  .  B
+```
+
+<Theorem kind="theorem" number="1" title="Naive Pipeline Bubble">
+단일 mini-batch를 $P$개 stage로 순차 처리할 때, GPU idle ratio는 다음과 같다.
+
+$$
+\text{Bubble ratio} = \frac{P-1}{P}
+$$
+
+따라서 effective throughput은 이상적 병렬화의 $1/P$에 불과하다.
+</Theorem>
+
+<Proof>
+총 시간 $= P(t_F + t_B)$. 각 GPU의 active time $= t_F + t_B$. 각 GPU의 idle time $= (P-1)(t_F + t_B)$. 전체 idle ratio $= P(P-1)(t_F+t_B) / P \cdot P(t_F+t_B) = (P-1)/P$. $\square$
+</Proof>
+
+$P=8$이면 87.5% bubble이다. 8대의 GPU를 빌려 1대 분량의 계산을 하는 셈이다.
+
+## GPipe — Micro-batching으로 Bubble을 희석한다
+
+GPipe (Huang et al., 2019)의 핵심 아이디어는 단순하다. Mini-batch를 $M$개 micro-batch로 쪼개 파이프라인에 연속으로 흘려보내면, GPU간 의존성을 더 세밀하게 겹칠 수 있다.
+
+```
+Time:  0  1  2  3  4  5  6  7  8  9 10 11 12 13   (P=4, M=4)
+GPU 0: F1 F2 F3 F4 B1 B2 B3 B4  .  .  .  .  .  .
+GPU 1:  . F1 F2 F3 F4 B1 B2 B3 B4  .  .  .  .  .
+GPU 2:  .  . F1 F2 F3 F4 B1 B2 B3 B4  .  .  .  .
+GPU 3:  .  .  . F1 F2 F3 F4 B1 B2 B3 B4  .  .  .
+```
+
+<Theorem kind="theorem" number="2" title="GPipe Bubble Ratio">
+$M$개 micro-batch로 분할한 경우, bubble ratio는 다음과 같다.
+
+$$
+\text{Bubble ratio}_{\text{GPipe}} = \frac{P-1}{P-1+M}
+$$
+</Theorem>
+
+<Proof>
+총 시간 $= 2(M+P-1)$. 각 GPU의 active time $= 2M$. Idle time per GPU $= 2(P-1)$. Idle ratio $= 2(P-1)/2(M+P-1) = (P-1)/(P-1+M)$. $\square$
+</Proof>
+
+$M \to \infty$이면 bubble $\to 0$이다. 실용적 선택은 $M \approx 4P$ — 이때 bubble은 20% 미만이다.
+
+대가가 있다. GPipe는 모든 $M$개 micro-batch의 forward를 완료한 후 backward를 시작한다. 이 "all-forward-then-backward" 구조는 backward 직전까지 모든 activation을 메모리에 보유해야 한다 — **activation memory $O(M)$**.
+
+## 1F1B — 같은 Bubble, 절약된 메모리
+
+PipeDream (Narayanan et al., 2019)의 1F1B(1-Forward-1-Backward) schedule은 forward와 backward를 교대로 실행한다. 각 GPU가 한 micro-batch의 forward를 끝내면 가능한 가장 빠른 시점에 이전 micro-batch의 backward를 실행한다.
+
+<Theorem kind="theorem" number="3" title="1F1B Activation Memory">
+1F1B schedule 하에서 각 stage의 activation memory는 다음과 같다.
+
+$$
+\text{Activation memory}_{\text{1F1B}} = O(P \times A)
+$$
+
+여기서 $A$는 micro-batch당 activation 크기다.
+</Theorem>
+
+<Proof>
+GPU $i$가 forward $m_j$를 수행하면 (시간 $t = j+i$), 해당 activation은 GPU $i$에서 backward $m_j$가 실행될 때 (시간 $t = M+P-1+j+i$)까지 보유된다. 이 duration 동안 GPU $i$가 동시에 보유하는 micro-batch 수는 최대 $P$개 (dependency chain 깊이에 의해 제한된다). $\square$
+</Proof>
+
+Bubble ratio는 GPipe와 동일하다 — $(P-1)/(P-1+M)$. Timeline의 총 길이가 $2(M+P-1)$로 같고 각 GPU의 active time도 $2M$으로 같기 때문이다. 1F1B의 기여는 bubble 감소가 아니라 **activation memory를 $O(M)$에서 $O(P)$로 줄인 것**이다. $M \gg P$인 대규모 학습에서 이 차이는 수십 GB에 달한다.
+
+<Callout type="note" title="트레이드오프: GPipe vs 1F1B">
+GPipe는 구현이 단순하고 staleness가 없다. 대신 activation memory가 $O(M)$으로 micro-batch 수에 비례한다. 1F1B는 activation memory를 $O(P)$로 제한하지만 forward-backward 교대 스케줄링이 더 복잡하다. 두 방식 모두 bubble ratio는 $(P-1)/(P-1+M)$으로 동일하다.
+</Callout>
+
+## Interleaved 1F1B — 한 GPU가 여러 Stage를 맡는다
+
+1F1B의 한계는 파이프라인 깊이 $P$에 있다. GPT-3 (96 레이어, $P=48$)에서 bubble은 $(48-1)/(48-1+M) = 47/(47+M)$이다. 이를 20% 미만으로 낮추려면 $M > 235$가 필요하고, 이는 activation memory 급증으로 이어진다.
+
+Megatron-LM (Narayanan et al., 2021)의 Interleaved 1F1B는 다른 접근을 취한다. 각 physical GPU가 $V$개 **virtual stage**를 담당하게 한다. Physical GPU 8대에 $V=4$를 적용하면 total depth $P = V \times 8 = 32$가 된다.
+
+$$
+\text{Bubble ratio}_{\text{Interleaved}} = \frac{V \cdot n_{\text{gpu}} - 1}{V \cdot n_{\text{gpu}} - 1 + M}
+$$
+
+$V$를 높일수록 bubble은 낮아진다. 대가는 **activation memory $O(V \cdot P)$** — virtual stage당 레이어가 늘어나는 만큼 메모리도 증가한다.
+
+```
+# P_simple = 8GPUs, 1F1B: bubble = 7/(7+M)
+# Interleaved V=4, P_eff = 32: bubble = 31/(31+M)
+# 실제 bubble 비교 (M=32 기준):
+# 1F1B:        7/39  ≈ 17.9%
+# Interleaved: 31/63 ≈ 49.2%  ← 더 나쁘다?
+```
+
+역설적으로 보이지만, Interleaved는 **같은 GPU 수로 더 큰 모델을 수용**할 때 의미 있다. 단순 1F1B로는 올릴 수 없는 96레이어 모델을 8 GPU에 올리면서, micro-batch $M$을 충분히 키워 bubble을 관리하는 전략이다.
+
+## Chimera — Bubble을 기하학적으로 반감시킨다
+
+Li & Hoefler (2021)의 Chimera는 근본적으로 다른 접근을 취한다. Stage 0에서만 micro-batch를 주입하는 단방향 파이프라인 대신, **stage 0과 stage $P-1$ 양쪽에서 동시에 micro-batch를 주입**한다.
+
+양쪽에서 동시에 파이프라인이 시작되면, warm-up과 cold-down이 절반으로 단축된다. 이론적 bubble은 다음과 같다.
+
+$$
+\text{Bubble ratio}_{\text{Chimera}} \approx \frac{P-1}{2(P-1)+M}
+$$
+
+$P=8, M=4P=32$일 때 비교하면:
+
+| 방식 | Bubble ratio |
+|------|-------------|
+| 1F1B | $7/39 \approx 17.9\%$ |
+| Chimera | $7/46 \approx 15.2\%$ |
+
+수치만 보면 개선폭이 작아 보인다. 실제 이점은 **동일한 bubble을 절반의 $M$으로 달성**할 수 있다는 데 있다 — 즉 activation memory 압박이 줄어든다.
+
+<Callout type="warning" title="Chimera의 현실적 한계">
+양방향 파이프라인을 위해 각 GPU는 두 파이프라인의 activation을 동시에 보유해야 한다 — **activation memory 2배**. 1F1B의 $O(P)$가 이미 수십 GB에 달하는 대규모 모델에서 이 2배는 종종 prohibitive하다. Chimera는 개념적으로 중요하지만 단독 사용보다는 selective recomputation이나 CPU offload와 결합해야 실용적이다.
+</Callout>
+
+## 정리
+
+4세대 스케줄링 알고리즘의 진화를 하나의 표로 정리한다.
+
+| 방식 | Bubble ratio | Activation memory | 핵심 아이디어 |
+|------|-------------|-------------------|-------------|
+| Naive | $(P-1)/P$ | $O(1)$ | Sequential |
+| GPipe | $(P-1)/(P-1+M)$ | $O(M)$ | Micro-batching |
+| 1F1B | $(P-1)/(P-1+M)$ | $O(P)$ | F-B 교대 |
+| Interleaved | $(VP'-1)/(VP'-1+M)$ | $O(VP)$ | Virtual stage |
+| Chimera | $\approx(P-1)/(2(P-1)+M)$ | $2 \times O(P)$ | 양방향 주입 |
+
+각 방식은 bubble과 메모리 사이의 다른 균형점을 선택한다. 실제 대규모 모델 학습(GPT-3, LLaMA 등)에서는 1F1B 또는 Interleaved 1F1B가 표준으로 자리잡았다. 다음 글에서는 이 파이프라인 병렬화 위에 ZeRO sharding이 어떻게 겹쳐지는지 추적한다.
+
+<Reference
+  title="GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism"
+  authors="Huang et al."
+  year={2019}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1811.06965"
+/>
+
+<Reference
+  title="Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM"
+  authors="Narayanan et al."
+  year={2021}
+  venue="SC"
+  url="https://arxiv.org/abs/2104.04473"
+/>

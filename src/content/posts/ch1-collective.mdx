@@ -1,0 +1,165 @@
+---
+title: "분산 학습의 통신은 왜 전부 AllReduce로 귀결되는가"
+description: "Broadcast부터 Ring AllReduce의 bandwidth-optimal 증명까지, 분산 학습 multi-GPU 통신의 6가지 collective operation과 NCCL 토폴로지 선택 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [distributed-training, allreduce, nccl, collective-operations, ring-allreduce]
+difficulty: advanced
+series:
+  slug: distributed-training-deep-dive
+  title: Distributed Training Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+분산 학습의 모든 multi-GPU 통신은 결국 6가지 collective operation의 조합으로 환원된다. Data Parallelism의 gradient sync든, ZeRO-3의 parameter fetch든, 겉으로 보이는 프레임워크 추상화 아래에는 동일한 수학 구조가 있다. 그렇다면 왜 그 수많은 operation 중 AllReduce가 지배적으로 쓰이고, 그 AllReduce를 구현하는 최선의 방법은 무엇인가?
+
+## 6가지 Operation의 구조적 분류
+
+collective operation 6가지는 두 가지 원시 패턴의 조합으로 이해할 수 있다 — "하나가 모두에게" 와 "모두가 하나로".
+
+| Operation | 입력 | 출력 | 분산 학습 사용처 |
+|---|---|---|---|
+| **Broadcast** | root의 tensor 1개 | 모든 rank에 복사 | 모델 초기화 |
+| **Scatter** | root의 P개 chunk | 각 rank에 자신의 chunk | ZeRO-3 param 분배 |
+| **Gather** | 각 rank의 chunk | root에 concatenate | inference output 수집 |
+| **AllGather** | 각 rank의 chunk | 모든 rank에 full tensor | ZeRO-3 forward param fetch |
+| **ReduceScatter** | 모든 rank의 tensor | reduce 후 각 rank에 자신의 chunk | ZeRO-2 gradient sharding |
+| **AllReduce** | 모든 rank의 tensor | sum 후 모든 rank에 broadcast | DDP gradient sync |
+
+이 중 AllReduce가 "가장 흔한 operation"이 된 이유는 단순하다. Data Parallelism에서 backward pass 후 모든 GPU는 **동일한 gradient를 갖고 동일한 optimizer step을 밟아야** 한다. 각 rank의 gradient를 합산해 전부에게 돌려주는 것 — 그것이 AllReduce의 정의다.
+
+<Callout type="note" title="AllReduce ≡ ReduceScatter + AllGather">
+AllReduce를 한 번에 수행하는 것과, ReduceScatter로 합산된 chunk를 각 rank에 분배한 뒤 AllGather로 재조립하는 것은 수학적으로 동등하다. ZeRO-2/3는 이 등가성을 이용해 메모리를 절약한다.
+</Callout>
+
+## AllReduce ≡ ReduceScatter + AllGather
+
+이 등가성은 단순한 관찰이 아니라 분산 학습 메모리 최적화의 근간이다.
+
+<Theorem kind="theorem" number="1" title="AllReduce 분해 등가성">
+$P$개 rank의 distributed group $\mathcal{G}$에서, 각 rank $p$가 tensor $x^{(p)} \in \mathbb{R}^{N}$을 보유할 때:
+
+$$\text{AllReduce} \equiv \text{ReduceScatter} + \text{AllGather}$$
+
+즉 두 방식은 동일한 최종 상태를 생성하며, 총 통신량도 동일하다.
+</Theorem>
+
+<Proof>
+**Step 1 — ReduceScatter 후 상태**: 각 rank $p$는 sum된 chunk $c_p = \bigoplus_{q=0}^{P-1} x^{(q)}_p$를 보유한다.
+
+**Step 2 — AllGather 적용**: 각 rank는 모든 $c_0, c_1, \ldots, c_{P-1}$을 수신하여 full reduced tensor를 얻는다.
+
+**Step 3 — AllReduce와의 동등성**: AllReduce의 정의
+
+$$y^{(p)} = \bigoplus_{q=0}^{P-1} x^{(q)}, \quad \forall p \in \mathcal{G}$$
+
+와 정확히 동일한 결과다. 통신량 역시 ReduceScatter의 scatter phase와 AllGather의 gather phase를 합하면 AllReduce와 일치한다. $\square$
+</Proof>
+
+이 분해가 중요한 이유는 **메모리 활용 방식이 달라지기 때문**이다. AllReduce는 전 과정에서 각 rank가 full-size gradient를 보유해야 하지만, ReduceScatter + AllGather는 중간 단계에서 $1/P$ 크기의 chunk만 유지할 수 있다. ZeRO-2가 이를 정확히 활용한다.
+
+## Ring AllReduce는 왜 Bandwidth-Optimal인가
+
+AllReduce를 구현하는 방법은 여러 가지다. Naive reduce-then-broadcast, Recursive Halving/Doubling, Tree, 그리고 Ring. 이 중 대규모 분산 학습에서 Ring이 사실상 표준이 된 이유는 수학적으로 증명 가능하다.
+
+Ring AllReduce는 두 phase로 구성된다.
+
+```
+초기: rank i는 tensor를 N개 chunk로 분할
+  rank i: [c0^(i) | c1^(i) | ... | c_{N-1}^(i)]
+
+Scatter-Reduce (N-1 steps):
+  각 rank i가 시계방향으로 chunk를 전달하며 누적
+  step 0: rank 0 → 1, rank 1 → 2, ..., rank N-1 → 0
+  step N-2 완료 시: rank i가 chunk i의 완전한 합 보유
+
+All-Gather (N-1 steps):
+  완성된 chunk를 동일한 ring으로 전파
+  최종: 모든 rank가 모든 chunk의 합 보유
+```
+
+<Theorem kind="theorem" number="2" title="Ring AllReduce Bandwidth-Optimality">
+$\alpha\beta$ communication model에서, Ring AllReduce의 per-rank 통신량은:
+
+$$T_{\text{ring}} = 2(N-1)\left(\alpha + \beta\frac{M}{N}\right)$$
+
+이며, $N \to \infty$일 때 AllReduce의 bandwidth lower bound $2\beta M$에 수렴한다.
+</Theorem>
+
+<Proof>
+**통신량 유도**: 각 step에서 rank는 $M/N$ bytes 크기의 chunk 1개만 전송/수신한다. Scatter-Reduce phase는 $N-1$ steps, All-Gather phase도 $N-1$ steps이므로:
+
+$$T_{\text{ring}} = 2(N-1) \cdot \left(\alpha + \beta \frac{M}{N}\right)$$
+
+**Lower bound와의 비교**: AllReduce의 결과는 각 rank가 size-$M$ vector를 보유해야 하므로, 어떤 알고리즘도 per-rank 최소 통신량 $2M$ bytes를 피할 수 없다. 이 bandwidth lower bound는:
+
+$$T_{\min} \geq 2\beta M$$
+
+Ring은 $N \to \infty$일 때:
+
+$$\lim_{N \to \infty} 2(N-1)\beta\frac{M}{N} = 2\beta M$$
+
+따라서 Ring은 점근적으로 bandwidth-optimal이다. $\square$
+</Proof>
+
+이 증명이 Patarasuk & Yuan (2009)의 핵심 기여다. NCCL, DeepSpeed, Megatron이 모두 large message에서 Ring을 기본값으로 채택하는 수학적 근거가 바로 여기에 있다.
+
+## Bandwidth vs Latency: 언제 어느 알고리즘을 선택하는가
+
+Ring이 bandwidth-optimal임에도 항상 Ring을 쓰지 않는 이유가 있다. Ring의 latency는 $O(N)$이지만, Tree AllReduce는 $O(\log N)$이다. 작은 message에서는 이 차이가 지배적이다.
+
+$\alpha\beta$ 모델에서 두 알고리즘의 교차점 $M^*$는 다음과 같이 도출된다:
+
+$$T_{\text{tree}} = T_{\text{ring}} \implies M^* \approx \frac{\alpha P}{\beta}$$
+
+$$T_{\text{tree}} < T_{\text{ring}} \iff M < M^*$$
+
+실제 값으로 보면: $P=16$, $\alpha=1\,\mu s$, $\beta=1\,\text{ns/byte}$ 일 때 $M^* \approx 16\,\text{KB}$. 현대 LLM의 gradient는 수 GB 단위이므로, 대규모 학습에서 Ring이 압도적으로 유리하다.
+
+<Callout type="warning" title="Latency vs Bandwidth 트레이드오프">
+Tree AllReduce는 latency $O(\log P)$, bandwidth per-rank $O(M \log P)$. Ring AllReduce는 latency $O(P)$, bandwidth per-rank $O(2M)$. NCCL은 message size를 기준으로 자동 선택하지만, `NCCL_DEBUG=INFO`로 실제 선택된 알고리즘을 확인할 수 있다.
+</Callout>
+
+## 물리 토폴로지가 Ring을 바꾼다: NCCL의 역할
+
+Ring AllReduce가 수학적으로 bandwidth-optimal이더라도, 물리적 네트워크 토폴로지를 무시하면 수배의 성능 손실이 발생한다.
+
+| 연결 종류 | Bandwidth | 비고 |
+|---|---|---|
+| NVLink 4.0 | 600 GB/s | Intra-node (H100, 8 GPU) |
+| InfiniBand NDR | 50 GB/s | Inter-node |
+| PCIe Gen5 | 64 GB/s | CPU-GPU 또는 구형 |
+
+NVLink와 InfiniBand 간에는 **12배 이상의 bandwidth 차이**가 있다. Ring의 bottleneck은 가장 느린 edge에서 결정되므로, ring 구성 순서가 성능을 좌우한다. node-aware ring(같은 노드의 GPU를 연속 배치)은 inter-node hop을 최소화하여 최적 성능을 낸다.
+
+NCCL은 이 토폴로지를 자동으로 인식하고 최적 ring을 구성한다. 이것이 "그냥 `dist.all_reduce()` 호출하면 되는" 이유다.
+
+<Aside label="설계 철학">
+Ring AllReduce의 bandwidth-optimal 성질 덕분에, GPU 수 $N$을 100 이상으로 늘려도 per-rank 통신량은 $\approx 2M$ (거의 상수)에 수렴한다. 이것이 대규모 분산 학습의 확장성(scalability)을 가능하게 하는 수학적 토대다.
+</Aside>
+
+## 정리
+
+- 분산 학습의 모든 통신은 Broadcast, Scatter, Gather, AllGather, ReduceScatter, AllReduce 6가지로 분해된다.
+- AllReduce ≡ ReduceScatter + AllGather는 수학적 등가이며, ZeRO-2/3의 메모리 최적화 근거다.
+- Ring AllReduce는 $N \to \infty$에서 bandwidth lower bound $2\beta M$에 수렴하는 점근적 최적 알고리즘이다.
+- message size가 $M^* \approx \alpha P / \beta$보다 작으면 Tree가, 크면 Ring이 유리하다 — NCCL이 자동으로 선택한다.
+- 물리 토폴로지(NVLink vs InfiniBand)가 ring 구성에 영향을 주며, node-aware ring이 필수다.
+
+다음 글에서는 이 collective operation의 조합 위에 ZeRO-1/2/3가 어떻게 메모리 효율을 단계적으로 개선하는지 추적한다.
+
+<Reference
+  title="Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations"
+  authors="Patarasuk, P. and Yuan, X."
+  year={2009}
+  venue="Journal of Parallel and Distributed Computing"
+  url="https://www.semanticscholar.org/paper/Bandwidth-optimal-all-reduce-algorithms-for-clusters-Patarasuk-Yuan/4a3a1bfab960cf3d99b1d24e7fdbf3a32f0c24e1"
+/>

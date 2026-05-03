@@ -1,0 +1,127 @@
+---
+title: "Tensor Parallelism은 왜 AllReduce가 정확히 2번인가"
+description: "단일 GPU 메모리 한계에서 출발해 Column-GELU-Row 구조의 2-AllReduce 최적성과 NVLink vs InfiniBand 효율 차이까지, Megatron-LM의 설계 결정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [tensor-parallelism, megatron, allreduce, distributed-training, transformer]
+difficulty: advanced
+series:
+  slug: distributed-training-deep-dive
+  title: Distributed Training Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+70B 파라미터 모델의 FP32 weight, gradient, optimizer state를 합산하면 1TB를 가볍게 넘는다. 단일 A100(80GB)에는 올릴 수도 없다. 그래서 Tensor Parallelism이 필요하다 — 그런데 Megatron-LM은 왜 하필 "block당 AllReduce 2번"이라는 숫자에 집착하는가?
+
+## 왜 단일 GPU 메모리로 부족한가
+
+70B 모델의 메모리 요구량을 정리하면 다음과 같다.
+
+| 항목 | 메모리 (70B 모델) |
+|------|----------|
+| Weight (FP32) | 280 GB |
+| Gradient (FP32) | 280 GB |
+| Optimizer state (Adam) | 560 GB |
+| **총합 (DP)** | **1.12 TB** |
+
+Data Parallelism만 쓰면 각 GPU에 **전체 모델 복사본**이 올라간다. ZeRO-3로 8 GPU에 분산해도 per-GPU 약 280GB, TP=2와 ZeRO-2를 결합하면 약 47GB까지 내려온다. 이 계산이 가능한 이유가 Tensor Parallelism이다.
+
+Naive layer-split은 GPU 0이 forward를 마칠 때까지 GPU 1이 대기하는 구조다. $P$개 GPU의 bubble ratio는 다음과 같다.
+
+$$\text{bubble ratio} = \frac{P-1}{P}$$
+
+$P=8$이면 87.5%가 낭비된다. Megatron-LM은 이 구조를 근본적으로 바꾼다 — layer를 순서대로 배치하는 대신, **각 layer 내부의 weight 행렬을 column/row로 쪼개** 모든 GPU가 동시에 같은 layer를 계산하게 한다.
+
+## Column-parallel과 Row-parallel의 통신 패턴
+
+linear layer $Y = XW$를 $P$개 GPU에 분할하는 방법은 두 가지다.
+
+**Column-parallel**: $W = [W^{[0]} | W^{[1]} | \cdots | W^{[P-1]}]$, 각 GPU $i$가 $Y^{[i]} = XW^{[i]}$ 계산. 출력이 column 방향으로 흩어진다(scattered).
+
+**Row-parallel**: $W$를 row로 쪼개 각 GPU가 $X^{(i)}W^{(i)}$를 계산한 뒤 합산. 출력이 모든 GPU에서 동일하게 복제된다(replicated).
+
+핵심 규칙은 다음과 같다.
+
+<Callout type="note" title="Column vs Row의 AllReduce 위치">
+Column-parallel은 **backward에서** AllReduce가 발생한다 — `∂L/∂X`를 구하려면 모든 GPU의 local gradient를 합산해야 하기 때문이다. Row-parallel은 **forward에서** AllReduce가 발생한다 — partial sum들을 모아야 완전한 출력을 얻기 때문이다.
+</Callout>
+
+이 규칙이 중요한 이유는 두 연산을 **교대 배치**하면 forward AllReduce 1회 + backward AllReduce 1회 = 총 2회로 고정할 수 있기 때문이다.
+
+## Column-GELU-Row: 2-AllReduce 최적성의 증명
+
+MLP block `FFN(x) = GELU(xW₁)W₂`에서 Megatron은 $W_1$을 column-parallel, $W_2$를 row-parallel로 배치한다.
+
+<Theorem kind="theorem" number="1" title="Megatron MLP의 2-AllReduce (Shoeybi 2019)">
+$P$개 GPU에서 column-GELU-row MLP block을 forward/backward할 때, 발생하는 AllReduce는 정확히 2회다.
+</Theorem>
+
+<Proof>
+**Forward pass**:
+
+GPU $i$는 $Y_1^{[i]} = \text{GELU}(XW_1^{[i]})$를 local에서 계산 → AllReduce 없음.
+
+$$Y_2 = \text{AllReduce}\!\left(\sum_{i=0}^{P-1} Y_1^{[i]} W_2^{(i)}\right) \quad \Rightarrow \text{1회}$$
+
+**Backward pass**:
+
+Row-parallel $W_2$의 backward는 local (AllReduce 없음).
+
+Column-parallel $W_1$의 backward:
+
+$$\bar{X} = \text{AllReduce}\!\left(\sum_{i=0}^{P-1} \bar{Y}_{1}^{[i]}\,(W_1^{[i]})^T\right) \quad \Rightarrow \text{1회}$$
+
+$\bar{W}_1^{[i]}$와 $\bar{W}_2^{(i)}$는 모두 local 계산. **총 2회** $\square$
+</Proof>
+
+같은 논리가 Attention에도 그대로 적용된다. QKV projection을 column-parallel, output projection을 row-parallel로 배치하면 마찬가지로 2회. Softmax는 head별로 독립 계산이므로 AllReduce가 불필요하다. 결과적으로 **Transformer layer 전체 = Attention 2회 + MLP 2회 = 4회**로 고정된다.
+
+<Aside label="왜 activation도 1/P로 줄어드는가">
+Column-parallel의 출력 $Y_1$은 scattered 상태 — 각 GPU가 `ffn_size/P` 크기만 저장한다. Megatron의 selective recomputation과 결합하면 per-GPU activation memory는 $O(A/P)$로 수렴한다. Weight 감소와 activation 감소가 동시에 일어나는 것이 TP의 진짜 이득이다.
+</Aside>
+
+## 트레이드오프: NVLink냐, InfiniBand냐
+
+AllReduce 비용이 0이 아니라는 사실은 TP의 치명적 제약이다. Ring AllReduce의 비용은 다음과 같다.
+
+$$T_{\text{AR}} = 2(P-1)\frac{M}{B}$$
+
+여기서 $M$은 message size, $B$는 대역폭이다. TP의 실질 효율은 다음 식으로 결정된다.
+
+$$\eta = \frac{T_{\text{compute}}}{T_{\text{compute}} + T_{\text{AR}}}$$
+
+A100(312 TFLOPS), hidden=4096, batch=256, seq=2048, TP=2 기준으로 계산하면:
+
+- **NVLink (600 GB/s)**: $T_{\text{AR}} \approx 22\text{ms}$, $\eta \approx 75\%$ ✓
+- **InfiniBand (25 GB/s)**: $T_{\text{AR}} \approx 527\text{ms}$, $\eta \approx 11\%$ ✗
+
+<Callout type="warning" title="TP는 intra-node 전용이다">
+TP의 AllReduce는 NVLink 수준의 대역폭(600 GB/s 이상)이 있어야 효율적이다. InfiniBand(25 GB/s) 구간에서는 AllReduce 오버헤드가 compute를 압도한다. Inter-node 병렬화에는 TP 대신 Pipeline Parallelism을 우선해야 한다.
+</Callout>
+
+TP degree $P$가 커질수록 message size는 $1/P$로 줄지만, AllReduce phases는 $2(P-1)$로 늘어난다. TP=2→4로 늘리면 message는 절반이 되지만 AllReduce 시간은 오히려 1.5배가 된다 — phase 증가의 손실이 message 감소의 이득을 상쇄한다.
+
+## 정리
+
+- 70B 모델은 단일 GPU 메모리로 불가능하다. TP는 weight와 activation을 동시에 $1/P$로 줄이는 유일한 방법이다.
+- Naive layer-split의 bubble ratio $(P-1)/P$를 Megatron은 weight 행렬을 column/row로 교대 분할해 0으로 만든다.
+- Column-GELU-Row 구조는 block당 정확히 2 AllReduce를 달성한다 — 이는 최소값이며, 다른 배치는 activation memory를 $P$배로 늘린다.
+- TP는 NVLink(600 GB/s) 환경에서 75%+ 효율, InfiniBand(25 GB/s)에서는 11%로 붕괴한다. 네트워크 토폴로지가 TP degree 결정의 전제 조건이다.
+
+다음 글에서는 inter-node 병렬화의 현실적 선택인 Pipeline Parallelism, 그리고 GPipe의 bubble ratio `(P-1)/(P+M-1)`이 어떻게 microbatch로 완화되는지를 다룬다.
+
+<Reference
+  title="Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism"
+  authors="Shoeybi et al."
+  year={2019}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1909.08053"
+/>

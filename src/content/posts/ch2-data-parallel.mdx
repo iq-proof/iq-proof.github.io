@@ -1,0 +1,137 @@
+---
+title: "Data Parallelism의 수학 — AllReduce는 왜 정확한가"
+description: "Gradient averaging의 linearity 증명부터 critical batch size, async staleness의 수렴 조건까지, 분산 학습 Data Parallelism의 수학적 토대를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [distributed-training, data-parallelism, allreduce, batch-size-scaling, gradient]
+difficulty: advanced
+series:
+  slug: distributed-training-deep-dive
+  title: Distributed Training Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Data Parallelism은 분산 학습의 출발점이다. 배치를 N개 GPU에 나눠 gradient를 계산하고 AllReduce로 평균낸다 — 직관적으로 "맞아 보이는" 이 과정이 실제로 어떤 SGD와 동등한가? 그리고 배치를 키울수록 학습률도 그냥 같이 키우면 되는가?
+
+## Gradient Averaging이 정확한 이유
+
+Synchronous DP의 핵심 주장은 하나다: N개 rank에서 각자 크기 $b$의 배치로 계산한 gradient를 AllReduce로 평균내면, 크기 $B = Nb$인 단일 배치의 SGD와 **정확히 같은** 업데이트가 된다.
+
+이것이 성립하는 이유는 gradient의 선형성이다.
+
+$$
+\bar{g}_t = \frac{1}{N}\sum_{j=1}^{N} g^{(j)} = \frac{1}{N}\sum_{j=1}^{N} \frac{1}{b}\sum_{i \in \mathcal{B}_j} \nabla L(\theta_t; x_i) = \frac{1}{Nb}\sum_{i=1}^{B} \nabla L(\theta_t; x_i)
+$$
+
+각 $\mathcal{B}_j$가 서로소 분할(disjoint partition)을 이루므로 합산 순서를 바꾸면 전체 배치의 gradient와 일치한다. $\nabla(\sum c_i f_i) = \sum c_i \nabla f_i$, 미분의 선형성 — 이것이 AllReduce가 정확한 이유의 전부다.
+
+<Theorem kind="theorem" number="1" title="Synchronous DP = Mini-Batch SGD">
+동일한 학습률 $\eta$에서, synchronous DP의 gradient averaging은 batch size $B = Nb$의 표준 mini-batch SGD와 정확히 동일한 업데이트를 생성한다.
+</Theorem>
+
+<Proof>
+Rank $k$의 local gradient $g^{(k)} = \frac{1}{b}\sum_{i \in \mathcal{B}_k} \nabla L(\theta_t; x_i)$에 대해 AllReduce 평균을 전개하면:
+
+$$\bar{g}_t = \frac{1}{N}\sum_{k=1}^{N} g^{(k)} = \frac{1}{Nb}\sum_{k=1}^{N}\sum_{i \in \mathcal{B}_k} \nabla L(\theta_t; x_i) = \frac{1}{B}\sum_{i=1}^{B} \nabla L(\theta_t; x_i)$$
+
+마지막 등호는 $\bigcup_{k} \mathcal{B}_k = \{1, \ldots, B\}$이 disjoint union이기 때문이다. $\square$
+</Proof>
+
+## DDP가 이 정리를 구현하는 방법
+
+PyTorch의 `DistributedDataParallel`은 이 수학을 두 가지 메커니즘으로 구현한다.
+
+첫째, **gradient bucket**: backward는 출력층에서 입력층 방향으로 진행되므로, DDP는 먼저 완료된 layer의 gradient를 layer-reverse 순서의 bucket으로 묶어 즉시 AllReduce를 시작한다. 마지막 layer의 AllReduce가 진행되는 동안 앞쪽 layer의 backward computation이 겹친다.
+
+```
+[Backward]
+Layer 3: grad 완료 ──► Bucket 0 ──► AllReduce (async)
+Layer 2: grad 완료 ──► Bucket 1 ──► AllReduce (async)  ← Layer 3 AllReduce와 동시
+Layer 1: grad 완료 ──► Bucket 2 ──► AllReduce (async)
+```
+
+전체 벽시계 시간은 backward + 마지막 bucket의 AllReduce 정도로 줄어든다. 순차 실행 대비 speedup은 모델 크기와 네트워크 대역폭의 비율에 따라 달라진다.
+
+둘째, **`DistributedSampler`**: 각 rank가 서로 다른 배치 subset을 받아야 DP 등가성이 성립한다. `sampler.set_epoch(epoch)`를 호출해야 epoch마다 shuffle이 달라진다 — 빠뜨리면 매 epoch이 동일한 배치 순서로 반복된다.
+
+<Callout type="warning" title="no_sync()를 사용하는 이유">
+Gradient accumulation을 쓸 때 중간 step에서 `model.no_sync()` 컨텍스트를 쓰지 않으면, micro-batch마다 AllReduce가 발생해 통신 비용이 K배로 뛴다. 마지막 accumulation step에서만 AllReduce가 일어나도록 `no_sync()`로 감싸야 한다. Effective batch size는 $B_\text{eff} = b \times K \times N$이 된다.
+</Callout>
+
+## 배치를 키울 때 학습률은 어떻게 조정해야 하는가
+
+Goyal et al. (2017)이 ImageNet 학습에서 보인 linear scaling rule은 간단하다: 배치를 $\alpha$배 키우면 학습률도 $\alpha$배 키운다.
+
+$$
+\eta(B) = \eta_0 \cdot \frac{B}{B_0}
+$$
+
+이 규칙의 수학적 근거는 gradient noise에 있다. 배치 크기 $B$에서 gradient의 noise는 $\sigma_g / \sqrt{B}$에 비례하므로, 배치가 $\alpha$배 커지면 noise가 $1/\sqrt{\alpha}$배로 줄어든다. 학습률을 $\alpha$배 키우면 effective step의 true gradient 부분이 scale되어 동일 epoch 수에서 같은 convergence를 달성한다.
+
+단, 이 규칙이 무한정 유효하지는 않다. McCandlish et al. (2018)은 **critical batch size** $B_c$를 넘으면 linear scaling이 깨진다고 보였다.
+
+$$
+\eta(B) = \begin{cases} \eta_0 \cdot B/B_0 & B \leq B_c \\ \eta_0 \cdot \sqrt{B/B_0} & B > B_c \end{cases}
+$$
+
+$B_c$를 넘으면 gradient noise가 너무 작아져 optimizer가 sharp minima에 수렴하게 되고, generalization gap이 커진다.
+
+<Aside label="Warmup이 필수인 이유">
+Linear scaling 후 학습률이 매우 커진 상태에서 학습을 시작하면, 초기 random parameter에서의 gradient가 크므로 overshooting이 발생한다. Warmup은 $t = 0$에서 $t = T_w$까지 학습률을 선형으로 증가시켜 parameter가 reasonable 영역에 도달한 후에야 full learning rate를 적용한다.
+</Aside>
+
+## 트레이드오프: Synchronous vs Asynchronous
+
+Synchronous DP는 AllReduce에서 모든 rank가 동기화된다. straggler가 한 대 있으면 나머지 모두가 기다린다. Hogwild!(Recht et al. 2011)로 시작된 asynchronous SGD는 이를 해결한다 — 각 worker가 parameter server에 gradient를 push하고 즉시 다음 배치로 넘어간다.
+
+대가는 **staleness**다. Worker $k$가 시간 $t_k$에 읽은 parameter로 계산한 gradient를 현재 시간 $t$에 적용하면, 그 사이 다른 worker들의 $t - t_k$번의 업데이트가 반영되지 않는다.
+
+$$
+\theta(t) \leftarrow \theta(t) - \eta \nabla L(\theta(t - \tau); \mathcal{B}_t), \quad \tau = \text{staleness}
+$$
+
+Convex 문제에서는 $\tau_\text{max} < \text{poly}(d)$ 조건 하에 수렴이 보장된다 (Recht et al. 2011). Non-convex에서는 staleness의 영향이 제곱으로 커진다 — 즉 deep network에서는 큰 staleness가 훨씬 더 위험하다.
+
+<Callout type="note" title="트레이드오프 요약">
+| | Synchronous DP | Asynchronous (PS) |
+|---|---|---|
+| **Gradient 정확성** | 정확 (Theorem 1) | Stale gradient (수렴 불안정) |
+| **Straggler 처리** | 취약 (최악 worker 대기) | 강건 (no blocking) |
+| **수렴 보장** | 강 | 조건부 (staleness bound 필요) |
+| **적용 사례** | GPU 클러스터, 동질적 환경 | Federated learning, heterogeneous |
+
+현재 대부분의 대규모 학습은 Synchronous DP + gradient bucketing 조합을 쓴다. Async는 federated learning처럼 디바이스가 간헐적으로 offline이 되는 환경에서 주로 재조명된다.
+</Callout>
+
+## 정리
+
+- Synchronous DP의 AllReduce가 정확한 이유는 gradient의 선형성 하나다. $B = Nb$인 단일 SGD와 수학적으로 동등하다.
+- DDP의 layer-reverse bucket과 async AllReduce는 이 수학을 communication-computation overlap으로 구현해 벽시계 시간을 줄인다.
+- 배치를 키울 때 학습률은 $B \leq B_c$에서 선형, $B > B_c$에서 square-root로 스케일하고 warmup을 반드시 추가해야 한다.
+- Async SGD는 straggler에 강건하지만 staleness가 non-convex 수렴에 quadratic으로 악영향을 미친다.
+
+이 챕터들의 수학은 결국 한 질문으로 모인다 — *N개 GPU가 하나처럼 행동하려면 무엇을 보존해야 하는가*. gradient의 linearity가 그 답이고, 나머지 최적화(bucketing, accumulation, scaling rule)는 그 등가성을 실제 하드웨어에서 지키기 위한 공학이다.
+
+<Reference
+  title="Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour"
+  authors="Goyal et al."
+  year={2017}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1706.02677"
+/>
+
+<Reference
+  title="An Empirical Model of Large-Batch Training"
+  authors="McCandlish et al."
+  year={2018}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1812.06162"
+/>
