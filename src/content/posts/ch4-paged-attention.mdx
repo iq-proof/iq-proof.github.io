@@ -1,0 +1,156 @@
+---
+title: "PagedAttention은 왜 GPU 메모리 낭비를 95%까지 줄이는가"
+description: "Contiguous KV cache의 60-80% 메모리 낭비 원인부터 OS paging 차용, PagedAttention 알고리즘, prefix caching, vLLM 통합 아키텍처까지, LLM 서빙 메모리 효율의 핵심을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-inference, paged-attention, kv-cache, vllm, memory-management]
+difficulty: advanced
+series:
+  slug: llm-inference-deep-dive
+  title: Llm Inference Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 추론 시스템에서 GPU 메모리의 60-80%가 실제로 사용되지 않는 채 낭비된다. LLaMA-70B를 naive하게 배치 처리하면 256 request를 처리하기 위해 13.6 GB를 할당하지만 실제 사용량은 3.4 GB에 불과하다. 왜 이런 일이 생기고, PagedAttention은 이 문제를 어떻게 거의 완벽하게 해결하는가?
+
+## 낭비의 구조: Contiguous Allocation의 세 가지 결함
+
+Naive KV cache는 각 request마다 **max context 길이 기준으로 연속 메모리를 미리 할당**한다. 여기서 세 종류의 낭비가 겹친다.
+
+**Internal fragmentation**: max context 2048에 실제 사용 토큰이 256이면, 한 request당 87.5%가 낭비다. 수식으로 표현하면 다음과 같다.
+
+$$
+\text{IFragmentation} = 1 - \frac{T}{T_{\max}} = \frac{T_{\max} - T}{T_{\max}}
+$$
+
+$T_{\max} = 2048$, $T = 256$이면 낭비율은 87.5%다.
+
+**External fragmentation**: request가 종료되면 할당된 메모리가 hole로 남는다. 새 request가 1500 MB를 필요로 할 때 1008 MB짜리 hole이 있으면 맞지 않아 더 뒤쪽 빈 공간에 할당된다. compaction 없이 방치하면 메모리 이용률이 50% 이하로 떨어진다.
+
+**Reservation waste**: prefill 후 decode 단계에 진입하면 최악의 경우를 대비해 남은 context를 전부 예약한다. 실제로는 평균 50 토큰만 생성하는데 1792 토큰 분의 메모리를 유지하면 reservation waste만 97%에 이른다.
+
+세 낭비를 합산하면 typical workload에서 60-80%가 사라진다. 256 request batch에서 13.6 GB를 할당해도 실제로는 3.4 GB만 쓰인다.
+
+## OS Paging에서 가져온 해법
+
+PagedAttention이라는 이름은 **OS virtual memory paging을 직접 차용**했다는 선언이다. 50년간 검증된 fragmentation 해결 원리를 GPU KV cache에 그대로 매핑한다.
+
+| OS Paging | LLM KV Cache |
+|---|---|
+| Virtual page (4 KB) | KV block (16 토큰) |
+| Physical frame | GPU 메모리 블록 |
+| Page table | Block table (request별) |
+| Process | Request |
+
+OS에서 4 KB 페이지가 external fragmentation을 제거하는 원리는 단순하다. free list에 페이지 단위로 저장하면, 메모리 총량이 충분한 한 크기와 무관하게 항상 할당에 성공한다. Internal fragmentation 상한은 $P - 1$ bytes, 즉 4 KB 미만으로 묶인다.
+
+Copy-on-Write(CoW)는 메모리 공유를 가능하게 한다. $R$개 request가 길이 $p$인 동일 prefix를 공유할 때 절감 비율은 다음과 같다.
+
+$$
+\text{Savings} = 1 - \frac{1}{R}
+$$
+
+$R = 100$이면 초기 메모리의 99%를 절약한다.
+
+## PagedAttention 알고리즘
+
+Kwon et al.(2023)의 핵심은 세 가지다.
+
+**블록 단위 할당**: KV cache를 16 토큰 고정 크기 블록으로 분할한다. 각 블록은 LLaMA-70B 기준 약 10.5 MB다.
+
+**Block table**: request마다 logical block ID → physical block address 매핑 테이블을 유지한다. physical address는 연속일 필요가 없다.
+
+**Attention kernel**: query와 logical block index가 주어지면 block table을 O(1)로 조회해 non-contiguous K, V blocks를 gather한 뒤 attention을 계산한다.
+
+<Theorem kind="theorem" number="1" title="PagedAttention Fragmentation Bound">
+Batch 내 모든 request의 sequence 길이가 $T$ 이상이고, block size $B_s = 16$일 때:
+
+$$
+\text{waste} \le \frac{B_s}{T} = \frac{16}{T}
+$$
+</Theorem>
+
+<Proof>
+각 request $r$에 대해 allocated blocks $B_r = \lceil T_r / B_s \rceil$. 마지막 블록에서 낭비는 최대 $B_s - 1$ 토큰이다.
+
+$$
+W_r \le (B_s - 1) \times 2Ldb
+$$
+
+전체 낭비:
+
+$$
+\frac{W_{\text{total}}}{M_{\text{total}}^{\text{alloc}}} \le \frac{n(B_s - 1)}{n \cdot T} < \frac{B_s}{T}
+$$
+
+$T = 2048$이면 waste $< 0.78\%$. Naive contiguous의 75%와 비교하면 약 100배 개선이다. $\square$
+</Proof>
+
+<Callout type="note" title="트레이드오프">
+Fixed block size 16은 fragmentation과 block table 크기의 균형점이다. Block size를 8로 줄이면 waste bound가 절반이 되지만 block table entry 수가 두 배로 늘어 cache miss가 증가한다. Block size 32는 반대 방향. Kwon et al.의 ablation study는 16이 attention kernel의 CUDA warp size와 alignment되면서 fragmentation-overhead Pareto optimal임을 보인다.
+</Callout>
+
+## Prefix Caching — 공유를 통한 추가 절감
+
+많은 request가 동일 system prompt나 few-shot example을 prefix로 공유한다. Prefix caching은 hash 기반으로 동일 prefix blocks를 물리적으로 공유한다.
+
+$R$개 request가 길이 $p$인 prefix를 공유하고 각 suffix 길이가 $\bar{s}$일 때:
+
+$$
+\text{Savings} = \frac{(R-1) \times p}{R(p + \bar{s})}
+$$
+
+$R = 100$, $p = 200$, $\bar{s} = 50$이면 절감률 79.2%다. Beam search($k = 5$)에서는 prefix blocks를 $k$개 candidate가 공유하므로 27% 추가 절감이 발생한다.
+
+구현은 세 단계다. SHA256으로 prefix hash를 계산해 동일 prefix를 식별하고, block table에서 prefix blocks에 ref\_count를 올려 공유하며, write 발생 시에만 CoW로 copy한다. KV cache는 decode 단계에서 거의 read-only이므로 CoW 비용은 사실상 0에 가깝다.
+
+<Aside label="Hash collision">
+SHA256을 사용하면 birthday paradox 기준 100만 request에서 collision 확률이 $10^{-74}$에 불과하다. 무시해도 되는 수준이다. 단 production에서는 model version과 tokenizer version을 composite key에 포함시켜야 checkpoint 교체 후 stale cache를 방지할 수 있다.
+</Aside>
+
+## vLLM의 4-Layer 통합 아키텍처
+
+PagedAttention, continuous batching, prefix caching을 하나의 serving system으로 통합한 것이 vLLM이다. 책임이 명확히 분리된 4개 레이어로 구성된다.
+
+```
+Request → Engine(AsyncIO/FastAPI)
+        → Scheduler(Continuous Batching)
+        → KV Cache Manager(Block Table, Prefix Cache)
+        → Model Executor(Forward, TP/PP, CUDA Graph)
+        → Output
+```
+
+**Engine**은 OpenAI API 호환 FastAPI 서버다. `async/await`로 non-blocking I/O를 처리하고 streaming response를 generator로 반환한다.
+
+**Scheduler**는 iteration 단위로 batch를 재구성한다. Prefill request와 decode request를 같은 batch에 혼합하고, request가 완료되면 즉시 새 request를 삽입한다. Static batching 대비 throughput이 3-5배 증가하는 이유다.
+
+**KV Cache Manager**가 PagedAttention과 prefix caching을 구현한다. Block table 관리와 ref\_count 기반 CoW를 담당한다. 256 request 기준 block table 메모리 오버헤드는 약 131 KB — KV cache 자체(수십 GB)에 비해 무시 가능하다.
+
+**Model Executor**는 block table을 CUDA kernel에 직접 전달해 attention을 계산한다. CUDA graph로 kernel launch overhead를 제거하고, Tensor Parallel과 Pipeline Parallel을 지원한다.
+
+같은 GPU budget에서 naive contiguous가 batch size 32를 허용할 때, vLLM은 batch size 256까지 올릴 수 있다. Throughput 증가는 **메모리 효율이 곧 병렬도**임을 보여준다.
+
+## 정리
+
+- Contiguous KV cache는 internal fragmentation, external fragmentation, reservation waste 세 가지가 겹쳐 60-80%를 낭비한다.
+- PagedAttention은 OS paging 원리를 차용해 waste를 $16/T$ 이하로 bound한다. $T = 2048$이면 0.78% 미만.
+- Prefix caching은 동일 prefix를 물리적으로 공유해 system prompt 시나리오에서 추가로 70-80%를 절감한다.
+- vLLM은 이 세 기법을 4-layer 아키텍처로 통합해 산업 표준 serving system이 되었다.
+
+메모리 효율이 0%에서 98%로 바뀌는 것은 하드웨어 업그레이드 없이 throughput을 수배 끌어올린다는 의미다. 낭비를 구조화하고 이름을 붙이는 것 — 그것이 해결의 절반이다.
+
+<Reference
+  title="Efficient Memory Management for Large Language Model Serving with PagedAttention"
+  authors="Kwon et al."
+  year={2023}
+  venue="SOSP"
+  url="https://arxiv.org/abs/2309.06180"
+/>

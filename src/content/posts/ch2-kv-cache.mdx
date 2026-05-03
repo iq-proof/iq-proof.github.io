@@ -1,0 +1,114 @@
+---
+title: "KV Cache는 왜 LLM 서빙의 핵심인가"
+description: "Naive autoregressive decoding의 O(T²) 재계산 문제부터 GQA와 KVQuant를 거쳐 실제 서빙 메모리 예산까지, KV cache 최적화의 연쇄적 설계 결정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-inference, kv-cache, gqa, quantization, memory]
+difficulty: advanced
+series:
+  slug: llm-inference-deep-dive
+  title: Llm Inference Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM이 토큰을 하나씩 생성하는 autoregressive decoding은 단순해 보인다. 하지만 KV cache 없이 구현하면, 생성 길이 $T$가 늘어날수록 계산량이 $\mathcal{O}(T^2)$로 폭발한다. 이 문제를 해결하는 과정이 단순한 "캐싱"이 아니라, 메모리와 계산 사이의 일련의 트레이드오프 선택이라면 — 그 선택들은 어디서 끝나는가?
+
+## Naive Decode의 O(T²) 비용
+
+Prefill 단계에서 프롬프트의 K, V를 계산한 뒤, decoding 단계에서 가장 단순한 구현은 이렇다: 매 step $t$마다 토큰 $1:t$ 전부를 다시 forward pass에 넣어 $K_{1:t}, V_{1:t}$를 재계산한다.
+
+Step $t$에서 projection FLOPs는 $3td^2$ (QKV 각각 $t \times d$ 행렬 곱)이므로, $T$ steps의 총 비용은
+
+$$\mathrm{FLOPs}_{\mathrm{naive}} = \sum_{t=1}^{T} 3td^2 = 3d^2 \cdot \frac{T(T+1)}{2} = \Theta(T^2 d^2)$$
+
+<Theorem kind="theorem" number="1" title="Naive Decoding의 이차 복잡도">
+KV cache 없는 autoregressive decoding에서 총 projection FLOPs는 생성 길이 $T$에 대해 $\Theta(T^2 d^2)$이다.
+</Theorem>
+
+<Proof>
+Step $t$에서 input sequence $x_{1:t} \in \mathbb{R}^{t \times d}$에 weight $W_K, W_V \in \mathbb{R}^{d \times d}$를 적용하면 FLOPs $\approx 2td^2$. 이를 $t=1$부터 $T$까지 합산하면 $2d^2 \cdot T(T+1)/2 = d^2 T(T+1) \approx d^2 T^2$. $\square$
+</Proof>
+
+LLaMA-7B ($d=4096$, $L=32$ layers), $T=2048$ 기준으로 계산하면 약 1.6 PFLOPs가 projection 재계산에만 쓰인다. A100 FP16 피크인 312 TFLOP/s로 나누면 5,000초 이상 — 이 구현은 실무에서 불가능하다.
+
+## KV Cache: O(T²)를 O(T)로
+
+핵심 아이디어는 단순하다. 이미 계산한 $K_{1:t-1}, V_{1:t-1}$을 메모리에 보존하고, step $t$에서는 새 토큰 $x_t$에 대해서만 $k_t, v_t$를 계산한 뒤 append한다.
+
+```
+Decode step t:
+  q_t = x_t · W_Q          ← 새 토큰 1개만
+  k_t = x_t · W_K          ← 새 토큰 1개만
+  v_t = x_t · W_V          ← 새 토큰 1개만
+  K_{1:t} = [K_{1:t-1} ; k_t]   ← append
+  attn_t = softmax(q_t · K_{1:t}^T / √d) · V_{1:t}
+```
+
+projection FLOPs가 매 step마다 $3d^2$ (고정)으로 줄어들어, $T$ steps 합산은 $3Td^2$ — 즉 $\mathcal{O}(T)$다. attention FLOPs는 여전히 $\Theta(T^2 d)$이지만 $d \gg 1$이면 projection이 지배적이므로 wall-clock time은 $\mathcal{O}(T)$로 보인다. 실측에서 약 4× 이상의 속도 향상이 관찰된다.
+
+<Callout type="note" title="트레이드오프">
+KV cache는 계산을 메모리로 교환한다. 절약된 FLOPs의 대가로, $K_{1:t}, V_{1:t}$를 모든 layer에 걸쳐 상주시켜야 한다. 한 요청의 메모리 비용은 $M_{\mathrm{KV}} = 2 \cdot L \cdot T \cdot d_{\mathrm{cache}} \cdot b$ bytes로 시퀀스 길이에 선형 비례하며, 동시 요청 수에도 선형 비례한다.
+</Callout>
+
+## 메모리 공식과 GQA의 동기
+
+MHA(Multi-Head Attention) 기준 LLaMA-7B ($L=32$, $d=4096$, FP16)의 per-request KV cache는
+
+$$M = 2 \times 32 \times 2048 \times 4096 \times 2\text{ bytes} \approx 1.0\text{ GB}$$
+
+LLaMA-70B ($L=80$, $d=8192$)라면 MHA 기준 5.37 GB/request — 100개 동시 요청이면 537 GB. A100 80GB로는 weights(140 GB)조차 올리지 못한다.
+
+GQA(Grouped Query Attention, Ainslie 2023)는 여기서 나온다. $n_h$개의 query head가 $n_{\mathrm{kv}}$개의 K/V 그룹을 공유하면
+
+$$M_{\mathrm{KV}}^{\mathrm{GQA}} = 2LT \cdot (d_h \times n_{\mathrm{kv}}) \cdot b, \quad \text{절감배수} = \frac{n_h}{n_{\mathrm{kv}}}$$
+
+LLaMA-2-70B는 $n_h=64, n_{\mathrm{kv}}=8$로 KV cache를 8배 줄인다 — 5.37 GB → 0.66 GB/request. Ainslie et al.의 실험에서 GQA-8은 perplexity 손실이 0.1% 미만이다. 현대 오픈소스 LLM(LLaMA-2/3, Mistral, Qwen)이 모두 GQA를 채택한 이유가 여기에 있다.
+
+<Aside label="설계 철학">
+MQA(Multi-Query Attention, Shazeer 2019)는 $n_{\mathrm{kv}}=1$로 $n_h$배 절감하지만 perplexity 손실이 4-5%다. GQA는 $n_{\mathrm{kv}}$를 조절 가능한 파라미터로 만들어 절감과 정확도 사이의 균형점을 찾은 것이다. "한 번에 전부 공유"보다 "그룹으로 공유"가 실용적임을 4년의 시차가 보여준다.
+</Aside>
+
+## KVQuant: 마지막 4배
+
+GQA-8로도 LLaMA-70B의 100-request 서빙은 66 GB의 KV cache를 요구한다. weights와 합산하면 단일 A100을 여전히 초과한다. Hooper et al.(2024, KVQuant)는 K와 V를 INT4로 양자화해 추가로 4배를 줄인다.
+
+핵심은 K와 V의 분포가 다르다는 관찰이다. K cache는 특정 dimension(channel)에 outlier가 집중되는 반면, V cache는 token 단위로 분산이 크다. 따라서 K는 per-channel quantization, V는 per-token quantization을 적용한다.
+
+$$\hat{K}[i, t] = \mathrm{round}\left(\frac{K[i, t]}{s_i}\right), \quad s_i = \frac{\max_t K[i,t] - \min_t K[i,t]}{2^b - 1}$$
+
+Naive per-tensor quantization(단일 scale factor) 대비 MSE가 약 46배 낮다. Hooper et al.의 실험에서 INT4 KVQuant의 perplexity 손실은 0.1% 미만 — INT4 naive(~2%)와 20배 차이다.
+
+GQA-8 + INT4 기준 LLaMA-70B의 per-request KV cache는 0.165 GB. 100 requests면 16.5 GB — A100 80GB에서 weights와 함께 충분히 수용 가능하며, batch size는 GQA-8 FP16 대비 4배 증가한다.
+
+## 정리
+
+- KV cache 없는 decoding의 projection 비용은 $\Theta(T^2 d^2)$이다. $T=2048$, LLaMA-7B 기준 1.6 PFLOPs — 실무 불가능.
+- KV cache는 projection을 $\mathcal{O}(T)$로 낮추되, 메모리 비용 $2LTd_{\mathrm{cache}} \cdot b$를 부과한다.
+- GQA($n_{\mathrm{kv}}=8$)는 KV 메모리를 8배 줄이면서 perplexity 손실 0.1% 미만 — 현대 LLM의 표준.
+- KVQuant(INT4, per-channel K + per-token V)는 추가로 4배를 줄여 동일 GPU에서 batch capacity를 4배 늘린다.
+
+각 최적화는 "계산 vs 메모리"라는 같은 트레이드오프의 다른 레이어다. KV cache는 계산을 메모리로 바꾸고, GQA는 정확도 일부를 메모리 절감으로 바꾸고, KVQuant는 표현 정밀도를 메모리 절감으로 바꾼다. 다음 글에서는 이 메모리 예산 위에서 여러 요청을 어떻게 효율적으로 packing하는지 — PagedAttention과 continuous batching을 추적한다.
+
+<Reference
+  title="GQA: Training Generalist Models with Group Query Attention"
+  authors="Ainslie et al."
+  year={2023}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/2305.13245"
+/>
+
+<Reference
+  title="KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization"
+  authors="Hooper et al."
+  year={2024}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2401.18079"
+/>

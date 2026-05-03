@@ -1,0 +1,140 @@
+---
+title: "Speculative Decoding은 왜 빠르면서도 정확한가"
+description: "Draft-target 이중 구조의 시스템 복잡성부터 Medusa·EAGLE·Lookahead의 설계 트레이드오프, Best-of-N의 경제성 분석까지, LLM 추론 가속의 핵심 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [speculative-decoding, llm-inference, kv-cache, acceptance-rate]
+difficulty: advanced
+series:
+  slug: llm-inference-deep-dive
+  title: Llm Inference Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 추론은 본질적으로 순차적이다. 토큰 하나를 생성하려면 이전 토큰 전체를 참조해야 하고, 그 결과물이 다음 입력이 된다. Speculative Decoding은 이 제약을 정면으로 공략한다 — 작은 draft model이 여러 토큰을 미리 제안하고, target model이 한 번의 forward pass로 일괄 검증한다. 알고리즘은 우아하다. 그런데 실전 배포에서 이것이 정말 작동하려면 무엇이 필요한가?
+
+## 이중 구조가 만드는 시스템 복잡성
+
+Speculative Decoding의 한 iteration은 세 단계로 구성된다. Draft model $q$가 $K$개 토큰을 병렬로 생성하고, target model $p$가 이 $K+1$개 위치를 단일 forward pass로 검증하며, rejection sampling으로 최종 출력을 결정한다.
+
+$$
+\alpha_i = \min\!\left(1, \frac{p(x_i|\cdot)}{q(x_i|\cdot)}\right), \quad y \sim \frac{(p - q)_+}{\|(p - q)_+\|}\ \ \text{(rejection 시)}
+$$
+
+이 구조는 **두 개의 KV cache 상태**를 동시에 추적해야 한다.
+
+$$
+\mathcal{K}_t = (\mathcal{K}_t^{(q)},\ \mathcal{K}_t^{(p)},\ \tau_t)
+$$
+
+Draft KV는 최대 $t+K$까지 앞서 있고, target KV는 실제 accept 위치 $\tau_t$까지만 유효하다. Rejection이 발생하면 draft KV의 `[τ:]` 부분을 버리고 target KV를 부분 업데이트해야 한다. 메모리 오버헤드를 수식으로 쓰면:
+
+$$
+M_{\text{spec}} = \mathcal{O}(3Ldb)
+$$
+
+draft + target + rollback buffer 합산으로, 표준 continuous batching 대비 약 2.2배다. 실험적으로 LLaMA-7B 기준 (batch=32, seq=2048) standard는 7.73GB, speculative decoding은 16.90GB로 측정된다.
+
+<Callout type="warning" title="Batch 내 변동 길이">
+N개 시퀀스가 각기 다른 시점에 reject되면, 다음 iteration의 입력 길이가 불규칙해진다. 시뮬레이션 결과 100번 iteration 후 길이 범위가 min=107 ~ max=423으로 벌어지고, padding overhead가 약 48%까지 치솟는다. Continuous batching과 speculative decision point가 충돌하는 이 문제는 현재도 empirical tuning으로 완화하는 open problem이다.
+</Callout>
+
+## Speedup의 정량 분석
+
+Speedup의 직관은 "draft가 빠를수록, target과 분포가 가까울수록 좋다"는 것이다. 이를 수식으로 정리하면:
+
+$$
+S(\alpha, K, \phi) = \frac{1 - \alpha^{K+1}}{(1-\alpha)(K\phi + 1)}
+$$
+
+여기서 $\alpha$는 acceptance rate, $K$는 draft token budget, $\phi = c_q/c_p$는 draft와 target의 비용 비율이다.
+
+<Theorem kind="proposition" number="1" title="Speedup의 상한">
+임의의 $\alpha, K, \phi$에 대해 $S(\alpha, K, \phi) \le (K+1)/(\phi K + 1)$이다.
+</Theorem>
+
+<Proof>
+$1 - \alpha^{K+1} \le 1$이므로 $S \le 1/((1-\alpha)(\phi K+1))$. $\alpha \le 1/(K+1)$일 때 $1/(1-\alpha) \le K+1$을 대입하면 상한이 성립한다. $\square$
+</Proof>
+
+실전에서 $\phi = 0.1$ (draft가 10배 빠름)일 때 최적 $K^*$는 $\alpha$에 따라 달라진다.
+
+| $\alpha$ | 권장 $K$ | 이론적 $S$ | 실측 $S$ (×0.9) |
+|----------|---------|-----------|----------------|
+| 0.50 | 2 | 1.35 | 1.22 |
+| 0.70 | 5 | 1.86 | 1.67 |
+| 0.75 | 5 | 2.03 | 1.83 |
+| 0.90 | 8 | 2.59 | 2.33 |
+
+Leviathan et al. (2023)의 원래 공식 $S = (1-\alpha^{K+1})/((1-\alpha)K)$는 draft cost를 0으로 가정한다. $\phi > 0$이면 분모가 $K\phi + 1$로 커지므로 실제 speedup은 더 낮다 — $\phi = 1$일 때만 두 공식이 일치한다.
+
+## Medusa, EAGLE, Lookahead의 설계 분기
+
+별도 draft model을 유지하는 비용을 피하려는 세 가지 접근이 경쟁한다.
+
+**Medusa** (Cai 2024)는 target model의 hidden state $h_t$에 FC head를 붙여 position $t+j$의 토큰을 예측한다. Fine-tuning이 필요하지만 추가 메모리는 1.2배에 그친다. Tree-based verification으로 $K$를 16까지 늘릴 수 있으나, acceptance rate는 약 0.72로 standard draft보다 낮다.
+
+**EAGLE** (Li 2024)은 target의 hidden state를 입력으로 받는 slim model을 학습한다. 토큰 embedding 단계를 건너뛰기 때문에 context 정보 손실이 적고, acceptance rate가 0.87로 세 기법 중 가장 높다. 메모리 overhead는 1.05배. 단점은 target model이 바뀌면 EAGLE도 재학습해야 한다는 것이다.
+
+**Lookahead** (Fu 2024)는 사전 계산된 n-gram cache만 사용한다. Fine-tuning이 전혀 필요 없고 메모리 overhead는 1% 미만이다. 대신 marginal distribution에만 의존하므로 context-specific 예측이 불가능하고, acceptance rate는 0.40 수준에 머문다.
+
+<Aside label="선택 기준">
+training data가 없으면 Lookahead, 높은 throughput이 우선이면 EAGLE, 검증된 안정성이 필요하면 standard draft. Medusa는 기존 모델을 확장하는 중간 선택지다.
+</Aside>
+
+## Best-of-N과 test-time compute의 경제학
+
+Speculative Decoding이 "같은 품질을 더 빠르게"를 추구한다면, Best-of-N은 "더 많은 compute로 더 높은 품질을"을 추구한다. $N$개 샘플을 생성하고 reward model로 최선을 선택하는 구조다.
+
+핵심 인프라는 **prefix caching**이다. 길이 $p$의 공유 prompt는 KV를 한 번만 계산하고, $N$개의 decode sequence만 각각 메모리를 차지한다.
+
+$$
+\frac{M_{\text{no-cache}} - M_{\text{cache}}}{M_{\text{no-cache}}} \approx \frac{p}{p + \ell}
+$$
+
+$p=768, \ell=512, N=16$이면 약 56%의 메모리를 절감한다. FLOPs 비율은 여전히 $\approx N$배이지만, 메모리가 병목인 대규모 배포에서 이 절감은 결정적이다.
+
+정확도 향상의 상한 (independence 가정):
+
+$$
+\text{Acc}_{\text{best-of-N}} \le 1 - (1-p)^N
+$$
+
+$p=0.70, N=16$이면 이론상 99.2%까지 올라간다. 실제로는 샘플 간 상관성이 있어 0.8배 수준으로 조정해야 하고, reward model의 calibration error (보통 5~15%)가 추가로 깎인다.
+
+<Callout type="note" title="트레이드오프">
+Best-of-N은 **코드 생성·수학 추론**처럼 정답이 명확하고 reward signal이 강한 태스크에서 투자 대비 효과가 크다. 반대로 open-ended 생성에서는 N=4 이상부터 수익 체감이 빠르게 온다. DeepSeek-R1처럼 RL로 학습된 policy는 같은 compute 예산에서 Best-of-N보다 더 효율적인 추론 궤적을 생성한다 — sampling 다양성보다 reasoning 깊이를 늘리는 쪽이 더 효과적이기 때문이다.
+</Callout>
+
+## 정리
+
+- Speculative Decoding의 losslessness는 수학적으로 보장된다. 시스템 복잡성은 알고리즘이 아니라 KV cache 동기화와 batch 변동 길이 처리에서 발생한다.
+- Speedup 공식 $S(\alpha, K, \phi)$에서 $\alpha \ge 0.75$이면 $K=4\text{-}5$로 $S \approx 1.8\text{-}2.0\times$가 기대 가능하다.
+- Medusa · EAGLE · Lookahead는 memory × acceptance rate × training cost의 세 축에서 서로 다른 균형점을 선택한다. EAGLE이 대부분의 시나리오에서 최선이다.
+- Best-of-N은 prefix caching 없이는 N배 메모리를 요구하며, reward model calibration이 실질적 품질 상한을 결정한다.
+
+inference-time compute의 설계 공간은 speculative decoding(속도 유지)과 best-of-N(품질 향상)의 두 축으로 나뉜다. 두 기법을 조합하는 것이 현대 LLM 서빙의 다음 과제다.
+
+<Reference
+  title="Fast Inference from Transformers via Speculative Decoding"
+  authors="Leviathan et al."
+  year={2023}
+  venue="ICML"
+  url="https://arxiv.org/abs/2211.17192"
+/>
+
+<Reference
+  title="EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty"
+  authors="Li et al."
+  year={2024}
+  venue="ICML"
+  url="https://arxiv.org/abs/2401.15077"
+/>

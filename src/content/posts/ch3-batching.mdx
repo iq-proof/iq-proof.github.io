@@ -1,0 +1,153 @@
+---
+title: "LLM 서빙의 병목은 배치에 있다"
+description: "Static batching의 67% GPU 낭비부터 Prefill-Decode 분리까지, LLM 추론 처리량을 3-5배 끌어올리는 배치 전략의 진화를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-inference, continuous-batching, prefill-decode, batching]
+difficulty: advanced
+series:
+  slug: llm-inference-deep-dive
+  title: Llm Inference Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM 서빙 시스템의 처리량을 3배 높이면서 P99 latency를 동시에 절반으로 줄이는 것이 가능할까? 직관에 반하는 이 결과는 "배치"라는 개념을 어디서 정의하느냐에서 온다. 왜 static batching은 GPU 시간의 67%를 낭비하고, continuous batching은 그 낭비를 0으로 만드는가?
+
+## Static Batching의 구조적 낭비
+
+전통적인 static batching은 $B$개 요청을 모아 같은 수의 iteration을 돌린다. 모든 샘플이 batch 내 최장 길이 $T_{\max}$까지 padding되어 처리된다.
+
+$$
+U_{\text{static}} = \frac{\sum_{i=1}^B T_i}{B \cdot T_{\max}} = \frac{\bar{T}}{T_{\max}}
+$$
+
+ShareGPT처럼 생성 길이가 heavy-tail 분포를 따르는 실제 워크로드에서는 이 값이 얼마나 작아지는가?
+
+<Theorem kind="theorem" number="1" title="Heavy-tail 분포에서 Utilization 하한">
+Sequence 길이 $T$가 tail index $\alpha$의 Pareto 분포를 따를 때, batch size $B$에서:
+
+$$
+U_{\text{static}} \le \frac{1}{1 + \frac{1}{\alpha} \log B}
+$$
+</Theorem>
+
+<Proof>
+Pareto 분포에서 $B$개 최댓값의 기댓값은 $\mathbb{E}[T_{\max}^{(B)}] \approx \bar{T}(1 + \frac{1}{\alpha} \log B)$이다. $\alpha = 1.5$, $B = 32$를 대입하면:
+
+$$
+\mathbb{E}[T_{\max}] \approx \bar{T} \times 3.2 \implies U \approx \frac{1}{3.2} = 0.31
+$$
+
+따라서 GPU 시간의 약 69%가 낭비된다. $\square$
+</Proof>
+
+padding 오버헤드는 compute 낭비로도 직결된다. $T_{\max} = 3\bar{T}$이면 attention GEMM FLOPs가 이상적 경우 대비 **200% 초과**한다. 배치 크기를 3배 늘려도 utilization은 그대로다 — tail latency가 $T_{\max}$에 지배되는 구조 자체를 바꾸지 않는 한.
+
+## Dynamic Batching의 부분적 개선
+
+Dynamic batching은 고정된 시간 창 $\Delta t_{\max}$ 동안 도착한 요청을 모아 배치를 구성한다. Poisson arrival rate $\lambda$에서:
+
+$$
+\mathrm{Latency} = \frac{\Delta t_{\max}}{2} + t_p, \quad \mathrm{Throughput} \propto \lambda \Delta t_{\max}
+$$
+
+$\Delta t_{\max}$를 크게 하면 throughput이 선형으로 증가하지만 latency도 선형으로 증가한다. SLO budget 안에서 최적값을 찾는 것이 전부다.
+
+<Callout type="warning" title="근본 미해결">
+Dynamic batching은 partial batch 문제를 개선하지만, batch 내에서 여전히 $T_{\max}$가 모든 샘플의 latency를 지배한다. Utilization은 static과 거의 같은 $\sim 0.3$ 수준에 머문다.
+</Callout>
+
+## Continuous Batching — 배치 개념의 폐기
+
+Orca (Yu et al., 2022)의 핵심 통찰은 간단하다: **"batch"를 request 단위가 아니라 iteration 단위로 정의한다.** 매 iteration(토큰 1개 생성 1 step)마다 active batch를 재구성한다.
+
+```
+Iteration 1:  Active = {Req1(T=50), Req2(T=30), Req3(T=100)}
+Iteration 2:  Req2 완료 → 제거, Req4 도착 → 즉시 prefill 후 추가
+              Active = {Req1, Req3, Req4}
+Iteration 3:  Req1 완료 → 제거
+              Active = {Req3, Req4}
+...
+```
+
+이 구조에서 각 요청은 정확히 $T_i$ iteration만 처리된다. padding이 0이다.
+
+$$
+\text{Padding}_{\text{cont}} = 0, \quad \text{Compute saved} = \sum_i (T_{\max} - T_i) \times \mathrm{FLOPs/iter}
+$$
+
+$T_{\max} = 150$, $\bar{T} = 50$이면 compute를 **67% 절감**한다. P99 latency도 바뀐다. Static에서는 $\mathrm{P}_{99}(\text{latency}) = T_{\max}^{(B)}$ — batch 내 최대에 의존했다. Continuous batching에서는:
+
+$$
+\mathrm{P}_{99}(\text{latency}) = \mathrm{P}_{99}(T_i)
+$$
+
+각 샘플이 자신의 길이만큼만 처리된다. Orca 논문 실측치: throughput 3.0×, P99 latency 4.7× 감소. throughput과 latency가 **동시에** 개선되는 이유는 "비효율의 제거"이기 때문이다 — trade-off가 아니라 낭비 회수다.
+
+## Chunked Prefill — Long Prompt의 TPOT 급등 문제
+
+Continuous batching도 새로운 문제를 드러낸다. 16k 토큰 long prompt의 prefill이 한 iteration을 점유하면, decode 중인 다른 요청들이 그 iteration 동안 완전히 블록된다. **TPOT(Time Per Output Token) spike**가 발생한다.
+
+Sarathi-Serve(Agrawal, 2023)의 해결은 prefill을 chunk size $c$로 분할하는 것이다.
+
+$$
+\mathrm{TTFT}_c = \left\lceil \frac{L}{c} \right\rceil \cdot t_{\text{iter}}, \quad \mathrm{TPOT}_c \approx t_{\text{iter}} \text{ (stable)}
+$$
+
+| Chunk Size | Num Chunks (L=16k) | TTFT (ms) | TPOT std |
+|:---:|:---:|:---:|:---:|
+| 256 | 64 | 640 | 0 |
+| 512 | 32 | 320 | 0 |
+| 1024 | 16 | 160 | 0 |
+| Monolithic | 1 | 160 | 19ms |
+
+chunk size를 줄이면 TTFT가 증가하고 TPOT가 안정된다. SLO budget에 맞춰 최대 chunk size를 선택하는 것이 최적 전략이다:
+
+$$
+\Delta t_{\max} = \mathrm{SLO} - t_{\text{processing}} - \text{margin}
+$$
+
+## Prefill-Decode 분리 — Hardware Optimal의 차이
+
+연속 배치의 궁극적 진화는 prefill과 decode를 **다른 GPU 클러스터**에서 처리하는 것이다.
+
+Roofline model에서 두 단계의 arithmetic intensity는 본질적으로 다르다. Prefill은 $I_{\text{prefill}} \approx L$(compute-bound), decode는 $I_{\text{decode}} \approx 1$(memory-bound)이다. A100의 ridge point($\approx 200$ FLOPS/byte)를 기준으로 prefill은 항상 compute-bound 구간에, decode는 항상 memory-bound 구간에 있다.
+
+같은 GPU에서 두 단계를 섞으면 한쪽이 항상 idle이다. DistServe(Zhong 2024)와 Splitwise(Patel 2024)는 이를 분리한다.
+
+<Callout type="note" title="트레이드오프">
+분리의 비용은 KV cache 전송이다. LLaMA-70B, GQA($n_{kv}=8$), prompt 2048 토큰 기준으로 RDMA(100 Gbps)를 통한 KV 전송 시간은 약 1.67ms다. NVLink(600 Gbps)에서는 0.28ms. 이 전송 비용이 분리로 얻는 utilization 개선보다 작아야 disaggregation이 이득이다.
+
+$$
+\mathrm{Gain} > \mathrm{Transfer\ overhead} \times \lambda
+$$
+
+고트래픽(100+ req/s) 환경에서는 disaggregation이 비용 대비 처리량 관점에서 압도적으로 유리하다. Splitwise 실측치: 동일 비용 대비 goodput 3×.
+</Callout>
+
+<Aside label="설계 철학">
+Static → Dynamic → Continuous → Chunked → Disaggregated 의 진화는 하나의 방향을 따른다 — "batch"라는 경계를 더 작은 단위로 쪼갤수록 낭비가 줄고 하드웨어가 자신의 optimal에 가까워진다. 이 시리즈의 각 챕터는 그 경계를 한 단계씩 무너뜨리는 과정이다.
+</Aside>
+
+## 정리
+
+- Static batching의 GPU 낭비는 구조적이다. Heavy-tail 분포에서 utilization은 이론적으로 $\sim 0.3$이 상한이며, batch size를 늘려도 해결되지 않는다.
+- Continuous batching은 "batch" 개념을 iteration 단위로 재정의해 padding을 0으로 만든다. throughput과 P99 latency가 동시에 개선되는 것은 trade-off 해소가 아니라 비효율 제거다.
+- Long prompt의 TPOT spike는 chunked prefill로 chunk size와 TTFT의 trade-off를 SLO에 맞춰 조정함으로써 해결한다.
+- Prefill과 decode의 hardware optimal이 다르다는 사실은 disaggregation을 고트래픽 환경에서 경제적으로 정당화한다.
+
+<Reference
+  title="Orca: A Distributed Serving System for Transformer-Based Generative Models"
+  authors="Yu et al."
+  year={2022}
+  venue="OSDI"
+  url="https://www.usenix.org/conference/osdi22/presentation/yu"
+/>

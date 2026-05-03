@@ -1,0 +1,127 @@
+---
+title: "LLM Serving의 모든 선택은 결국 비용-지연 트레이드오프다"
+description: "vLLM·TGI·TensorRT-LLM·SGLang의 메모리 전략부터 Tensor/Pipeline Parallel 배포 패턴, TTFT·Goodput 측정, Disaggregated Serving 절감까지 — LLM 추론 시스템의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm-inference, vllm, paged-attention, tensor-parallel, goodput]
+difficulty: advanced
+series:
+  slug: llm-inference-deep-dive
+  title: Llm Inference Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+같은 모델, 같은 하드웨어인데 시스템마다 throughput이 2–3배 다르다. 배포 방식만 바꿔도 월 비용이 20배 벌어진다. 이 차이는 어디서 오는가?
+
+## 4개 시스템이 선택한 메모리 전략
+
+vLLM·TGI·TensorRT-LLM·SGLang은 각자 다른 철학으로 KV cache를 다룬다.
+
+**vLLM**은 OS의 페이징 개념을 차용한다. KV cache를 고정 크기 블록으로 쪼개 비연속 메모리에 배치하는 PagedAttention으로 단편화(fragmentation)를 4% 미만으로 낮춘다. Naive 할당의 60–80%와 비교하면 극적인 차이다.
+
+$$
+\frac{\mathrm{throughput}_{\mathrm{Paged}}}{\mathrm{throughput}_{\mathrm{Naive}}} \approx \frac{1.6\text{–}1.8 \times \mathrm{KV}}{1.04 \times \mathrm{KV}} \approx 1.6\text{–}1.7\times
+$$
+
+**SGLang**은 한 발 더 나아간다. 반복되는 system prompt나 few-shot 예시를 radix tree로 공유해 KV cache 자체를 재사용한다(RadixAttention). 32개 요청이 256토큰 prefix를 공유하면 배치당 약 640MB를 절약한다.
+
+**TensorRT-LLM**은 메모리보다 연산을 공략한다. QKV projection과 attention, MLP를 단일 GPU kernel로 합쳐 메모리 I/O를 대폭 줄인다. A100 기준 약 1.6배 latency 개선이 가능하지만 NVIDIA 하드웨어에 강하게 종속된다.
+
+**TGI**는 Flash Attention v2를 전면 통합하고 Rust 스케줄러로 안정성을 확보한다. 극적인 성능보다 예측 가능한 운영을 택한 선택이다.
+
+<Callout type="note" title="시스템 선택 기준">
+API 서버처럼 모델 호환성이 중요하면 vLLM, NVIDIA 전용 팜에서 극한 성능이 필요하면 TensorRT-LLM, tool-use나 JSON 구조화 출력이 필수면 SGLang, 생산 환경의 안정성이 우선이면 TGI다.
+</Callout>
+
+## 측정하지 않으면 아무것도 모른다: TTFT, TPOT, Goodput
+
+"throughput 3000 tok/s"는 맥락 없이는 무의미한 숫자다. LLM serving의 latency는 두 단계로 분해된다.
+
+$$
+T_{\mathrm{total}} = \mathrm{TTFT} + (T_{\mathrm{gen}} - 1) \times \mathrm{TPOT}
+$$
+
+**TTFT(Time To First Token)**는 사용자가 "응답이 왔다"고 체감하는 순간이다. Prefill phase 길이에 거의 정비례한다. **TPOT(Time Per Output Token)**는 스트리밍의 체감 속도를 결정한다. 20개 토큰을 생성할 때 decode 단계가 전체 latency의 88% 이상을 차지한다.
+
+평균 latency만 보는 것은 위험하다. Request latency가 lognormal 분포를 따를 때 P50=50ms인 시스템의 P99가 300ms일 수 있다. 999개 요청이 50ms에 처리되고 1개가 500ms걸리면, 평균은 50.45ms지만 P99는 ~100ms로 뛴다.
+
+SLO가 있다면 **Goodput**이 핵심 지표다.
+
+$$
+\mathrm{Goodput}_{\mathrm{SLO}} = \frac{\sum_{r:\, L_r < \mathrm{SLO}} \mathrm{tokens}_r}{T_{\mathrm{total}}}
+$$
+
+SLO를 100ms로 설정했을 때 SLO 50ms 대비 goodput이 절반 이하로 떨어지는 것은 흔한 일이다.
+
+## GPU 간 분산: Tensor Parallel vs Pipeline Parallel
+
+단일 GPU에 모델이 올라가지 않는 순간부터 분산 전략이 비용을 결정한다.
+
+**Tensor Parallel(TP)**은 하나의 weight matrix를 GPU 간에 분할한다. GPU 0이 $W[:d/2]$를, GPU 1이 $W[d/2:]$를 계산한 뒤 all-reduce로 합친다. Latency가 낮지만 NVLink 대역폭에 민감하다. 2–4 GPU 규모에 적합하다.
+
+**Pipeline Parallel(PP)**은 layer를 GPU 간에 나눈다. Communication은 layer 경계에서만 발생하지만 "pipeline bubble"이 생긴다.
+
+<Theorem kind="proposition" number="1" title="Pipeline Bubble Fraction">
+micro-batch 수 $m$, GPU 수 $n$일 때 bubble fraction은 다음과 같다.
+
+$$
+\text{Bubble fraction} = \frac{n-1}{m \times n}
+$$
+</Theorem>
+
+<Proof>
+전체 시간은 $(m + n - 1)\tau$, 유효 작업 시간은 $m \times n \times \tau$이므로 bubble = $\frac{(n-1)\tau}{(m+n-1)\tau} \approx \frac{n-1}{mn}$ (큰 $m$에서). $\square$
+</Proof>
+
+PP=8일 때 bubble을 10% 미만으로 유지하려면 micro-batch를 70개 이상으로 늘려야 한다. 32개 이상의 GPU 규모에서는 TP와 PP를 계층적으로 조합하는 Hybrid 전략이 현실적이다.
+
+MoE 모델에는 Expert Parallel(EP)이 추가된다. 라우터의 skew가 심해질수록 일부 GPU는 과부하, 나머지는 유휴 상태가 된다. auxiliary loss로 load balance를 강제하면 throughput은 올라가지만 모델 품질이 저하될 수 있다.
+
+## 비용의 진짜 얼굴: SLO가 가격을 결정한다
+
+GPU 시간당 비용을 token 당 비용으로 환산하는 공식은 단순하다.
+
+$$
+C_{\text{M}} = \frac{p \times 10^6}{T \times 3600} \quad \text{(\$ per M tokens)}
+$$
+
+A100 \$1.5/hr, throughput 3000 tok/s이면 약 \$0.14/M tokens다. 그런데 SLO P99 < 100ms 제약이 붙으면 이야기가 달라진다.
+
+Latency가 $L(B) = L_0 \times B^{0.7}$로 증가할 때, SLO를 만족하는 최대 batch size는 다음과 같다.
+
+$$
+B_{\max}^{\mathrm{SLO}} = \left( \frac{L_{\mathrm{SLO}}}{L_0} \right)^{1/0.7}
+$$
+
+$L_0 = 50\text{ms}$, SLO = 100ms이면 $B_{\max} \approx 3$다. Batch 256일 때 throughput의 1/20 수준인 goodput만 달성할 수 있고, 결과적으로 **같은 하드웨어에서 비용이 20배 올라간다**.
+
+Disaggregated Serving은 이 격차를 줄이는 현실적인 전략이다. Prefill은 FLOP-bound(compute 집약), decode는 memory-bound(대역폭 집약)이므로 각각에 최적화된 GPU를 쓸 수 있다. Prefill 70%를 H100이, decode 30%를 L40S가 처리하면 A100 2개 통합 배포 대비 22% 비용이 절감된다.
+
+<Aside label="설계 원칙">
+배치 처리와 실시간 서빙의 비용 격차는 구조적이다. SLO가 없는 워크로드라면 반드시 offline batch로 분리하고, SLO가 필요한 영역은 disaggregated 배포로 goodput을 최대화하라.
+</Aside>
+
+## 정리
+
+- vLLM·TGI·TensorRT-LLM·SGLang은 각각 메모리 효율, 안정성, 극한 성능, 편의성이라는 서로 다른 축에서 최적화되어 있다. 워크로드 먼저, 시스템 선택은 그 다음이다.
+- LLM latency는 TTFT + `(생성 토큰 수 - 1) × TPOT`으로 분해된다. P99를 측정하지 않으면 실제 worst case를 알 수 없다.
+- TP는 latency를 낮추고 PP는 communication을 낮춘다. 규모와 네트워크 인프라에 따라 최적 조합이 달라진다.
+- SLO 제약은 비용을 선형이 아닌 지수적으로 높인다. Goodput 기반으로 비용을 계산해야 실제 운영 비용이 보인다.
+
+throughput 숫자보다 "어떤 SLO 하에서 달성한 Goodput인가"가 LLM serving 시스템의 진짜 성능이다.
+
+<Reference
+  title="Efficient Memory Management for Large Language Model Serving with PagedAttention"
+  authors="Kwon et al."
+  year={2023}
+  venue="SOSP"
+  url="https://arxiv.org/abs/2309.06180"
+/>
