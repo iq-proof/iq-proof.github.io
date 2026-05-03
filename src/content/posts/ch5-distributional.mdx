@@ -1,0 +1,158 @@
+---
+title: "Return을 분포로 보면 무엇이 달라지는가"
+description: "기댓값 하나로 축약된 Q-value가 놓치는 것들 — 분산, 꼬리 위험, 다봉 분포 — 부터 Wasserstein contraction, C51, QR-DQN, 그리고 Rainbow ablation의 실증까지, Distributional RL의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, distributional-rl, wasserstein, c51, qr-dqn]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+표준 Q-learning은 return의 **기댓값** 하나만 학습한다. 그런데 같은 기댓값을 가진 두 행동이 완전히 다른 분포를 가질 수 있다. 그 차이를 무시하면 무엇을 잃는가? 그리고 분포 전체를 학습하면 단순히 "더 많은 정보"를 얻는 것 이상으로, 왜 표현 학습 자체가 달라지는가?
+
+## 기댓값이 숨기는 것들
+
+$Q^\pi(s, a) = \mathbb{E}[Z^\pi(s, a)]$ 는 return 확률변수 $Z^\pi$ 의 1차 moment에 불과하다. 두 행동이 $Q = 10$ 으로 동일해도 분포는 전혀 다를 수 있다.
+
+$$
+Q^\pi(s, a) = \mathbb{E}\!\left[\sum_{t=0}^\infty \gamma^t R(s_t, a_t)\right]
+$$
+
+- **Action 1**: 항상 return 10 (확정적, $\sigma^2 = 0$)
+- **Action 2**: 50% 확률로 0, 50% 확률로 20 ($\sigma^2 = 100$)
+
+표준 RL은 둘을 구별하지 못한다. 그러나 위험 회피 agent라면 Action 1을, 자본이 충분한 agent라면 Action 2를 선호할 수 있다. 분포 $Z^\pi(s, a)$ 를 직접 학습하면 분산, 왜도(skewness), 꼬리 위험을 모두 계산할 수 있다.
+
+**Conditional Value-at-Risk (CVaR)** 는 이 차이를 수치로 보여준다.
+
+$$
+\text{CVaR}_\alpha(Z) = \mathbb{E}[Z \mid Z \leq F_Z^{-1}(\alpha)]
+$$
+
+CartPole 예시: $\mu = 250$ 으로 동일한 두 경로가 `CVaR_10% = 200` vs `CVaR_10% = 50` 으로 갈린다. 분포 없이는 이 계산 자체가 불가능하다.
+
+## Distributional Bellman과 Wasserstein Contraction
+
+표준 Bellman operator는 $\sup$-norm에서 $\gamma$-contraction이다. 분포로 확장하면 어떤 거리 척도를 써야 수렴이 보장되는가?
+
+**Distributional Bellman operator**:
+
+$$
+\mathcal{T}^\pi Z(s, a) \stackrel{D}{=} R(s, a) + \gamma Z(s', A'), \quad s' \sim P(\cdot|s,a),\; A' \sim \pi(\cdot|s')
+$$
+
+오른쪽은 확률변수의 합이다. Bellemare et al. (2017)의 핵심 발견은 이 operator가 **Wasserstein 거리**에서 $\gamma$-contraction임을 보인 것이다.
+
+<Theorem kind="theorem" number="1" title="Distributional Bellman Contraction (Bellemare 2017)">
+임의의 분포 $\mu, \nu$ 에 대해,
+
+$$
+W_p(\mathcal{T}^\pi \mu,\; \mathcal{T}^\pi \nu) \leq \gamma\, W_p(\mu, \nu)
+$$
+</Theorem>
+
+<Proof>
+Wasserstein 거리의 두 성질을 순서대로 적용한다.
+
+1. **Translation invariance**: $W_p(\mu + c,\, \nu + c) = W_p(\mu, \nu)$. Reward $R$ 을 더해도 거리는 불변이다.
+
+2. **Homogeneity**: $W_p(\gamma\mu,\, \gamma\nu) = \gamma\, W_p(\mu, \nu)$. $\gamma$ 배 scaling 시 거리도 $\gamma$ 배.
+
+따라서
+
+$$
+W_p(\mathcal{T}^\pi\mu,\, \mathcal{T}^\pi\nu)
+= W_p(R + \gamma\mu',\, R + \gamma\nu')
+= W_p(\gamma\mu',\, \gamma\nu')
+= \gamma\, W_p(\mu', \nu')
+\leq \gamma\, W_p(\mu, \nu). \quad \square
+$$
+</Proof>
+
+반면 **KL divergence는 contraction이 아니다**. support가 조금만 어긋나도 $D_\text{KL} = \infty$ 로 발산한다. Dirac at 0 vs Dirac at $\varepsilon$ 이 반례다. 이것이 C51이 categorical projection이라는 별도 단계를 거치는 이유다.
+
+Banach fixed point theorem에 의해 optimal distribution $Z^{\pi,*}$ 가 유일하게 존재하고, 임의의 초기 분포에서 기하급수적으로 수렴한다.
+
+$$
+\|Z_n - Z^{\pi,*}\|_p \leq \gamma^n \|Z_0 - Z^{\pi,*}\|_p
+$$
+
+## C51과 QR-DQN — 두 가지 이산화 전략
+
+이론은 연속 분포를 다루지만, 신경망은 유한한 표현을 학습해야 한다. C51과 QR-DQN은 서로 다른 방향에서 이 문제를 해결한다.
+
+**C51 (Categorical)**: 위치 $z_i = V_\min + i\,\Delta z$ 를 고정하고 확률 $p_i(s,a)$ 를 학습한다.
+
+$$
+Z_\theta(s,a) = \sum_{i=0}^{50} p_i(s,a)\,\delta_{z_i}, \qquad p = \text{softmax}(\text{logits})
+$$
+
+Bellman update $\mathcal{T}Z$ 의 결과는 고정 atom 위에 놓이지 않을 수 있으므로, **categorical projection** $\Phi$ 로 가장 가까운 두 atom에 선형 분배한다. Loss는 $D_\text{KL}(\Phi\mathcal{T}Z_{\theta'} \| Z_\theta)$.
+
+**QR-DQN (Quantile Regression)**: 반대로 확률 $1/N$ 을 균등 고정하고, **위치** $\theta_i(s,a)$ 를 학습한다.
+
+$$
+Z_\theta(s,a) = \frac{1}{N}\sum_{i=1}^{N} \delta_{\theta_i(s,a)}, \qquad \tau_i = \frac{2i-1}{2N}
+$$
+
+1D에서 Wasserstein-1은 quantile function의 $L_1$ 거리와 같다 (Villani 2003).
+
+$$
+W_1(\mu,\nu) = \int_0^1 |F_\mu^{-1}(\tau) - F_\nu^{-1}(\tau)|\, d\tau
+$$
+
+따라서 Huber quantile loss를 최소화하는 것이 Wasserstein-1 최소화와 동치가 된다. $V_\min$, $V_\max$ 를 미리 설정할 필요가 없고, support가 domain에 자동으로 적응한다.
+
+<Callout type="note" title="C51 vs QR-DQN 트레이드오프">
+C51은 고정 atom이라 구현이 단순하지만 $V_\min$, $V_\max$ 튜닝이 필요하다. QR-DQN은 support가 자동 적응하고 Wasserstein-1을 직접 최소화하지만, quantile 단조성이 보장되지 않아 실무에서 추가 처리가 필요하다.
+</Callout>
+
+## 왜 분포 학습이 표현 학습을 강화하는가
+
+Distributional RL의 이점은 단순히 "더 많은 정보"에 그치지 않는다. **gradient signal이 근본적으로 달라진다.**
+
+MSE loss는 스칼라 하나를 target으로 한다. KL/Wasserstein loss는 $N$개의 atom/quantile 각각이 독립적인 gradient를 제공한다. tail region에서 KL은 $p_\theta \to 0$ 일 때 무한히 커지므로, 확률이 작은 영역도 학습 신호가 살아있다.
+
+이를 **auxiliary supervised task** 관점으로도 볼 수 있다. 분포 예측은 $N$개의 target을 동시에 맞추는 multi-task learning이다. 같은 네트워크 용량이라면 더 많은 감독 신호 → 더 풍부한 feature.
+
+Rainbow ablation (Hessel et al. 2018)은 이를 실증한다. 57개 Atari 게임에서 Distributional 컴포넌트를 제거했을 때 성능이 약 7.5% 하락했는데, 이는 Double DQN이나 Dueling network를 제거했을 때보다 훨씬 크다. 중요한 것은 capacity-matched 실험이다 — output dimension을 $51|A|$로 늘린 일반 DQN은 C51만큼 성능이 오르지 않았다. 단순히 파라미터가 늘어서가 아니라, KL gradient의 informativeness와 auxiliary supervision이 본질적 원인이라는 뜻이다.
+
+<Aside label="Bellemare의 발견">
+Bellemare et al. (2017)이 발견한 흥미로운 사실은, distributional RL이 risk-aware decision을 위해 설계되었음에도 불구하고, Atari에서의 성능 향상은 주로 **representation learning 개선** 덕분이라는 것이다. 분포 예측이 보조 감독 신호로 작용해 CNN feature를 풍부하게 만든다.
+</Aside>
+
+## 정리
+
+- $Q^\pi = \mathbb{E}[Z^\pi]$ 는 분포의 1차 moment다. 분산, CVaR, 꼬리 위험은 분포 없이 계산할 수 없다.
+- Distributional Bellman operator는 **Wasserstein 거리에서 $\gamma$-contraction**이지만, KL divergence에서는 아니다. support sensitivity 때문이다.
+- C51은 고정 atom + KL loss, QR-DQN은 학습 quantile + Huber quantile loss로 Wasserstein-1을 직접 최소화한다.
+- 성능 향상의 핵심은 risk awareness만이 아니다. **KL/Wasserstein gradient의 richness와 auxiliary representation learning**이 Rainbow에서 가장 중요한 컴포넌트 중 하나가 된 이유다.
+
+분포를 학습하는 것은 더 많은 숫자를 예측하는 일이 아니라, agent가 세계를 바라보는 해상도를 높이는 일이다.
+
+<Reference
+  title="A Distributional Perspective on Reinforcement Learning"
+  authors="Bellemare, Dabney, Munos"
+  year={2017}
+  venue="ICML"
+  url="https://arxiv.org/abs/1707.06887"
+/>
+
+<Reference
+  title="Distributional Reinforcement Learning with Quantile Regression"
+  authors="Dabney, Rowland, Bellemare, Munos"
+  year={2018}
+  venue="AAAI"
+  url="https://arxiv.org/abs/1710.10044"
+/>

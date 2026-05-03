@@ -1,0 +1,144 @@
+---
+title: "Rainbow DQN의 다섯 가지 개선은 왜 함께 작동하는가"
+description: "Dueling Network의 분해부터 Noisy Net의 암묵적 탐험까지, Rainbow를 구성하는 다섯 요소가 공유하는 설계 철학과 그 수학적 근거를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, rainbow, dqn, prioritized-replay, exploration]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Rainbow(Hessel 2018)는 DQN 위에 여섯 가지 독립적인 개선을 쌓아 Atari 57게임에서 인간 수준을 뛰어넘었다. 그런데 이 개선들은 각자 별개의 논문에서 나왔음에도 함께 쌓였을 때 단순 합산보다 더 잘 작동한다. 왜 그런가? 그리고 이 요소들이 공유하는 설계 원칙은 무엇인가?
+
+## Q-value를 쪼갠다 — Dueling Network
+
+DQN은 $Q(s, a)$를 end-to-end로 학습한다. 이 방식의 낭비는, 어떤 state에서는 모든 action의 Q값이 높거나 낮아서 "이 상황이 좋다/나쁘다"는 정보가 action-specific 학습에 묻힌다는 것이다.
+
+Dueling Network(Wang 2016)는 Q를 두 갈래로 분해한다.
+
+$$
+Q(s, a;\,\theta) = V(s;\,w) + A(s, a;\,w) - \frac{1}{|\mathcal{A}|}\sum_{a'} A(s, a';\,w)
+$$
+
+$V(s)$는 state의 본질적 가치, $A(s,a)$는 그 state에서 해당 action이 평균보다 얼마나 나은지를 나타낸다. 공유 hidden layer의 gradient가 모든 action에 동시에 흘러들어, $V$의 학습이 $|\mathcal{A}|$배 강해진다.
+
+여기서 mean subtraction이 핵심이다. $Q = V + A$만으로는 $(V+c, A-c)$처럼 무한히 많은 분해가 존재해 네트워크가 하나의 표현으로 수렴할 이유가 없다. Mean subtraction은 $\sum_a A(s,a) = 0$을 강제해 표현을 유일하게 만든다.
+
+<Theorem kind="proposition" number="1" title="Dueling Decomposition의 유일성">
+Mean-centered constraint $\sum_a A(s,a) = 0$을 만족하는 $(V(s), A(s,a))$는 $Q$로부터 유일하게 복구된다.
+
+$$V(s) = \frac{1}{|\mathcal{A}|}\sum_a Q(s, a), \quad A(s,a) = Q(s,a) - V(s)$$
+</Theorem>
+
+<Proof>
+$(V', A')$가 또 다른 identifiable 분해라면, $V'(s) = \frac{1}{|\mathcal{A}|}\sum_a Q(s,a) = V(s)$이고 따라서 $A'(s,a) = Q(s,a) - V'(s) = A(s,a)$. 유일성 성립. $\square$
+</Proof>
+
+## 중요한 경험을 더 자주 본다 — Prioritized Experience Replay
+
+표준 DQN의 experience replay는 모든 transition을 $1/N$의 동일한 확률로 샘플링한다. TD error $|\delta_i|$가 작은, 이미 잘 학습된 sample도 high-error sample과 같은 빈도로 불린다.
+
+PER(Schaul 2016)은 priority를 TD error에 비례하게 설정한다.
+
+$$
+p_i = \frac{(|\delta_i| + \epsilon)^\alpha}{\sum_j (|\delta_j| + \epsilon)^\alpha}
+$$
+
+$\alpha$는 prioritization 강도이고, $\epsilon$은 zero-division 방지를 위한 작은 상수다. 그런데 priority sampling은 gradient의 기대값을 uniform sampling과 다르게 만든다 — biased estimator다. 이를 보정하기 위해 Importance Sampling(IS) weight를 곱한다.
+
+$$
+w_i = \left(\frac{1}{N \cdot p_i}\right)^\beta
+$$
+
+$\beta = 1$이면 완전히 unbiased로 복구된다. 학습 초기에는 $\beta$를 작게 두어 variance를 낮추고, 학습이 진행될수록 $\beta \to 1$로 annealing한다. 모델이 부정확할 때는 bias가 오히려 variance를 억제하고, 모델이 수렴하면 unbiasedness가 중요해지기 때문이다.
+
+<Callout type="note" title="트레이드오프">
+$\beta$가 클수록 unbiased하지만 IS weight의 분산이 커진다. $w_{\max}/w_{\min}$이 수백 배에 달할 수 있어 gradient를 불안정하게 만들 수 있다. Rainbow에서는 max-normalization(`w_i / max(w)`)으로 weight를 `[0, 1]`로 클리핑한다.
+</Callout>
+
+## 실제 reward를 더 많이 쓴다 — Multi-Step Returns
+
+1-step TD는 매 step마다 bootstrapped value에 의존한다. 이 추정이 틀리면 오류가 매 step마다 누적된다.
+
+$$
+G_t^{(n)} = \sum_{l=0}^{n-1} \gamma^l r_{t+l} + \gamma^n \hat{V}(s_{t+n})
+$$
+
+$n$을 늘리면 실제 reward를 더 많이 사용하게 되어 bootstrapping 의존도가 줄고, 분산이 감소한다. 대신 $s_{t+n}$에서의 value 추정 오류가 전파될 수 있어 bias가 생긴다. 이 bias-variance tradeoff의 균형점이 Atari 환경에서는 경험적으로 $n \in [3, 5]$ 근방이다.
+
+$$
+\text{Var}(G^{(n)}) = \sigma_r^2 \cdot \frac{1 - \gamma^{2n}}{1 - \gamma^2} + \gamma^{2n} \sigma_V^2
+$$
+
+$n$이 커지면 reward 항은 늘어나지만 $\gamma^{2n}$이 $V$ 항을 감쇄한다. 최적 $n$에서 둘의 합이 최소가 된다.
+
+## 탐험을 학습한다 — Noisy Networks
+
+$\epsilon$-greedy는 모든 state에서 동일한 확률로 random action을 취한다. 이미 잘 알려진 state에서도, 불확실한 state에서도 똑같이 탐험한다는 뜻이다.
+
+Noisy Net(Fortunato 2018)은 탐험을 weight의 확률성으로 구현한다.
+
+$$
+W = \mu + \sigma \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+$\mu$는 standard network의 weight, $\sigma$는 탐험의 강도, $\epsilon$은 매 forward pass마다 재샘플링된다. 핵심은 $\sigma$도 gradient로 학습된다는 것이다 — 불확실한 state에서는 gradient variance가 커서 $\sigma$가 자동으로 늘어나고, 잘 알려진 state에서는 줄어든다.
+
+계산 효율을 위해 Factorized Gaussian noise를 쓴다. Full rank noise $\epsilon \in \mathbb{R}^{m \times n}$은 $mn$개의 샘플이 필요하지만, $\epsilon_{ij} = \epsilon_i^x \cdot \epsilon_j^y$로 factorize하면 $m + n$개로 충분하다.
+
+<Aside label="다섯 요소의 공통 철학">
+Dueling은 표현을 나눠 gradient를 공유한다. PER은 중요한 sample에 gradient를 집중한다. Multi-step은 실제 reward로 bootstrap 오류를 줄인다. Noisy Net은 불확실한 곳에 gradient가 더 흐르게 한다. 모두 같은 방향을 가리킨다 — **gradient signal의 품질을 높여라**.
+</Aside>
+
+## 함께 쌓으면 무엇이 달라지는가
+
+Hessel 2018의 ablation에서 각 요소의 단독 기여도는 다음과 같다(Atari 57게임 human-normalized score 기준):
+
+- Multi-step, Distributional: 각 +8~10%
+- PER: +6%
+- Dueling: +3~4%
+- Noisy Net: +2~3%
+- Double DQN: +1~2%
+
+단순 합산이면 약 +22~27%이지만 실제 Rainbow는 +40% 이상이다. Synergy가 있다.
+
+PER과 Dueling의 결합이 대표적이다. PER이 high-error sample을 자주 불러오면, Dueling의 $V$ head가 그 오류를 모든 action에 공유하며 빠르게 수정한다. Multi-step과 Distributional도 서로를 강화한다 — n-step return이 더 풍부한 target 정보를 제공하면, 분포 추정의 정확도가 함께 올라간다.
+
+<Callout type="warning" title="트레이드오프">
+이 요소들은 각자 hyperparameter를 가진다($\alpha, \beta, n, \sigma_{\text{init}}$ 등). 조합하면 민감도가 곱해진다. Rainbow의 hyperparameter는 Atari에 맞게 조정된 것이므로, 새로운 환경에서는 재조정이 필요하다. 특히 $n$이 너무 크면 off-policy bias가 커지고, $\beta$ annealing이 너무 빠르면 초기 학습이 불안정해진다.
+</Callout>
+
+## 정리
+
+- Dueling은 $Q = V + A$로 분해해 state-value 학습을 모든 action에 공유한다. Mean subtraction이 표현의 유일성을 보장한다.
+- PER은 TD error 기반 priority sampling으로 informative sample에 집중하고, IS weight로 bias를 보정한다.
+- Multi-step return은 실제 reward를 더 많이 사용해 bootstrapping 오류를 줄이며, 최적 $n$은 bias-variance tradeoff에서 결정된다.
+- Noisy Net은 weight의 확률성으로 state-dependent exploration을 자동화하며, $\sigma$가 gradient로 학습된다.
+- 이 네 요소는 독립적인 동기에서 나왔지만, 모두 **gradient signal의 품질 향상**이라는 원칙을 공유하기 때문에 결합했을 때 synergy가 발생한다.
+
+<Reference
+  title="Rainbow: Combining Improvements in Deep Reinforcement Learning"
+  authors="Hessel et al."
+  year={2018}
+  venue="AAAI"
+  url="https://arxiv.org/abs/1710.02298"
+/>
+
+<Reference
+  title="Prioritized Experience Replay"
+  authors="Schaul et al."
+  year={2016}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1511.05952"
+/>

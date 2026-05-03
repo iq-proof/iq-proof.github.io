@@ -1,0 +1,181 @@
+---
+title: "DDPG는 왜 불안정한가 — Continuous Control의 설계와 균열"
+description: "DQN이 연속 행동 공간에서 실패하는 수학적 이유부터 DDPG의 결정론적 정책 기울기 유도, Q-과대추정과 탐험 민감성까지, continuous control의 핵심 트레이드오프를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, ddpg, policy-gradient, continuous-control, actor-critic]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DQN은 Atari를 정복했다. 하지만 로봇 팔 하나를 제어하는 데는 쓸 수 없다. 왜인가? 그리고 이 한계를 돌파하기 위해 만든 DDPG가 "작동하지만 믿을 수 없다"는 평가를 받는 이유는 무엇인가?
+
+## DQN의 경계 — 이산에서 연속으로
+
+DQN의 핵심 연산은 다음 한 줄이다.
+
+$$
+y = r + \gamma \max_{a' \in \mathcal{A}} Q(s', a';\, \theta^-)
+$$
+
+행동 집합 $\mathcal{A}$가 유한하면, $\max$는 단순히 모든 행동에 대해 $Q$를 평가하고 가장 큰 값을 고르는 $O(M)$ 연산이다. Atari에서 $M \leq 18$이므로 문제없다.
+
+연속 행동 공간 $\mathcal{A} = [-1, 1]^d$로 넘어오면 이 연산이 **제약 최적화 문제**로 바뀐다.
+
+$$
+\max_{a' \in [-1,1]^d} Q(s', a';\, \theta^-)
+$$
+
+신경망 $Q$는 일반적으로 비볼록 함수다. 매 스텝마다 비볼록 최적화를 풀어야 한다. 흔히 제안되는 우회책인 균등 이산화는 차원 $d$에 지수적으로 폭발한다.
+
+$$
+|\mathcal{A}_{\text{discrete}}| = K^d
+$$
+
+$K=10$, $d=7$(휴머노이드 로봇의 전형적인 행동 차원)이면 $10^7$개 행동을 매 스텝 평가해야 한다. GPU로 초당 1백만 번 평가한다고 해도 10 스텝/초가 한계다. RL 학습에 필요한 $10^6 \sim 10^7$ 스텝은 현실적으로 불가능하다.
+
+<Callout type="warning" title="차원의 저주">
+이산화 오차는 $O(1/K)$로 줄지만, 필요한 평가 횟수는 $K^d$로 증가한다. 오차 허용 범위 $\epsilon$을 달성하려면 $N = \Theta((1/\epsilon)^d)$번 평가가 필요하다 — $d$가 커질수록 근본적으로 불가능해진다.
+</Callout>
+
+## 결정론적 정책 기울기 — DPG 정리
+
+연속 행동 공간의 해법은 $\max_a Q$를 **명시적으로 계산하지 않는 것**이다. 대신 "어떤 행동이 좋은가"를 직접 출력하는 **행위자 네트워크** $\mu_\theta(s)$를 도입하고, 이를 $Q$의 기울기로 개선한다.
+
+Silver et al.(2014)의 결정론적 정책 기울기(DPG) 정리는 이 직관을 엄밀하게 만든다.
+
+<Theorem kind="theorem" number="1" title="Deterministic Policy Gradient (Silver et al. 2014)">
+파라미터화된 결정론적 정책 $\mu_\theta: \mathcal{S} \to \mathcal{A}$에 대해, 정책 성능의 기울기는 다음과 같다.
+
+$$
+\nabla_\theta J(\mu_\theta) = \mathbb{E}_{s \sim d^{\mu_\theta}}\!\left[\nabla_\theta \mu_\theta(s) \cdot \nabla_a Q^{\mu_\theta}(s, a)\Big|_{a=\mu_\theta(s)}\right]
+$$
+
+여기서 $d^{\mu_\theta}$는 정책 $\mu_\theta$를 따를 때의 할인된 상태 분포다.
+</Theorem>
+
+<Proof>
+핵심은 연쇄 법칙이다. 정책 성능 $J(\theta) = \mathbb{E}_{s \sim d^{\mu_\theta}}[Q^{\mu_\theta}(s, \mu_\theta(s))]$에서 $\theta$는 두 경로로 $J$에 영향을 미친다: 상태 분포 $d^{\mu_\theta}$를 통한 직접 경로, 그리고 행동 $\mu_\theta(s)$를 통한 간접 경로.
+
+Silver(2014)는 에르고딕 MDP의 정상 분포 성질에 의해 직접 경로의 기여가 정확히 상쇄됨을 보였다. 따라서 간접 경로만 남는다.
+
+$$
+\nabla_\theta J = \mathbb{E}_s\!\left[\frac{\partial Q(s, a)}{\partial a}\bigg|_{a=\mu_\theta(s)} \cdot \frac{\partial \mu_\theta(s)}{\partial \theta}\right]
+$$
+
+행렬 차원을 확인하면: $\nabla_a Q \in \mathbb{R}^{|\mathcal{A}|}$, $\nabla_\theta \mu_\theta \in \mathbb{R}^{|\mathcal{A}| \times |\theta|}$, 결과는 $\mathbb{R}^{|\theta|}$. $\square$
+</Proof>
+
+이 공식의 함의는 명확하다. 행위자는 단 한 번의 순전파로 행동을 생성하고($O(1)$), 비평자의 $\nabla_a Q$를 신호 삼아 개선된다. 지수적 이산화 격자가 필요 없다.
+
+DPG 정리는 오프-정책 호환성도 제공한다. 확률적 정책 기울기는 현재 정책에서 샘플링한 $(s, a)$가 필요하지만, DPG는 상태 $s$만 필요하고 행동은 현재 정책 $\mu_\theta$가 결정론적으로 생성한다. 따라서 재현 버퍼의 오래된 전이에서도 유효한 기울기 추정치를 얻을 수 있다 — DQN의 경험 재현을 그대로 활용하는 DDPG의 토대다.
+
+## DDPG의 구조 — DQN 위에 쌓인 것들
+
+DDPG(Lillicrap et al. 2016)는 DPG 정리를 심층 신경망으로 구현하면서 DQN의 세 가지 안정화 장치를 계승한다.
+
+**경험 재현**: 오프-정책 학습으로 과거 전이를 재사용한다.
+
+**목표 네트워크**: DQN의 하드 복사($C$ 스텝마다 덮어쓰기) 대신 **소프트 업데이트**를 도입한다.
+
+$$
+\theta^- \leftarrow \tau\,\theta + (1-\tau)\,\theta^-, \quad \tau = 0.005
+$$
+
+업데이트 $n$회 후 목표 네트워크의 지연은 $(1-\tau)^n$으로 지수적으로 감소한다. $\tau=0.005$이면 반감기는 약 139 스텝 — 충분히 느려서 부트스트래핑 불안정을 억제한다.
+
+**비평자-행위자 분리**: 비평자 $Q_\phi(s, a)$는 DQN처럼 벨만 목표로 학습하고, 행위자 $\mu_\theta(s)$는 DPG 기울기로 학습한다.
+
+```python
+# DDPG 비평자 업데이트
+with torch.no_grad():
+    next_a = actor_target(next_states)
+    target_q = rewards + (1 - dones) * gamma * critic_target(next_states, next_a)
+current_q = critic(states, actions)
+critic_loss = ((current_q - target_q) ** 2).mean()
+
+# DDPG 행위자 업데이트 (DPG: -Q를 최소화 = Q를 최대화)
+actor_loss = -critic(states, actor(states)).mean()
+```
+
+결정론적 정책이므로 탐험을 위해 행동에 잡음을 별도로 추가해야 한다. Lillicrap(2016)은 오른스타인-울렌벡(OU) 과정을 사용했다: $a_t = \mu(s_t) + x_t$, 여기서 $x_t$는 자기 상관된 연속 잡음이다.
+
+## DDPG의 균열 — 세 가지 불안정성
+
+DDPG는 continuous control의 돌파구였지만, 실무에서 "하이퍼파라미터를 약간 바꾸면 발산한다"는 평판이 따라붙었다. 세 가지 근본 원인이 있다.
+
+**Q 과대추정**: 비평자는 행동 잡음이 포함된 $(s, a_{\text{old}})$ 쌍으로 학습하지만, 행위자는 잡음 없는 $\mu_\theta(s)$에서 $Q$를 평가한다. 이 분포 불일치가 체계적 과대추정을 낳는다.
+
+$$
+\mathbb{E}[Q_\phi(s, \mu_\theta(s))] \geq \mathbb{E}[Q^\mu(s, \mu_\theta(s))]
+$$
+
+Fujimoto et al.(2018)은 이 과대추정 오차가 행동 분포 $\beta$(과거 정책)와 $\mu$(현재 정책) 사이의 KL 발산에 비례함을 보였다.
+
+**소프트 업데이트 $\tau$의 민감성**: $\tau$가 너무 작으면 목표 네트워크가 구식이 되어 비평자 손실이 정체되고, 너무 크면 부트스트래핑 불안정이 재현된다. 최적 범위 $\tau \in [0.001, 0.01]$은 환경마다 다르다.
+
+**탐험 잡음의 취약성**: OU 잡음의 하이퍼파라미터 $(\theta_{\text{ou}}, \sigma)$는 환경의 시간 척도에 따라 달라진다. 잘못된 설정은 탐험 부족 또는 과잉으로 이어진다.
+
+<Callout type="note" title="트레이드오프">
+DDPG의 핵심 긴장은 **오프-정책 효율성**과 **분포 정합성** 사이에 있다. 재현 버퍼를 오래 쓸수록 샘플 효율은 높아지지만, 과거 정책과 현재 정책의 행동 분포 차이가 Q 추정을 오염시킨다. $\tau$, 잡음 크기, 비평자 학습률은 모두 이 긴장의 다른 표현이다.
+</Callout>
+
+## TD3와 SAC — 두 갈래의 해법
+
+DDPG의 불안정성에 대한 답은 2018년에 두 방향으로 나왔다.
+
+**TD3(Fujimoto 2018)**: 보수적 접근. 두 개의 독립 비평자 $Q_{\phi_1}, Q_{\phi_2}$를 유지하고 최솟값으로 벨만 목표를 계산한다.
+
+$$
+y = r + \gamma \min\!\left(Q_{\phi_1^-}(s', \mu_{\theta^-}(s') + \epsilon),\; Q_{\phi_2^-}(s', \mu_{\theta^-}(s') + \epsilon)\right)
+$$
+
+$\epsilon \sim \text{Clip}(\mathcal{N}(0,\sigma), -c, c)$는 목표 행동을 부드럽게 만든다(target policy smoothing). 행위자 업데이트는 매 $d=2$ 비평자 업데이트마다 한 번으로 지연된다. $\min$은 과대추정을 과소추정으로 전환하고, 지연 업데이트는 불안정한 $Q$ 신호가 행위자에 전파되기 전에 비평자가 수렴할 시간을 준다.
+
+**SAC(Haarnoja 2018)**: 원칙적 접근. 보상 최대화에 정책 엔트로피 항을 추가한다.
+
+$$
+J(\theta) = \mathbb{E}\!\left[\sum_t \gamma^t \left(r_t + \alpha\, H(\pi_\theta(\cdot|s_t))\right)\right]
+$$
+
+엔트로피 계수 $\alpha$는 라그랑지안 이중 최적화로 자동 조정된다 — 목표 엔트로피 $H_{\text{target}}$을 제약으로 삼는 제약 최적화의 쌍대 변수가 $\alpha$다. 이 구조는 탐험을 잡음 하이퍼파라미터가 아닌 **정책의 본질**로 만든다.
+
+<Aside label="설계 철학">
+TD3는 "Q가 잘못되면 행위자도 잘못된다"는 문제를 Q를 보수적으로 만들어 차단한다. SAC는 "탐험-활용 균형이 하이퍼파라미터에 달려 있다"는 문제를 목적 함수 안에 엔트로피를 포함시켜 해소한다. 같은 문제를 향한 두 철학 — 보수주의와 최대 엔트로피.
+</Aside>
+
+## 정리
+
+- DQN의 $\max_a Q$ 연산은 이산 행동 공간의 산물이다. 연속 공간에서 이산화는 $K^d$ 지수 폭발로 계산 불가능해진다.
+- DPG 정리는 $\max_a Q$ 없이 연속 행동을 개선하는 경로를 제공한다 — 비평자의 $\nabla_a Q$를 신호로 행위자를 직접 학습한다.
+- DDPG는 이 정리를 경험 재현, 소프트 타깃, 행위자-비평자 분리로 구현했지만, Q 과대추정과 탐험 잡음 민감성이라는 구조적 취약점을 남겼다.
+- TD3는 보수적 이중 Q와 지연 업데이트로, SAC는 엔트로피 정규화로 같은 취약점을 서로 다른 원칙에서 공략한다.
+
+연속 제어의 역사는 "행동 최대화를 어떻게 회피하는가"라는 하나의 질문에 대한 반복적 정제다.
+
+<Reference
+  title="Deterministic Policy Gradient Algorithms"
+  authors="Silver, Lever, Heess, Degris, Wierstra, Riedmiller"
+  year={2014}
+  venue="ICML"
+  url="http://proceedings.mlr.press/v32/silver14.pdf"
+/>
+
+<Reference
+  title="Addressing Function Approximation Error in Actor-Critic Methods"
+  authors="Fujimoto, van Hoof, Meger"
+  year={2018}
+  venue="ICML"
+  url="https://arxiv.org/abs/1802.09477"
+/>

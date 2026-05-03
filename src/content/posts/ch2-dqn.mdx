@@ -1,0 +1,105 @@
+---
+title: "DQN은 어떻게 픽셀에서 인간을 이겼는가"
+description: "Experience Replay로 i.i.d.를 복원하고, Target Network로 moving target을 고정하고, Reward Clipping으로 gradient를 제어하는 DQN 세 가지 트릭의 수학적 의미를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, dqn, experience-replay, target-network, atari]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Tabular Q-learning은 이론적으로 완벽하다. 그런데 상태 공간이 Atari raw pixel처럼 $256^{210 \times 160 \times 3}$에 이르면 테이블 자체를 만들 수 없다. DNN을 function approximator로 붙이면 자동 feature learning이 가능하지만, off-policy + bootstrap + function approximation이 만나는 순간 학습이 발산한다. DQN은 이 deadly triad를 우회하는 세 가지 트릭으로 2015년 Nature에 실렸다 — 그 트릭들이 각각 정확히 어떤 수학적 문제를 풀고 있는가?
+
+## DQN이 풀어야 했던 문제
+
+표준 Q-learning의 업데이트 규칙은 다음과 같다.
+
+$$Q(s, a) \leftarrow Q(s, a) + \alpha \left[r + \gamma \max_{a'} Q(s', a') - Q(s, a)\right]$$
+
+DNN $Q(s, a; \theta)$로 대체하면 세 가지 문제가 동시에 터진다.
+
+첫째, trajectory $(s_t, s_{t+1}, \ldots)$의 인접 frame은 픽셀 수준에서 거의 동일하다 — sequential correlation이 SGD의 i.i.d. 가정을 위반해 gradient estimate를 biased로 만든다. 둘째, target $y = r + \gamma \max_{a'} Q(s', a'; \theta)$가 학습 중인 파라미터 $\theta$에 의존하므로 매 스텝 변한다 — moving target 문제. 셋째, 게임마다 reward scale이 달라 같은 learning rate로는 모든 게임을 동시에 학습할 수 없다.
+
+DQN의 세 트릭은 이 세 문제에 각각 대응한다.
+
+## Experience Replay — i.i.d. 복원
+
+Experience Replay는 모든 transition $(s, a, r, s')$을 크기 $N = 10^6$의 원형 버퍼 $D$에 저장하고, 학습 시 uniform random sampling으로 minibatch를 구성한다.
+
+$$\widehat{L} = \frac{1}{M} \sum_{(s, a, r, s') \sim D} \left(r + \gamma \max_{a'} Q(s', a'; \theta^-) - Q(s, a; \theta)\right)^2$$
+
+SGD 수렴의 핵심 조건은 각 minibatch가 데이터 분포의 unbiased estimate여야 한다는 것이다. Sequential trajectory는 $\text{Corr}(s_t, s_{t+k}) \approx \rho^k$ ($\rho \approx 0.99$)로 강하게 연결되어 있어 이 조건을 위반한다. Uniform random sampling은 position 차이가 $k$인 두 샘플 사이에 수많은 episode boundary와 policy 변화를 끼워 넣어 correlation을 exponentially decay시킨다.
+
+부수 효과가 두 가지 더 있다. 하나의 transition을 여러 번 재사용하므로 동일한 environment interaction에서 $K$배 많은 gradient update를 얻는다 ($T_{\text{grad}} \ll T_{\text{env}}$이면 off-policy가 $K$배 sample efficient). 버퍼에 오래된 transition이 남아 있어 정책이 급격히 바뀌어도 이전 state를 간헐적으로 학습하므로 catastrophic forgetting도 완화된다.
+
+<Aside label="버퍼 크기의 트레이드오프">
+$N$이 너무 작으면($< 10^4$) correlation이 남고, 너무 크면($> 10^7$) 오래된 policy의 data가 너무 많아 현재 정책 update가 느리게 반영된다. Atari 기준 mixing time이 $\approx 100$이므로 $N = 10^6$은 충분하다.
+</Aside>
+
+## Target Network — Supervised Regression으로의 환원
+
+Target network $\theta^-$는 매 $C$ step마다만 $\theta$로 동기화된다. 그 사이에는 고정된다.
+
+$$L(\theta) = \mathbb{E}_{(s, a, r, s') \sim D}\!\left[\left(\underbrace{r + \gamma \max_{a'} Q(s', a'; \theta^-)}_{\text{상수}} - Q(s, a; \theta)\right)^2\right]$$
+
+$\theta^-$가 고정되면 target이 $\theta$와 무관한 상수가 된다. 이 순간 loss는 실수값 target $y$에 network output을 맞추는 표준 supervised regression이 된다 — convex-like landscape, standard SGD 수렴 보장.
+
+<Theorem kind="proposition" number="1" title="Target Network의 Supervised Regression 환원">
+Target network $\theta^-$를 매 $C$ step마다만 동기화할 때, 각 update cycle $[kC, (k+1)C)$ 내에서 loss $L(\theta)$는 $\theta$만의 함수로, frozen target $y = r + \gamma \max Q(s', \cdot; \theta^-)$에 대한 supervised MSE regression이다.
+</Theorem>
+
+<Proof>
+$t \in [kC, (k+1)C)$ 구간에서 $\theta^- = \theta_{kC}$로 고정. target $y = r + \gamma \max_{a'} Q(s', a'; \theta^-)$는 현재 $\theta$와 무관한 상수. 따라서 $\partial y / \partial \theta = 0$이고, gradient는 $\nabla_\theta L = -2(y - Q(s, a; \theta)) \nabla_\theta Q$로 단순화된다. 이는 표준 MSE의 gradient와 동일하다. $\square$
+</Proof>
+
+반대로 target network가 없으면 $\partial y / \partial \theta \neq 0$이 되어 gradient에 자기참조 항이 추가된다. 단순 1D toy ($Q(\theta) = \theta$, $r=1$, $\gamma=0.9$)에서도 moving target이 존재하지만 수렴하는 것처럼 보이는 이유는 loss가 여전히 quadratic이기 때문이다. 그러나 수백만 파라미터의 nonlinear NN에서는 두 gradient의 상대적 크기에 따라 saddle point dynamics가 발생하고 발산 또는 진동으로 이어진다.
+
+업데이트 주기 $C$의 선택은 이론보다 실험으로 정해졌다. Mnih 2015의 ablation에서 $C = 10^4$가 49개 게임 평균 성능을 최대화했다. $C \to 0$이면 moving target 문제가 복귀하고, $C \to \infty$이면 target이 너무 오래된 값을 참조해 학습이 느려진다.
+
+## Reward Clipping — Gradient Norm의 Lipschitz 제어
+
+Atari 49개 게임의 reward scale은 Pong($\pm 1$)부터 Q*bert($25 \sim 1000$)까지 천차만별이다. 같은 learning rate를 쓰려면 reward scale을 통일해야 한다. DQN은 다음과 같이 처리한다.
+
+$$r' = \text{sign}(r) \cdot \min(|r|, 1)$$
+
+이것이 단순한 normalization trick처럼 보이지만 수학적 역할이 명확하다. Clipping 함수 $f(r) = \text{clip}(r, -1, 1)$의 Lipschitz 상수는 1이다. 따라서 target $y = r' + \gamma \max Q(s', \cdot; \theta^-)$의 $r$에 대한 Lipschitz 상수도 1로 bounded되고, gradient norm $\|\nabla_\theta L\| \leq C_{\text{grad}}$가 보장된다. Learning rate를 게임마다 튜닝하지 않아도 되는 이유가 여기 있다.
+
+<Callout type="warning" title="트레이드오프: 정보 손실">
+Clipping은 injection이 아니다. $r = 5$와 $r = 100$이 둘 다 $r' = 1$로 mapping된다. 학습 신호 관점에서 두 reward는 동일하다. Dense, small reward 게임에서는 영향이 미미하지만, sparse하고 보상 크기가 의미 있는 게임(Montezuma's Revenge 등)에서는 실질적 성능 저하가 발생한다. 이를 완화하기 위해 현대 알고리즘들은 reward normalization이나 PopArt 기법을 사용한다.
+</Callout>
+
+## 세 트릭의 결합 — 공통 철학
+
+세 트릭은 각각 독립적인 문제를 풀지만 공통 철학을 공유한다 — **"비정상적인 것을 일시적으로 정상으로 만들어라"**.
+
+Experience Replay는 sequential하게 생성된 데이터를 i.i.d.처럼 보이게 만든다. Target Network는 매 스텝 바뀌는 목표값을 일시적으로 고정해 supervised learning처럼 만든다. Reward Clipping은 스케일이 제각각인 게임 신호를 통일된 범위로 정규화해 같은 optimizer가 작동하게 만든다.
+
+Mnih 2015의 ablation 결과(Pong 기준)는 이 해석을 뒷받침한다. Full DQN이 +18.9점일 때, Target Network를 제거하면 +4.6, Replay를 제거하면 +7.4, Reward Clipping을 제거하면 +8.0으로 모두 급락한다. Target Network가 가장 critical한 이유는 moving target이 deadly triad의 핵심인 bootstrap과 function approximation의 충돌을 직접 유발하기 때문이다.
+
+## 정리
+
+- DQN의 loss는 $L(\theta) = \mathbb{E}_{D}\!\left[(r + \gamma \max_{a'} Q(s', a'; \theta^-) - Q(s, a; \theta))^2\right]$이며, $\theta^-$의 고정이 supervised regression을 가능하게 한다.
+- Experience Replay는 sequential correlation을 파괴해 SGD의 i.i.d. 가정을 근사하고, 동시에 sample reuse로 efficiency를 높인다.
+- Reward Clipping은 Lipschitz bound를 통해 gradient norm을 제어하며, 49개 게임에 동일한 hyperparameter를 쓰는 것을 가능하게 한다.
+- 세 트릭 중 하나라도 빠지면 성능이 급락한다 — 이들은 독립적 개선이 아니라 deadly triad를 우회하는 하나의 시스템이다.
+
+DQN의 구조 위에 Double DQN(overestimation bias 제거), Dueling Architecture(효율 향상), Prioritized Experience Replay(중요 sample 선별)가 쌓이는 것은 다음 글에서 다룬다.
+
+<Reference
+  title="Human-level control through deep reinforcement learning"
+  authors="Mnih et al."
+  year={2015}
+  venue="Nature"
+  url="https://www.nature.com/articles/nature14236"
+/>

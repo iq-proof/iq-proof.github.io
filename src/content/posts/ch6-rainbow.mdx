@@ -1,0 +1,130 @@
+---
+title: "Rainbow에서 MuZero까지 — DQN 진화의 통일된 논리"
+description: "6개 컴포넌트의 직교성부터 분산 학습, 잠재 공간 계획까지, Rainbow 이후 DQN 계보가 공유하는 하나의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, rainbow-dqn, muzero, distributional-rl, model-based-rl]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DQN은 단순하다. 하나의 Q-네트워크, 균일 샘플링, 단일 스텝 TD 오차. 그런데 2018년부터 2020년 사이, 이 단순한 구조 위에 여섯 개의 트릭이 쌓이고(Rainbow), 수백 개의 액터가 병렬로 붙고(Ape-X), LSTM이 시간 축을 늘리고(R2D2), 마침내 환경 규칙을 모른 채 잠재 공간에서 MCTS를 수행하는 모델(MuZero)이 등장했다. 이 모든 변화가 하나의 방향을 가리킨다 — **DQN의 약점 목록을 체계적으로 소거한다**. 그 논리는 무엇인가?
+
+## Rainbow — 직교 분해의 미학
+
+Rainbow(Hessel 2018)의 핵심 주장은 단순하다. DQN의 실패 원인은 여섯 가지이고, 각각의 해결책은 서로 독립적(orthogonal)이다.
+
+| 문제 | 해결책 |
+|------|--------|
+| 과대추정 편향 | Double DQN |
+| Q 분산 | Dueling Network |
+| 샘플 효율 | PER |
+| 시간 지평 | Multi-step return |
+| 분포 무시 | Distributional (C51) |
+| 탐색 부족 | Noisy Net |
+
+"직교적"이라는 말은 수학적으로 엄밀하다. Double DQN은 타깃 선택(action selection)의 편향을 줄이고, Distributional은 손실 함수의 KL 발산을 최소화한다. 두 컴포넌트의 기울기 경로가 다르기 때문에 곱셈 또는 덧셈으로 결합할 수 있다. Rainbow의 통합 손실은 이를 반영한다.
+
+$$L_t(\theta) = \mathbb{E}_{(s,a,r,s',d)\sim\mathcal{B}}\!\left[w_t \cdot \rho_\tau^{\text{Huber}}\!\left(\mathcal{T}_{\text{dist}} Z_{\theta^-}, Z_\theta\right)\right]$$
+
+여기서 $w_t = (1/Np_t)^\beta$는 PER의 중요도 가중치이고, $\mathcal{T}_{\text{dist}}$는 Multi-step과 Double을 통합한 분포 벨만 연산자다. 각 항은 독립적으로 추가된다.
+
+<Callout type="note" title="Superadditivity">
+Hessel 2018의 ablation 결과는 흥미롭다. 여섯 컴포넌트의 개별 기여를 단순히 더하면 실제 Rainbow 성능에 못 미친다. Multi-step과 PER은 특히 강한 시너지를 만든다 — n-step return의 높은 분산이 PER의 우선순위 계산을 더 의미 있게 만들기 때문이다. 직교성은 독립적 추가를 가능하게 하지만, 상호 강화를 막지는 않는다.
+</Callout>
+
+## Ablation — 무엇이 정말 중요한가
+
+Rainbow를 분해하면 컴포넌트마다 기여도가 균등하지 않다.
+
+Hessel 2018의 ablation(57개 Atari 게임, human-normalized score 중앙값 기준)은 세 계층을 드러낸다.
+
+- **결정적(Critical)**: Multi-step $n=3$ ($\approx +30\%$), Distributional ($\approx +20\%$), PER ($\approx +15\%$)
+- **중요**: Noisy Net ($\approx +10\%$)
+- **한계적(Marginal)**: Double DQN, Dueling (각 $\approx +5\%$)
+
+<Theorem kind="proposition" number="1" title="Component Addition Order">
+대부분의 컴포넌트 쌍은 추가 순서에 무관하게 최종 수렴 성능이 거의 동일하다. 단, PER과 Multi-step을 결합할 때 초기 학습 곡선(transient)은 순서에 따라 다를 수 있다.
+</Theorem>
+
+<Proof>
+직교 컴포넌트의 손실이 가산적(additive) 또는 스칼라 곱셈으로 결합 가능할 때, 손실 최솟값은 추가 순서에 무관하다. PER+Multi-step의 경우 초기에 큰 n-step 분산이 PER 우선순위를 부풀리는 transient 효과가 있으나, 점근적으로(asymptotically) 수렴점은 동일하다. 따라서 Hessel 2018이 제안하는 순서(Double → Dueling → PER → Multi-step → Distributional → Noisy)는 임의적 관례가 아니라 초기 학습 안정성을 위한 추천이다. $\square$
+</Proof>
+
+이 결과가 실무에 주는 메시지는 명확하다. 새로운 환경에 Rainbow를 적용할 때, Multi-step과 Distributional을 먼저 구현하고 나머지는 나중에 추가하라.
+
+## Post-Rainbow — 규모와 기억의 축
+
+Rainbow는 단일 머신, 균일 관찰, 단순 MDP를 가정한다. 이 세 가정을 깨는 방향이 곧 Ape-X, R2D2, IMPALA다.
+
+**Ape-X(Horgan 2018)**는 가로 축으로 확장한다. 수백 개의 액터가 병렬로 경험을 생성하고 중앙 PER 버퍼에 저장하며, 단일 학습자(learner)가 GPU에서 배치를 샘플링한다. 256개 액터 기준 단일 머신 대비 50~100배 빠른 학습이 가능하다.
+
+**R2D2(Kapturowski 2019)**는 세로 축(시간)으로 확장한다. LSTM hidden state가 에피소드 경계를 넘어 carry-over되고, episode 시작 후 초반 $m$ 스텝은 burn-in으로 처리해 hidden state가 수렴한 뒤 손실을 계산한다. 부분 관찰(partial observability) 환경에서 단순 frame-stack보다 훨씬 정확한 상태 표현을 제공한다.
+
+**IMPALA(Espeholt 2018)**는 액터와 학습자의 정책 격차 문제를 V-trace로 해결한다.
+
+$$\bar{\rho}_s = \min\!\left(\rho_s,\, \overline{\rho}\right), \quad \rho_s = \frac{\pi(a_s \mid s)}{\mu(a_s \mid s)}$$
+
+중요도 비율을 $\overline{\rho} \approx 1.0$으로 클리핑하면 분산 폭증을 막으면서도 off-policy 편향을 보정한다.
+
+<Aside label="설계 패턴">
+Ape-X / R2D2 / IMPALA 세 알고리즘은 각각 다른 제약을 완화하지만, 모두 "단일 Rainbow 학습 루프를 분해해 병렬화한다"는 동일한 패턴을 따른다. 규모가 달라질 때 어떤 가정이 먼저 깨지는지를 파악하는 것이 핵심이다.
+</Aside>
+
+## MuZero — 모델 없이 계획하기
+
+MuZero(Schrittwieser 2020)는 방향이 다르다. 앞선 알고리즘들이 모두 model-free였다면, MuZero는 환경 규칙 없이도 잠재 공간에서 MCTS를 수행한다.
+
+세 네트워크가 역할을 분담한다.
+
+$$h: \mathcal{O} \to \mathcal{S}_{\text{latent}}, \quad g: \mathcal{S}_{\text{latent}} \times \mathcal{A} \to \mathcal{S}_{\text{latent}} \times \mathbb{R}, \quad f: \mathcal{S}_{\text{latent}} \to \Delta_{\mathcal{A}} \times \mathbb{R}$$
+
+표현 네트워크 $h$가 원시 관찰을 압축하고, 동역학 네트워크 $g$가 잠재 공간에서 전이를 시뮬레이션하며, 예측 네트워크 $f$가 정책과 가치를 출력한다. MCTS는 이 잠재 공간 트리에서 수행된다. 픽셀을 직접 예측할 필요가 없다 — 행동 가치를 정확히 예측하는 잠재 표현이면 충분하다.
+
+손실은 세 항의 합이다.
+
+$$L_t(\theta) = L_v(v_t, G_t) + L_\pi(\pi_t, \pi^{\text{MCTS}}) + L_r(r_t, r_t^{\text{env}})$$
+
+보상 예측 손실 $L_r$이 동역학 네트워크 $g$를 직접 교정한다. 이것이 핵심이다 — 보상만 정확하면 장기 가치도 자동으로 개선된다.
+
+결과는 인상적이다. Atari에서 Rainbow가 약 50M 스텝을 요구하는 반면 MuZero는 5M 스텝으로 동등한 성능을 달성한다. Go, Chess, Shogi에서는 AlphaZero를 능가한다.
+
+<Callout type="warning" title="트레이드오프">
+MuZero의 잠재 공간 모델은 **계획 지평선 내에서만** 정확하면 된다는 설계 철학을 갖는다. 반면 장기 계획이나 희소 보상 환경에서는 표현 네트워크가 essential statistics를 놓칠 수 있다. MCTS의 시뮬레이션당 연산 비용도 실시간 제약이 있는 로봇 제어에서는 병목이 된다.
+</Callout>
+
+## 정리
+
+Rainbow부터 MuZero까지의 흐름을 하나의 문장으로 요약하면: **DQN의 각 약점을 직교하는 해결책으로 소거하고, 그 구조를 점진적으로 확장했다.**
+
+- Rainbow: 여섯 컴포넌트는 직교하므로 독립적으로 추가 가능하다. 가장 중요한 것은 Multi-step과 Distributional이다.
+- Ape-X / R2D2 / IMPALA: 단일 머신, 마르코프 가정, on-policy 가정을 각각 완화한다.
+- MuZero: 환경 모델 없이도 잠재 공간 MCTS로 model-based의 샘플 효율을 달성한다.
+- 남은 질문: 이 계보가 연속 제어와 부분 관찰 로봇 환경에서 어디까지 일반화되는가.
+
+<Reference
+  title="Rainbow: Combining Improvements in Deep Reinforcement Learning"
+  authors="Hessel et al."
+  year={2018}
+  venue="AAAI"
+  url="https://arxiv.org/abs/1710.02298"
+/>
+
+<Reference
+  title="Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model"
+  authors="Schrittwieser et al."
+  year={2020}
+  venue="Nature"
+  url="https://arxiv.org/abs/1911.08265"
+/>

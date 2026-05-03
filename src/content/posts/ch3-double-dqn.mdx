@@ -1,0 +1,146 @@
+---
+title: "Q-Learning은 왜 항상 과대평가하는가"
+description: "Jensen's inequality에서 비롯된 maximization bias의 수학적 구조부터 Double DQN이 online/target network 분리로 이를 제거하는 원리까지, 편향의 근원을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [deep-rl, q-learning, double-dqn, overestimation, bellman]
+difficulty: advanced
+series:
+  slug: deep-rl-deep-dive
+  title: Deep Rl Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Q-Learning은 수렴한다. Watkins & Dayan(1992)이 증명했다. 그런데 van Hasselt(2010)은 수렴하는 그 Q-Learning이 학습 내내 진짜 값보다 **체계적으로 높은** 추정치를 생성한다는 사실을 보였다. 수렴과 편향은 모순이 아니다 — 극한에서 수렴하더라도, 유한한 학습 과정에서 overestimation이 누적되면 탐색 방향이 왜곡된다. 왜 `max` 연산자 하나가 이런 문제를 만들어내는가?
+
+## 문제: max가 noise를 증폭한다
+
+target network에서 각 action의 Q-추정값이 true value 주변에 noise를 가진다고 하자.
+
+$$\hat{Q}(s', a) = Q^*(s', a) + \xi_a, \quad \mathbb{E}[\xi_a] = 0$$
+
+여기서 핵심은 `max` 연산이다. `max`는 **볼록 함수(convex function)**이므로 Jensen's inequality에 의해 다음이 성립한다.
+
+$$\mathbb{E}\left[\max_a \hat{Q}(s', a)\right] \geq \max_a \mathbb{E}[\hat{Q}(s', a)] = \max_a Q^*(s', a)$$
+
+각 estimator가 unbiased라도, 그 max의 기댓값은 true max보다 크거나 같다. noise가 대칭이어도 `max`의 비대칭성이 편향을 만든다.
+
+<Theorem kind="theorem" number="1" title="Maximization Bias (van Hasselt 2010)">
+$\hat{Q}(s', a)$가 $Q^*(s', a)$의 unbiased estimator이면,
+
+$$\mathbb{E}_{\hat{Q}}\left[\max_a \hat{Q}(s', a)\right] \geq \max_a Q^*(s', a)$$
+</Theorem>
+
+<Proof>
+`max`는 convex이므로 Jensen's inequality: $\max_a \mathbb{E}[\hat{Q}(s', a)] \leq \mathbb{E}[\max_a \hat{Q}(s', a)]$. Unbiasedness에서 $\mathbb{E}[\hat{Q}(s', a)] = Q^*(s', a)$이므로 대입하면 성립한다. $\square$
+</Proof>
+
+## 편향의 크기: action 수에 따라 자란다
+
+noise가 zero-mean sub-Gaussian이고 분산이 $\sigma^2$이면, action 수 $m$에 따른 bias 크기를 정량화할 수 있다.
+
+$$\mathbb{E}\left[\max_a (Q^* + \xi_a)\right] - \max_a Q^* \approx \sigma \sqrt{2 \log m}$$
+
+$m$이 10배 늘어도 bias는 $\sqrt{\log}$ 속도로만 커진다. 그러나 절대값은 무시할 수 없다.
+
+| Action 수 ($m$) | Bias ($\sigma \sqrt{2 \log m}$), $\sigma = 1$ 기준 |
+|---|---|
+| 2 | 0.84 |
+| 10 | 1.81 |
+| 50 | 2.68 |
+| 100 | 3.03 |
+
+Atari처럼 action이 10-20개인 환경에서 Q-추정값의 noise $\sigma$가 1~2 수준이면, bias는 실제 reward와 비슷한 크기까지 쌓인다.
+
+<Callout type="warning" title="함수 근사에서는 더 심각하다">
+Tabular setting에서는 샘플이 충분히 쌓이면 noise $\xi_a$가 0으로 수렴한다. 하지만 neural network 함수 근사에서는 네트워크 용량의 한계, non-stationary target, 그리고 off-policy 샘플링이 지속적으로 noise를 공급한다. overestimation은 학습 내내 사라지지 않는다.
+</Callout>
+
+## 해결: selection과 evaluation을 분리한다
+
+편향의 원인은 명확하다 — 같은 network가 "어떤 action이 좋은가(selection)"와 "그 action이 얼마나 좋은가(evaluation)"를 동시에 담당하면서 noise가 두 번 적용된다.
+
+Double Q-Learning(van Hasselt 2010)의 핵심 아이디어는 이 두 역할을 **독립적인 두 estimator**로 분리하는 것이다.
+
+$$y_{\text{DQL}} = r + \gamma Q^B\!\left(s',\, \arg\max_a Q^A(s', a)\right)$$
+
+$Q^A$가 action을 선택하고, $Q^B$가 그 action의 가치를 평가한다. 둘이 독립적인 noise를 가지면 cross-term이 상쇄된다.
+
+<Theorem kind="theorem" number="2" title="Double Q-Learning Unbiasedness (Hasselt 2010)">
+$Q^A, Q^B$가 $Q^*$의 독립적인 unbiased estimator이면,
+
+$$\mathbb{E}\left[Q^B\!\left(s', \arg\max_a Q^A(s', a)\right)\right] = Q^*\!\left(s', \arg\max_a Q^*(s', a)\right)$$
+</Theorem>
+
+<Proof>
+Tower property: $\mathbb{E}[Q^B(s', a^*)] = \mathbb{E}_A[\mathbb{E}_B[Q^B(s', a^*) \mid Q^A]]$. $Q^A \perp Q^B$이므로 $\mathbb{E}_B[Q^B(s', a^*) \mid Q^A] = \mathbb{E}_B[Q^B(s', a^*)]$. $Q^B$의 unbiasedness에서 $= Q^*(s', a^*)$. $\square$
+</Proof>
+
+## Double DQN: 추가 network 없이 같은 효과
+
+두 개의 독립 network를 유지하는 것은 메모리 비용이 2배다. Hasselt et al.(2016)은 DQN이 이미 갖고 있는 구조를 재활용한다.
+
+- **Online network** $\theta$: 매 step 업데이트 → action selection
+- **Target network** $\theta^-$: $C$ step마다 동기화 → value evaluation
+
+$$\boxed{y^{\text{DDQN}} = r + \gamma Q\!\left(s',\, \arg\max_{a'} Q(s', a'; \theta)\,;\, \theta^-\right)}$$
+
+기존 DQN과 단 한 줄 차이다.
+
+```python
+# Standard DQN: 둘 다 target network
+q_next = target(s_next).max(dim=1)[0]
+
+# Double DQN: selection은 online, evaluation은 target
+a_next = online(s_next).argmax(dim=1)
+q_next = target(s_next).gather(1, a_next.unsqueeze(1)).squeeze(1)
+```
+
+시간 lag $C$가 $\theta$와 $\theta^-$를 부분적으로 decorrelate시킨다. 완전한 독립은 아니지만, 충분한 bias reduction을 제공한다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**bias 감소 vs. decorrelation 강도**: target update 주기 $C$가 크면 $\theta$와 $\theta^-$의 차이가 커져 decorrelation이 강해지고 bias가 줄어든다. 하지만 target이 너무 오래된 정보를 담으면 non-stationary learning target 문제가 심해진다. 보통 Atari 기준 $10^4$ step이 균형점이다.
+
+**overestimation vs. underestimation**: Double DQN은 overestimation을 줄이는 방향으로 작동한다. 일부 게임처럼 네트워크 용량 부족으로 인한 underestimation이 지배적인 환경에서는 오히려 성능이 떨어질 수 있다. van Hasselt(2016)의 Atari 57 벤치마크에서도 4개 게임은 DQN이 우세했다.
+</Callout>
+
+van Hasselt et al.(2016)의 실증 결과: Atari 57 게임에서 Double DQN은 standard DQN 대비 평균 ~36% 높은 human-normalized score를 달성했다. Q-value overestimation bias는 약 2배 감소했다. 코드 변경은 두 줄, 추가 메모리는 거의 없다.
+
+<Aside label="설계 철학">
+maximization bias는 Q-Learning의 버그가 아니라 `max` 연산자의 수학적 성질에서 비롯된다. 이를 "없애는" 것이 아니라 "selection과 evaluation을 분리해 상쇄시키는" 것이 Double Q-Learning의 핵심이다. 이 원칙은 이후 Dueling DQN, PER, C51, Rainbow 등 모든 DQN variant에 기본 구성 요소로 흡수되었다.
+</Aside>
+
+## 정리
+
+- Q-Learning의 target $\max_{a'} \hat{Q}(s', a')$는 Jensen's inequality에 의해 항상 $\max_{a'} Q^*(s', a')$를 과대평가한다.
+- bias 크기는 $\sigma\sqrt{2\log m}$으로, action 수가 많고 noise가 클수록 커진다.
+- Double Q-Learning은 selection과 evaluation을 독립 estimator로 분리해 bias를 이론적으로 정확히 제거한다.
+- Double DQN은 DQN의 online/target network 분리를 재활용해 추가 비용 없이 같은 효과를 달성한다.
+
+다음 글에서는 이 편향 제거 위에 Dueling Network가 어떻게 value와 advantage를 분리해 Q-function의 표현력을 높이는지 추적한다.
+
+<Reference
+  title="Deep Reinforcement Learning with Double Q-learning"
+  authors="van Hasselt, Guez, Silver"
+  year={2016}
+  venue="AAAI"
+  url="https://arxiv.org/abs/1509.06461"
+/>
+
+<Reference
+  title="Double Q-learning"
+  authors="van Hasselt"
+  year={2010}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/2010/hash/091d584fcea301d1117a64da974be23a-Abstract.html"
+/>
