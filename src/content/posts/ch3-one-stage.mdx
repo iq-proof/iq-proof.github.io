@@ -1,0 +1,144 @@
+---
+title: "One-Stage Detector는 어떻게 두 단계를 하나로 녹였나"
+description: "YOLOv1의 grid prediction부터 Focal Loss, modern YOLO, RT-DETR까지 — one-stage detection의 핵심 설계 결정과 그 trade-off를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [object-detection, yolo, focal-loss, anchor-free, one-stage]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+R-CNN 계열이 "후보 영역을 뽑은 뒤 분류한다"는 두 단계를 당연하게 여기던 시절, YOLOv1은 그 전제를 통째로 버렸다. 이미지 한 장을 한 번 보고, 모든 박스와 클래스를 동시에 예측한다. 이 선택이 무엇을 얻고 무엇을 잃었는지, 그리고 후속 세대가 그 손실을 어떻게 메워왔는지를 추적하면 one-stage detection 전체의 설계 논리가 보인다.
+
+## 하나로 통합한다는 것의 의미
+
+YOLOv1의 핵심 아이디어는 $S \times S$ 그리드다. 이미지를 $7 \times 7$ 격자로 나누고, 각 셀이 $B$개의 박스와 $C$개의 클래스 확률을 동시에 예측한다. 출력 텐서는 $S \times S \times (5B + C)$ — PASCAL VOC 기준 $7 \times 7 \times 30$.
+
+$$
+\text{conf} = P(\text{Object}) \cdot \text{IoU}_{\text{pred}}^{\text{truth}}
+$$
+
+이때 **responsibility assignment**가 핵심이다. GT 박스의 center가 셀 $(i, j)$에 속하면 그 셀이 해당 객체를 책임진다. 셀의 두 박스 중 GT와 IoU가 더 높은 쪽만 좌표 손실을 받는다. 나머지는 "no object" — 작은 weight의 confidence 손실만.
+
+손실 함수에서 눈에 띄는 선택이 두 가지다. width/height의 regression target을 $\sqrt{w}, \sqrt{h}$로 쓰는 것, 그리고 $\lambda_{\text{coord}} = 5, \lambda_{\text{noobj}} = 0.5$로 비대칭 weighting을 주는 것.
+
+<Theorem kind="proposition" number="1" title="√w regression의 small-box 보호 효과">
+$w \mapsto \sqrt{w}$ 변환은 같은 절대 오차 $\delta$에 대해 작은 박스일수록 더 큰 손실을 부여한다.
+</Theorem>
+
+<Proof>
+$g(w) = \sqrt{w}$의 도함수 $g'(w) = 1/(2\sqrt{w})$는 $w$가 작을수록 크다. $w_1 = 0.05$와 $w_2 = 0.5$에서 같은 오차 $\delta$가 발생할 때, $\sqrt{w}$ 공간의 오차 비율은 $\sqrt{1/w_1} / \sqrt{1/w_2} \approx 3.16$이다. 즉 작은 박스의 같은 오차가 약 $3\times$ 큰 손실로 변환된다. $\square$
+</Proof>
+
+$\lambda_{\text{noobj}} = 0.5$의 동기는 더 단순하다. PASCAL VOC 이미지당 평균 GT는 약 2.4개 — responsible 셀은 2–3개, 나머지 46개 이상의 셀은 no-object다. 같은 weight를 쓰면 no-object 손실이 object 손실의 약 20배가 되어 학습 신호를 압도한다.
+
+## Anchor: 셀당 박스 수를 늘리다
+
+YOLOv1의 근본 한계는 셀당 박스 수가 고정 $B=2$라는 것이다. 한 셀에 GT가 3개 이상이면 탐지 자체가 불가능하다. 7×7 coarse 그리드는 작은 객체의 위치 정확도도 충분하지 않았다.
+
+YOLOv2는 anchor box로 이를 해결한다. 그리고 anchor의 형태를 수작업으로 설계하는 대신 k-means clustering으로 dataset 분포에서 직접 학습한다.
+
+$$
+d(b_i, c_k) := 1 - \text{IoU}(b_i, c_k)
+$$
+
+Euclidean distance 대신 IoU-distance를 쓰는 이유가 있다. Euclidean이면 큰 박스들이 클러스터를 지배한다 — $(10, 10)$과 $(20, 20)$의 Euclidean 거리는 $(100, 100)$과 $(200, 200)$의 $1/10$이지만, 두 쌍의 IoU는 동일하다. IoU-distance는 scale에 무관하게 작은 객체와 큰 객체를 동등하게 다룬다.
+
+YOLOv2의 또 다른 선택: center 좌표를 sigmoid로 제한한다.
+
+$$
+b_x = \sigma(t_x) + c_x, \quad b_w = p_w \cdot e^{t_w}
+$$
+
+학습 초기 random init으로 $t_x$가 unbounded이면, 박스 center가 멀리 떨어진 셀로 이동하여 인접 셀의 책임 박스와 충돌한다. $\sigma(t_x) \in (0, 1)$로 제한하면 center가 항상 자신의 셀 안에 머문다.
+
+YOLOv3는 여기에 3-scale prediction을 더한다. Stride 8, 16, 32의 feature map에 각각 3개의 anchor를 배정 — 작은 feature map(13×13)은 큰 객체, 세밀한 feature map(52×52)은 작은 객체를 담당한다.
+
+<Callout type="note" title="SSD와의 수렴">
+비슷한 시기(2016) Liu의 SSD도 multi-feature-map prediction을 시도했다. SSD는 backbone의 서로 다른 층이 서로 다른 receptive field를 갖는다는 사실을 직접 활용했고, FPN(2017)의 선구자가 되었다. YOLOv3의 multi-scale과 SSD의 multi-feature-map은 같은 문제에 대한 두 가지 해답이다.
+</Callout>
+
+## Class Imbalance: 손실 함수의 수학적 해결
+
+one-stage detector가 anchor를 아무리 잘 설계해도 two-stage보다 mAP가 뒤처지는 문제가 계속됐다. Lin의 RetinaNet(2017)은 그 원인이 backbone이나 구조가 아니라 **손실 함수의 class imbalance handling**임을 보였다.
+
+Dense prediction에서 anchor의 수는 $10^4$–$10^5$ 수준이다. 그 중 GT와 매칭되는 positive는 수십 개. 나머지 수만 개의 쉬운 negative가 cross-entropy 손실을 압도하면, 모델은 background를 구분하는 것만 학습하게 된다.
+
+$$
+FL(p_t) = -\alpha_t (1 - p_t)^\gamma \log p_t
+$$
+
+$(1 - p_t)^\gamma$가 핵심이다. $p_t = 0.9$ (쉬운 예시)이면 $(0.1)^2 = 0.01$ — CE의 $1/100$로 감쇠. $p_t = 0.1$ (어려운 예시)이면 $(0.9)^2 = 0.81$ — CE와 거의 동일. 자동 hard mining이다.
+
+SSD의 hard negative mining(1:3 ratio)과 YOLOv1의 $\lambda_{\text{noobj}}$는 이 문제에 대한 manual heuristic이었다. Focal Loss는 단일 수학적 원칙으로 통합한다.
+
+결과: RetinaNet(ResNet-101+FPN)이 COCO test-dev mAP 39.1 — Faster R-CNN의 36.2를 처음으로 넘어선 one-stage detector.
+
+## Modern YOLO: 공학적 누적의 정점
+
+YOLOv4 이후 YOLO는 단일 논문의 알고리즘이 아니라 continuously updated production framework가 된다.
+
+YOLOv4(Bochkovskiy 2020)의 핵심은 "bag of freebies"의 조합이다. CSPNet은 feature를 두 파트로 분리하여 한쪽만 dense path를 통과시킨다 — gradient duplication을 줄이면서 parameter를 약 25% 절감한다. Mosaic augmentation은 4장의 이미지를 하나로 합쳐 effective batch size를 4배로 늘리고, 작은 객체의 학습 신호를 강화한다. CIoU loss는 단순 IoU 대신 center 거리와 aspect ratio까지 고려한다.
+
+YOLOv7(Wang 2022)은 학습과 inference의 표현을 분리하는 re-parameterization을 도입한다. 학습 시에는 $3 \times 3 + 1 \times 1 +$ identity의 multi-branch 구조로 풍부한 gradient flow를 확보하고, inference 시에는 수학적으로 동등한 단일 $3 \times 3$ conv로 fold한다 — 학습 비용 없는 inference 가속.
+
+YOLOv8(Ultralytics 2023)은 anchor-free로 전환하면서 Task-Aligned Assigner를 도입한다.
+
+$$
+s = p^\alpha \cdot u^\beta \quad (\alpha = 1, \beta = 6)
+$$
+
+$p$는 predicted class probability, $u$는 predicted box와 GT의 IoU. 이 joint score의 top-$k$만 positive로 선택한다 — 분류와 위치 추정이 둘 다 좋은 anchor만 학습에 사용한다.
+
+<Aside label="anchor의 역사적 역할">
+anchor는 dataset 분포에 대한 prior를 명시적으로 주입하는 방법이었다. Task-Aligned Assigner와 학습 기반 soft assignment가 성숙하면서 그 prior가 불필요해졌다. anchor-free transition은 단순히 hyperparameter를 줄인 것이 아니라, 매칭의 책임을 hand-craft prior에서 learned score로 이전한 것이다.
+</Aside>
+
+## 트레이드오프: NMS와 예측 가능성
+
+RT-DETR(Zhao 2024)은 DETR 계열을 real-time(53.1 AP @ 108 FPS)으로 만들면서 one-stage detection의 오랜 숙제를 건드린다 — NMS 제거.
+
+DETR의 quadratic attention 비용과 500 epoch 학습을 RT-DETR은 두 가지로 해결한다. 첫째, AIFI(Attention-based Intra-scale Feature Interaction)는 가장 semantic이 풍부한 최상위 feature map에서만 attention을 적용한다. 둘째, Uncertainty-Minimal Query Selection은 classification과 localization의 joint score에서 uncertainty가 작은 anchor를 query로 선택 — 학습 초기 noisy anchor가 decoder에 유입되는 것을 막아 수렴을 안정화한다.
+
+<Callout type="note" title="트레이드오프">
+**NMS-free(RT-DETR)**: post-processing이 $O(1)$에 가까워 crowded scene에서도 latency가 일정하다. 대신 decoder의 fixed query cap(300)이 병목이 될 수 있다. **NMS-based(YOLOv8/RTMDet)**: 검증된 생태계와 더 작은 모델 크기 옵션이 있지만, detection 수가 많을수록 NMS의 $O(N^2)$ 비용이 커진다. 두 선택의 경계는 사용 시나리오에 따라 달라진다.
+</Callout>
+
+RTMDet(Lyu 2023)은 anchor-free YOLO 계열의 다른 방향을 탐색한다. ConvNeXt에서 영감을 받은 5×5 depthwise conv는 3×3 stack보다 적은 parameter로 비슷한 receptive field를 확보한다. Quality Focal Loss는 class probability 대신 IoU를 soft label로 사용한다 — box의 위치 품질이 분류 학습에 직접 반영된다.
+
+## 정리
+
+- YOLOv1의 grid prediction은 단일 forward pass로 detection을 가능하게 했지만, 셀당 박스 수와 coarse grid가 recall의 ceiling을 만들었다.
+- Anchor(YOLOv2/v3)는 그 ceiling을 올렸고, IoU-distance k-means는 anchor 설계를 dataset 분포에서 자동화했다.
+- Focal Loss는 class imbalance라는 one-stage의 구조적 약점을 손실 함수 수준에서 수학적으로 해결했고, 처음으로 one-stage가 two-stage를 넘어서게 했다.
+- Modern YOLO는 re-parameterization, Task-Aligned Assigner, anchor-free 등으로 공학적 누적을 이어가고 있다.
+- RT-DETR은 NMS-free라는 새로운 축을 열었고, YOLO 계열과 DETR 계열의 경계가 점점 흐려지고 있다.
+
+"unified"라는 단어는 스펙트럼이다 — R-CNN에서 YOLOv1으로, YOLOv1에서 DETR로. 각 단계의 통합이 다음 단계의 문제를 드러냈고, 그 문제가 다음 세대의 설계를 만들었다.
+
+<Reference
+  title="You Only Look Once: Unified, Real-Time Object Detection"
+  authors="Redmon et al."
+  year={2016}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1506.02640"
+/>
+
+<Reference
+  title="Focal Loss for Dense Object Detection"
+  authors="Lin et al."
+  year={2017}
+  venue="ICCV"
+  url="https://arxiv.org/abs/1708.02002"
+/>

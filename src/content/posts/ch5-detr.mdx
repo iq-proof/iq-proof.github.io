@@ -1,0 +1,116 @@
+---
+title: "DETR은 왜 NMS 없이 작동하는가"
+description: "End-to-end set prediction 아이디어부터 Hungarian matching의 수학적 근거, slow convergence의 원인과 DINO·RT-DETR의 해결까지, DETR 계열 detection의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [detr, object-detection, transformer, hungarian-matching, set-prediction]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Object detection의 오랜 pipeline에는 공통 부품이 있다 — anchor 설계, NMS 후처리, multi-stage refinement. DETR(Carion 2020)은 이것을 전부 지웠다. "detection을 set prediction으로 정의하면 NMS는 필요 없다"는 아이디어 하나로. 그렇다면 NMS를 architectural하게 대체한 메커니즘은 무엇이고, 왜 그 우아함은 500 epoch라는 비용을 요구했는가?
+
+## Set Prediction의 구조
+
+DETR의 핵심 수식은 단순하다.
+
+$$\hat{Y} = \text{FFN}(\text{Decoder}(\text{Encoder}(\text{CNN}(I)),\, Q))$$
+
+CNN backbone이 이미지를 feature map으로 압축하면, Transformer encoder가 self-attention으로 global context를 주입하고, decoder가 $N = 100$개의 learnable **object query** $Q \in \mathbb{R}^{N \times 256}$를 통해 각자 하나의 객체를 찾는다. 각 query는 cross-attention으로 encoder memory를 보며 "내가 책임질 객체가 여기 있는가?"를 묻고, decoder self-attention으로 query끼리 "같은 객체에 두 명이 붙지 않도록" 조율한다.
+
+이 조율이 핵심이다. Decoder self-attention이 query 간 암묵적 경쟁을 학습시키기 때문에, 학습이 수렴한 뒤에는 동일 객체에 복수의 high-confidence prediction이 나오지 않는다. NMS가 사후에 제거하던 중복을, 구조 자체가 사전에 방지한다.
+
+## Hungarian Matching — 1-to-1 Assignment의 수학
+
+NMS-free 추론이 가능한 이유는 **학습 시** 적용되는 Hungarian matching에 있다. 매 iteration마다 $N$개의 prediction과 $M$개의 GT 사이의 최소 비용 1-to-1 대응을 찾는다.
+
+$$\hat{\sigma} = \arg\min_{\sigma \in \mathfrak{S}_N} \sum_{i=1}^{M} L_{\text{match}}(y_i, \hat{y}_{\sigma(i)})$$
+
+매칭 비용은 분류 확률, L1 box 거리, GIoU를 결합한다.
+
+$$L_{\text{match}} = \lambda_{\text{cls}}(-\hat{p}(c)) + \lambda_{L_1}\|b - \hat{b}\|_1 + \lambda_{\text{iou}}(1 - \text{GIoU}(b, \hat{b}))$$
+
+DETR default는 $\lambda_{L_1} = 5$, $\lambda_{\text{iou}} = 2$. L1 weight가 더 큰 이유는 정규화 좌표에서 L1의 magnitude가 GIoU보다 작기 때문 — 두 항의 실효 기여를 균형 맞추는 조정이다.
+
+<Theorem kind="proposition" number="1" title="Hungarian Matching의 Optimality">
+Kuhn-Munkres algorithm은 $N \times N$ cost matrix에서 $O(N^3)$ 시간에 minimum-cost perfect matching을 정확히 찾는다. Greedy 방식은 동일한 GT를 두 prediction이 best로 평가하는 충돌 상황에서 sub-optimal이 된다.
+</Theorem>
+
+<Proof>
+LP duality로 증명된다. Assignment problem의 primal LP에 대해 Hungarian은 complementary slackness를 만족하는 primal solution을 구성하며, LP duality에 의해 이것이 optimal임이 보장된다. $N = 100$의 DETR에서 실용 비용은 CPU 기준 ~1ms로 학습 bottleneck이 아니다.
+</Proof>
+
+Inference에서는 matching이 완전히 사라진다. 학습이 수렴한 뒤 각 query가 특정 spatial-semantic 패턴에 specialize되어 있으므로, 단순히 class confidence 상위 $k$개를 출력하면 된다.
+
+## Slow Convergence의 세 원인
+
+DETR의 elegance는 500 epoch이라는 비용을 숨기고 있다. Faster R-CNN(25 epoch)의 20배다. 원인은 세 가지로 분해된다.
+
+**첫째, cross-attention의 sparsity 학습.** 초기에 각 query의 attention map은 image 전체에 거의 uniform하게 분포한다. 이것이 특정 spatial region에 집중된 sparse 패턴으로 전환되는 데 100+ epoch이 필요하다. Anchor가 제공하던 explicit location prior가 없어, query가 처음부터 "어디를 볼지"를 학습해야 하기 때문이다.
+
+**둘째, bipartite matching instability.** 학습 초기에는 matching이 epoch마다 바뀐다. Query $j$가 한 iteration에 GT_1에, 다음 iteration에 GT_5에 매칭되면, gradient가 conflicting direction을 가리켜 query의 specialization이 지연된다.
+
+**셋째, single-scale feature.** Stride 32의 backbone feature에서 32px 미만 객체는 1pixel 미만으로 표현된다. Faster R-CNN+FPN의 stride 8 feature가 동일 객체에 4×4=16 cell을 할당하는 것과 대조적이다. 이것이 DETR AP_S 21.5 대 Faster R-CNN+FPN 22.3의 격차를 만든다.
+
+<Callout type="warning" title="트레이드오프">
+DETR의 단순함(no anchor, no NMS, end-to-end)은 학습 동역학에 비용을 전가한다. Anchor의 explicit prior가 제거된 자리를 query가 스스로 채워야 하며, 이 학습이 곧 slow convergence의 본질이다. 이후 변형들이 보여주듯 이것은 architectural 한계가 아니라 engineering challenge다.
+</Callout>
+
+## Deformable → DINO → RT-DETR의 진화
+
+Deformable DETR(Zhu 2021)은 dense cross-attention $O(H'W' \cdot N \cdot d)$를 sparse sampling으로 대체한다.
+
+$$\text{DefAttn}(q, p_q) = \sum_m W_m \sum_l \sum_k A_{mlqk} \cdot V^l(\phi_l(p_q) + \Delta p_{mlqk})$$
+
+각 query가 $K=4$개의 sampled point만 attend한다. $H'W' = 2400$에서 $K=4$로의 전환은 600배 compute 감소다. 동시에 $C_3, C_4, C_5$ multi-scale feature를 도입해 AP_S를 21.5 → 26.4로 끌어올리고, 50 epoch convergence를 달성한다.
+
+DINO-DETR(Zhang 2023)은 두 가지 idea로 12 epoch convergence를 이룬다. **Contrastive denoising training(CDN)**: GT box에 small noise를 추가한 positive query와 big noise의 negative query를 별도 denoising group으로 fixed matching 학습시킨다. Matching instability를 안정된 학습 신호로 보완하는 것이다. **Mixed query selection**: encoder top-$K$ anchor의 spatial 좌표를 reference point 초기값으로, content embedding은 learnable로 유지한다. Image-specific spatial prior와 dataset-level content prior를 분리하는 설계다.
+
+RT-DETR(Zhao 2024)은 real-time 배포를 목표로 hybrid encoder(AIFI + CCFM)와 uncertainty-minimal query selection을 결합해 53.1 AP @ 108 FPS를 달성한다. Co-DETR(Zong 2023)은 학습 시 one-to-many auxiliary head(ATSS, Faster R-CNN style RPN)를 추가해 backbone에 dense gradient를 흘리고, inference에서는 one-to-one DETR head만 사용한다. 동일 epoch에서 +1.7 AP — free lunch에 가까운 학습 신호 다층화다.
+
+| Model | Epoch | COCO mAP |
+|-------|-------|----------|
+| DETR (R-50) | 500 | 42.0 |
+| Deformable DETR (R-50) | 50 | 46.2 |
+| DINO-DETR (R-50) | 12 | 50.4 |
+| DINO-DETR (Swin-L) | 36 | 63.3 |
+| RT-DETR (R-50) | 72 | 53.1 |
+| Co-DETR (Swin-L) | — | 64.1 |
+
+<Aside label="설계 철학">
+5년(2020→2024) 동안 convergence가 40배 가속됐다. DETR의 fundamental idea — set prediction, Hungarian matching, NMS-free — 는 그대로다. 바뀐 것은 "anchor 없이도 학습을 빠르게 수렴시키는" engineering이다. Novel architecture의 초기 inefficiency는 종종 fundamental 한계가 아니라 engineering challenge임을 DETR 계열이 가장 선명하게 보여준다.
+</Aside>
+
+## 정리
+
+- DETR의 NMS-free 추론은 training-time Hungarian matching이 query를 1-to-1 specialization으로 강제한 결과다. Inference에서 matching은 사라지고 top-k만 남는다.
+- Slow convergence의 본질은 "anchor가 주던 prior를 query가 처음부터 학습해야 한다"는 데 있다. Cross-attention sparsity, matching instability, single-scale feature가 그 표현이다.
+- Deformable의 sparse sampling, DINO의 contrastive denoising, RT-DETR의 uncertainty query selection은 각각 다른 axis에서 같은 문제를 공격한다.
+- 2024 기준 production detection은 RT-DETR(DETR 계열)과 YOLO의 혼재다. 5년 후 균형이 어디로 기울지는 tooling ecosystem이 결정할 것이다.
+
+<Reference
+  title="End-to-End Object Detection with Transformers"
+  authors="Carion et al."
+  year={2020}
+  venue="ECCV"
+  url="https://arxiv.org/abs/2005.12872"
+/>
+
+<Reference
+  title="Deformable DETR: Deformable Transformers for End-to-End Object Detection"
+  authors="Zhu et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2010.04159"
+/>

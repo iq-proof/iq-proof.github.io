@@ -1,0 +1,123 @@
+---
+title: "COCO mAP 너머 — Detection Benchmark의 한계와 진화"
+description: "COCO의 mAP@[.5:.95]가 detection의 표준이 된 이유부터 LVIS long-tail, open-vocabulary, domain adaptation까지, closed-set 가정이 무너지는 과정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [object-detection, coco, open-vocabulary, domain-adaptation, benchmark]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+COCO는 detection의 "수능"이다. 지난 10년 동안 거의 모든 논문이 COCO mAP로 모델을 비교했고, 그 숫자가 올라갈수록 detection이 발전한다고 믿었다. 그런데 COCO mAP 63에 도달한 지금, 우리는 더 근본적인 질문 앞에 서 있다 — **이 숫자가 올라가면 실제 world의 detection도 나아지는가?**
+
+## COCO mAP가 엄격한 이유
+
+PASCAL VOC의 mAP@.5는 IoU 0.5 이상이면 correct detection으로 인정한다. COCO는 다르다.
+
+$$
+\text{mAP}@[.5:.95] = \frac{1}{10} \sum_{\tau \in \{0.50, 0.55, \ldots, 0.95\}} \text{AP}(\tau)
+$$
+
+10개 threshold의 평균이므로, 같은 모델에서 항상 $\text{mAP}@[.5:.95] \leq \text{mAP}@.5$가 성립한다. $\tau$가 클수록 AP는 단조 감소하기 때문이다. 실제로 AP@.5 = 60인 모델의 mAP@[.5:.95]는 35 수준에 그치는 경우가 많다 — box localization까지 평가하기 때문이다.
+
+크기 기반 분류도 정교하게 설계됐다. $\text{AP}_S$의 32² px, $\text{AP}_L$의 96² px 경계는 임의의 수가 아니다. COCO val의 GT box area 분포에서 33·66 percentile에 거의 정확히 대응하도록 설정됐다 — small/medium/large가 대략 균등한 sample 수를 갖도록. 이 균형 덕분에 특정 크기 구간에만 강한 모델이 전체 mAP에서 부당하게 높은 점수를 받지 않는다.
+
+<Callout type="note" title="COCO의 근본 한계">
+annotation noise floor는 약 5%다. COCO mAP가 60을 넘어서면서 이 noise ceiling에 가까워지고 있다. 최근 3년간의 progress 둔화는 모델의 한계가 아니라 benchmark의 한계일 수 있다.
+</Callout>
+
+## Long-Tail: LVIS가 드러낸 문제
+
+COCO의 80 class는 "흔한 것들"만 다룬다. LVIS(Gupta 2019)는 1203 class로 이 가정을 정면으로 깬다.
+
+LVIS의 핵심 문제는 class imbalance다. SGD batch에서 class $c$의 expected gradient는 해당 class의 sample 수 $N_c$에 비례한다. LVIS rare class는 $N_r \approx 5$, frequent class는 $N_f \approx 1000$이다. gradient 비율이 200:1에 달하므로, standard cross-entropy training에서 rare class는 사실상 학습되지 않는다.
+
+이를 완화하는 방법이 **Repeat Factor Sampling**이다.
+
+$$
+r_i = \max\!\left(1,\, \sqrt{\frac{t}{\min_{c \in \mathcal{N}(i)} f_c}}\right), \quad t = 0.001
+$$
+
+rare class를 포함한 image의 repeat factor $r_i$가 커지므로, 해당 image가 batch에 더 자주 등장한다. 결과적으로 rare class의 effective frequency가 약 3배 증가하고, $\text{AP}_r$이 약 +5 향상된다.
+
+**Federated annotation**은 또 다른 혁신이다. COCO는 모든 image의 모든 class를 exhaustive하게 annotation한다. LVIS는 image별로 일부 class만 annotation하고, unannotated class는 "모른다"고 처리한다. loss는 annotated class에 대해서만 backprop된다.
+
+$$
+L = \sum_i \sum_{c \in \mathcal{N}(i)} L_{\text{cls}}(p_{ic}, y_{ic})
+$$
+
+이 방식으로 annotation cost를 약 10배 절감하면서, 1203 class의 학습 신호를 확보한다.
+
+## Open-Vocabulary: Classification Head를 지운다
+
+LVIS는 여전히 closed-set이다 — training 때 정의된 1203 class 밖은 탐지할 수 없다. open-vocabulary detection은 이 가정을 근본부터 해체한다.
+
+Faster R-CNN부터 DINO-DETR까지 모든 detector의 마지막 레이어는 $K$-way classification head다. test class가 training vocabulary에 없으면 출력이 불가능하다. open-vocabulary는 이 head를 **text embedding similarity**로 교체한다.
+
+$$
+s_i(T) = \cos\!\left(\hat{e}_i,\, f_T(T)\right)
+$$
+
+patch $i$의 image embedding $\hat{e}_i$와 text query $T$의 CLIP embedding $f_T(T)$ 사이의 cosine similarity가 detection score가 된다. "raccoon"을 training에서 본 적 없어도, CLIP의 text encoder가 의미를 embedding 공간에 매핑하므로 detection이 가능해진다.
+
+ViLD(Gu 2021)는 COCO 80 class로 학습된 detector의 classification head를 CLIP text embedding으로 교체하는 실험을 했다. base class에서는 약 -2 mAP의 손실이 있었지만, LVIS rare class(novel)에서는 0 → 27.8 $\text{AP}_r$로 뛰었다.
+
+**GroundingDINO**(Liu 2023)는 여기서 더 나아간다. image feature와 text feature 사이의 cross-modality fusion module을 도입해 "the cat sitting on the chair" 같은 multi-word phrase grounding이 가능하다. Flickr30k phrase grounding benchmark에서 OWL-ViT의 ~70 R@1 대비 ~85 R@1을 달성한다. 단순한 cosine similarity를 넘어서 fine-grained attribute(color, position, relation)까지 image의 specific region과 align시키기 때문이다.
+
+<Aside label="Grounded-SAM의 zero-shot pipeline">
+GroundingDINO(text → box) + SAM(box → mask)를 결합하면 text query만으로 instance segmentation이 가능하다. 두 component 모두 zero-shot이므로, 학습 없이 임의의 phrase에 대한 instance mask를 생성할 수 있다. 정밀도 한계는 있지만 training cost가 0이다.
+</Aside>
+
+## Domain Adaptation: Benchmark 성능과 배포 성능의 괴리
+
+같은 domain shift에서 detection의 AP 손실이 classification accuracy 손실보다 큰 이유가 있다. classification은 image-level decision이므로 local noise에 어느 정도 robust하다. detection은 spatial precision이 요구된다 — fog나 domain shift로 인한 pixel-level distortion이 box localization accuracy에 직접 영향을 준다. Cityscapes → Foggy Cityscapes 실험에서 classification accuracy는 15% 감소하지만 detection mAP는 50% 감소한다.
+
+domain adaptation의 이론적 한계는 Ben-David et al.(2010)의 generalization bound로 표현된다.
+
+$$
+\epsilon_T(h) \leq \epsilon_S(h) + d_{\mathcal{H}\Delta\mathcal{H}}(\mathcal{D}_S, \mathcal{D}_T) + \lambda
+$$
+
+target error는 source error + domain divergence로 bound된다. adversarial feature alignment는 $d_{\mathcal{H}\Delta\mathcal{H}}$를 줄이는 전략이다 — discriminator가 source/target feature를 구분하지 못하도록 backbone을 학습시킨다.
+
+<Callout type="warning" title="Self-training의 confirmation bias">
+pseudo-label self-training은 noisy label이 자기 강화될 위험이 있다. round 0의 wrong prediction이 pseudo-label로 들어가면, round 1에서 그 패턴이 강화되고, round 2에서 더 심화된다. confidence threshold를 0.9 이상으로 높이거나 Mean Teacher의 EMA를 활용해야 drift를 막을 수 있다.
+</Callout>
+
+foundation model 시대에 domain adaptation의 형태가 바뀌고 있다. SAM의 ViT-H encoder를 frozen feature extractor로 쓰고 detection head만 학습하면, K=10 few-shot에서 ImageNet pretrain 대비 약 +13 nAP를 얻는다. SA-1B(1.1B mask)로 학습된 feature의 prior가 medical, satellite 같은 domain에서도 강하게 작동하기 때문이다.
+
+## 정리
+
+- COCO mAP@[.5:.95]는 box localization까지 평가하는 엄격한 metric이지만, annotation noise floor(~5%)에 의한 saturation이 시작됐다.
+- LVIS는 1203 class의 long-tail distribution으로 COCO가 숨기던 class imbalance 문제를 명시적으로 드러냈다. Repeat Factor Sampling과 federated loss가 현재 표준 대응책이다.
+- open-vocabulary detection은 classification head를 CLIP text embedding similarity로 교체해 closed-set 가정 자체를 해체했다. GroundingDINO + SAM 조합이 zero-shot instance segmentation의 실용적 baseline이 됐다.
+- domain adaptation의 중심이 adversarial alignment에서 foundation model fine-tuning으로 이동하고 있다.
+
+benchmark의 숫자를 높이는 것과 real-world detection을 개선하는 것은 점점 다른 문제가 되고 있다. 다음 글에서는 이 open-vocabulary detector들이 video와 tracking에 어떻게 결합되는지 추적한다.
+
+<Reference
+  title="Microsoft COCO: Common Objects in Context"
+  authors="Lin et al."
+  year={2014}
+  venue="ECCV"
+  url="https://arxiv.org/abs/1405.0312"
+/>
+
+<Reference
+  title="Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection"
+  authors="Liu et al."
+  year={2023}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2303.05499"
+/>

@@ -1,0 +1,130 @@
+---
+title: "R-CNN에서 Mask R-CNN까지 — 두 단계 검출기의 진화"
+description: "Region proposal의 병목부터 sub-pixel 정렬 오차까지, two-stage detector 5세대의 설계 결정과 그 연쇄적 해결 과정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [object-detection, two-stage-detector, roi-pooling, fpn, anchor]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+R-CNN이 2014년 PASCAL VOC mAP를 30% 포인트 끌어올린 이후 불과 3년 사이에 Fast R-CNN, Faster R-CNN, FPN, Mask R-CNN이 연달아 등장했다. 각 논문은 이전 모델의 병목 하나를 정확히 겨냥해 해체했다. 이 다섯 세대의 궤적을 따라가면, two-stage detector의 설계 철학이 단순히 "더 빠르게, 더 정확하게"가 아니라 **병목의 정체를 구조로 해결한다**는 반복 패턴임을 알 수 있다. 무엇이 각 세대의 병목이었고, 그 해결이 어떤 새로운 제약을 낳았는가?
+
+## R-CNN: 47초가 걸리는 이유
+
+R-CNN의 파이프라인은 세 단계다. Selective Search로 ~2000개의 후보 영역을 추출하고, 각 영역을 227×227로 변형해 CNN에 통과시키고, SVM과 선형 회귀기로 분류·정렬한다. 통찰은 명확했다 — 딥러닝 특징과 region proposal의 결합. 그러나 병목도 명확했다.
+
+$$T_{\text{R-CNN}} \approx T_{\text{SS}} + N \cdot T_{\text{CNN}}, \quad N \approx 2000, \quad T \approx 47\text{s}$$
+
+2000번의 CNN forward가 문제였다. 같은 이미지의 중첩된 영역이 receptive field를 공유함에도 각 영역을 독립적으로 처리했다. 여기에 multi-stage training이 더해진다 — CNN fine-tune, SVM 학습, box regressor 학습이 각각 독립 최적화되어 joint optimum에 도달하지 못한다.
+
+<Callout type="note" title="R-CNN의 트레이드오프">
+Selective Search에 의존하므로 proposal의 quality가 detection의 상한을 결정한다. SS가 놓친 GT는 어떤 classifier도 구제할 수 없다. 227×227 warp는 aspect ratio를 왜곡해 둥근 객체의 특징 표현을 저하시킨다. 이 세 가지 한계 — 외부 의존 proposal, per-region forward, multi-stage training — 가 Fast/Faster R-CNN의 표적이 된다.
+</Callout>
+
+## Fast R-CNN: RoI Pooling으로 중복 제거
+
+Fast R-CNN의 핵심 아이디어는 단순하다. CNN을 이미지 전체에 한 번만 돌리고, feature map 위에서 각 RoI에 해당하는 영역을 뽑는다. 이것이 **RoI Pooling**이다.
+
+```python
+def roi_pool_simple(feat, rois, output_size=(7, 7), spatial_scale=1/16):
+    # image coord → feature coord (floor quantization)
+    for x1, y1, x2, y2 in rois:
+        fx1, fy1 = int(x1 * spatial_scale), int(y1 * spatial_scale)
+        fx2, fy2 = int(x2 * spatial_scale), int(y2 * spatial_scale)
+        roi_feat = feat[:, fy1:fy2+1, fx1:fx2+1]
+        # H_o × W_o subwindow로 등분 후 max-pool
+        out = F.adaptive_max_pool2d(roi_feat, output_size)
+```
+
+임의 크기의 RoI가 항상 7×7로 출력되므로 FC head가 고정 입력을 받을 수 있고, R-CNN의 warp 강제가 사라진다. 동시에 multi-task loss가 multi-stage training을 해체한다.
+
+$$L = L_{\text{cls}}(p, u) + \lambda \cdot \mathbb{1}[u \geq 1] \cdot L_{\text{loc}}(t^u, v)$$
+
+box regression에는 Smooth-L1을 사용한다. L2는 outlier에서 gradient가 폭발하고, L1은 작은 오차에서 수렴이 느리다. Smooth-L1은 `|x| < 1`에서 이차식, 그 이상에서 선형 — 두 영역의 장점을 결합해 gradient를 `±1`로 제한한다. 결과: R-CNN 47초 → Fast R-CNN 0.32초. 남은 병목은 Selective Search의 ~2초다.
+
+## Faster R-CNN: 학습 가능한 proposal
+
+RPN(Region Proposal Network)은 Selective Search를 neural network로 대체한다. backbone feature map 위에 3×3 conv를 얹고, 각 spatial location마다 9개의 anchor에 대해 objectness score와 box delta를 예측한다.
+
+$$t_x^* = \frac{g_x - a_x}{a_w}, \quad t_w^* = \log \frac{g_w}{a_w}$$
+
+log-space encoding이 핵심이다. $g_w \to \alpha g_w$와 $a_w \to \alpha a_w$가 동시에 일어나면 $t_w$는 변하지 않는다 — scale invariance. 이 덕분에 작은 객체와 큰 객체가 같은 regression head를 공유할 수 있다.
+
+<Theorem kind="proposition" number="1" title="Anchor Parameterization의 Scale Invariance">
+$t_w = \log(g_w / a_w)$에서, $g_w$와 $a_w$가 동일 배율 $\alpha$로 스케일되면 $t_w$는 변하지 않는다.
+</Theorem>
+
+<Proof>
+$$t_w' = \log \frac{\alpha g_w}{\alpha a_w} = \log \frac{g_w}{a_w} = t_w \quad \square$$
+</Proof>
+
+RPN의 binary classification(object vs background)은 의도적 선택이다. K+1-way classification을 anchor마다 수행하면 COCO 기준 anchor당 324 scalar가 필요한 반면, binary는 5 scalar면 충분하다. RPN은 "어디"를 결정하고, Fast R-CNN head가 "무엇"을 결정하는 coarse-to-fine 분업이다. 결과: PASCAL VOC mAP 53.7(R-CNN) → 73.2(Faster R-CNN), 5 FPS 달성.
+
+## FPN: 모든 스케일에 강한 semantic 전파
+
+단일 feature level에서 detection하는 것은 작은 객체와 큰 객체를 동일 receptive field로 처리하는 모순을 안는다. ResNet의 깊은 layer는 의미론적 정보가 풍부하지만 공간 해상도가 낮고, 얕은 layer는 반대다. FPN은 이 trade-off를 **top-down pathway**로 해결한다.
+
+$$P_l = \text{Conv}_{1\times 1}(C_l) + \text{Upsample}_{2\times}(P_{l+1})$$
+
+1×1 conv가 channel을 256으로 통일하고, 상위 level의 semantic을 bilinear upsampling으로 하위 level에 더한다. 결과적으로 모든 $P_l$이 $C_5$의 receptive field를 포함하게 된다 — $P_2$도 deep semantic context를 갖는다.
+
+RoI는 크기에 따라 자동으로 pyramid level에 배정된다.
+
+$$l(r) = \left\lfloor 4 + \log_2 \frac{\sqrt{wh}}{224} \right\rfloor$$
+
+32×32 객체는 $P_2$(stride 4)에, 512×512 객체는 $P_5$(stride 32)에. base-2 log가 ResNet의 stride doubling과 정확히 일치한다. 효과: COCO AP_S(small object AP) +6 포인트. 작은 객체 detection의 결정적 분기점이다.
+
+<Callout type="note" title="FPN의 트레이드오프">
+top-down pathway는 semantic을 전파하지만 bottom-up 방향의 추가 경로는 없다. PAN(YOLOv4)은 bottom-up extra path를 추가하고, BiFPN(EfficientDet)은 learnable weight로 bi-directional fusion을 수행한다. FPN의 핵심 아이디어 — strong semantic을 모든 scale에 전파 — 는 이후 모든 변형의 공통 기반이다.
+</Callout>
+
+## Mask R-CNN: 픽셀 정렬의 정밀도
+
+Mask R-CNN은 Faster R-CNN + FPN에 mask head를 추가한 구조처럼 보이지만, 핵심 기여는 **RoI Align**이다. RoI Pooling의 floor quantization은 1~2 픽셀의 spatial misalignment를 도입한다. box regression에는 무해하지만 28×28 mask의 모든 픽셀에 누적되면 치명적이다.
+
+RoI Align은 quantization을 제거한다. feature coordinate를 실수로 유지하고, 각 subwindow 안의 sampling point에서 bilinear interpolation으로 feature를 읽는다.
+
+$$F(x, y) = \sum_{i \in \{\lfloor x \rfloor, \lceil x \rceil\}} \sum_{j \in \{\lfloor y \rfloor, \lceil y \rceil\}} F(i, j) \cdot (1 - |x - i|) \cdot (1 - |y - j|)$$
+
+결과: COCO mask AP RoI Pool 23.3 → RoI Align 28.2(+4.9). box AP는 +1.4에 그친다. mask가 dense prediction이기 때문에 정렬 오차의 영향이 훨씬 크다.
+
+mask head는 FC가 아닌 FCN(fully convolutional)이다. conv는 translation-equivariant하므로 RoI 안의 spatial structure가 mask 출력에 정확히 전파된다. GT class의 channel만 학습하는 class-specific 방식은 mask와 classification을 decouple하여 mask head가 shape 학습에 집중하게 한다.
+
+$$L = L_{\text{cls}} + L_{\text{bbox}} + L_{\text{mask}}$$
+
+## 정리
+
+- R-CNN의 병목(per-region CNN forward, multi-stage training, 외부 proposal)은 각각 RoI Pooling, multi-task loss, RPN으로 해체되었다.
+- anchor parameterization의 log-space encoding은 scale invariance를 보장해 단일 regression head가 모든 크기의 객체를 처리할 수 있게 한다.
+- FPN의 top-down pathway는 semantic을 모든 pyramid level에 전파해 small object detection의 결정적 한계를 돌파했다.
+- RoI Align의 bilinear interpolation은 dense prediction에서 픽셀 정렬이 architectural choice임을 증명했다.
+
+다음 글에서는 이 two-stage의 coarse-to-fine 분업을 단일 패스로 압축한 one-stage detector(YOLO, SSD, RetinaNet)가 어떤 새로운 trade-off를 선택했는지 추적한다.
+
+<Reference
+  title="Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks"
+  authors="Ren et al."
+  year={2015}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1506.01497"
+/>
+
+<Reference
+  title="Feature Pyramid Networks for Object Detection"
+  authors="Lin et al."
+  year={2017}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1612.03144"
+/>

@@ -1,13 +1,13 @@
 ---
-title: "확률과정을 정의한다는 것은 무엇인가"
-description: "sample path, 유한차원 분포, 필트레이션, 정상성 — 확률과정의 네 가지 핵심 언어가 어떻게 하나의 수학적 구조를 이루는지, AI 모델 설계까지 추적한다."
-pubDate: 2026-04-28
+title: "Object Detection의 수학적 출발점 — 왜 출력이 집합인가"
+description: "Detection 출력이 가변 크기 집합이라는 사실이 NMS, mAP, Hungarian matching을 모두 도출한다. task formalization부터 IoU loss 진화, mAP 계산, NMS의 한계까지 하나의 설계 철학으로 추적한다."
+pubDate: 2026-05-03
 category: ai
-tags: [stochastic-processes, measure-theory, filtration, markov, diffusion]
+tags: [object-detection, iou, nms, map, bbox]
 difficulty: advanced
 series:
-  slug: stochastic-processes-deep-dive
-  title: Stochastic Processes Deep Dive
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
   order: 1
 draft: false
 featured: false
@@ -19,94 +19,119 @@ import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
 import Reference from '@/components/mdx/Reference.astro';
 
-DDPM의 forward process를 "연속시간 마르코프 과정"이라 부를 때, 그 말은 정확히 무엇을 의미하는가? Transformer가 "비마르코프"이고 Mamba가 "마르코프"라는 구분은 어떤 수학적 언어 위에 서 있는가? 확률과정을 단순히 "확률변수들의 나열"로 이해하면 이 질문들에 답할 수 없다.
+Object detection의 모든 설계 결정 — NMS, anchor, Hungarian matching, mAP — 은 단 하나의 사실에서 나온다. **출력이 고정 크기 벡터가 아니라 가변 크기 집합이다.** 이 집합 구조를 출발점으로 삼으면 왜 NMS가 필요하고, 왜 IoU loss가 L1보다 나으며, 왜 DETR이 NMS를 제거할 수 있는지가 자연스럽게 도출된다. 그 연쇄를 지금부터 추적한다.
 
-## 세 가지 관점, 하나의 대상
+## Detection의 출력 공간
 
-확률과정 $\{X_t\}_{t \in T}$는 세 가지 동등한 방식으로 볼 수 있다.
+분류는 이미지 한 장을 하나의 라벨로 매핑한다. Segmentation은 픽셀마다 라벨을 붙인다. Detection은 "어디에 뭐가 몇 개 있는가"를 답해야 하므로, 출력의 크기가 이미지마다 달라진다.
 
-**관점 A**: 각 $t$마다 확률변수 $X_t : \Omega \to E$.
+모델 $f_\theta$의 출력을 정식화하면:
 
-**관점 B**: 두 변수의 함수 $X : \Omega \times T \to E$, $(\omega, t) \mapsto X_t(\omega)$.
+$$
+\hat{Y} = \{(\hat{b}_j,\, \hat{c}_j,\, \hat{s}_j)\}_{j=1}^{\hat{N}}, \quad \hat{s}_j \in [0, 1]
+$$
 
-**관점 C**: 함수값 확률변수 $X : \Omega \to E^T$, 즉 "$\omega$를 고정하면 $T$ 위의 함수 하나"가 나온다. 이 함수를 **sample path**라 부른다.
+여기서 $\hat{N}$은 모델이 결정하는 예측 개수이고, ground-truth의 개수 $N$과 일반적으로 다르다. 이 **variable-size set** 이라는 성질 하나가 아래의 모든 문제를 만든다.
 
-관점 A는 단일 시점 분포를 다룰 때 편하다. 관점 B는 $\sup_t X_t$나 $\int_0^T X_t dt$ 같은 경로 범함수의 측정가능성을 따를 때 필수다. 관점 C는 "경로 공간 위의 확률측도"를 볼 수 있게 해준다 — Wiener measure가 여기서 산다.
+Bounding box 표기법은 두 가지가 공존한다. Center-size form $(c_x, c_y, w, h)$는 regression target에 자연스럽고, corner form $(x_1, y_1, x_2, y_2)$는 IoU 계산에 자연스럽다. 두 표기법은 $w, h > 0$ 조건에서 bijective이므로 정보 손실 없이 변환된다. 단, numerical stability와 loss formulation 편의에 따라 선택이 갈린다.
 
-세 관점을 매개하는 것이 **유한차원 분포(fdd)**다.
+## IoU — 평가와 학습의 간극
 
-$$\mu_{t_1, \ldots, t_n}(A_1 \times \cdots \times A_n) = \mathbb{P}(X_{t_1} \in A_1, \ldots, X_{t_n} \in A_n)$$
+Detection 품질은 IoU로 측정한다.
 
-fdd 가족은 과정의 분포 정보를 완전히 담지만, 경로의 연속성이나 joint measurability까지는 결정하지 않는다. $X_t \equiv 0$과 $Y_t(\omega) = \mathbf{1}_{\{t = \omega\}}$는 모든 fdd가 동일하지만, 후자의 각 경로는 하나의 점프를 가진다. 이 두 과정은 **modification** 관계(각 $t$마다 a.s. 일치)이지만 **indistinguishable**이 아니다(모든 $t$에서 동시에 a.s. 일치하지 않는다).
+$$
+\text{IoU}(A, B) := \frac{|A \cap B|}{|A \cup B|} \in [0, 1]
+$$
 
-<Callout type="warning" title="연속 경로는 공짜가 아니다">
-"모든 fdd가 잘 정의된다"는 것과 "sample path가 연속이다"는 독립된 성질이다. Brownian motion의 연속 경로는 정의에서 추가로 요구되는 조건이며, Kolmogorov continuity theorem으로 그 존재를 보장한다.
-</Callout>
+그런데 IoU를 **loss function**으로 그대로 쓰면 심각한 문제가 있다.
 
-## Kolmogorov 확장정리 — 유한에서 전체로
-
-fdd 가족만 주어졌을 때 과정이 존재하는가? 이 질문이 Kolmogorov 확장정리의 출발점이다.
-
-두 가지 일관성 조건이 필요하다. **(C1) 대칭**: 인덱스를 permute해도 분포가 같아야 한다. **(C2) 주변**: 한 인덱스를 잊으면 더 작은 fdd와 일치해야 한다. 이 조건을 만족하는 fdd 가족이 주어지면:
-
-<Theorem kind="theorem" number="1" title="Kolmogorov 확장정리">
-$(E, \mathcal{E})$가 Polish space 위의 Borel $\sigma$-대수라 하자. 일관성을 만족하는 fdd 가족 $\{\mu_{t_1, \ldots, t_n}\}$이 주어지면, $(E^T, \mathcal{E}^{\otimes T})$ 위에 유일한 확률측도 $\mathbb{P}$가 존재하여 coordinate 과정 $X_t(\omega) = \omega(t)$가 주어진 fdd를 갖는다.
+<Theorem kind="proposition" number="1" title="IoU loss의 disjoint plateau">
+$A \cap B = \emptyset$인 모든 box pair에서 $\text{IoU}(A, B) = 0$이고, 거의 모든 disjoint 영역에서 $\nabla_{\hat{b}}\,\text{IoU} = 0$이다.
 </Theorem>
 
 <Proof>
-증명의 핵심은 cylinder set 위에 정의한 premeasure $\mathbb{P}_0$가 $\sigma$-additive임을 보이는 것이다. $C_n \downarrow \emptyset$이면 $\mathbb{P}_0(C_n) \downarrow 0$이어야 한다. Polish 상태공간이므로 각 marginal이 inner-regular하고(Ulam의 정리), compact approximation을 잡을 수 있다. Tychonoff 정리로 $\prod K_n$이 $E^T$의 compact set이므로 유한교집합 성질에 의해 $\bigcap C_n \neq \emptyset$이라는 모순이 나온다. Polish 가정은 정확히 이 지점에서 쓰인다. $\sigma$-additive premeasure는 Carathéodory 확장정리로 $\mathcal{E}^{\otimes T}$로 유일 확장된다. $\square$
+$|A \cap B| = 0$이면 정의에 의해 IoU = 0. 작은 perturbation $\hat{b} + \epsilon$이 여전히 disjoint하면 IoU는 계속 0으로 유지된다. 따라서 거의 모든 disjoint 영역에서 gradient가 0이다. $\square$
 </Proof>
 
-이 정리가 Gaussian Process를 커널만으로 정의할 수 있는 이유이고, Score-SDE의 path measure가 존재한다는 보장이다. 양정치 커널 $k(s, t)$는 자동으로 일관성을 만족하는 fdd를 생성하고, Polish 상태공간 $\mathbb{R}$에서 Kolmogorov가 과정의 존재를 보증한다.
+학습 초기에는 예측 box와 GT box가 겹치지 않는 경우가 흔하다. 이 영역에서 학습 신호가 0이면 모델은 이동 방향을 알 수 없다. GIoU (Rezatofighi et al. 2019)는 이를 해결하기 위해 두 box를 모두 감싸는 최소 외접 사각형 $C$를 도입한다.
 
-경로의 연속성은 별도의 정리가 필요하다. $\mathbb{E}[|X_t - X_s|^\alpha] \leq C|t-s|^{1+\beta}$가 성립하면 $\gamma < \beta/\alpha$인 Hölder 연속 modification이 존재한다(Kolmogorov continuity theorem). BM은 $\mathbb{E}|B_t - B_s|^{2n} = c_n|t-s|^n$이므로 "거의 $1/2$-Hölder"가 이 정리의 귀결이다.
+$$
+\text{GIoU}(A, B) := \text{IoU}(A, B) - \frac{|C \setminus (A \cup B)|}{|C|} \in [-1, 1]
+$$
 
-## 정상성과 필트레이션 — 두 종류의 불변성
+$A \cap B = \emptyset$일 때 GIoU는 $-1 + (|A| + |B|)/|C|$로, 두 box가 멀수록 더 큰 패널티를 부과한다. gradient가 0이 아니므로 학습이 가능하다.
 
-**정상성**은 시간 시프트에 대한 불변성이다. 모든 fdd가 시프트 불변이면 엄격 정상, 평균과 공분산만 불변이면 약 정상이다. 가우시안 과정에서는 두 개념이 일치한다 — fdd가 평균과 공분산으로 완전히 결정되기 때문이다.
-
-**필트레이션** $\{\mathcal{F}_t\}$는 시간에 따라 누적되는 정보 구조다. "시각 $t$까지 알 수 있는 사건"의 $\sigma$-대수 $\mathcal{F}_t$가 단조증가하는 가족. 과정이 $\mathcal{F}_t$에 **adapted**라는 것은 각 $t$에서 $X_t$가 $\mathcal{F}_t$-measurable이라는 의미다. **Predictable**은 더 강한 조건 — $H_t$가 "$t$ 직전까지의 정보"로 결정된다.
-
-이 구분이 이토 적분에서 결정적이다. $\int_0^t H_s dB_s$가 마팅게일이 되려면 $H$가 predictable이어야 한다:
-
-$$\mathbb{E}[H_n(B_n - B_{n-1}) | \mathcal{F}_{n-1}] = H_n \cdot \mathbb{E}[B_n - B_{n-1} | \mathcal{F}_{n-1}] = 0$$
-
-$H_n$이 $dB_n$을 보고 결정된다면(adapted이지만 not predictable) 이 등식이 깨진다. Transformer의 causal mask가 decoder를 adapted로 강제하는 것, DDPM의 score network $s_\theta(X_t, t)$가 $X_{t+\delta}$를 보지 않는 것 — 모두 이 필트레이션 구조의 직접 응용이다.
-
-<Aside label="Usual conditions">
-연속시간 필트레이션에 우연속(right-continuous)과 완비(complete) 조건을 요구하는 것을 "usual conditions"라 한다. 이 조건 하에서 closed set의 첫 hit time이 정지시각이 되고, Doob-Meyer 분해 등 주요 정리가 성립한다. BM의 자연 필트레이션을 영집합으로 augmentation하면 자동으로 usual conditions를 만족한다.
-</Aside>
-
-## 분류 지도 — 4개 축의 교차
-
-확률과정은 네 가지 이진 축으로 분류된다: (시간 이산/연속) × (상태 이산/연속) × (마르코프/비마르코프) × (정상/비정상). 각 분면마다 전용 수학적 도구가 있다.
-
-```
-이산 시간 × 이산 상태 × 마르코프:  전이행렬 P, πP = π
-연속 시간 × 이산 상태 × 마르코프:  Q-matrix, πQ = 0
-이산 시간 × 연속 상태 × 마르코프:  AR(1), DDPM forward
-연속 시간 × 연속 상태 × 마르코프:  SDE, Fokker-Planck ∂_t p = L*p
-이산/연속 × 연속 상태 × 비마르코프: GP(정상 커널), Transformer
-```
-
-마르코프 성질은 필트레이션 언어로 다음과 같이 쓰인다:
-
-$$\mathbb{P}(X_t \in A \mid \mathcal{F}_s) = \mathbb{P}(X_t \in A \mid X_s), \quad s \leq t$$
-
-Gaussian process가 마르코프이기 위한 필요충분조건은 공분산 커널이 $k(s,t) = u(\min(s,t)) \cdot v(\max(s,t))$ 형태로 인수분해되는 것이다. RBF 커널 $\exp(-(s-t)^2/2)$는 이 조건을 만족하지 않으므로 비마르코프다. 그래서 GP 회귀는 "모든 과거 관찰"에 의존하고, 조건부 분산이 과거 점을 얼마나 추가하느냐에 따라 달라진다.
-
-Transformer와 Mamba의 구분이 여기서 나온다. Self-attention은 모든 과거에 직접 접근하므로 비마르코프, 추론 비용 $O(T^2)$. Hidden state $h_t$를 통한 Mamba는 마르코프, 추론 비용 $O(T)$. 이는 "AR(∞) vs HMM"의 현대적 버전이다.
+DIoU (Zheng et al. 2020)는 한 box가 다른 box 내부에 완전히 포함될 때 GIoU = IoU라서 추가 신호가 없다는 한계를 center distance penalty로 보완한다. CIoU는 여기에 aspect ratio 차이까지 더한다. 현대 detector(YOLOv5/v8)가 CIoU를 기본값으로 쓰는 이유는 수렴 속도와 최종 IoU 모두 개선되기 때문이다.
 
 <Callout type="note" title="트레이드오프">
-비마르코프(Transformer): long-range dependency를 직접 포착, 연산 비용 $O(T^2)$, 긴 문맥에서 메모리 제약.
-
-마르코프(Mamba, RNN): 연산 비용 $O(T)$, hidden state 차원이 병목, long-range 일부 손실.
-
-정상 과정의 에르고딕 정리(시간평균 = 공간평균)는 MCMC의 이론적 근거이고, 비정상 과정(DDPM, Score-SDE)은 시간 $t$를 명시적 조건부 입력으로 받아 비정상성을 처리한다.
+**L1/Smooth-L1**: 안정적이고 단순하지만 평가 metric(IoU)과 직접 연결되지 않는다. **GIoU**: disjoint plateau를 해결하지만 포함 관계에서 추가 신호가 없다. **DIoU/CIoU**: 더 풍부한 gradient를 제공하지만 `arctan` 계산에서 numerical 위험이 있고 `alpha` term에 stop-gradient가 필요하다. DETR은 L1 + GIoU를 조합해 set prediction matching cost로 사용한다.
 </Callout>
+
+## mAP — 집합 평가 metric
+
+평가 metric도 출력이 집합이라는 사실을 반영해야 한다. confidence threshold $\theta$를 변화시키면서 precision과 recall을 측정하면 PR curve가 만들어지고, AP는 그 곡선 아래 면적이다.
+
+$$
+\text{AP} := \int_0^1 p_{\text{interp}}(r)\, dr, \quad p_{\text{interp}}(r) = \max_{\tilde{r} \geq r} P(\tilde{r})
+$$
+
+envelope $p_{\text{interp}}$를 사용하는 이유는 raw PR curve가 zigzag를 가질 수 있기 때문이다 — FP 다음 TP가 연속으로 발생하면 recall이 증가하면서 precision이 잠깐 올라간다. Monotone 보정 후 적분한다.
+
+PASCAL VOC 2007의 11-point 근사와 COCO의 all-point 적분은 **같은 PR curve에서 다른 숫자를 준다**. 옛 논문과 현대 논문의 mAP를 직접 비교하면 안 되는 이유다. COCO의 표준 metric은 IoU threshold 10개의 평균이다.
+
+$$
+\text{mAP}_{\text{COCO}} = \frac{1}{|\mathcal{T}|} \frac{1}{C} \sum_{\tau \in \mathcal{T}} \sum_{c=1}^{C} \text{AP}_c(\tau), \quad \mathcal{T} = \{0.50, 0.55, \ldots, 0.95\}
+$$
+
+mAP@.5 = 0.7인데 mAP@[.5:.95] = 0.3인 모델은 class는 맞추지만 **localization이 부정확**한 모델이다. CIoU loss 도입이나 FPN으로 해상도를 높이는 것이 처방이 된다.
+
+## NMS — 집합 구조가 강제하는 후처리
+
+출력이 집합이라는 사실이 NMS를 필연적으로 만든다.
+
+<Theorem kind="proposition" number="2" title="중복 예측의 FP 강제">
+detector가 같은 object에 대해 두 예측 $(\hat{b}_1, c, \hat{s}_1)$, $(\hat{b}_2, c, \hat{s}_2)$를 출력하고 $\text{IoU}(\hat{b}_1, \hat{b}_2) > \tau_{\text{eval}}$이면, 둘 중 하나는 반드시 FP가 된다.
+</Theorem>
+
+<Proof>
+GT box $b$가 하나뿐이고 $\hat{b}_1, \hat{b}_2$ 모두 $b$와 IoU $\geq \tau$라 하자. TP/FP 매칭 규칙은 GT당 하나의 예측만 TP로 인정한다. confidence sort 후 첫 번째만 매칭되고, 두 번째는 자동으로 FP가 된다. $\square$
+</Proof>
+
+Anchor-based / one-stage detector는 dense prediction을 통해 같은 object에 여러 grid cell이 응답하도록 학습한다. 이는 positive sample 다양성을 높여 학습을 안정화시키지만, inference에서는 반드시 중복 제거가 필요하다. Greedy NMS는 confidence 내림차순으로 정렬 후, 선택된 box와 IoU $\geq \tau$인 나머지를 제거하는 $O(N^2)$ 알고리즘이다.
+
+Greedy NMS의 근본 한계는 **crowded scene**에 있다. 두 사람이 가까이 서 있어 IoU = 0.6이면, $\tau = 0.5$로 설정할 경우 두 번째 사람의 예측이 제거되어 FN이 발생한다. Soft-NMS (Bodla et al. 2017)는 hard removal 대신 score decay를 적용한다.
+
+$$
+s_j \leftarrow s_j \cdot \exp(-\text{IoU}^2 / \sigma)
+$$
+
+Gaussian decay는 모든 IoU에서 score를 단조비증가로 유지하면서, 가까운 박스를 제거하는 대신 confidence를 낮춰 최종 threshold에서 자연스럽게 걸러낸다. COCO에서 약 +1.7 mAP의 개선을 준다.
+
+<Aside label="NMS의 미래">
+DETR은 Hungarian matching 기반 set prediction loss로 training-time에 중복 예측 자체를 억제해 NMS를 완전히 제거한다. 그러나 500 epoch의 느린 수렴과 small object 어려움이 따른다. 현재는 scene complexity와 latency 요구에 따라 NMS-based(YOLO 계열)와 NMS-free(RT-DETR) 중 선택하는 양상이다.
+</Aside>
 
 ## 정리
 
-- 확률과정은 "각 시각마다 확률변수"(관점 A)이기도 하고 "sample path라는 함수값 확률변수"(관점 C)이기도 하며, 두 관점은 유한차원 분포가 매개한다.
-- Kolmogorov 확장정리는 일관성 + Polish 상태공간이 주어지면 경로 측도가 유일하게 존재함을 보장한다. 경로 연속성은 Kolmogorov continuity theorem이 별도로 제공한다.
-- 필트레이션은 시간에 따라 누적되
+- Detection 출력은 **variable-size set**이다. 이 사실 하나가 NMS, set prediction loss, mAP, anchor 책임 할당을 모두 도출한다.
+- IoU loss는 disjoint 영역에서 gradient가 0이다. GIoU → DIoU → CIoU는 각각 enclosing box 패널티, center distance, aspect ratio를 더해 학습 신호를 풍부하게 했다.
+- mAP@.5와 mAP@[.5:.95]는 다른 정보를 측정한다. 논문 숫자를 비교할 때 반드시 metric을 확인해야 한다.
+- NMS는 dense prediction의 필연적 귀결이고, Soft-NMS는 crowded scene의 FN을 부드럽게 완화한다. NMS를 없애려면 loss 설계 자체를 바꿔야 한다.
+
+출발점의 수학이 명확하지 않으면, 각 설계 결정이 왜 그 형태인지 알 수 없다.
+
+<Reference
+  title="Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression"
+  authors="Rezatofighi et al."
+  year={2019}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1902.09630"
+/>
+
+<Reference
+  title="Soft-NMS — Improving Object Detection With One Line of Code"
+  authors="Bodla et al."
+  year={2017}
+  venue="ICCV"
+  url="https://arxiv.org/abs/1704.04503"
+/>

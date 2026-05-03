@@ -1,0 +1,116 @@
+---
+title: "Anchor-Free Detection은 무엇을 해방시켰는가"
+description: "Anchor의 6가지 설계 부담부터 FCOS의 per-pixel regression, CenterNet의 keypoint 환원, CornerNet의 pair matching까지 — anchor-free paradigm shift의 동기와 귀결을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [object-detection, anchor-free, fcos, centernet, cornernet]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+2015년 Faster R-CNN이 anchor를 도입한 이후 5년간, anchor는 detection의 기본 어휘였다. 그러나 2019년 FCOS가 등장하면서 질문이 바뀐다 — anchor가 정말 필요한가? anchor-free가 같은 mAP를 낼 수 있다면, anchor가 남기는 것은 성능이 아니라 **설계 부담**뿐이 아닌가?
+
+## Anchor가 남긴 설계 부담
+
+Anchor-based detector가 요구하는 hyperparameter를 명시적으로 열거하면 다음과 같다.
+
+$$\Theta_{\text{anchor}} = \{S, R, K, \tau^+, \tau^-, k_{\text{km}}\}$$
+
+scale 집합 $S$, aspect ratio 집합 $R$, location당 anchor 수 $K$, positive/negative IoU threshold $\tau^+, \tau^-$, k-means cluster 수 $k_{\text{km}}$. 전형적 조합의 cardinality는 $10^4$ 수준 — 전수 탐색 불가, 사람의 hand-engineering이 필수다.
+
+여기에 class imbalance 문제가 더해진다. 800×800 이미지, stride 16, location당 anchor 9개를 두면 전체 anchor는 22,500개다. 그런데 COCO 기준 이미지당 GT는 평균 7개, positive anchor(IoU > 0.5)는 약 50개다.
+
+$$\rho^+ = \frac{50}{22{,}500} \approx 0.2\%$$
+
+Focal Loss는 이 imbalance를 완화하지만, anchor 설계 자체의 부담은 그대로다. anchor scale을 `{32, 64, 128, 256, 512}`에서 `{64, 128, 256, 512, 1024}`로 바꾸면 COCO mAP가 36.5에서 34.8로 떨어진다. 1.7 mAP는 작아 보이지만, 같은 아키텍처에서 anchor 설정 하나로 발생하는 격차다.
+
+## FCOS — 거리를 직접 측정하다
+
+FCOS(Tian 2019)는 anchor를 per-pixel regression으로 대체한다. feature map의 각 location $(x, y)$에서 GT box의 네 변까지 거리를 직접 예측한다.
+
+$$l^* = x - x_1, \quad t^* = y - y_1, \quad r^* = x_2 - x, \quad b^* = y_2 - y$$
+
+표현력은 anchor-based와 동등하다 — $(l^*, t^*, r^*, b^*)$와 location $(x, y)$가 주어지면 box $(x-l, y-t, x+r, y+b)$로 일대일 복원된다. anchor의 가치는 표현력이 아니라 학습 초기의 size prior에만 있었던 셈이다.
+
+두 가지 설계가 이 단순함을 실용적으로 만든다.
+
+**Multi-scale assignment**: 각 FPN level에 max regression distance를 할당한다 — P3(max 64px), P4(128), P5(256), P6(512), P7(∞). GT의 size에 따라 담당 level이 자동으로 결정되므로, anchor의 scale 설계가 사라진다.
+
+**Centerness**: GT box 내 location의 box 예측 품질은 중심일수록 높고 가장자리일수록 낮다. COCO validation 실험에서 centerness 0.9 이상 location의 예측 IoU는 0.85, centerness 0.1 미만은 0.55였다. FCOS는 이를 보조 head로 학습시켜 NMS score에 곱한다.
+
+$$\text{ctr}^* = \sqrt{\frac{\min(l, r)}{\max(l, r)} \cdot \frac{\min(t, b)}{\max(t, b)}} \in [0, 1]$$
+
+edge pixel의 부정확한 box가 score 감소로 자연스럽게 suppressed된다. centerness ablation 결과는 COCO mAP 33.5 → 36.6 (+3.1)다.
+
+FCOS(ResNet-50+FPN)의 최종 COCO mAP는 36.6 — RetinaNet(ResNet-50+FPN)의 35.7을 넘는다. anchor 없이 anchor-based를 뛰어넘은 첫 사례다.
+
+## CenterNet — Object를 점 하나로 환원하다
+
+CenterNet(Zhou 2019)은 다른 방향을 택한다. object를 center keypoint 하나로 줄이고, heatmap으로 그 위치를 예측한다.
+
+$$Y(x, y) = \exp\left(-\frac{\|(x, y) - p\|^2}{2\sigma_p^2}\right)$$
+
+$\sigma_p$는 box size에 비례한다 — 큰 object는 더 넓은 Gaussian. 여러 GT가 겹치면 element-wise max를 취한다.
+
+<Callout type="note" title="Gaussian heatmap이 hard label보다 안정적인 이유">
+hard one-hot label은 1픽셀만 positive이므로 extreme imbalance가 발생하고, 인접 픽셀의 prediction이 조금만 빗나가도 large loss를 만든다. Gaussian splat은 인접 픽셀에 soft target(~0.9)을 부여해 smooth한 gradient landscape를 형성하고, center의 공간적 불확실성을 자연스럽게 인코딩한다.
+</Callout>
+
+inference는 세 단계다. heatmap에서 3×3 max-pool로 local maximum을 추출하고, top-K(보통 100)를 고른 뒤, 각 peak에서 offset head와 size head로 box를 복원한다. offset은 stride에 의한 sub-pixel quantization 오차를 보정한다.
+
+$$c_x = (p_x + O_x) \cdot s, \quad c_y = (p_y + O_y) \cdot s$$
+
+이 구조의 핵심 성질은 NMS가 거의 불필요하다는 것이다. 두 GT가 가까이 있으면 heatmap에 두 Gaussian peak가 생기고, 3×3 max-pool이 두 peak를 각각 추출한다. crowded scene에서 anchor-based의 IoU threshold 기반 NMS가 일으키는 false suppression이 구조적으로 완화된다. DLA-34 backbone으로 COCO mAP 42를 달성했다.
+
+CenterNet의 또 다른 강점은 multi-task 일반화다. center point에서 어떤 attribute든 regression이 가능하므로, depth + dimension head를 추가하면 3D detection, keypoint heatmap을 추가하면 pose estimation이 된다. R-CNN 계열의 RoI Pool이 고정 크기라는 제약과 달리, single point에서 모든 attribute를 읽는다.
+
+## CornerNet — 쌍으로 찾고, 유사도로 묶다
+
+CornerNet(Law 2018)은 더 복잡한 방향을 택한다. box를 top-left corner와 bottom-right corner 두 점으로 표현하고, 같은 object의 두 corner는 비슷한 embedding을 갖도록 학습한다.
+
+$$L_{\text{pull}} = \frac{1}{N} \sum_g (e_g^t - e_g)^2 + (e_g^b - e_g)^2, \quad e_g = \frac{e_g^t + e_g^b}{2}$$
+
+$$L_{\text{push}} = \frac{1}{N(N-1)} \sum_{g \neq h} \max(0, \Delta - |e_g - e_h|)$$
+
+pull loss는 같은 box의 두 corner를 가까이, push loss는 다른 box의 corner를 멀리 보낸다.
+
+corner 위치에는 visual feature가 약하다는 문제가 있다. object의 강한 activation은 보통 중심에 있기 때문이다. **Corner Pooling**이 이를 해결한다.
+
+$$\text{TL}[i, j] = \max_{j' \geq j} F[i, j'] + \max_{i' \geq i} F[i', j]$$
+
+top-left corner $(i, j)$의 출력은 "해당 row의 오른쪽 max + 해당 column의 아래 max"다. box interior의 strong activation이 corner 위치까지 propagate된다. Hourglass-104 backbone으로 COCO mAP 42.1 — RetinaNet(39.1), Faster R-CNN(36.2)보다 높다.
+
+<Aside label="왜 mainstream에 못 들어갔나">
+CornerNet의 matching은 $O(N^2)$ — top-100 TL × top-100 BR = 10,000 pair를 embedding distance로 비교해야 한다. corner pooling은 non-local receptive field로 표현력이 높지만 GPU-unfriendly하다. Hourglass network의 학습 비용과 embedding collapse 위험까지 더해져, production 채택률은 낮다. 그러나 "matching을 architecture-level에서 처리"라는 idea는 DETR의 Hungarian matching으로 이어진다.
+</Aside>
+
+ExtremeNet(Zhou 2019)은 이를 4개의 extreme point(top-most, left-most, bottom-most, right-most) + center로 확장한다. 5개 heatmap을 검출하고 geometric constraint로 valid combination만 고른다 — embedding 없이도 false matching을 자연 제거할 수 있다.
+
+## 트레이드오프
+
+anchor-free는 hyperparameter를 줄이지만 zero는 아니다.
+
+<Callout type="note" title="트레이드오프 요약">
+FCOS는 anchor의 6 hyperparameter를 scale assignment threshold + centerness weight 2개로 줄인다. CenterNet은 heatmap σ + size loss weight 2개다. DETR은 object query 수 $N$ + matching cost weight로 1–3개다. 줄어들지만 사라지지는 않는다. 본질적 단순화와 학습 가능한 prior가 anchor-free의 핵심 가치다 — anchor의 explicit size prior를 FPN scale assignment 또는 Gaussian σ라는 다른 형태의 prior로 교체한 것이다.
+</Callout>
+
+또한 anchor-based가 완전히 죽지 않았다는 점도 중요하다. 작은 dataset이나 fine-tuning 상황에서 잘 tuned된 anchor는 여전히 경쟁력 있다. ATSS(Zhang 2020)는 anchor와 anchor-free의 경계가 assignment 전략에 달려 있음을 보여줬고, dynamic assignment(TAL, SimOTA)가 등장하면서 두 paradigm의 격차는 사실상 minimal해졌다.
+
+## 정리
+
+- Anchor의 design burden은 6차원 — scale, aspect ratio, anchor 수, $\tau^+$, $\tau^-$, k-means $k$. 이 부담이 anchor-free 이행의 실질적 동기다.
+- FCOS는 per-pixel $(l, t, r, b)$ regression과 centerness로 anchor 없이 RetinaNet을 넘는 mAP를 달성했다.
+- CenterNet은 detection을 keypoint 문제로 환원해 NMS를 거의 불필요하게 만들고, 단일 구조에서 3D/pose/tracking으로 일반화했다.
+- CornerNet의 pair matching은 production에서 채택되지 못했지만, end-to-end set prediction이라는 아이디어는 DETR로 이어졌다.
+
+anchor-free가 증명한 것은 "anchor가 없어도 된다"가 아니라, anchor가 담당하던 일을 더 단순하고 dataset-agnostic한 방식으로 할 수 있다는 것이다.

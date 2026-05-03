@@ -1,0 +1,145 @@
+---
+title: "Video에서 Foundation까지 — 객체 인식의 확장 경계"
+description: "단일 프레임 탐지의 시간적 한계부터 3D 공간 추론, 통합 분할, 그리고 프롬프트 기반 Foundation Model까지 — 객체 인식 파이프라인이 어떻게 진화하는지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [object-detection, multi-object-tracking, 3d-detection, segmentation, foundation-model]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+단일 이미지에서 바운딩 박스를 찾는 문제는 오래전에 어느 정도 해결됐다. 진짜 어려움은 그 다음부터다 — 시간이 흐를 때, 공간이 3차원일 때, 경계가 픽셀 단위여야 할 때, 그리고 학습에 없던 클래스까지 처리해야 할 때. 이 네 가지 확장이 현대 객체 인식 연구의 전선(前線)이다. 각 확장이 공유하는 설계 원리는 무엇인가?
+
+## 시간 축의 추가 — Tracking-by-Detection
+
+YOLO나 DETR을 비디오 프레임마다 독립적으로 돌리면 즉각적인 문제가 생긴다. 같은 자동차가 프레임마다 다른 ID를 받고, 잠깐 가려진 보행자는 탐지 목록에서 사라진다. Multi-Object Tracking(MOT)은 탐지에 **시간적 연관(temporal association)**을 얹는다.
+
+SORT(Bewley 2016)의 접근은 단순하면서 강력하다. 각 트랙의 상태를 Kalman 필터로 예측하고, 새 프레임의 탐지 결과와 Hungarian 알고리즘으로 매칭한다. 상태 벡터는 7차원이다.
+
+$$x = (c_x,\, c_y,\, s,\, r,\, \dot{c}_x,\, \dot{c}_y,\, \dot{s})$$
+
+$s = wh$ (면적), $r = w/h$ (종횡비), 나머지는 각 속도 성분이다. 선형 전이 행렬 $F$가 등속 운동을 가정하며, Kalman 업데이트가 새 관측으로 상태를 보정한다.
+
+DeepSORT(Wojke 2017)는 여기에 ReID 임베딩을 추가한다. 각 탐지 패치를 CNN에 통과시켜 128차원 벡터를 얻고, 비용 행렬을 다음과 같이 구성한다.
+
+$$\text{Cost} = \lambda \cdot (1 - \text{IoU}) + (1 - \lambda) \cdot d_{\cos}(\text{emb}_t,\, \text{emb}_{t-1})$$
+
+$\lambda = 0.98$으로 IoU가 주 신호지만, 가려져서 IoU가 떨어질 때 ReID가 보완한다. ByteTrack(Zhang 2022)은 한 발 더 나간다. 탐지를 고신뢰($\geq 0.5$)와 저신뢰($\geq 0.1$)로 나눠 두 번 매칭한다 — 1단계에서 고신뢰 탐지로 기존 트랙을 업데이트하고, 2단계에서 매칭 실패 트랙을 저신뢰 탐지와 재매칭한다. 가려진 객체가 confidence가 낮더라도 weak signal을 살려 연결한다.
+
+<Callout type="note" title="트레이드오프: Kalman 모델의 가정">
+등속 운동 가정은 갑작스러운 방향 전환이나 가속에서 깨진다. 자율주행의 급제동, 스포츠의 방향 전환이 대표적이다. Extended Kalman Filter나 학습 기반 모션 예측(LSTM)이 대안이지만, 단순한 등속 Kalman이 production 베이스라인으로 여전히 충분한 경우가 많다.
+</Callout>
+
+성능 지표로는 MOTA, IDF1, HOTA가 쓰인다. HOTA(Luiten 2020)가 가장 informative한데, 탐지 정확도(DetA)와 연관 정확도(AssA)의 기하 평균이기 때문이다.
+
+$$\text{HOTA} = \sqrt{\text{DetA} \cdot \text{AssA}}$$
+
+한쪽이 약하면 전체가 약해지는 구조 — 탐지만 좋거나 연관만 좋아서는 안 된다.
+
+## 3차원으로의 확장 — LiDAR와 BEV
+
+2D 박스는 $(x_1, y_1, x_2, y_2)$지만, 3D 박스는 7차원이다.
+
+$$b_{3D} = (c_x,\, c_y,\, c_z,\, w,\, h,\, l,\, \theta)$$
+
+자율주행 맥락에서는 pitch와 roll을 무시(지면 평행 가정)하므로 yaw($\theta$)만 남는다. LiDAR 포인트 클라우드는 여기서 핵심 입력이 된다 — 수십만 점의 비순서, 비균일 집합이라 2D 이미지용 CNN을 직접 쓸 수 없다.
+
+PointNet(Qi 2017)은 이 문제를 permutation invariance로 풀었다. 각 점에 독립적으로 MLP를 적용하고, max-pooling으로 집약한다. 어떤 순서로 점이 들어와도 출력이 같다.
+
+$$h_i = \text{MLP}(p_i), \quad f = \text{MaxPool}_i(h_i)$$
+
+VoxelNet(Zhou 2018)은 공간을 복셀로 분할해 각 복셀 안의 점들을 PointNet으로 인코딩한 뒤 3D conv를 돌린다. 정확하지만 느리다. PointPillars(Lang 2019)는 z축을 무한히 늘려 2D 그리드의 pillar로 만든다 — pillar별로 PointNet 인코딩 후 2D 유사 이미지(pseudo-image)를 만들어 2D conv로 처리한다. 3D conv를 피해 60+ FPS가 가능하다. KITTI 기준:
+
+| 모델 | Bird-view AP | FPS |
+|------|-------------|-----|
+| VoxelNet | 89.4 | 4 |
+| SECOND | 87.4 | 20 |
+| PointPillars | 88.4 | 62 |
+
+다중 센서(카메라+LiDAR+레이더)를 통합할 때 BEV(Bird's Eye View)가 자연스러운 공통 캔버스가 된다. LiDAR는 z축 압축으로 직접 BEV가 가능하고, 레이더는 원래 지면 평면을 측정하며, 카메라도 깊이 추정 후 BEV로 투영한다. BEVFusion(Liu 2022) 같은 최신 멀티모달 아키텍처가 이 공간에서 feature를 정렬하고 융합하는 이유다.
+
+카메라만으로의 3D 탐지(BEVFormer 등)는 구조적으로 ill-posed다. 단일 시점의 픽셀 $(u, v)$는 3D ray 전체에 대응 — 깊이 $z$가 자유 변수다. 다시점(6카메라 서라운드)이나 시간적 스테레오를 써도, 전문 LiDAR 대비 성능 격차는 크다(KITTI mAP: 카메라 전용 ~10–15 vs LiDAR ~80+).
+
+## 픽셀까지 — Mask2Former의 통합 분할
+
+탐지가 바운딩 박스를 찾는다면, 분할(segmentation)은 픽셀 단위로 경계를 긋는다. Panoptic segmentation은 그 경계 안에서도 두 종류를 구분한다 — 셀 수 있는 객체(things: 자동차, 사람)는 인스턴스 ID까지 부여하고, 배경(stuff: 하늘, 도로)은 클래스만 붙인다.
+
+Mask2Former(Cheng 2022)는 DETR의 set prediction 아이디어를 분할로 확장한다. $N$개의 학습 가능 쿼리가 각각 `(class, mask)` 쌍을 예측하고, Hungarian 매칭으로 GT와 연결된다. 바운딩 박스가 4차원 직사각형이었다면, 마스크는 image-level 이진 맵으로의 일반화다.
+
+핵심 혁신은 **masked attention**이다. 표준 cross-attention은 쿼리가 이미지 전체에 어텐션을 분산시키므로 DETR처럼 수렴이 느리다. Masked attention은 이전 레이어의 예측 마스크 영역 안에서만 어텐션을 허용한다.
+
+$$\text{mask}_{ij} = \begin{cases} 1 & m_i(j) > 0.5 \\ -\infty & \text{otherwise} \end{cases}$$
+
+레이어를 거칠수록 마스크가 정밀해지고, 어텐션도 그에 따라 좁아진다. 결과적으로 DETR 대비 5배 빠른 수렴(100k vs 500k 반복)이 가능하다.
+
+성능 평가에는 PQ(Panoptic Quality)를 쓴다. 탐지 정확도(RQ)와 마스크 품질(SQ)의 곱이다.
+
+$$\text{PQ} = \underbrace{\frac{\sum_{(p,g) \in \text{TP}} \text{IoU}(p, g)}{|\text{TP}|}}_{\text{SQ}} \times \underbrace{\frac{|\text{TP}|}{|\text{TP}| + \frac{1}{2}|\text{FP}| + \frac{1}{2}|\text{FN}|}}_{\text{RQ}}$$
+
+HOTA와 구조가 같다 — 두 측면을 모두 잘해야 단일 숫자가 높아진다.
+
+## Foundation으로의 도약 — SAM
+
+Mask2Former가 정해진 클래스 집합에 대한 통합 분할이라면, SAM(Segment Anything, Kirillov 2023)은 클래스 레이블 없이 **어떤 이미지의 어떤 객체든** 분할한다.
+
+아키텍처는 세 부분이다. ViT-H 이미지 인코더(632M 파라미터)가 이미지당 한 번 256×64×64 임베딩을 만들고, 경량 프롬프트 인코더가 점/박스/마스크를 임베딩으로 변환하며, 2레이어 마스크 디코더가 둘을 합쳐 마스크 3개와 IoU 점수를 출력한다.
+
+이미지 인코더가 한 번만 돌면 이후 프롬프트 변경은 수십 ms — 인터랙티브 어노테이션 UI가 가능한 이유다.
+
+<Theorem kind="proposition" number="1" title="Data Scale이 Zero-Shot 품질을 결정">
+SAM의 zero-shot 일반화 성능은 아키텍처보다 SA-1B 데이터 규모(1.1B 마스크)에 의존한다.
+</Theorem>
+
+<Proof>
+논문의 ablation: 100k 마스크 학습 시 COCO mask AP 60, 10M 마스크에서 75, 1.1B 마스크에서 87. +27점의 이득이 단순 스케일 증가에서 나온다. 아키텍처 변경의 한계 이득보다 크다. CLIP(400M 이미지-텍스트), GPT 계열과 같은 패턴 — foundation model의 성공은 데이터 스케일이 주도한다. $\square$
+</Proof>
+
+SA-1B 자체가 모델-인-더-루프로 만들어진 점도 주목할 만하다. 소규모 수동 어노테이션 → 초기 SAM 학습 → semi-automatic → fully automatic(32×32 격자 프롬프트)의 3단계로 비용 없이 1.1B 마스크를 축적했다.
+
+프롬프트 모호성(점 하나가 사람 전체인지 옷인지 불분명) 문제는 3개의 마스크 출력으로 처리한다 — whole, part, sub-part를 동시에 예측하고 사용자가 선택하거나 IoU 점수가 가장 높은 것을 취한다. 단일 마스크 출력으로는 두 GT 사이를 평균하는 나쁜 마스크로 수렴했을 것이다.
+
+detection과의 결합은 자연스럽다. GroundingDINO가 텍스트 쿼리에서 박스를 예측하고, 그 박스를 SAM 프롬프트로 넣으면 zero-shot 인스턴스 분할 파이프라인이 된다. 학습이나 어노테이션 없이 가능하다.
+
+## 공통 설계 원리
+
+네 확장을 관통하는 패턴이 있다.
+
+**모든 확장은 기존 탐지기를 교체하지 않고 위에 쌓는다.** ByteTrack은 어떤 탐지기 위에도 얹힌다. PointPillars는 2D conv 위에서 동작한다. Mask2Former는 DETR의 set prediction을 마스크로 재해석한다. SAM은 기존 탐지기(GroundingDINO)와 파이프라인으로 연결된다.
+
+**정보 병목이 임베딩 하나로 수렴하는 경향도 보인다.** Kalman 상태 벡터, BEV feature map, Mask2Former 쿼리, SAM 이미지 임베딩 — 모두 다운스트림 처리에 재사용되는 중간 표현이다. SAM이 이미지 임베딩을 한 번만 계산하고 여러 프롬프트에 재사용하는 것은 이 패턴의 극단이다.
+
+## 정리
+
+- MOT에서 Kalman 필터의 등속 가정은 언제나 약점이다. 탐지기 품질이 tracker 알고리즘보다 성능에 더 크게 기여한다.
+- 3D 탐지에서 BEV는 카메라·LiDAR·레이더를 통합하는 canonical canvas로 자리잡았다. PointPillars의 속도-정확도 균형이 production 기준선이다.
+- Mask2Former는 masked attention으로 DETR의 느린 수렴 문제를 마스크 레벨에서 해결했다. detection→segmentation의 아키텍처 통합이 완성됐다.
+- SAM은 클래스가 아닌 프롬프트로 작동하는 첫 번째 분할 foundation model이다. 1.1B 마스크의 스케일이 zero-shot 일반화를 만든다.
+
+네 방향 모두 "탐지기를 닫힌 클래스 집합에서 해방시킨다"는 같은 압력 아래 움직이고 있다.
+
+<Reference
+  title="Segment Anything"
+  authors="Kirillov et al."
+  year={2023}
+  venue="ICCV"
+  url="https://arxiv.org/abs/2304.02643"
+/>
+
+<Reference
+  title="ByteTrack: Multi-Object Tracking by Associating Every Detection Box"
+  authors="Zhang et al."
+  year={2022}
+  venue="ECCV"
+  url="https://arxiv.org/abs/2110.06864"
+/>
