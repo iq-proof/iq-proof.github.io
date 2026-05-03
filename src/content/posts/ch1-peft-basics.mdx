@@ -1,0 +1,125 @@
+---
+title: "LLM Fine-Tuning의 메모리 문제는 어디서 오는가"
+description: "7B 모델 full fine-tuning의 112GB 메모리 분해부터 PEFT 3대 계열의 수학적 정당성까지, 파라미터 효율화의 공통 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [llm, peft, lora, fine-tuning, memory]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: Llm Efficiency Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+7B LLM을 fine-tuning하려는 순간, 첫 번째 벽은 언제나 같다 — GPU 메모리 부족. LoRA, QLoRA, Adapter, Prompt Tuning은 모두 이 하나의 문제에서 출발했다. 그런데 정확히 **어디에** 메모리가 필요한지 알지 못한 채로는, 각 기법이 얼마나 무엇을 절감하는지 정량화할 수 없다. 메모리 회계에서 시작해 PEFT의 공통 원리까지 — 이 모든 설계 결정의 뿌리는 같은 공식 하나에 있다.
+
+## Adam이 메모리를 삼키는 방식
+
+FP32 full fine-tuning에서 GPU 메모리는 네 개의 버킷으로 나뉜다: 모델 가중치, 그래디언트, Adam optimizer 상태(`m`, `v` 벡터), 그리고 activation cache. 이 중 optimizer 상태가 전체의 절반을 차지한다.
+
+<Theorem kind="theorem" number="1" title="Adam Memory per Parameter">
+Adam optimizer를 사용할 때 파라미터 $\theta_j$ 하나당 필요한 최소 메모리는 정확히 **16바이트**다.
+
+$$
+M_j^{\text{Adam}} = \underbrace{4}_{\theta_j} + \underbrace{4}_{\nabla_j} + \underbrace{4}_{m_j} + \underbrace{4}_{v_j} = 16 \text{ bytes}
+$$
+</Theorem>
+
+<Proof>
+Adam의 한 step에서: (1) backward pass로 $\nabla_j$ 생성 — 4바이트, (2) momentum $m_j \leftarrow \beta_1 m_j + (1-\beta_1)\nabla_j$ 유지 — 4바이트, (3) velocity $v_j \leftarrow \beta_2 v_j + (1-\beta_2)(\nabla_j)^2$ 유지 — 4바이트, (4) weight $\theta_j$ 자체 — 4바이트. Activation을 제외한 최소 메모리는 따라서 16B per param. $\square$
+</Proof>
+
+$D = 7 \times 10^9$이면 이 공식이 전개된다.
+
+$$
+M_{\text{total}}^{\text{full}} = 16D + M_{\text{act}} = 112\text{ GB} + 10\text{-}20\text{ GB}
+$$
+
+Mixed precision(BF16 weight + FP32 master copy)을 써도 $14D$로 98 GB — A100 80GB 단일 GPU에서는 여전히 불가능하다. 이 불가능성이 PEFT 전체의 출발점이다.
+
+## PEFT의 세 가지 제약 방식
+
+PEFT는 "파라미터를 줄인다"는 단일 아이디어가 아니다. Lialin et al. (2023)의 분류가 보여주듯, 세 계열이 서로 다른 철학을 가진다.
+
+$$
+W_{\text{ft}} = W_{\text{pt}} + \Delta W, \quad \Delta W \in \mathcal{S}
+$$
+
+$\mathcal{S}$가 무엇이냐에 따라 계열이 갈린다.
+
+- **Additive** (Adapter, LoRA): 새 모듈을 추가하거나 low-rank 행렬을 주입. $\Delta W = BA$.
+- **Selective** (BitFit): 전체 weight 중 일부(bias 등)만 업데이트. $\text{support}(\Delta W) \subseteq I_{\text{selected}}$.
+- **Reparameterization** (LoRA, DoRA): $\Delta W$를 더 작은 잠재 변수 $z$의 함수로 표현. $\Delta W = g(z)$.
+
+LoRA가 두 계열에 걸쳐 있는 것이 눈에 띈다. $\Delta W = BA$는 additive이기도 하고, $(B, A)$라는 잠재 파라미터로 reparameterize된 것이기도 하다. 이 이중성이 LoRA를 실용적으로 만드는 핵심이다 — 학습 후 $W' = W + BA$로 merge하면 inference latency가 0이 된다.
+
+<Callout type="note" title="트레이드오프">
+Adapter는 inference 시마다 bottleneck forward pass를 추가로 실행한다(~1-3% latency 증가). LoRA는 merge 후 overhead 0. BitFit은 bias만 건드려 호환성이 가장 높지만 표현력이 가장 낮다. 선택은 latency, 호환성, 성능 중 무엇을 우선하느냐에 달려 있다.
+</Callout>
+
+## Intrinsic Dimension — "왜 작동하는가"의 답
+
+세 계열이 공유하는 질문이 있다: 왜 $D$차원 업데이트를 훨씬 작은 차원으로 제한해도 성능이 유지되는가? Aghajanyan et al. (2020)이 이에 답했다.
+
+핵심 실험은 단순하다. Pre-trained BERT의 파라미터 공간에 무작위 행렬 $P \in \mathbb{R}^{D \times d}$를 고정하고, $z \in \mathbb{R}^d$만 학습한다.
+
+$$
+\theta = \theta_{\text{pt}} + Pz, \quad z^* = \arg\min_z \mathcal{L}(f_{\theta_{\text{pt}} + Pz}; \mathcal{D}_{\text{task}})
+$$
+
+결과: BERT-base MRPC 기준으로 $d = 200$에서 이미 full fine-tuning의 92% 성능이 나온다. 행렬 $P$가 완전히 무작위인데도.
+
+이를 이론적으로 뒷받침하는 것이 Johnson-Lindenstrauss lemma다 — random projection은 확률적으로 기하학적 구조를 보존한다. Task manifold 자체가 low-dimensional이므로, 무작위 basis도 그 구조를 충분히 capture한다.
+
+$$
+(1 - \delta)\|u - v\|^2 \leq \frac{1}{d}\|Pu - Pv\|^2 \leq (1 + \delta)\|u - v\|^2
+$$
+
+LoRA의 $BA$는 이 random projection의 **학습 가능한(structured) 버전**이다. Random basis 대신 task-specific basis를 학습하므로 더 효율적이다. 이것이 rank $r = 8$ 같은 극도로 작은 값에서도 작동하는 이유다.
+
+## 규모가 커지면 달라지는 것 — Prompt Tuning의 발견
+
+Lester et al. (2021)의 발견은 직관에 반한다. Input embedding에만 학습 가능한 soft prompt $P \in \mathbb{R}^{l \times d}$를 prepend하는 방식 — trainable parameter가 $l \times d$에 불과한 이 기법이, 10B 이상 모델에서는 full fine-tuning과 거의 같은 성능을 낸다.
+
+$$
+X' = [P; X], \quad P \in \mathbb{R}^{l \times d} \text{ (learnable only)}
+$$
+
+왜 모델이 클수록 유리한가? Small model은 새 task를 위해 weight 수정으로 새 representation을 만들어야 한다. Large model은 이미 충분히 풍부한 representation을 가지고 있어, attention의 routing(reweighting)만으로 task adaptation이 가능하다. Prompt는 모델이 이미 가진 지식을 activate하는 신호가 되는 것이다.
+
+<Aside label="규모와 PEFT 선택">
+실전 규칙: 1B 미만은 LoRA 또는 full FT, 1B-10B는 LoRA(r=8-16), 10B 초과에서는 Prompt Tuning이 최소 parameter로 거의 동등한 성능을 낸다. 단, Prompt Tuning은 context length를 $l$만큼 소비하므로 long-context task에서는 prefix length를 최소화해야 한다.
+</Aside>
+
+## 정리
+
+- Full fine-tuning의 메모리는 `16D + activation`으로 정확히 분해된다. Adam optimizer 상태가 그 절반(50%)을 차지한다.
+- PEFT 3대 계열(Additive / Selective / Reparameterization)은 모두 $\Delta W \in \mathcal{S}$라는 제약된 업데이트 형태로 통일된다.
+- Intrinsic dimension 가설이 이 제약의 이론적 정당성이다 — task manifold가 low-dimensional이므로 작은 rank로도 충분하다.
+- 모델 규모가 커질수록 필요한 PEFT의 "침습도"가 낮아진다. 10B 초과에서는 soft prompt 하나면 된다.
+
+다음 글에서는 LoRA의 수식 $\Delta W = BA$가 실제로 어떻게 초기화되고, rank $r$의 선택이 학습 안정성에 어떤 영향을 주는지 추적한다.
+
+<Reference
+  title="Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning"
+  authors="Aghajanyan et al."
+  year={2020}
+  venue="ACL 2021"
+  url="https://arxiv.org/abs/2012.13255"
+/>
+
+<Reference
+  title="The Power of Scale for Parameter-Efficient Prompt Tuning"
+  authors="Lester et al."
+  year={2021}
+  venue="EMNLP 2021"
+  url="https://arxiv.org/abs/2104.08691"
+/>

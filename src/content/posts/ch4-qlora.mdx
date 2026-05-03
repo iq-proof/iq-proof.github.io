@@ -1,0 +1,107 @@
+---
+title: "QLoRA는 어떻게 65B 모델을 GPU 한 장에 올렸나"
+description: "NF4 양자화, LoRA 어댑터, Paged Optimizer가 합쳐지는 QLoRA의 설계 결정부터 Full FT와의 성능 격차가 1% 미만인 이유까지, 메모리 효율 fine-tuning의 전체 그림을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [qlora, lora, quantization, fine-tuning, llm-efficiency]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: Llm Efficiency Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+65B 파라미터 모델을 fine-tuning하려면 얼마나 많은 GPU가 필요할까? 2022년까지의 답은 "A100 8장"이었다. Dettmers 2023은 그 답을 "A100 1장"으로 바꿨다. NF4 양자화, LoRA 어댑터, Paged Optimizer — 세 기법이 정확히 어떻게 결합되어 이 도약을 만들었는가?
+
+## 문제: 거대 모델 fine-tuning의 메모리 장벽
+
+Full fine-tuning은 세 가지 메모리 비용을 모두 치른다. 파라미터 자체(FP32로 65B = 260GB), 역전파 gradient, Adam optimizer state(파라미터당 m과 v, 각 FP32) — 합산하면 단일 GPU는 물론이고 멀티 GPU 클러스터도 벅차다.
+
+LoRA는 이 문제를 부분적으로 해결한다. Base weight를 고정하고 저랭크 행렬 $A \in \mathbb{R}^{r \times d_{\text{in}}}$, $B \in \mathbb{R}^{d_{\text{out}} \times r}$만 학습하면, 학습 파라미터 수가 수십만 분의 일로 줄어든다. 하지만 base weight를 FP32로 그대로 올려두면 메모리 절감 효과는 절반에 그친다. **QLoRA의 핵심 질문**: base weight 자체를 4비트로 압축한 채 LoRA adapter를 정상 학습할 수 있는가?
+
+## QLoRA의 수식: 두 항의 결합
+
+QLoRA의 forward pass는 정확히 두 항의 합이다.
+
+$$
+h = \mathrm{dequant}(W_{\mathrm{NF4}},\, c_{\mathrm{block}})\, x + \frac{\alpha}{r} B A x
+$$
+
+첫 번째 항은 4비트로 저장된 base weight를 블록 단위 스케일 $c_{\mathrm{block}}$으로 역양자화해 연산한다. 두 번째 항은 BF16 정밀도의 LoRA 어댑터가 task-specific 신호를 담당한다.
+
+Backward pass에서 base weight는 `requires_grad=False`이므로 역양자화 경로에 gradient가 흐르지 않는다. NF4 역양자화 함수가 미분 불가능해도 문제없다 — gradient 요청 자체가 없기 때문이다. LoRA 경로만 완전 미분 가능하고, $\partial \mathcal{L}/\partial A$와 $\partial \mathcal{L}/\partial B$는 unbiased estimator가 된다.
+
+<Theorem kind="proposition" number="1" title="QLoRA Backward Unbiasedness">
+Loss $\mathcal{L}$에 대한 LoRA 파라미터 $\theta_{\text{LoRA}} = (A, B)$의 gradient는 unbiased estimator다.
+</Theorem>
+
+<Proof>
+NF4 dequantization은 미분 불가능하지만 base weight가 frozen이므로 backward 시 dequant 경로의 gradient 요청이 없다. LoRA 경로 $\frac{\alpha}{r}BAx$는 fully differentiable하고, gradient는 정확히 $(A, B)$에만 적용된다. 따라서 $\hat{\nabla}_{\theta_{\text{LoRA}}} \mathcal{L}$은 unbiased $\square$.
+</Proof>
+
+## 메모리 회계: 세 겹의 최적화
+
+65B 모델의 메모리 예산을 세분하면 각 기법이 어느 부분을 공략하는지 명확해진다.
+
+**NF4 양자화**: base weight를 4비트로 압축한다. 블록 단위 FP32 스케일 때문에 유효 비트수는 4.5비트/파라미터다. 65B 기준 약 33GB.
+
+**Double Quantization**: 블록 스케일 자체를 INT8로 재압축한다. 스케일 분포는 좁고 정규화되어 있어 INT8(256단계)로도 재구성 오차가 $s_{\max}/256$ 이하로 유지된다. 비트 비용이 4.5 → 4.13비트/파라미터로 줄어 약 3GB를 추가 절감한다.
+
+$$
+\hat{w}_i = c(q_i) \cdot \frac{q_k^{(2)}}{256} \cdot s_{\max}
+$$
+
+**Paged Optimizer**: LoRA adapter의 Adam state(m, v)를 CPU pinned memory로 overflow시킨다. CUDA 스트림을 활용해 backward 연산과 CPU optimizer update를 병렬화하면 GPU-CPU transfer latency가 대부분 숨겨진다. 실측 throughput 손실은 약 8%.
+
+<Callout type="note" title="65B 메모리 예산 요약">
+NF4 base: ~33GB / LoRA 파라미터: ~80MB / Adam state(CPU): ~160MB / Activation(batch 8, seq 512): ~2.6GB. 합산 약 36GB — 48GB GPU 한 장에 여유 있게 들어간다.
+</Callout>
+
+## 성능 격차는 얼마나 작은가
+
+이론이 아무리 깔끔해도, 4비트 양자화가 fine-tuning 성능을 얼마나 떨어뜨리는지가 핵심이다. Dettmers 2023의 Alpaca 벤치마크 결과(LLaMA-13B):
+
+| 방법 | Alpaca Score | vs Full FT |
+|------|:---:|:---:|
+| Full FT | 81.5 | baseline |
+| LoRA rank 64 | 81.3 | −0.2% |
+| QLoRA rank 64 | 80.9 | −0.74% |
+
+NF4 양자화가 추가하는 손실은 0.5% 수준이다. 직관적으로 이해하자면, pre-training이 이미 모델의 "주요 방향"을 설정했고 fine-tuning은 그 위의 task-specific 조정이기 때문이다. 4비트 base가 만드는 노이즈보다 LoRA adapter가 학습하는 신호가 더 크다.
+
+LoRA rank의 sweet spot은 64 전후다. Aghajanyan 2020의 intrinsic dimension 개념에 따르면 LLM fine-tuning의 effective 차원은 수백 이하 — rank 64는 이미 그 경계를 넘는다. rank 128으로 올려도 성능 개선은 0.1% 미만이다.
+
+## 트레이드오프
+
+세 기법을 결합할 때 감수해야 할 비용도 명확하다.
+
+<Callout type="note" title="트레이드오프 요약">
+**NF4 양자화**: 4비트 재구성 오차 ~0.5% (fine-tuning에서 LoRA가 부분 보정). **Double quantization**: scale 재압축 추가 오차 <0.01%이나, 극단적 weight 분포에서 오차 누적 가능. **Paged optimizer**: throughput 8-10% 손실(GPU-CPU transfer). **LoRA rank 제약**: intrinsic dimension을 초과하는 rank는 diminishing return — 작은 rank에서는 표현력 부족 가능. Pre-training에는 적용 불가(frozen base는 task 학습을 가정).
+</Callout>
+
+비용 관점에서 격차는 더 극적이다. 13B 모델 기준 Full FT는 4× A100에 약 $4,000, QLoRA는 1× A100에 약 $1,000 — 비용 1/4에 성능 99.26%다. 65B에서는 8× A100($8,000) 대 1× A100($1,000), 그리고 성능 격차는 1% 미만이다.
+
+## 정리
+
+- QLoRA는 `h = dequant(W_NF4)x + (α/r)BAx` 한 수식으로 기술된다. Base는 frozen 4비트, adapter만 BF16으로 학습한다.
+- Double quantization이 블록 스케일을 재압축해 실효 비트수를 4.5 → 4.13으로 낮춘다.
+- Paged optimizer가 Adam state를 CPU로 overflow시켜 메모리 한계를 GPU VRAM 너머로 밀어낸다.
+- 65B 모델에서 Full FT 대비 메모리는 16배 감소, 성능 격차는 1% 미만이다.
+
+세 기법 각각은 독립적으로 알려진 것이었다. QLoRA의 공헌은 이 조합이 "합산 이상의 시너지"를 낸다는 실증이다 — 양자화 오차를 LoRA가 부분 보정하고, LoRA가 만드는 작은 optimizer state를 paging이 수용한다.
+
+<Reference
+  title="QLoRA: Efficient Finetuning of Quantized LLMs"
+  authors="Dettmers et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.14314"
+/>

@@ -1,0 +1,125 @@
+---
+title: "LoRA는 왜 저차원 행렬 두 개로 충분한가"
+description: "파라미터 절감의 수학적 근거부터 초기화 전략, 타깃 모듈 선택, 배포 방식, 태스크 벡터 산술까지 — LoRA 설계 결정의 통일된 논리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [lora, peft, fine-tuning, low-rank, task-vector]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: Llm Efficiency Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+7B 파라미터 모델을 full fine-tuning 하려면 FP32 기준 112GB 이상의 메모리가 필요하다. LoRA는 이 문제를 단 하나의 직관으로 우회한다 — *태스크별 가중치 변화 $\Delta W$는 매우 낮은 rank로 근사할 수 있다*. 그렇다면 왜 이 낮은 rank 근사가 충분한가? 그리고 그 위에 쌓인 초기화, 스케일링, 모듈 선택, 배포 전략은 각각 어떤 이유로 그 형태를 갖추었는가?
+
+## LoRA의 수학적 출발점
+
+Pre-trained weight $W \in \mathbb{R}^{d \times k}$를 fine-tuning하면 최적 가중치는 $W + \Delta W$ 형태다. Full fine-tuning은 $\Delta W$의 모든 $d \times k$ 원소를 학습한다. LoRA는 여기에 low-rank factorization을 끼워 넣는다.
+
+$$
+h = Wx + \frac{\alpha}{r} B A x, \quad B \in \mathbb{R}^{d \times r},\, A \in \mathbb{R}^{r \times k},\, r \ll \min(d, k)
+$$
+
+학습 파라미터 수는 $r(d+k)$로, 원래의 $dk$에서 약 $\min(d,k)/r$배 줄어든다. $d = k = 4096$, $r = 8$이면 감소율은 **250배**다.
+
+<Theorem kind="theorem" number="1" title="Eckart-Young — best rank-r 근사">
+임의의 행렬 $M \in \mathbb{R}^{d \times k}$와 정수 $r \leq \min(d,k)$에 대해, Frobenius norm 기준 rank-$r$ 최적 근사는 $M$의 SVD 상위 $r$항이다.
+
+$$
+\min_{X:\,\mathrm{rank}(X) \leq r} \|M - X\|_F = \sqrt{\sum_{i=r+1}^{\min(d,k)} \sigma_i(M)^2}
+$$
+</Theorem>
+
+<Proof>
+$M = U\Sigma V^\top$ (SVD). Rank-$r$ 행렬 $X = U_r \Sigma_r V_r^\top$로 두면 $\|M - X\|_F^2 = \sum_{i=r+1} \sigma_i^2$. 임의의 rank-$r$ 행렬과의 거리는 이보다 작을 수 없음은 Schmidt의 정리로 따라온다. $\square$
+</Proof>
+
+이 정리는 LoRA의 **표현력 보장**이다. $\Delta W$의 실제 rank가 $r$이면 $BA$로 완전히 복원되고, rank가 더 크더라도 나머지 singular value가 작다면 근사 오차는 무시 가능하다. Aghajanyan et al. (2020)의 intrinsic dimension 가설 — "LLM의 태스크 manifold는 낮은 차원에 거주한다" — 이 실증적으로 이 조건이 실제로 성립함을 지지한다.
+
+## 초기화와 스케일링의 이유
+
+LoRA의 성공은 factorization 자체만이 아니라 **신중한 초기화와 스케일링**에도 달려 있다.
+
+표준 초기화는 $A \sim \mathcal{N}(0, \sigma^2)$, $B = 0$이다. $B = 0$이면 훈련 시작 시점에 $\Delta W = BA = 0$이 보장되므로, pre-trained 모델의 동작이 그대로 유지된다. $B$도 random으로 초기화하면 학습 초기에 pre-trained 동작을 이미 벗어난 상태에서 gradient를 계산하게 되어 수렴이 불안정해진다.
+
+스케일링 항 $\alpha/r$의 역할은 gradient norm을 rank에 무관하게 안정시키는 것이다. `scaling` 없이 rank를 키우면 $\|BA\|_F$가 $r$에 비례해 증가하고 gradient도 폭발한다. $\alpha/r$을 곱하면 이 효과가 상쇄된다.
+
+<Callout type="note" title="rsLoRA의 개선">
+Kalajdzievski (2023)는 스케일링을 $\alpha/r$ 대신 $\alpha/\sqrt{r}$로 바꾸는 rsLoRA를 제안했다. $r$이 클수록 ($r > 32$) standard scaling에서 gradient가 다시 불안정해지는 문제를 `$\alpha/\sqrt{r}`이 완화한다. 단, 소규모 rank에서는 두 방법의 차이가 거의 없다.
+</Callout>
+
+## 어떤 모듈에 걸 것인가
+
+Hu et al. (2021)은 원래 attention의 $W_q$, $W_v$에만 LoRA를 적용했다. 직관은 "태스크별 동작은 attention이 결정한다"는 것이었다. 하지만 Transformer에서 MLP의 파라미터는 attention보다 약 3배 이상 많다.
+
+$$
+\text{Params}_{\text{MLP}} \approx 3 \times \text{Params}_{\text{Attn}} \quad \text{(per layer, LLaMA 계열)}
+$$
+
+Pareek et al. (2024)의 실증은 instruction tuning처럼 semantic transformation이 핵심인 태스크에서는 MLP LoRA가 attention LoRA보다 효과적임을 보였다. QLoRA 이후 현대 fine-tuning 파이프라인이 모든 linear layer에 LoRA를 적용하는 추세가 된 것은 이 발견과, quantization 덕분에 생긴 메모리 여유가 맞물린 결과다.
+
+| 전략 | 학습 파라미터 (%) | 성능 | 권장 상황 |
+|------|:-:|:-:|:---|
+| Attention-only | ~0.1% | 중간 | 속도·메모리 제약 |
+| All-Linear | ~1% | 최고 | 성능 중시, instruction tuning |
+
+## 배포: merge vs. unmerge
+
+훈련 후 $W' = W + (\alpha/r)BA$를 계산해 base weight에 합치면, inference는 단순히 $y = W' x$다. **추가 연산 비용이 0**이다.
+
+adapter를 분리 유지하면 memory가 절약된다. 100개 태스크를 merged 모델로 관리하면 LLaMA-7B 기준 1,300GB 이상이 필요하지만, base 하나 + adapter 100개는 약 16GB면 충분하다. vLLM의 S-LoRA는 이 구조를 활용해 adapter를 요청별로 hot-swap한다.
+
+<Aside label="QLoRA와의 상호작용">
+NF4로 quantize된 base 위에서 LoRA를 훈련한 뒤 merge할 때는 dequantize 후 $W' = W + (\alpha/r)BA$를 계산하고 다시 quantize하는 것이 권장된다. inference 시마다 dequantize하는 것은 비효율적이다.
+</Aside>
+
+## 태스크 벡터 산술
+
+LoRA의 $\Delta W = BA$는 Ilharco et al. (2023)이 제안한 **태스크 벡터** 개념과 정확히 일치한다.
+
+$$
+\Delta_\tau := W_\tau - W_{\mathrm{pt}}
+$$
+
+태스크 벡터들이 근사적으로 선형 공간을 이루기 때문에 다음 연산이 가능하다.
+
+- **덧셈**: $W_{\mathrm{multi}} = W_{\mathrm{pt}} + \sum_i c_i \Delta_i$ — 여러 태스크의 동작을 하나의 모델에 혼합
+- **뺄셈**: $W_{\mathrm{clean}} = W_{\mathrm{task}} - \lambda \Delta_{\mathrm{undesired}}$ — 독성·저작권 침해 행동 제거
+- **유추**: $\Delta_? = \Delta_A + (\Delta_C - \Delta_B)$ — "A가 B에 대해 갖는 관계를 C에 적용"
+
+LoRA에서는 각 태스크 벡터가 $r(d+k)$ 크기의 compact 표현이므로, 수백 개의 태스크 벡터를 디스크에서 관리하는 것이 실용적이다. Full fine-tuning의 태스크 벡터는 원리는 같지만 저장 비용이 100배 이상 크다.
+
+## 정리
+
+- $\Delta W = BA$는 Eckart-Young 정리로 표현력이 보장되고, intrinsic dimension 가설로 실용성이 지지된다.
+- $B = 0$ 초기화는 pre-trained 동작의 보존을, $\alpha/r$ 스케일링은 gradient 안정성을 각각 담당한다.
+- 타깃 모듈은 태스크 유형과 메모리 예산에 따라 결정한다 — instruction tuning이라면 all-linear가 우세하다.
+- Merge는 latency-critical 단일 태스크에, unmerge는 multi-task serving hub에 각각 적합하다.
+- 태스크 벡터 산술은 LoRA의 compact 표현 덕분에 실용적인 multi-task 편집 도구가 된다.
+
+LoRA의 모든 설계 결정은 하나의 질문으로 수렴한다 — "pre-trained 모델이 이미 알고 있는 것을 건드리지 않고, 태스크별 변화만 최소한으로 표현하려면?"
+
+<Reference
+  title="LoRA: Low-Rank Adaptation of Large Language Models"
+  authors="Hu et al."
+  year={2021}
+  venue="ICLR 2022"
+  url="https://arxiv.org/abs/2106.09685"
+/>
+
+<Reference
+  title="Editing Models with Task Vectors"
+  authors="Ilharco et al."
+  year={2023}
+  venue="ICLR 2023"
+  url="https://arxiv.org/abs/2212.04089"
+/>

@@ -1,0 +1,134 @@
+---
+title: "MoE는 왜 같은 연산으로 더 큰 모델처럼 동작하는가"
+description: "Sparse activation의 정식화부터 load balancing loss, token dropping, 그리고 scaling law까지 — MoE가 dense를 넘어서는 이유를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [moe, sparse-activation, scaling-law, llm-efficiency]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: Llm Efficiency Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Dense FFN은 모든 토큰이 모든 파라미터를 통과한다. 수십억 파라미터 모델에서 이 구조는 attention보다 compute-dominant하고, 모델이 커질수록 비용은 선형으로 쌓인다. Mixture of Experts(MoE)는 단 하나의 질문으로 이 구조를 뒤집는다 — 각 토큰에 필요한 expert만 활성화하면 어떻게 될까?
+
+## Sparse Activation의 수학적 출발점
+
+MoE layer의 출력은 다음과 같이 정의된다.
+
+$$
+y = \sum_{i=1}^N g_i(x) \cdot E_i(x), \quad g(x) = \text{Softmax}(W_g x)
+$$
+
+여기서 $g_i(x)$는 gating network, $E_i$는 $i$번째 expert FFN이다. "soft" mixture는 모든 expert를 계산해야 하므로 sparsity가 없다. 실용적인 형태는 **hard top-$k$ selection**이다.
+
+$$
+y = \sum_{i \in \text{Top}_k(W_g x)} E_i(x)
+$$
+
+$N=128$, $k=8$이면 active FLOPs는 dense 대비 $k/N = 1/16$으로 감소한다. 전체 파라미터는 $N \times |E_i|$이지만, 토큰당 실제 계산은 $k \times |E_i|$에 불과하다.
+
+<Theorem kind="proposition" number="1" title="MoE Expressivity">
+동일한 active parameter를 갖는 top-1 MoE는 dense FFN을 정확히 흉내낼 수 있다. 따라서 MoE의 표현력은 dense 이상이다.
+</Theorem>
+
+<Proof>
+Dense FFN을 expert $E_1$에 두고 나머지 $N-1$개 expert를 zero로 초기화한다. Gating logits를 $W_g x = [L, -L, -L, \ldots]$로 설정하면 ($L \to \infty$), top-1 selection은 항상 $E_1$을 선택한다. 따라서 MoE output = $E_1(x)$ = dense output. 추가 expert는 표현력을 더할 수 있으므로 $\geq$ 관계가 성립한다. $\square$
+</Proof>
+
+## Top-$k$ Routing과 Gradient Flow
+
+Top-$k$ selection은 $\arg\max$를 포함하므로 미분 불가능하다. 학습을 가능하게 하는 방법은 두 가지다.
+
+**Noisy top-k**: training 시 Gumbel noise를 추가해 확률적으로 이완한다.
+
+$$
+z_i^{\text{noisy}} = z_i + G_i, \quad G_i \sim \text{Gumbel}(0, 1)
+$$
+
+inference에서는 deterministic top-$k$를 사용한다. **Straight-through estimator(STE)**는 backward pass에서 $\arg\max$ 대신 softmax의 gradient를 그대로 흘린다.
+
+residual connection이 없으면 unselected expert는 gradient를 전혀 받지 못한다. $y = E_{i^*}(x)$에서 $j \neq i^*$인 $E_j$는 출력에 기여하지 않으므로 $\partial L / \partial E_j = 0$이다. residual을 추가하면 — $y = E_{i^*}(x) + x$ — identity term을 통해 모든 expert에 간접적인 gradient가 흐른다. Switch Transformer와 Mixtral이 모두 residual을 유지하는 이유다.
+
+## Load Balancing과 Router Collapse
+
+Sparse routing을 그냥 두면 feedback loop가 생긴다. 초기에 조금 더 많이 선택된 expert가 더 많은 gradient를 받고, gating network가 그 expert를 더 선호하게 된다. 결국 한 expert가 토큰의 90% 이상을 받고 나머지는 사실상 죽는다 — **router collapse**다.
+
+Switch Transformer는 이를 막기 위해 auxiliary loss를 도입했다.
+
+$$
+L_{\text{aux}} = \alpha \cdot N \sum_{i=1}^N f_i \cdot P_i
+$$
+
+$f_i$는 expert $i$가 실제로 선택된 비율(frequency), $P_i$는 gating softmax의 평균 확률이다. 두 양의 곱을 최소화하면 — AM-GM 부등식에 의해 — 최솟값은 $f_i = k/N$, $P_i = 1/N$인 균등 분포일 때 달성된다.
+
+<Callout type="note" title="트레이드오프">
+$\alpha$가 너무 작으면 collapse를 막지 못하고, 너무 크면 task loss를 희생한다. Switch Transformer의 기본값은 $\alpha = 10^{-2}$이며, expert 수가 많을수록($N > 128$) 더 큰 값이 필요하다. ST-MoE(Zoph et al. 2022)는 logit magnitude를 제어하는 router z-loss $L_z = \sum_i (\log \sum_t g_i(x_t))^2$를 추가해 안정성을 높인다.
+</Callout>
+
+## Expert Capacity와 Token Dropping
+
+GPU는 fixed-shape tensor 연산에 최적화되어 있다. expert별로 처리할 토큰 수가 달라지면 커널 효율이 급감한다. 이를 해결하기 위해 per-expert capacity를 정의한다.
+
+$$
+C = \lceil k T / N \rceil \cdot c_f
+$$
+
+$T$는 batch 내 총 토큰 수, $c_f$는 capacity factor(일반적으로 1.25)다. capacity를 초과한 토큰은 MoE layer를 건너뛰고 residual connection으로 직접 통과한다 — **token dropping**이다.
+
+dropped token도 $\partial L / \partial x_j = \partial L / \partial y_j$로 gradient를 받는다(identity residual 덕분). Chernoff bound 분석에 따르면 drop rate는 $\exp(-\Omega(c_f))$에 비례하므로, $c_f = 1.25$에서 대부분의 경우 1% 이하를 유지한다. dropped token은 평균적으로 gating logit이 낮은(낮은 confidence) 토큰이다 — 높은 confidence 순으로 capacity를 채우기 때문이다.
+
+## MoE Scaling Law — 왜 같은 연산으로 더 크게 동작하는가
+
+Dense 모델의 scaling law는 다음과 같다.
+
+$$
+L(N, D) = a N^{-\alpha} + b D^{-\beta}, \quad \alpha \approx 0.07
+$$
+
+MoE에는 두 개의 파라미터 차원이 있다 — active parameter $N_a$(compute를 결정)와 total parameter $N_t$(지식 용량을 결정). Clark et al.(2022)의 empirical 분석은 다음을 보인다.
+
+$$
+\boxed{L_{\text{MoE}} \approx L_{\text{dense}}\!\left(\sqrt{N_a \times N_t}\right)}
+$$
+
+$N_{\text{eff}} = \sqrt{N_a N_t}$가 **effective parameter**다. compute는 $N_a$만 결정하므로, 동일한 compute budget 하에서 $N_t$를 독립적으로 키울 수 있다. $N_a = N_t$인 dense와 달리, MoE는 $N_t > N_a$로 설정해 $N_{\text{eff}} > N_a$를 달성한다.
+
+Sparsity ratio $s = N_t / N_a$의 실용적 최적값은 $s \in [8, 16]$이다(Krajewski 2024). $s < 4$이면 $N_t$의 이점이 부족하고, $s > 32$이면 routing overhead와 communication cost가 이론적 이득을 잠식한다. Mixtral 8×7B(47B total, 13B active)는 $s \approx 3.6$으로 이 범위의 하한 근방이며, GPT-3.5에 준하는 성능을 3배 빠른 inference로 제공한다.
+
+<Aside label="설계 철학">
+MoE의 핵심 통찰은 compute와 capacity의 분리다. dense 모델에서 "더 많은 파라미터"는 항상 "더 많은 FLOPs"를 의미했다. MoE는 이 결합을 끊는다 — 지식을 저장하는 비용(total param)과 토큰을 처리하는 비용(active param)을 독립적으로 조절할 수 있다.
+</Aside>
+
+## 정리
+
+- MoE는 top-$k$ routing으로 FLOPs를 $k/N$으로 감소시키면서, 표현력은 dense 이상을 보장한다.
+- Router collapse는 load balancing loss $L_{\text{aux}} = \alpha N \sum f_i P_i$로 막는다. 최솟값은 균등 분포에서만 달성된다.
+- Token dropping은 capacity를 초과한 토큰을 residual로 bypass한다. $c_f = 1.25$에서 drop rate는 대부분 1% 이하다.
+- MoE의 effective parameter는 $N_{\text{eff}} = \sqrt{N_a N_t}$이며, 동일 compute 예산에서 dense보다 큰 $N_{\text{eff}}$를 달성한다.
+- Sparsity ratio의 실용적 최적값은 $s \in [8, 16]$이다.
+
+<Reference
+  title="Unified Scaling Laws for Routed Language Models"
+  authors="Clark et al."
+  year={2022}
+  venue="ICML"
+  url="https://arxiv.org/abs/2202.01169"
+/>
+
+<Reference
+  title="Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"
+  authors="Shazeer et al."
+  year={2017}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1701.06538"
+/>

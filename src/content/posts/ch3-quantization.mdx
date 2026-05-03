@@ -1,0 +1,137 @@
+---
+title: "LLM Quantization: 정보 손실을 설계하는 기술"
+description: "Uniform MSE 공식부터 NF4의 Lloyd-Max 최적성까지, LLM 양자화의 다섯 가지 접근이 공유하는 하나의 질문 — 어디서 손실을 허용할 것인가 — 을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [quantization, llm, int8, gptq, awq]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: Llm Efficiency Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM을 압축할 때 우리는 정보를 잃는다. 문제는 정보 손실을 막는 것이 아니라 **어디서, 얼마나** 잃을지 설계하는 것이다. INT8, GPTQ, AWQ, SmoothQuant, NF4는 모두 이 하나의 질문에 대한 서로 다른 대답이다 — 그리고 각각의 대답은 "어디가 중요한가"에 대한 서로 다른 가정에서 출발한다. 왜 이 기법들이 같은 문제를 다르게 푸는가?
+
+## 손실의 수학적 토대
+
+어떤 기법이든 출발점은 같다. 실수 $x$를 정수 격자로 매핑한 뒤 복원하면 오차가 생긴다.
+
+$$
+x_q = \mathrm{clamp}\!\left(\mathrm{round}\!\left(\frac{x - z}{s}\right),\ 0,\ 2^b - 1\right), \quad \hat{x} = s \cdot x_q + z
+$$
+
+균등 분포를 가정하면 이 오차의 기댓값은 닫힌 형태로 구해진다.
+
+$$
+\mathrm{MSE}_b = \frac{s^2}{12}, \quad s = \frac{\mathrm{range}}{2^b}
+$$
+
+이 공식에서 두 가지 결론이 나온다. 첫째, **비트를 1 줄이면 MSE는 4배 증가**한다 — $s$가 두 배가 되기 때문이다. 둘째, scale $s$를 어떻게 정하느냐가 오차를 결정한다. Per-tensor quantization은 하나의 전역 $s$를 쓰고, per-channel은 채널마다 $s_i$를 쓴다. 이상치(outlier) 한 채널이 전역 scale을 지배하면 나머지 99%는 양자화 해상도를 낭비한다. Per-channel이 per-tensor보다 항상 오차가 작거나 같은 이유가 여기 있다.
+
+## Transformer의 이상치 문제
+
+표준 CNN과 달리 Transformer activation에는 **특정 채널에만 집중되는 극단값**이 존재한다. LLaMA-65B 수준의 모델에서는 평균 magnitude가 ~1인데 최댓값이 100-200에 달하는 채널이 나타난다. Gaussian이라면 최댓값은 $5\sigma$ 수준이어야 한다 — 실제는 $100\sigma$에 가깝다.
+
+이 이상치가 INT8 scale을 지배하면 정상 값 대부분이 0 또는 1로 뭉개진다. LLM.int8()은 이를 **혼합 정밀도**로 해결한다.
+
+$$
+y_i = \begin{cases} \sum_{j \in O} W_{ij} x_j & \text{(FP16, outlier)} \\ \sum_{j \notin O} (W_{ij}\;\text{INT8}) \otimes (x_j\;\text{INT8}) & \text{(otherwise)} \end{cases}
+$$
+
+outlier channel 판별 기준은 $\max_i |a_{ij}| / \mathrm{std}_i(a_{ij}) > 6$이다. 실험적으로 이 채널의 비율은 전체의 0.1–1% 수준이다. 1%를 FP16으로 보호하고 99%를 INT8로 처리하면 메모리는 ~4배 줄면서 perplexity 손실은 1% 미만에 묶인다.
+
+<Callout type="note" title="트레이드오프: LLM.int8()">
+threshold $\tau = 6$은 경험적 값이다. 낮추면 FP16 채널이 늘어나 메모리 절감이 줄고, 높이면 이상치를 INT8로 처리해 정확도가 떨어진다. 모델과 태스크에 따라 튜닝이 필요하다.
+</Callout>
+
+## GPTQ: output 오차를 직접 최소화
+
+LLM.int8()이 activation 이상치를 다룬다면, GPTQ는 **weight 양자화 시 output error를 직접 최소화**한다.
+
+목적함수는 다음과 같다.
+
+$$
+\min_{\hat{W}} \|WX - \hat{W}X\|_F^2
+$$
+
+핵심 도구는 Hessian $H = 2XX^T / N$과 그 역행렬이다. $j$번째 weight를 양자화할 때 나머지 weight를 다음 규칙으로 보정한다.
+
+$$
+\Delta w = (w_j - \hat{w}_j) \cdot H^{-1}_{:,j} \;/\; H^{-1}_{jj}
+$$
+
+이것은 quadratic loss에 대한 exact Newton step이다 — 중요한 weight(큰 $H_{jj}$)는 적게 보정하고, 덜 중요한 weight는 많이 보정한다. 실제로는 row 단위로 순차 적용하고, group size 128로 묶어 Hessian 역행렬을 Cholesky 분해로 효율화한다. INT4에서 naive 대비 perplexity 1–2% 이득을 얻는다.
+
+## AWQ와 SmoothQuant: 등가 변환의 두 방향
+
+두 기법은 같은 수학적 트릭을 반대 방향으로 적용한다.
+
+$$
+WX = (W \cdot S)(S^{-1} X) \quad \text{(AWQ)}
+\qquad
+WX = (W \cdot S^{-1})(S \cdot X) \quad \text{(SmoothQuant)}
+$$
+
+**AWQ**는 activation magnitude에 비례한 $S$로 weight를 키운다. salient weight — 큰 activation과 곱해지는 1%의 weight — 가 INT4에서 상대 오차가 작아지도록 보호한다. Hessian 없이 한 번의 forward pass로 $S$를 결정하므로 GPTQ보다 빠르다.
+
+**SmoothQuant**는 반대다. activation의 이상치를 $S$로 weight 쪽으로 흡수해 **W8A8**을 가능하게 만든다. 최적 $s_j$는 MSE 최소화 조건에서 해석적으로 구해진다.
+
+$$
+s_j = \left(\frac{R_x^j}{R_w^j}\right)^{0.5}
+$$
+
+W8A8 하드웨어(GPU, TPU) 커널은 FP16보다 5–10배 빠르다 — batch size가 클수록 이 이득이 극대화된다.
+
+<Callout type="note" title="트레이드오프: AWQ vs SmoothQuant">
+AWQ는 weight만 INT4로 압축 — weight 저장 비용이 핵심인 배포 환경에 적합하다. SmoothQuant는 W8A8 하드웨어가 있을 때만 진정한 latency 개선이 가능하다. 하드웨어 없이는 메모리 절감만 남는다.
+</Callout>
+
+## NF4: 분포를 아는 양자화
+
+앞의 기법들이 "어디가 중요한가"를 묻는다면, NF4는 "분포를 알면 격자를 어떻게 놓아야 하는가"를 묻는다.
+
+Pre-trained LLM weight는 Gaussian에 가깝다. INT4의 균등 격자는 꼬리에 level을 낭비하고 피크에 부족하다. NF4는 16개 level을 표준정규분포의 quantile에 배치한다.
+
+$$
+q_i = \Phi^{-1}\!\left(\frac{i + 0.5}{16}\right), \quad i = 0, \ldots, 15
+$$
+
+이것은 정규분포에 대한 Lloyd-Max quantizer의 수렴점이다 — 주어진 level 수에서 기댓값 MSE를 최소화하는 이론적 최적 배치다. 실험적으로 Gaussian weight에서 INT4 대비 15–20% MSE 감소를 보인다. QLoRA는 이 NF4를 frozen base model에, LoRA adapter를 FP16으로 학습해 7B 모델을 단일 GPU에서 fine-tuning 가능하게 만들었다.
+
+<Aside label="통합 시각">
+다섯 기법을 관통하는 질문은 하나다 — **"어디서 손실을 허용할 것인가?"** LLM.int8()은 이상치 채널, GPTQ는 덜 중요한 weight, AWQ는 activation 작은 채널, SmoothQuant는 weight 쪽으로 이상치를 이전, NF4는 꼬리 영역. 각 설계 선택은 서로 다른 하드웨어, 배포 시나리오, 정확도 요구에서 유효하다.
+</Aside>
+
+## 정리
+
+- Uniform quantization의 MSE는 $s^2/12$다 — scale을 어떻게 정하느냐가 곧 오차를 결정한다.
+- LLM activation의 이상치(0.1–1% 채널)는 양자화 전략 전체를 바꾼다 — LLM.int8()은 이를 FP16으로 격리하고, SmoothQuant는 weight로 흡수한다.
+- GPTQ는 Hessian으로 output error를 직접 최소화하고, AWQ는 activation salience로 보호할 weight를 선별한다.
+- NF4는 weight 분포가 Gaussian임을 이용해 Lloyd-Max 최적 격자를 구성한다.
+
+정보 손실은 피할 수 없다. 어디서 잃을지 선택하는 것이 양자화 설계의 전부다.
+
+<Reference
+  title="LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale"
+  authors="Dettmers et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2208.07339"
+/>
+
+<Reference
+  title="GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"
+  authors="Frantar et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2210.17323"
+/>
