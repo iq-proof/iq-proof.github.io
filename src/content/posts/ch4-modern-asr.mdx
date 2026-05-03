@@ -1,0 +1,141 @@
+---
+title: "ASR 아키텍처는 어떻게 진화했나"
+description: "Conformer의 conv+attention 결합부터 Wav2Vec 2.0의 self-supervised contrastive 학습, HuBERT의 iterative refinement, Whisper의 약지도 대규모 학습까지 — 현대 ASR 설계 철학의 변화를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [asr, conformer, wav2vec2, hubert, whisper]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+현대 ASR 연구는 5년 만에 세 번의 패러다임 전환을 겪었다. Conformer가 conv와 attention의 inductive bias를 결합했고, Wav2Vec 2.0과 HuBERT가 레이블 없는 오디오에서 표현을 끌어냈으며, Whisper가 인터넷 규모의 약지도 데이터로 그 모든 architectural 우위를 무력화했다. 이 네 가지 모델은 단순히 "더 나은 모델"이 아니다 — 각각은 "ASR의 병목이 무엇인가"라는 질문에 대한 서로 다른 답이다.
+
+## 문제의 출발: conv냐 attention이냐
+
+2018-2019년 pure Transformer를 ASR에 적용한 시도들은 BiLSTM 기반 모델보다 약했다. 이유는 명확했다. Transformer의 self-attention은 전체 시퀀스를 한 번에 바라보는 global 의존성에 강하지만, 포만트 전이(formant transient, ~25ms)나 음소 경계(~100ms) 같은 **local temporal pattern** 학습에는 비효율적이었다.
+
+Conformer(Gulati 2020)는 이 문제를 "두 inductive bias를 한 블록에 쌓는다"는 방식으로 해결했다.
+
+$$
+\begin{aligned}
+\tilde{x} &= x + \tfrac{1}{2}\,\text{FFN}(x) \\
+x' &= \tilde{x} + \text{MHSA}(\text{LN}(\tilde{x})) \\
+x'' &= x' + \text{Conv}(\text{LN}(x')) \\
+y &= \text{LN}\!\left(x'' + \tfrac{1}{2}\,\text{FFN}(x'')\right)
+\end{aligned}
+$$
+
+Conv 모듈(kernel 31, depthwise + GLU + Swish)은 음소 스케일 local pattern을, MHSA는 단어·문장 스케일 global context를 담당한다. Macaron 구조의 half-step residual(`×0.5`)은 Lu et al. 2019의 분산 안정화 원리를 따른다 — 표준 residual이 레이어마다 분산을 누적시키는 반면, 절반 스케일은 분산을 거의 일정하게 유지해 32개 레이어까지 안정 학습을 가능케 한다.
+
+**결과**: Conformer-L(120M)이 LibriSpeech test-clean 1.9% WER을 달성하며 모든 production ASR의 표준 backbone이 됐다.
+
+## Squeezeformer와 E-Branchformer: Conformer의 어디를 고쳤나
+
+Conformer의 두 가지 sub-optimal 지점이 곧 드러났다.
+
+첫째, **계산 불균형**. 모든 레이어가 동일한 시간 해상도 T로 처리하지만, 깊은 레이어는 fine temporal detail이 필요 없다. Squeezeformer(Kim 2022)는 temporal U-Net으로 이를 해결했다 — 중간 레이어에서 T → T/2로 다운샘플하면 attention의 complexity가 `O(T²d)` → `O(T²d/4)`로 줄고, test-other WER은 6.5% → 5.7%로 개선됐다.
+
+둘째, **순차적 순서 편향**. Conformer에서 attention이 항상 conv 앞에 온다는 강제 순서가 있다. E-Branchformer(Kim 2023)는 두 branch를 병렬로 배치해 각자 입력에서 독립적으로 학습한다.
+
+```
+Conformer:   x → MHSA → Conv → out          (순차)
+E-Branch:    x → MHSA ──┐
+                          ├─ Merge → out     (병렬)
+             x → CGMLP ──┘
+```
+
+결과는 LibriSpeech test-clean/other 1.81%/3.65%로 Conformer-L의 1.9%/4.4%를 개선했다.
+
+<Callout type="note" title="트레이드오프">
+E-Branchformer가 이론적으로 더 풍부하지만 production에서는 여전히 Conformer가 dominant하다. 사전학습 가중치의 풍부함, streaming 변환의 단순함, quantization 툴링의 성숙도 — 0.1~0.3% WER 개선이 이 실용적 우위를 넘지 못한다.
+</Callout>
+
+## 레이블 없는 오디오에서 표현 배우기
+
+Conformer 계열은 여전히 $(audio, transcript)$ 쌍에 의존했다. 대부분의 언어는 그 쌍이 충분하지 않다. Wav2Vec 2.0(Baevski 2020)과 HuBERT(Hsu 2021)는 이 병목을 self-supervised pretraining으로 공략했다.
+
+**Wav2Vec 2.0**은 CNN encoder → Gumbel-softmax VQ codebook → Transformer context encoder의 3단계 구조다. 오디오의 일부 timestep을 마스킹한 뒤, context representation `c_t`가 같은 시점의 quantized latent `q_t`를 100개의 negative에서 구별하도록 학습한다.
+
+$$
+L_m = -\log \frac{\exp(\text{sim}(c_t,\, q_t)/\kappa)}{\displaystyle\sum_{\tilde{q}\,\in\, Q_t} \exp(\text{sim}(c_t,\, \tilde{q})/\kappa)}
+$$
+
+이는 InfoNCE(van den Oord 2018)의 ASR 적용이다 — `c_t`와 `q_t` 사이의 mutual information 하한을 최대화한다. VQ codebook의 collapse를 막기 위해 codebook 사용을 균등하게 강제하는 diversity loss `L_d`를 함께 쓴다.
+
+**HuBERT**는 더 단순한 경로를 택한다. 외부 K-means로 pseudo-label을 만들고, Transformer가 마스킹된 위치에서 그 cluster id를 예측하는 cross-entropy loss를 쓴다.
+
+$$
+L = -\sum_{t\,\in\,\mathcal{M}} \log P(z_t \mid t), \qquad z_t = \text{KMeans}(h^{(\text{iter})}_t)
+$$
+
+핵심은 **iterative refinement**다. 처음엔 MFCC(k=100)로 pseudo-label을 만들고, 학습된 layer 6 representation으로 K-means를 다시 실행(k=500)해 더 의미 있는 label을 얻는다. 3번 반복하면 phoneme 분류 정확도가 ~50% → ~75%로 수렴한다. 이 구조는 VQ codebook이 없으므로 collapse가 원천적으로 없다.
+
+<Theorem kind="proposition" number="1" title="Self-supervised ASR의 sample efficiency">
+53,000시간 unlabeled pretraining 이후 10분의 레이블 데이터만으로 Wav2Vec 2.0은 LibriSpeech WER 4.8%, HuBERT는 3.5%를 달성한다. 동등한 supervised-only 모델이 100시간 레이블에서 얻는 8.5%보다 낫다.
+</Theorem>
+
+<Proof>
+Pretraining이 audio의 phoneme-level acoustic invariance를 이미 내재화하므로, fine-tuning의 CTC head는 "이 표현이 어떤 문자인가"만 추가로 학습하면 된다. 레이블의 역할이 representation 학습에서 classification head 학습으로 축소된 결과다.
+</Proof>
+
+## Whisper: inductive bias보다 scale
+
+Conformer 계열이 3년간 architectural 개선으로 LibriSpeech WER을 1.9% → 1.6%로 0.3%p 줄이는 동안, Whisper(Radford 2023)는 zero-shot으로 1.95%를 찍었다. LibriSpeech 바깥에서는 격차가 더 크다.
+
+| Test set | Conformer 계열 | Whisper-Large |
+|---|---|---|
+| LibriSpeech test-clean | 1.6% | 1.95% |
+| CommonVoice (accent) | ~18% | 8.1% |
+| Earnings22 (finance) | ~14% | 9.5% |
+
+Whisper의 핵심 차이는 아키텍처가 아니라 **데이터 분포**다. 680,000시간의 인터넷 오디오는 잡음, 억양, code-switching, 도메인을 자연스럽게 포함한다. 학습 분포가 실세계 테스트 분포와 가까우면 일반화 격차가 줄어든다.
+
+아키텍처는 표준 encoder-decoder Transformer다. 특기할 것은 **multitask format**이다.
+
+```
+⟨SOT⟩ ⟨lang⟩ ⟨task⟩ ⟨timestamp_0⟩ t_1 … t_n ⟨timestamp_T⟩ ⟨EOT⟩
+```
+
+이 단일 sequence로 99개 언어의 전사, 영어 번역, VAD, 언어 식별을 모두 처리한다. 텍스트 생성에서 GPT-3가 모든 task를 "다음 토큰 예측"으로 통일한 것처럼, Whisper는 모든 audio task를 "다음 토큰 예측"으로 통일했다.
+
+약점도 명확하다. 긴 침묵 구간에서 decoder가 audio guidance 없이 내부 언어모델을 따라 환각(hallucination)을 생성한다. `[no_speech]` logit subtraction(`logit' = logit - α·logit_[no_speech]`)이 완화책이지만 근본 해결은 아니다. Bidirectional encoder 구조상 streaming도 어렵다.
+
+<Aside label="Bitter Lesson의 오디오 판">
+Conformer → Squeezeformer → E-Branchformer의 3년 architectural 진보가 ~10% relative WER 개선이었다면, Whisper의 680,000시간 데이터는 OOD에서 그 모든 개선을 한 번에 뛰어넘었다. Sutton(2019)의 Bitter Lesson — "인간이 설계한 inductive bias보다 scale이 결국 이긴다" — 이 ASR에서도 재확인됐다.
+</Aside>
+
+## 정리
+
+- Conformer는 conv(local)와 attention(global)의 inductive bias를 한 블록에 통합해 supervised ASR의 표준을 세웠다.
+- Wav2Vec 2.0(contrastive + VQ)과 HuBERT(masked prediction + iterative K-means)는 레이블 10분만으로 SOTA에 근접하는 self-supervised 경로를 열었다.
+- Whisper는 아키텍처 혁신 없이 데이터 규모와 분포의 다양성으로 OOD 성능을 압도했다 — "무엇을 설계하느냐"보다 "무엇으로 학습하느냐"가 더 큰 변수임을 보였다.
+- 세 계열의 설계 원리는 공존한다. Edge/streaming 환경은 Conformer-S, low-resource 언어는 HuBERT/XLSR, 범용 robust ASR은 Whisper가 현재 최선이다.
+
+다음 글에서는 이 표현 학습 위에 올라타는 음성 합성(TTS) — Tacotron에서 시작해 어떻게 자연스러운 운율을 만드는가를 추적한다.
+
+<Reference
+  title="Conformer: Convolution-augmented Transformer for Speech Recognition"
+  authors="Gulati et al."
+  year={2020}
+  venue="Interspeech"
+  url="https://arxiv.org/abs/2005.08100"
+/>
+
+<Reference
+  title="Robust Speech Recognition via Large-Scale Weak Supervision"
+  authors="Radford et al."
+  year={2023}
+  venue="ICML"
+  url="https://arxiv.org/abs/2212.04356"
+/>

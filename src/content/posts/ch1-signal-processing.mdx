@@ -1,0 +1,191 @@
+---
+title: "디지털 오디오의 수학적 기반 — 샘플링부터 MFCC까지"
+description: "Nyquist-Shannon 정리부터 STFT, Heisenberg 불확정성, mel-scale, MFCC까지 — 모든 현대 오디오 AI가 공유하는 하나의 수학적 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [audio, signal-processing, mel-spectrogram, mfcc, sampling]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Whisper는 왜 16kHz 입력만 받는가? Encodec은 왜 24kHz와 48kHz 모델이 따로 존재하는가? MFCC의 마지막 단계는 왜 하필 DCT인가? 이 질문들은 서로 무관해 보이지만, 하나의 공통된 출발점으로 수렴한다 — **아날로그 세계를 디지털로 표현할 때 무엇이 보존되고, 무엇이 손실되며, 인간의 청각은 그 손실을 어떻게 인식하는가.**
+
+## 정보를 잃지 않는 샘플링의 조건
+
+연속 신호 $x(t)$를 이산 시퀀스 $x[n] = x(nT_s)$로 바꾸는 순간, 무한히 많은 서로 다른 신호가 동일한 샘플 열을 만들 수 있다. 이것이 **aliasing**이다.
+
+<Theorem kind="theorem" number="1" title="Nyquist-Shannon Sampling Theorem">
+$x(t)$가 대역폭 $B$의 band-limited 신호이고 $f_s > 2B$이면, 샘플만으로 원래 신호를 완전히 복원할 수 있다.
+
+$$
+x(t) = \sum_{n=-\infty}^{\infty} x(nT_s) \cdot \mathrm{sinc}\!\left(\frac{t - nT_s}{T_s}\right)
+$$
+</Theorem>
+
+<Proof>
+샘플링은 주파수 영역에서 스펙트럼을 $f_s$ 간격으로 무한히 복제한다. $f_s > 2B$이면 인접 복제본이 겹치지 않으므로, 차단 주파수 $f_s/2$의 이상적 저역통과 필터로 원래 스펙트럼을 정확히 분리할 수 있다. 역 푸리에 변환하면 sinc 보간 공식이 나온다.
+</Proof>
+
+이 정리가 실용적으로 의미하는 바는 구체적이다. 음성의 의미 있는 에너지는 8kHz까지 집중되어 있다 — 기본 주파수(80~250Hz), 모음 포먼트(F1~F3: 250~4500Hz), 마찰음(/s/, /sh/: 4~8kHz). 따라서 $f_s = 16\text{kHz}$면 충분하다. 반면 인간 가청 주파수 상한인 20kHz를 커버하려면 $f_s > 40\text{kHz}$가 필요하고, 이것이 CD 44.1kHz와 방송 표준 48kHz의 근거다.
+
+샘플링 **이전**에 $f_s/2$ 이상의 에너지를 제거하는 anti-aliasing LPF가 필수인 이유도 여기서 나온다. `librosa.resample`이나 `torchaudio.transforms.Resample`이 polyphase 필터를 포함하는 이유가 이것이다. 단순히 `x[::2]`로 서브샘플링하면 aliasing이 발생한다.
+
+## DFT와 FFT — 주파수 분석의 기계
+
+유한 길이 이산 신호 $x \in \mathbb{C}^N$의 스펙트럼을 정확히 계산하는 것이 **DFT**다.
+
+$$
+X[k] = \sum_{n=0}^{N-1} x[n]\, e^{-j 2\pi kn/N}, \quad k = 0, \ldots, N-1
+$$
+
+DFT 기저 벡터 $\phi_k[n] = e^{j 2\pi kn/N}$는 $\mathbb{C}^N$의 직교 기저를 이룬다. 이로부터 Parseval 정리가 따른다.
+
+$$
+\sum_{n=0}^{N-1} |x[n]|^2 = \frac{1}{N} \sum_{k=0}^{N-1} |X[k]|^2
+$$
+
+시간 영역의 에너지와 주파수 영역의 에너지가 같다. STFT 스펙트로그램의 파워 합이 원신호의 파워와 일치하는 근거다.
+
+실수 신호는 **Hermitian 대칭** $X[N-k] = \overline{X[k]}$를 만족하므로, $k = 0, \ldots, N/2$만으로 충분하다. `np.fft.rfft`가 메모리와 연산을 절반으로 줄이는 이유다.
+
+Cooley-Tukey FFT는 이 $O(N^2)$ 계산을 $O(N \log N)$으로 줄인다. 짝수/홀수 인덱스 분할로 얻어지는 butterfly 연산이 핵심이다.
+
+$$
+X[k] = G[k] + \omega_N^k H[k], \quad X[k + N/2] = G[k] - \omega_N^k H[k]
+$$
+
+$N = 2048$의 STFT 프레임을 초당 100,000번 호출하는 실시간 ASR에서, $O(N^2) = 4 \times 10^6$ 대 $O(N \log N) \approx 2.3 \times 10^4$ — **170배 차이**가 전체 파이프라인의 실현 가능성을 결정한다.
+
+## STFT와 시간-주파수 표현의 한계
+
+음성과 음악은 **비정상 신호**다. 단순 DFT는 전체 신호의 평균 스펙트럼만 주므로, 음소 전환이나 노트 변화를 포착하지 못한다. STFT는 신호를 짧은 window로 잘라 매 시점의 스펙트럼을 계산한다.
+
+$$
+X(m, \omega) = \sum_n x[n]\, w[n - mH]\, e^{-j\omega n}
+$$
+
+여기서 window $w$와 hop $H$의 선택이 재구성 가능성을 결정한다. Hann window와 50% overlap은 **COLA(Constant Overlap-Add)** 조건을 만족한다.
+
+$$
+\sum_m w[n - mH]^2 = C \quad \forall n
+$$
+
+이 조건이 만족될 때, overlap-add로 원신호를 완벽히 복원할 수 있다.
+
+그런데 STFT의 시간-주파수 해상도에는 피할 수 없는 한계가 있다.
+
+<Theorem kind="theorem" number="2" title="Heisenberg 시간-주파수 불확정성">
+임의의 $x \in L^2(\mathbb{R})$, $\|x\|_2 = 1$에 대해:
+
+$$
+\sigma_t \cdot \sigma_f \geq \frac{1}{4\pi}
+$$
+
+등호는 Gaussian $x(t) \propto e^{-t^2/(4\sigma_t^2)}$일 때만 성립한다.
+</Theorem>
+
+<Proof>
+$\langle t \rangle = 0$, $\langle f \rangle = 0$으로 일반성을 잃지 않는다. Fourier 미분 성질로 $\int |x'|^2 dt = (2\pi)^2 \sigma_f^2$. Cauchy-Schwarz 부등식과 부분 적분을 결합하면:
+
+$$
+\frac{1}{4} = \left|\int t\, x\, \overline{x'}\, dt\right|^2 \leq \sigma_t^2 \cdot (2\pi\sigma_f)^2
+$$
+
+등호 조건 $x' = c \cdot t \cdot x$를 풀면 Gaussian이 나온다.
+</Proof>
+
+이 정리의 실용적 귀결은 명확하다. Window 길이를 2배 늘리면 주파수 해상도가 2배 좋아지지만 시간 해상도가 2배 나빠진다. 곱 $\sigma_t \cdot \sigma_f$는 변하지 않는다.
+
+음성 ASR의 표준인 25ms window는 이 trade-off의 sweet spot이다. 자음 트랜지언트를 포착하기에 충분히 짧으면서($\sigma_t \approx 6$ms), 포먼트를 분리하기에 충분한 주파수 해상도($\sigma_f \approx 40$Hz, 포먼트 간격 ~500Hz)를 제공한다.
+
+## Mel-Scale — 청각의 비선형성을 코딩하다
+
+인간 청각은 주파수를 선형으로 인식하지 않는다. 100Hz와 200Hz는 한 옥타브 간격으로 명확히 구분되지만, 8000Hz와 8100Hz는 거의 같게 들린다. 이 지각적 비선형성을 정량화한 것이 **mel-scale**이다.
+
+$$
+m(f) = 2595 \log_{10}\!\left(1 + \frac{f}{700}\right)
+$$
+
+이 공식은 단순히 경험적 피팅이 아니다. Greenwood(1990)의 달팽이관 기저막 측정은 위치-주파수 mapping이 정확히 이 형태임을 보였다.
+
+$$
+f(x) = A(10^{ax/L} - K), \quad A = 165.4\text{ Hz},\; a = 2.1
+$$
+
+저주파($f \ll 700$Hz)에서 mel-scale은 거의 선형이고, 고주파에서 로그 형태로 변한다. 달팽이관의 해부학적 구조가 mel-scale의 지각적 측정을 정당화하는 것이다.
+
+Mel filter bank는 mel-scale에서 균일 간격의 삼각형 필터 집합이다. 결과적으로 저주파 대역에는 조밀하고 좁은 필터가, 고주파 대역에는 넓은 필터가 배치된다. Whisper, Conformer, Tacotron 등 모든 현대 오디오 AI가 80-mel log-spectrogram을 표준 입력으로 쓰는 이유다.
+
+## MFCC — 30년간의 표준 피처
+
+Davis & Mermelstein(1980)이 제안한 MFCC는 mel-spectrogram에 두 단계를 추가한다.
+
+$$
+x \;\xrightarrow{\text{STFT}}\; |\cdot|^2 \;\xrightarrow{\text{Mel}}\; \log(\cdot) \;\xrightarrow{\text{DCT-II}}\; c[n]
+$$
+
+**log 단계**는 homomorphic processing을 수행한다. 음성 신호는 성문 소스 $e$와 성도 필터 $h$의 컨볼루션이다($x = e * h$). 주파수 영역에서 $X = E \cdot H$이고, 로그를 취하면 $\log|X| = \log|E| + \log|H|$로 분리된다. 곱셈적 관계가 덧셈적 관계로 바뀐다.
+
+**DCT 단계**는 decorrelation이다. 인접 mel 대역은 스펙트럼 포락선(포먼트)으로 강하게 상관되어 있다($\rho \approx 0.8$). 이 상관 구조는 AR(1) 프로세스와 유사하고, 해당 공분산 행렬(Toeplitz)의 고유벡터는 DCT-II 기저로 점근 수렴한다.
+
+<Callout type="note" title="DCT가 KLT 근사인 이유">
+$C_{ij} = \rho^{|i-j|}$ 형태의 Toeplitz 행렬에서 $\rho \to 1$이면 고유벡터가 DCT-II 기저에 가까워진다(Strang 1999). Mel 대역 간 상관계수 $\rho \approx 0.8$은 이 조건을 충분히 만족한다. GMM-HMM ASR이 대각 공분산 Gaussian으로 효율적으로 학습 가능했던 이유다.
+</Callout>
+
+이 decorrelation 덕분에 13차원 MFCC는 80차원 mel-spectrogram의 정보를 압축적으로 표현했다. GMM-HMM 시대에는 MFCC 13 + delta 13 + delta-delta 13 = 39차원이 표준이었다.
+
+현대 딥러닝 ASR이 mel-spectrogram을 직접 사용하는 이유는 단순하다. NN은 BatchNorm/LayerNorm으로 정규화를 학습하고, 수억 파라미터로 80차원 전체를 처리할 수 있다. DCT로 버리던 고차 계수 속의 정보까지 활용한다. 그러나 MFCC의 두 핵심 아이디어 — log scaling과 mel warping — 는 Whisper에도 그대로 살아있다.
+
+## 트레이드오프
+
+이 챕터들을 관통하는 설계 결정을 하나의 표로 정리하면 다음과 같다.
+
+<Callout type="note" title="오디오 표현의 트레이드오프">
+| 결정 | 얻는 것 | 잃는 것 |
+|------|---------|---------|
+| $f_s = 16$kHz (speech) | 효율성, 8kHz 커버 | 8kHz 이상 정보 |
+| 짧은 STFT window | 시간 해상도 (transient) | 주파수 해상도 (formant) |
+| Mel filter bank | 지각적 효율성, 차원 축소 | 역변환 불가 (정보 손실) |
+| Log scaling | 지각적 진폭 표현, 소스-필터 분리 | 위상 정보 무시 |
+| DCT (MFCC) | Decorrelation, 추가 압축 | 고주파수 세부 정보 손실 |
+| Mel-spec 직접 (Whisper) | 더 풍부한 표현 | 모델 용량 필요 |
+</Callout>
+
+모든 오디오 AI 시스템은 이 trade-off 중 어딘가에 위치한다. Whisper는 log-mel까지만 쓰고 DCT를 버렸다. Encodec은 multi-scale STFT loss로 $L \in \{64, 128, \ldots, 2048\}$의 여러 시간-주파수 해상도를 동시에 커버한다. 이는 Heisenberg 불확정성을 단일 설정으로 해결하는 대신, 여러 레이어에 분배하는 전략이다.
+
+## 정리
+
+- Nyquist-Shannon 정리는 샘플링이 정보를 보존하는 충분조건을 제시한다. 16kHz speech, 44.1/48kHz music의 선택은 이 정리의 직접적 귀결이다.
+- DFT의 직교성, Parseval, Hermitian 대칭, Cooley-Tukey FFT는 서로 연결된 하나의 대수 구조다. rfft와 FFT의 실용성은 여기서 나온다.
+- STFT의 window 길이 선택은 $\sigma_t \cdot \sigma_f \geq 1/(4\pi)$라는 수학적 하한에 의해 제약된다. 25ms는 이 한계 안에서의 공학적 선택이다.
+- Mel-scale은 달팽이관의 해부학적 위치-주파수 mapping을 반영한다. 모든 오디오 AI의 지각적 표현 근거다.
+- MFCC의 log와 DCT는 각각 homomorphic processing과 KLT 근사라는 이론적 정당화를 가진다. 딥러닝 시대에는 mel-spectrogram이 이를 대체했지만, log와 mel 자체는 살아남았다.
+
+수식 하나하나의 뒤에는 "왜 이 형태여야 하는가"라는 구체적인 물리적·지각적 이유가 있다. 다음 챕터에서는 이 표현들이 HMM 기반 음성 인식 시스템에서 어떻게 사용되었는지, 그리고 딥러닝이 무엇을 대체하고 무엇을 계승했는지 추적한다.
+
+<Reference
+  title="Communication in the Presence of Noise"
+  authors="C. E. Shannon"
+  year={1949}
+  venue="Proceedings of the IRE"
+  url="https://ieeexplore.ieee.org/document/1697831"
+/>
+
+<Reference
+  title="Comparison of Parametric Representations for Monosyllabic Word Recognition in Continuously Spoken Sentences"
+  authors="S. B. Davis and P. Mermelstein"
+  year={1980}
+  venue="IEEE Transactions on Acoustics, Speech, and Signal Processing"
+  url="https://ieeexplore.ieee.org/document/1163420"
+/>

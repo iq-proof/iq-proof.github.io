@@ -1,0 +1,149 @@
+---
+title: "TTS는 어떻게 사람 목소리를 학습하는가"
+description: "Tacotron의 end-to-end seq2seq부터 WaveNet의 sample-level 생성, FastSpeech의 parallel inference, HiFi-GAN의 다중 판별기, VITS의 통합 프레임워크까지 — 현대 TTS 설계 철학의 진화를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [tts, speech-synthesis, neural-vocoder, end-to-end]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+2017년 이전 TTS 시스템은 손으로 만든 특징(feature)을 여러 단계 파이프라인으로 연결했다. 오늘날 VITS는 텍스트 한 줄을 입력하면 실시간으로 자연스러운 음성을 합성한다. 이 7년간의 변화는 단순한 성능 향상이 아니라 **설계 철학 자체의 교체**였다. 무엇이 바뀌었는가?
+
+## 출발점: end-to-end seq2seq
+
+Tacotron(Wang 2017, Shen 2018)은 TTS를 번역처럼 취급했다. 텍스트 시퀀스를 인코더로 압축하고, 어텐션으로 정렬하고, 디코더가 mel-spectrogram 프레임을 하나씩 생성한다. 이전 시스템이 음소 분리, 음향 모델, 보코더를 각각 설계했던 것과 달리, Tacotron은 이 모든 결정을 데이터에서 학습한다.
+
+핵심은 **location-sensitive attention**이었다. 표준 내용 기반 어텐션은 위치 정보가 없어서 긴 문장에서 어텐션이 같은 음소를 반복하거나 건너뛰는 failure가 발생한다. Chorowski(2015)의 위치 특징은 이전 어텐션 벡터 $\alpha_{u-1}$을 1D 컨볼루션으로 변환해 점수에 더한다.
+
+$$
+e_{u,t} = v^\top \tanh\!\left(W_q s_{u-1} + W_k h_t + W_f (F * \alpha_{u-1})_t + b\right)
+$$
+
+이 한 항이 "이전에 어디를 봤는가"라는 기억을 attention score에 주입해 단조 이동(monotonic shift)을 유도한다. Tacotron 2가 MOS 4.53을 달성한 이유의 절반은 이 어텐션, 나머지 절반은 vocoder 교체였다.
+
+## WaveNet: sample-level 자기회귀
+
+Tacotron이 mel-spectrogram을 출력하면, vocoder가 이를 파형으로 변환한다. Griffin-Lim은 위상 정보를 무시하는 반복 알고리즘으로 robotic 음질을 만들었다. WaveNet(van den Oord 2016)은 이 문제를 정면으로 해결했다.
+
+$$
+P(x_1, \ldots, x_T) = \prod_{t=1}^T P(x_t \mid x_{<t})
+$$
+
+매 샘플을 256-class 범주형 분포로 모델링하고, 8-bit $\mu$-law 양자화로 계산을 가능하게 한다. 핵심 구조는 **지수 팽창 인과 컨볼루션**이다.
+
+```
+레이어 dilation 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 (10층):
+  수용 영역 = 2^10 = 1024 샘플 = 64ms @ 16kHz
+```
+
+선형 깊이 $L$로 지수 수용 영역 $2^L$을 얻는다. 그러나 추론은 치명적으로 느렸다 — 16kHz 1초 오디오를 생성하는 데 GPU에서 약 1분이 걸렸다. 16,000번의 순차 NN forward가 필요하기 때문이다.
+
+<Callout type="warning" title="자기회귀의 병목">
+WaveNet의 추론 시간은 오디오 길이에 선형이다. 샘플 $x_t$를 생성하려면 $x_{<t}$ 전체가 필요하므로 GPU 병렬화가 불가능하다. RTF(real-time factor) 약 2.0 — 실시간보다 2배 느리다.
+</Callout>
+
+## FastSpeech: 병렬성을 위한 명시적 정렬
+
+FastSpeech(Ren 2019)의 출발점은 단순한 관찰이다. TTS의 text-to-audio 정렬은 **단조적이다** — 텍스트를 앞에서 뒤로 읽는 것과 오디오 프레임의 순서가 일치한다. 이 구조를 활용하면 어텐션 없이도 정렬을 다룰 수 있다.
+
+```
+음소: H  E  L  L  O   (5 음소)
+지속: 3  5  7  4  6   (프레임 수)
+확장: H H H E E E E E L L L L L L L L O O O O O O   (25 프레임)
+```
+
+**길이 조절기(length regulator)**가 음소를 지속 시간만큼 반복해 mel 디코더 입력을 만든다. 디코더는 모든 프레임을 동시에 생성한다 — Transformer self-attention이 sequential dependency 없이 $O(T^2)$ 병렬 연산이기 때문이다.
+
+결과는 극적이다. Tacotron 2의 RTF 0.5 대비 FastSpeech의 RTF는 0.002. **약 250배 빠르다.** MOS는 4.4로 약간 낮지만, production TTS에서 latency는 quality만큼 중요하다. FastSpeech 2(Ren 2020)는 pitch predictor와 energy predictor를 추가해 운율 다양성을 부분적으로 회복했다.
+
+<Aside label="knowledge distillation">
+FastSpeech 1은 학습된 Tacotron 2의 어텐션에서 단조 정렬을 추출해 duration label로 사용했다. 교사 모델의 어텐션 실패가 학생에 전파되는 문제가 있었고, FastSpeech 2는 이를 ground truth 직접 학습으로 해결했다.
+</Aside>
+
+## HiFi-GAN: 판별기가 곧 인식론이다
+
+WaveNet 이후 vocoder 개선은 두 방향으로 전개됐다. Parallel WaveNet(van den Oord 2017)과 WaveGlow는 flow 기반 병렬 생성을 탐구했다. HiFi-GAN(Kong 2020)은 다른 접근을 택했다 — **GAN의 판별기를 정교하게 설계하면 생성기가 그만큼 정교한 패턴을 학습한다.**
+
+**Multi-Period Discriminator(MPD)**는 오디오를 주기 $P \in \{2, 3, 5, 7, 11\}$로 reshape해 2D 컨볼루션으로 분석한다. 소수 주기를 쓰는 이유는 두 주기의 최소공배수가 적(redundancy)을 최소화하기 위해서다. 각 판별기는 서로 다른 배음(harmonic) 패턴을 검출한다.
+
+**Multi-Scale Discriminator(MSD)**는 원본, 2×, 4× 다운샘플 오디오를 각각 분석해 시간 척도를 넓힌다.
+
+$$
+\mathcal{L}_G = \mathcal{L}_{\text{adv}}^G + 2\,\mathcal{L}_{\text{fm}} + 45\,\mathcal{L}_{\text{mel}}
+$$
+
+$\lambda_{\text{mel}} = 45$라는 큰 가중치가 흥미롭다. adversarial 손실 혼자로는 학습이 불안정하므로, mel L1이 스펙트럼 외형을 고정하고 GAN이 위상(phase) 세부 사항을 추가로 학습한다. HiFi-GAN은 MOS 4.4에 RTF 0.006 — WaveNet 대비 300배 이상 빠르면서 음질도 높다.
+
+<Callout type="note" title="트레이드오프">
+GAN 기반 vocoder는 학습 불안정, 모드 붕괴, adversarial training의 수렴 민감성이라는 대가를 치른다. Feature matching loss와 mel L1은 이를 완화하는 공학적 해결책이지만, 여전히 다수의 하이퍼파라미터 조정이 필요하다. BigVGAN(2023)은 주기적 활성화 함수(snake activation)와 anti-aliased upsampling으로 aliasing artifact를 추가로 줄였다.
+</Callout>
+
+## VITS: 세 가지 생성 모델의 통합
+
+Tacotron에서 HiFi-GAN까지의 파이프라인은 두 가지 문제를 내포했다. 첫째, 텍스트→mel 모델과 mel→파형 모델이 별도로 학습되어 mel 불일치(mismatch)가 발생한다. 둘째, 결정론적 duration predictor는 같은 텍스트에서 항상 동일한 운율을 만든다.
+
+VITS(Kim 2021)는 이 두 문제를 하나의 프레임워크로 해결한다.
+
+$$
+\mathcal{L}_{\text{VITS}} = \mathcal{L}_{\text{ELBO}} + \mathcal{L}_{\text{adv}} + \mathcal{L}_{\text{fm}} + \mathcal{L}_{\text{mel}} + \mathcal{L}_d
+$$
+
+**VAE posterior** $q_\phi(z \mid x)$가 오디오를 잠재 변수 $z$로 인코딩한다. **Normalizing flow**가 텍스트 조건부 prior $p_\theta(z \mid \text{text})$를 비가우시안 분포로 변환해 표현력을 높인다. **HiFi-GAN 스타일 디코더**가 $z$에서 직접 파형을 생성한다. mel-spectrogram은 더 이상 명시적 중간 표현이 아니다.
+
+정렬 문제는 **Monotonic Alignment Search(MAS)**로 해결한다. 어텐션 대신 Viterbi-like DP로 단조 최적 경로를 찾는다.
+
+$$
+Q[i, j] = \max\!\bigl(Q[i, j-1],\; Q[i-1, j-1]\bigr) + \log P(z_j \mid \text{text}_i)
+$$
+
+$O(T_{\text{text}} \cdot T_{\text{audio}})$ 복잡도로 전역 최적 단조 정렬을 보장한다. Tacotron 2의 어텐션 실패율 5%가 VITS에서 0.1% 미만으로 줄었다.
+
+<Theorem kind="proposition" number="1" title="MAS의 단조 최적성">
+텍스트 길이 $T$, 오디오 프레임 수 $F$에 대해, MAS는 $O(TF)$ 시간에 단조 증가 정렬 $\pi^*$ 중 $\sum_t \log P(z_t \mid \text{text}_{\pi_t})$를 최대화하는 해를 찾는다.
+</Theorem>
+
+<Proof>
+매 위치 $(i, j)$에서 가능한 전이는 "현재 음소에 머무름 $(i, j-1)$" 또는 "다음 음소로 전진 $(i-1, j-1)$" 두 가지다. 단조 증가 제약 하에서 가능한 경로가 정확히 이 두 경우를 귀납적으로 최대화하는 DP로 표현되므로, 표준 Viterbi 논증에 의해 전역 최적이 보장된다. $\square$
+</Proof>
+
+**Stochastic Duration Predictor**는 flow 기반 변분 추론으로 음소 지속 시간의 분포 $P(d_i \mid h_i)$를 학습한다. 같은 텍스트를 여러 번 생성하면 각각 다른 운율이 나온다 — FastSpeech의 결정론적 duration과 근본적으로 다른 점이다.
+
+## 정리
+
+다섯 챕터를 관통하는 단 하나의 패턴이 있다면, **설계 결정을 학습에 넘기는 방향으로의 지속적 이동**이다.
+
+- Tacotron은 음향 특징 추출을 학습에 넘겼다.
+- FastSpeech는 정렬을 명시적 duration으로 고정했지만, 그 duration을 예측하는 모델을 학습한다.
+- WaveNet은 파형 분포를 직접 학습한다.
+- HiFi-GAN은 "좋은 오디오란 무엇인가"를 판별기 학습에 위임한다.
+- VITS는 텍스트-파형 정렬, 운율 다양성, 중간 표현을 모두 단일 손실로 통합한다.
+
+각 시스템이 인수(assumption)를 줄일수록, 학습 데이터와 계산 비용은 늘었다. 이 트레이드오프가 2024년 이후의 Audio LM 접근(VALL-E, Bark)으로 이어진다 — 수천 시간의 데이터로 학습한 언어 모델이 3초 프롬프트만으로 목소리를 복제한다. FastSpeech-style 아키텍처는 단일 화자 production에서 여전히 효율적이지만, "어떤 가정을 하는가"의 질문은 계속 유효하다.
+
+<Reference
+  title="Natural TTS Synthesis by Conditioning WaveNet on Mel Spectrogram Predictions"
+  authors="Shen et al."
+  year={2018}
+  venue="ICASSP"
+  url="https://arxiv.org/abs/1712.05884"
+/>
+
+<Reference
+  title="Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech"
+  authors="Kim et al."
+  year={2021}
+  venue="ICML"
+  url="https://arxiv.org/abs/2106.06103"
+/>

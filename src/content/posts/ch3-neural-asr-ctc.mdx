@@ -1,0 +1,193 @@
+---
+title: "CTC에서 RNN-T까지 — 음성 인식의 alignment 문제는 어떻게 풀렸나"
+description: "GMM-HMM의 forced alignment부터 CTC의 marginalization, LAS의 autoregressive decoder, RNN-T의 스트리밍까지 — end-to-end ASR의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [asr, ctc, rnn-transducer, attention, end-to-end]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+음성 인식의 핵심 난제는 **alignment**다. 오디오 프레임과 텍스트 문자 사이의 대응 관계는 학습 데이터에 주어지지 않는다. 2014년 이전에는 이 문제를 GMM-HMM과 forced alignment로 해결했다. DeepSpeech가 등장한 이후 10년간, alignment 문제는 세 가지 서로 다른 방법으로 "해소"되어 왔다. 그 세 가지 접근이 왜 각각 다른 트레이드오프를 낳는가?
+
+## End-to-End의 출발 — DeepSpeech와 CTC
+
+2014년 이전 ASR 파이프라인은 MFCC 추출, GMM-HMM 학습, triphone state-tying, lexicon, WFST 구성, Viterbi 디코딩 등 수십 개 하이퍼파라미터와 여러 학습 단계로 이루어졌다. Hannun et al. (2014)의 DeepSpeech는 이 전체를 단일 신경망으로 대체했다.
+
+```
+[GMM-HMM]  audio → MFCC → GMM-HMM → triphone → lexicon → word
+[DeepSpeech] audio → spectrogram → CNN → BiRNN×5 → CTC → character
+```
+
+이것이 가능했던 이론적 근거가 **CTC loss** (Graves 2006)다. CTC는 alignment를 직접 학습하지 않고, 가능한 모든 alignment의 marginalization으로 처리한다.
+
+$$
+P(y \mid x) = \sum_{\pi \in \mathcal{B}^{-1}(y)} \prod_{t=1}^T P(\pi_t \mid x)
+$$
+
+여기서 $\mathcal{B}: (\Sigma \cup \{\phi\})^T \to \Sigma^*$는 연속 중복 제거 후 blank를 제거하는 매핑이다. "cat"이라는 target은 `φccatφ`, `cφaatφ`, `ccaaattt` 등 수천만 개의 프레임 시퀀스로 표현될 수 있고, CTC는 이 전부를 합산해 loss로 사용한다.
+
+naive한 합산은 지수적으로 많은 경우의 수를 갖기 때문에 DP가 필수다. Extended target $y' = (\phi, y_1, \phi, y_2, \ldots, y_U, \phi)$를 도입하면 forward variable의 점화식이 다음과 같이 정리된다.
+
+$$
+\alpha_t(s) = P(\pi_t = y'_s \mid x) \cdot \bigl(\alpha_{t-1}(s) + \alpha_{t-1}(s-1) + [\text{skip valid}]\,\alpha_{t-1}(s-2)\bigr)
+$$
+
+skip 조건은 $y'_s \neq \phi$ **이고** $y'_s \neq y'_{s-2}$일 때만 성립한다. "ll"처럼 같은 문자가 반복되는 경우, 두 'l' 사이에 반드시 blank가 있어야 "ll"로 매핑되므로 skip을 허용하지 않는다.
+
+<Aside label="blank의 이중 역할">
+CTC의 blank $\phi$는 두 가지 의미를 동시에 표현한다. 첫째, 모델이 어떤 문자도 확신하지 못하는 **불확실성**. 둘째, 같은 문자의 두 인스턴스를 구분하는 **경계 마커**. 학습된 CTC 모델의 출력을 시각화하면 대부분 blank이고 문자는 짧은 spike로 나타나는 이유가 여기에 있다.
+</Aside>
+
+## CTC의 한계 — Conditional Independence
+
+CTC는 강력하지만 구조적 한계를 갖는다. $P(\pi_t \mid x)$가 $\pi_{<t}$와 무관하다는 **conditional independence 가정**이다.
+
+<Theorem kind="proposition" number="1" title="CTC의 conditional independence">
+CTC 모델에서 각 프레임의 출력 확률 $P(\pi_t \mid x)$는 이전 출력 $\pi_{1:t-1}$에 무관하다. 따라서 출력 문자 간의 언어적 의존성을 모델 내부에서 학습하지 않는다.
+</Theorem>
+
+이 때문에 CTC 기반 시스템은 외부 LM fusion이 거의 필수다.
+
+$$
+\text{score}(y) = \log P_{\text{CTC}}(y \mid x) + \alpha \log P_{\text{LM}}(y) + \beta |y|
+$$
+
+$\alpha$는 LM 가중치(0.3~1.0), $\beta$는 길이 패널티다. 이 식의 Bayesian 정당화는 다음과 같다. $P(y \mid x) \propto P(x \mid y) P(y)$에서 NN 모델이 학습 분포 $P_{\text{train}}(y)$에 대해 훈련됐을 때, 외부 LM을 더해 학습/배포 분포의 mismatch를 보정한다. $\alpha = 1$이 이론적으로 정확하지만, 실전에서는 NN의 overconfidence 때문에 $\alpha \in [0.3, 0.5]$를 사용한다.
+
+CTC 디코딩에서 greedy (per-frame argmax + collapse)는 단순하지만 sub-optimal이다.
+
+<Theorem kind="proposition" number="2" title="Greedy decoding의 sub-optimality">
+$\arg\max_\pi P(\pi \mid x) \neq \arg\max_y P(y \mid x)$ in general.
+</Theorem>
+
+<Proof>
+$T=2$, $V = \{a, \phi\}$, $P(a|x_1)=0.4$, $P(\phi|x_1)=0.6$, $P(a|x_2)=0.4$, $P(\phi|x_2)=0.6$.
+
+Greedy: $\pi^* = (\phi, \phi)$, $y^* = \varnothing$, $P = 0.36$.
+
+$P(y = \text{"a"} \mid x) = P(a,\phi) + P(\phi,a) + P(a,a) = 0.24 + 0.24 + 0.16 = 0.64 > 0.36$.
+
+따라서 greedy가 best $y$를 놓친다. $\square$
+</Proof>
+
+## LAS — Conditional Dependency를 내재화하다
+
+LAS (Chan et al. 2016)는 CTC의 conditional independence 문제를 encoder-decoder + attention 구조로 해결한다.
+
+```
+Encoder (Pyramidal BiLSTM): audio [T] → h_1, ..., h_{T/8}
+Attention:                  c_u = Σ_t α_{u,t} h_t
+Decoder (LSTM):             P(y_u | y_{<u}, x) via s_u, c_u
+```
+
+loss는 자기회귀 cross-entropy다.
+
+$$
+\mathcal{L}_{\text{LAS}} = -\sum_u \log P(y_u \mid y_{<u}, x)
+$$
+
+Pyramidal BiLSTM encoder가 시간 축을 $8\times$ 축소하는 이유는 attention 비용 때문이다. $T = 800$ 프레임에 직접 attention을 적용하면 decoder step마다 800회 내적이 필요하다. $100$으로 줄이면 8배 효율이 된다.
+
+location-sensitive attention (Chorowski 2015)은 이전 attention $\alpha_{u-1}$의 convolution feature를 현재 score에 더한다.
+
+$$
+e_{u,t} = v^\top \tanh(W_s s_{u-1} + W_h h_t + W_f (F * \alpha_{u-1})_t)
+$$
+
+이 항이 없으면 attention이 non-monotonic alignment를 학습할 위험이 있다. 음성에서 발음은 시간 순서대로 진행하므로 monotonic bias가 중요하다.
+
+<Callout type="warning" title="LAS의 구조적 제약">
+LAS의 backward BiLSTM encoder는 전체 시퀀스를 보아야 하므로 **스트리밍이 불가능**하다. 첫 바이트 지연이 오디오 전체 길이와 같다. production에서 실시간 음성 인식에 LAS를 직접 쓸 수 없는 이유다.
+</Callout>
+
+## RNN-T — Streaming과 Conditional Dependency를 동시에
+
+RNN-Transducer (Graves 2012)는 CTC와 LAS의 트레이드오프를 하나의 구조로 합친다.
+
+세 컴포넌트로 구성된다.
+
+- **Encoder**: $f^{\text{enc}}_t = \text{Encoder}(x_{1:t})$ — causal LSTM이면 스트리밍 가능
+- **Predictor**: $g_u = \text{LSTM}(y_{u-1}, g_{u-1})$ — 이전 출력에 의존하는 internal LM
+- **Joint**: $P(\pi \mid x_{1:t}, y_{<u}) = \text{softmax}(h(f^{\text{enc}}_t, g_u))$
+
+loss는 CTC와 동일한 marginalization 형태지만 lattice가 $T \times (U+1)$ 2차원이다.
+
+$$
+P(y \mid x) = \sum_{\pi \in \mathcal{B}^{-1}(y)} \prod_{(t,u)} P(\pi_{t,u} \mid x_{1:t}, y_{<u})
+$$
+
+forward variable의 점화식은 다음과 같다.
+
+$$
+\alpha(t, u) = \alpha(t-1, u) \cdot P(\phi \mid t-1, u) + \alpha(t, u-1) \cdot P(y_u \mid t, u-1)
+$$
+
+blank가 시간 축을 진행시키고, 문자 출력이 output 축을 진행시킨다. 복잡도는 $O(T \cdot U)$로 CTC와 동일하다.
+
+스트리밍 greedy 디코딩은 각 프레임마다 blank가 나올 때까지 문자를 emit하는 루프다.
+
+```
+for t = 1..T:
+    f_t = CausalEncoder(x_t)
+    while True:
+        π* = argmax Joint(f_t, g_u)
+        if π* == blank: break
+        emit π*, update g_u
+```
+
+이 구조가 Google Voice Search (He et al. 2019), Apple Siri, Amazon Alexa의 on-device ASR 표준이 된 이유다. 첫 출력 지연이 프레임 크기(약 100~200ms)에 불과하다.
+
+## 트레이드오프
+
+세 아키텍처의 핵심 차이를 정리하면 다음과 같다.
+
+<Callout type="note" title="CTC vs LAS vs RNN-T 트레이드오프">
+| | CTC | LAS | RNN-T |
+|---|---|---|---|
+| Conditional dep. | ✗ | ✓ | ✓ |
+| Streaming | ✓ | ✗ | ✓ |
+| LM fusion 필요 | 많음 | 적음 | 중간 |
+| 학습 복잡도 | $O(TU)$ DP | sequence CE | $O(TU)$ DP |
+| 대표 후계 | Whisper (CTC head) | Whisper (decoder) | Conformer-T |
+</Callout>
+
+RNN-T는 internal LM bias라는 고유한 문제를 갖는다. predictor가 학습 데이터의 텍스트 분포를 암묵적으로 학습하기 때문에, deployment domain이 다르면 out-of-domain 단어를 놓친다. 이를 완화하기 위해 "neutral acoustic input에서의 predictor 출력"을 internal LM 추정값으로 삼고 차감하는 ILME(Internal LM Estimation) 기법을 사용한다. Whisper의 `[no_speech]` logit subtraction도 같은 원리의 변형이다.
+
+Whisper가 external LM fusion 없이 SOTA를 달성한 것은 680K hours의 weakly-supervised 데이터가 internal LM 역할을 충분히 수행하기 때문이다. 대규모 데이터가 있으면 external LM의 가치가 줄고, 특수 도메인(의료, 법률)이면 여전히 external LM이 유효하다.
+
+## 정리
+
+- CTC는 alignment marginalization으로 GMM-HMM의 forced alignment를 제거했지만, conditional independence 때문에 external LM fusion이 필요하다.
+- LAS는 autoregressive decoder로 conditional dependency를 내재화했지만, BiLSTM encoder 때문에 스트리밍이 불가능하다.
+- RNN-T는 causal encoder + autoregressive predictor의 분리로 두 요건을 동시에 달성해 production streaming ASR의 표준이 됐다.
+- 세 아키텍처는 Whisper의 encoder-decoder Transformer로 수렴하지만, 스트리밍이 필요한 on-device 환경에서는 Conformer + RNN-T가 여전히 지배적이다.
+
+alignment 문제는 "제거"된 것이 아니라 각 아키텍처가 다른 방식으로 "숨긴" 것이다. 그 숨기는 방식의 차이가 스트리밍 가능 여부, LM fusion의 필요성, 학습 안정성을 결정한다.
+
+<Reference
+  title="Connectionist Temporal Classification: Labelling Unsegmented Sequence Data with Recurrent Neural Networks"
+  authors="Graves et al."
+  year={2006}
+  venue="ICML"
+  url="https://dl.acm.org/doi/10.1145/1143844.1143891"
+/>
+
+<Reference
+  title="Sequence Transduction with Recurrent Neural Networks"
+  authors="Graves"
+  year={2012}
+  venue="ICML Workshop"
+  url="https://arxiv.org/abs/1211.3711"
+/>

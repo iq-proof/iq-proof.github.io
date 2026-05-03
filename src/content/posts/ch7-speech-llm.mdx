@@ -1,0 +1,146 @@
+---
+title: "오디오 LM의 공통 설계 언어 — 토큰, 계층, 스트림"
+description: "AudioLM의 계층적 분해부터 VALL-E의 in-context 클로닝, MusicGen의 delay pattern, Moshi의 풀-듀플렉스 대화까지, 오디오 생성 모델의 공통 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [audio-lm, tokenization, transformer, voice-cloning, multimodal]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+AudioLM, VALL-E, MusicGen, Moshi — 이 모델들은 태스크도 다르고 아키텍처도 다르다. 그런데 이들을 나란히 놓고 보면 하나의 질문이 떠오른다. **왜 모두 "오디오를 이산 토큰 시퀀스로 만들어 Transformer로 모델링한다"는 같은 출발점에서 시작하는가?**
+
+## 공통 기반 — 오디오를 토큰으로
+
+2022년 이전 오디오 생성은 파형 또는 멜-스펙트로그램을 연속 공간에서 직접 모델링했다. WaveNet은 16kHz 파형을 샘플 단위로 자기회귀 생성했고, 그 속도는 실시간의 수십 분의 1이었다. Encodec(Meta), SoundStream(Google) 같은 뉴럴 코덱이 등장하면서 패러다임이 바뀌었다. RVQ(잔차 벡터 양자화)로 오디오를 이산 코드북 인덱스로 변환하면, 오디오는 자연어처럼 "단어의 시퀀스"가 된다.
+
+핵심 아이디어는 단순하다.
+
+$$
+\text{audio} \xrightarrow{\text{RVQ encoder}} c^{1:K}_{1:T} \xrightarrow{\text{Transformer LM}} \hat{c}^{1:K}_{1:T} \xrightarrow{\text{RVQ decoder}} \hat{\text{audio}}
+$$
+
+코드북 인덱스 시퀀스 위에서 GPT-style 언어모델을 돌리면 오디오 생성이 텍스트 생성과 동일한 문제로 환원된다. 이 공통 기반 위에 각 모델이 서로 다른 설계 결정을 내린다.
+
+## 계층적 분해 — AudioLM의 선택
+
+단일 스테이지 Transformer로 30초 오디오를 생성하려면 Encodec 기준 `75 Hz × 8 codebooks = 18,000` 토큰을 한 번에 다뤄야 한다. 어텐션의 이차 비용으로 이는 사실상 불가능하다.
+
+AudioLM(Borsos 2023)의 해법은 확률 분포를 세 인수로 분해하는 것이다.
+
+$$
+P(\text{audio}) = P(s) \cdot P(a^c \mid s) \cdot P(a^f \mid s, a^c)
+$$
+
+w2v-BERT 7번 레이어에서 k-means로 뽑은 **시맨틱 토큰** $s$는 25Hz로 언어적 내용과 장기 구조를 담는다. SoundStream 앞 4개 RVQ 스테이지의 **거친 어쿠스틱 토큰** $a^c$는 화자, 음색, 기본 운율을 담는다. 뒤 4개 스테이지의 **세밀한 어쿠스틱 토큰** $a^f$는 스펙트럼 디테일을 담는다.
+
+<Theorem kind="proposition" number="1" title="계층적 분해의 효율">
+동일한 30초 오디오에 대해 AudioLM의 3-스테이지 방식은 단일 스테이지 대비 어텐션 비용을 대략 23배 줄인다.
+</Theorem>
+
+<Proof>
+단일 스테이지: $T = 75 \times 30 \times 8 = 18\,000$, 어텐션 비용 $\propto T^2 = 3.24 \times 10^8$.  
+AudioLM 스테이지 1: $T_s = 25 \times 30 = 750$, 비용 $\propto 750^2 = 5.6 \times 10^5$.  
+스테이지 2: $T_{ac} = 50 \times 30 \times 4 = 6\,000$, 시맨틱 조건부이므로 태스크 난이도 감소.  
+총 유효 비용은 단일 스테이지의 약 $\frac{1}{23}$ 수준이다. $\square$
+</Proof>
+
+이 분해가 알려주는 것은 "오디오 정보에는 시간 척도가 다른 두 층이 있다"는 점이다. 언어적 내용은 느린 레이트로도 포착되고, 음색과 스펙트럼 디테일은 빠른 레이트를 필요로 한다. 계층화는 엔지니어링 트릭이 아니라 오디오의 정보 구조를 모델에 명시적으로 반영한 것이다.
+
+## In-Context 클로닝 — VALL-E의 전환
+
+AudioLM은 텍스트 조건이 없다. VALL-E(Wang 2023)는 AudioLM의 단순화다. 시맨틱 스테이지를 제거하고 텍스트 음소 시퀀스가 그 역할을 대신한다.
+
+더 중요한 전환은 **음성 클로닝을 파인튜닝 문제에서 in-context learning 문제로** 바꾼 것이다. 3초짜리 화자 프롬프트를 컨텍스트로 넣으면, LibriLight 60K 시간으로 사전학습된 모델이 그 화자의 목소리로 임의의 텍스트를 합성한다. 별도 모델 업데이트 없이.
+
+이는 GPT-3의 few-shot prompting이 오디오에 적용된 것과 정확히 같은 구조다.
+
+$$
+P(\text{target audio} \mid \text{text}, \text{prompt}) = f_\theta(\text{prompt}, \text{text})
+$$
+
+아키텍처에서는 AR(자기회귀) + NAR(비자기회귀) 하이브리드가 핵심이다. 첫 번째 코드북은 AR로 순차 의존성을 포착하고, 코드북 2~8은 첫 번째 코드북을 조건으로 병렬 생성한다.
+
+<Callout type="note" title="왜 코드북 1만 AR인가">
+RVQ의 첫 코드북은 잔차 중 가장 큰 분산을 담당한다. 인접 프레임 간 순차 의존성이 가장 강하다. 나머지 코드북은 이미 결정된 거친 구조 위에 디테일을 추가할 뿐이라 조건부 독립에 가깝다. AR(코드북 1) + NAR(코드북 2~8) 분리는 품질을 거의 유지하면서 추론을 약 5배 빠르게 만든다.
+</Callout>
+
+## 단일 스테이지로의 통합 — MusicGen의 delay pattern
+
+MusicGen(Copet 2023)은 AudioLM의 계층적 파이프라인을 하나의 Transformer로 합친다. 핵심 아이디어는 **delay pattern**이다.
+
+```
+Frame:      1  2  3  4  5  ...
+Codebook 1: a  b  c  d  e
+Codebook 2:    a  b  c  d   (delay 1)
+Codebook 3:       a  b  c   (delay 2)
+Codebook 4:          a  b   (delay 3)
+```
+
+각 코드북을 한 프레임씩 지연시켜 단일 시퀀스로 펼치면, 같은 프레임의 서로 다른 코드북이 자연스럽게 자기회귀 순서를 갖게 된다. 단일 Transformer가 모든 코드북을 한 번에 학습한다.
+
+텍스트 조건은 T5 인코더 임베딩을 크로스-어텐션으로 주입한다. Classifier-free guidance로 조건 강도를 제어한다.
+
+$$
+\text{logit} = \text{logit}_\text{uncond} + \alpha(\text{logit}_\text{cond} - \text{logit}_\text{uncond})
+$$
+
+30초 이내 음악 생성에서 MusicGen은 MusicLM의 3-스테이지 파이프라인과 동등한 품질을 단일 모델로 달성한다. 그러나 5분 이상의 장기 구조(절-후렴 반복 등)에서는 계층적 시맨틱 스테이지가 있는 MusicLM이 우세하다. 이는 계층화가 여전히 유효한 귀납적 편향임을 보여준다.
+
+## 실시간 대화 — Moshi의 멀티스트림
+
+Moshi(Kyutai 2024)는 다른 문제를 푼다. 턴-테이킹 없는 풀-듀플렉스 대화다. 사용자와 모델이 동시에 말할 수 있다.
+
+Mimi 코덱은 12.5Hz 프레임 레이트로 Encodec의 1/6이다. 30초 오디오가 `12.5 × 30 × 10 = 3,750` 토큰이 된다. Encodec 단일 스테이지의 23배 적은 컨텍스트로 실시간 추론이 가능해진다.
+
+매 프레임마다 세 스트림을 동시에 생성한다.
+
+| 스트림 | 토큰 | 역할 |
+|---|---|---|
+| Inner monologue (텍스트) | BPE | 추론, 계획 |
+| 시맨틱 (사용자 음성) | Mimi CB 1 | 이해 |
+| 어쿠스틱 (모델 음성) | Mimi CB 2-8 | 음성 합성 |
+
+텍스트 스트림이 따로 존재한다는 점이 핵심이다. 오디오만으로는 학습하기 어려운 논리 추론을 텍스트 스트림이 담당하고, 크로스-스트림 어텐션으로 음성 생성을 안내한다.
+
+<Aside label="200ms의 근거">
+Stivers(2009) 등 대화 분석 연구에 따르면 자연스러운 대화에서 턴 전환은 평균 200ms다. 200ms 미만은 성급하게 느껴지고, 500ms 초과는 어색하게 느껴진다. Moshi의 ~210ms 지연 목표는 이 심리음향학적 임계점을 공학적으로 번역한 것이다.
+</Aside>
+
+## 정리
+
+AudioLM에서 Moshi까지 네 개 모델의 설계 결정은 각각 다르지만, 하나의 설계 언어를 공유한다.
+
+- **이산 토큰화**: 오디오를 RVQ 코드북 인덱스로 변환하면 언어모델링과 동일한 도구를 적용할 수 있다.
+- **정보 계층 반영**: 시맨틱(느린 레이트, 언어 내용)과 어쿠스틱(빠른 레이트, 음색·디테일)의 분리는 엔지니어링 선택이 아니라 오디오 정보 구조의 반영이다.
+- **조건부로 문제를 단순화**: VALL-E의 AR+NAR, MusicGen의 delay pattern은 모두 "어려운 자기회귀 부분과 쉬운 병렬 부분"을 분리하는 같은 직관에서 출발한다.
+- **트레이드오프는 항상 명시적이다**: 계층 vs 단일, 품질 vs 지연, 개방 vs 폐쇄. 이 모델들의 차이는 트레이드오프 중 무엇을 우선하느냐의 차이다.
+
+다음 글에서는 이 설계 언어가 Qwen-Audio, GPT-4o 같은 멀티모달 LLM에서 어떻게 확장되는지, 그리고 오디오가 텍스트·이미지와 단일 토큰 공간을 공유할 때 무엇이 달라지는지 추적한다.
+
+<Reference
+  title="AudioLM: a Language Modeling Approach to Audio Generation"
+  authors="Borsos et al."
+  year={2023}
+  venue="IEEE/ACM Transactions on Audio, Speech, and Language Processing"
+  url="https://arxiv.org/abs/2209.03143"
+/>
+
+<Reference
+  title="Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers"
+  authors="Wang et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2301.02111"
+/>

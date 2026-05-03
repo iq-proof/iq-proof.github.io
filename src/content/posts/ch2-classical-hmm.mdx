@@ -1,0 +1,132 @@
+---
+title: "음성 인식의 세 시대 — LPC에서 WFST까지"
+description: "Source-Filter Model의 물리적 직관부터 LPC, HMM-GMM, WFST 기반 ASR까지, 음성 처리 고전 파이프라인의 설계 철학과 각 모듈이 deep learning에 무엇을 남겼는지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [speech, lpc, hmm, wfst, vocoder]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+1984년에 작성된 Griffin-Lim 알고리즘은 오늘날 PyTorch 표준 라이브러리에 그대로 들어 있다. 1989년 Rabiner의 HMM 튜토리얼은 30,000회 인용됐고, 그 수식은 CTC loss 안에 살아 있다. 왜 수십 년 된 알고리즘들이 사라지지 않는가? 답은 하나다 — 각 알고리즘이 **음성 신호의 물리적 구조를 수학으로 못 박은** 것이기 때문이다.
+
+## 음성은 왜 분해 가능한가
+
+모든 고전 음성 처리의 출발점은 **source-filter model**이다.
+
+$$
+X(\omega) = E(\omega) \cdot H(\omega)
+$$
+
+$E$는 성대(source), $H$는 성도(vocal tract filter). 이 분리가 가능한 이유는 해부학적 사실이다 — 25ms 창 안에서 성도 형태는 거의 고정되고, 성대 진동 패턴은 독립적으로 변한다. 컨볼루션을 분리할 수 있다면, 각 요소를 독립적으로 모델링할 수 있다.
+
+Linear Predictive Coding(LPC)는 이 직관을 autoregressive 모델로 변환한다.
+
+$$
+x[n] = \sum_{k=1}^p a_k\, x[n-k] + e[n], \quad H(z) = \frac{1}{A(z)}
+$$
+
+계수 $\{a_k\}$가 vocal tract filter $H$의 역함수다. 잔차 $e[n]$은 source — 유성음이면 펄스열, 무성음이면 백색 잡음에 가깝다. LPC는 Yule-Walker 방정식 $R\mathbf{a} = \mathbf{r}$을 풀어 계수를 구하고, Toeplitz 구조 덕분에 Levinson-Durbin 재귀가 $O(p^3)$ 대신 $O(p^2)$에 해결한다.
+
+<Aside label="Formant과 Pole">
+`A(z)`의 근(root) 위치가 formant frequency다. z-plane에서 단위원에 가까울수록 bandwidth가 좁고 (공명이 날카롭다), 각도가 주파수를 결정한다. 모음 삼각형(/a/, /i/, /u/)이 F1-F2 좌표계에서 구분되는 이유가 여기에 있다.
+</Aside>
+
+autocorrelation method는 항상 $|k_m| \leq 1$을 보장한다 — reflection coefficient가 1 미만이면 $H(z)$가 안정 필터임이 수학적으로 보장되므로, LPC codec은 발진하지 않는다. GSM, AMR, CELP가 30년간 mobile 통신의 backbone이 될 수 있었던 이유다.
+
+## HMM — 시간 불확실성을 모델로 끌어안다
+
+음성 인식의 핵심 난점은 **alignment**다. "hello"를 발음하는 속도는 사람마다, 맥락마다 다르다. HMM은 이 불확실성을 latent variable로 모델링한다.
+
+$$
+w^* = \arg\max_w P(o_{1:T} \mid w) \cdot P(w)
+$$
+
+각 phoneme이 hidden state, 25ms MFCC frame이 GMM observation이다. left-to-right HMM은 self-loop(상태 머무름)와 forward transition(다음 상태)만 허용해 시간의 단방향성을 구조에 못 박는다.
+
+Rabiner(1989)가 정의한 **세 문제**는 지금도 표준 교과서 구성이다.
+
+<Theorem kind="proposition" number="1" title="Forward Algorithm">
+$$
+\alpha_t(j) = \left(\sum_i \alpha_{t-1}(i)\, A_{ij}\right) B_j(o_t), \quad P(o_{1:T}) = \sum_j \alpha_T(j)
+$$
+복잡도 $O(T \cdot N^2)$.
+</Theorem>
+
+<Proof>
+$\alpha_t(j) = P(o_{1:t}, z_t = j)$의 정의에서 Markov property와 chain rule을 적용하면 재귀가 성립한다. Viterbi는 이 식의 $\sum$을 $\max$로 바꾼 것 — Bellman 최적성의 직접 적용이다.
+</Proof>
+
+Baum-Welch(EM)는 forward-backward 변수를 결합해 transition matrix와 GMM 파라미터를 업데이트한다. 로그 가능도는 단조 증가가 보장된다. 2012년 Hinton et al.의 DNN-HMM hybrid가 GMM emission을 DNN으로 교체하기 전까지, 이 구조가 20년간 ASR의 전부였다.
+
+## WFST — 모든 모듈을 하나의 그래프로
+
+GMM-HMM 시스템에는 서로 다른 네 개의 모듈이 존재한다: HMM state, context-dependent triphone, lexicon, language model. Mohri, Pereira, Riley(2002)의 통찰은 이것들이 모두 **weighted finite-state transducer**의 composition으로 표현된다는 것이다.
+
+$$
+HCLG = H \circ C \circ L \circ G
+$$
+
+Kaldi의 핵심 철학이다. Composition의 핵심 대수 구조는 **semiring**이다.
+
+<Callout type="note" title="두 가지 Semiring">
+- **Tropical** $(\min, +)$: 최소 비용 경로만 유지 → Viterbi와 수학적으로 동형
+- **Log** $(\oplus_{\log}, +)$: 모든 경로를 확률 합산 → Forward algorithm과 동형
+
+Decoding에는 tropical, training(MMI)에는 log. 같은 그래프 위에서 semiring만 바꾸면 알고리즘이 바뀐다.
+</Callout>
+
+HCLG를 한 번 compile하면 decoding 시 재사용된다. $10^7 \sim 10^8$ state 규모의 그래프를 determinize·minimize해 최적화된 단일 FST로 만든다. 크기는 무섭지만 compile은 한 번뿐이다.
+
+## Griffin-Lim — magnitude에서 phase로, 그리고 그 한계
+
+Mel-spectrogram을 waveform으로 변환하는 **vocoding** 문제에서, 고전 baseline은 Griffin-Lim(1984)이다. magnitude $A = |X|$만 주어졌을 때 phase를 복원하는 iterative projection 알고리즘이다.
+
+$$
+X^{(k+1)} = A \odot e^{j\,\arg\, \mathcal{S}(\mathcal{S}^{-1}(X^{(k)}))}
+$$
+
+두 집합 사이를 번갈아 projection한다 — $\mathcal{C}_A$ (target magnitude를 만족하는 집합)와 $\mathcal{C}_B$ (어떤 time-domain 신호의 STFT인 "consistent" 집합). Griffin & Lim(1984)은 각 iteration마다 거리 $\mathcal{D} = \||X̃| - A\|^2$가 단조 감소함을 증명했다.
+
+<Callout type="warning" title="트레이드오프">
+단조 감소는 **local minimum** 수렴만 보장한다. Phase 정보 자체가 magnitude에서 유일하게 결정되지 않기 때문에 global optimum은 원칙적으로 도달 불가능하다. Tacotron 1(2017)이 Griffin-Lim을 썼을 때 음질이 "robotic"했던 이유다. Tacotron 2(2018)부터 WaveNet으로 교체됐다.
+</Callout>
+
+그러나 Griffin-Lim은 학습 데이터 없이 작동하고, 30줄 코드로 구현된다. 40년이 지난 지금도 neural vocoder 비교 baseline, 빠른 prototype, source separation 후처리에 쓰인다.
+
+## 정리
+
+네 챕터를 관통하는 공통 패턴이 있다.
+
+- **물리적 구조를 수학으로 고정한다**: source-filter 분리, Markov 시간 진행, semiring 합성, consistent STFT — 각각이 음성 신호의 실제 성질을 귀납적 편향으로 못 박는다.
+- **고전 알고리즘은 사라지지 않는다**: LPCNet, CTC loss(= Forward algorithm의 동형), WFST lattice rescoring, Griffin-Lim baseline — 모두 deep learning 시대에 살아있다.
+- **deep learning이 대체한 것은 파라미터 추정 방식이지 구조 자체가 아니다**: GMM → DNN, forced alignment → CTC, hand-crafted G2P → sequence-to-sequence. Inductive bias는 이어진다.
+
+다음 글에서는 이 파이프라인을 end-to-end로 대체한 DeepSpeech와 CTC의 등장, 그리고 "alignment 없는 학습"이 어떻게 가능한지를 추적한다.
+
+<Reference
+  title="A Tutorial on Hidden Markov Models and Selected Applications in Speech Recognition"
+  authors="Rabiner, L. R."
+  year={1989}
+  venue="Proceedings of the IEEE"
+  url="https://ieeexplore.ieee.org/document/18626"
+/>
+
+<Reference
+  title="Signal Estimation from Modified Short-Time Fourier Transform"
+  authors="Griffin, D. W. and Lim, J. S."
+  year={1984}
+  venue="IEEE Transactions on Acoustics, Speech, and Signal Processing"
+  url="https://ieeexplore.ieee.org/document/1164317"
+/>

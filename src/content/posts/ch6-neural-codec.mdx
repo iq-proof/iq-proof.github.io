@@ -1,0 +1,166 @@
+---
+title: "Neural Audio Codec은 왜 VQ를 버리지 못하는가"
+description: "Vector Quantization의 기본 원리부터 RVQ·Encodec의 bitrate scalability, semantic/acoustic token의 계층적 분리까지, 현대 audio codec 설계를 관통하는 공통 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [audio-codec, vector-quantization, rvq, encodec, neural-codec]
+difficulty: advanced
+series:
+  slug: audio-speech-deep-dive
+  title: Audio Speech Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+AudioLM, VALL-E, MusicGen — 현재 주목받는 audio 생성 모델들은 전부 이산(discrete) token 위에서 동작한다. 그리고 그 token을 만드는 방법은 하나같이 Vector Quantization이다. 1957년 Lloyd가 PCM 코딩을 위해 정립한 이 알고리즘이 왜 2024년 신경망 codec의 핵심으로 살아 있는가?
+
+## VQ의 수학적 뼈대
+
+Vector Quantizer의 정의는 단순하다.
+
+$$
+q(x) = e_{k^*}, \qquad k^*(x) = \arg\min_k \|x - e_k\|_2
+$$
+
+codebook $\{e_1, \ldots, e_K\} \subset \mathbb{R}^d$에서 입력 $x$에 가장 가까운 entry를 찾아 반환한다. 전송되는 정보는 인덱스 $k^*$뿐이므로 rate는 $R = \log_2 K$ bits, distortion은 $D = \mathbb{E}\|x - q(x)\|^2$다.
+
+<Theorem kind="theorem" number="1" title="Lloyd-Max 수렴">
+Assignment 단계(각 $x$를 가장 가까운 $e_k$에 할당)와 Update 단계($e_k \leftarrow \mathbb{E}_{x \in V_k}[x]$)를 교대로 수행하면 distortion $D$는 단조 감소한다.
+</Theorem>
+
+<Proof>
+Assignment 단계: $e_k$ 고정 상태에서 nearest-neighbor 할당은 $D$를 줄이거나 유지한다. Update 단계: $V_k$ 고정 상태에서 $\partial D / \partial e_k = 2(\mathbb{E}[x] - e_k) = 0$이 성립하므로 centroid가 L2 error의 최솟값이다. 두 단계 모두 $D$를 non-increasing으로 유지하므로 수렴한다. $\square$
+</Proof>
+
+이 수렴은 **local** optimum으로의 수렴이다. Global 해를 보장하지 않으며, 초기화에 민감하다. 현대 codec에서 EMA(Exponential Moving Average) 업데이트나 k-means++ 초기화를 쓰는 이유가 여기에 있다.
+
+핵심 제약도 이미 정리 안에 숨어 있다. 차원 $d$에서 distortion $\epsilon$을 달성하려면 $K \sim (\sigma/\epsilon)^d$가 필요하다. mel-spectrogram의 80차원 frame에 직접 VQ를 적용하면 codebook 크기가 천문학적이 된다. 이것이 RVQ가 등장한 이유다.
+
+## VQ-VAE — 신경망과의 결합
+
+van den Oord et al. (2017)은 VQ를 신경망 latent space에 끼워 넣었다. 핵심 문제는 VQ의 non-differentiability다. `argmin` 연산은 gradient를 죽인다.
+
+해결책은 **straight-through estimator**다.
+
+$$
+z_q = z_e + (q(z_e) - z_e).\text{detach()}
+$$
+
+forward pass에서는 $z_q = e_{k^*}$로 이산 quantization을 수행하고, backward pass에서는 $\partial z_q / \partial z_e = I$로 gradient를 그대로 통과시킨다. 이 근사의 bias는 $\|z_e - z_q\|$에 비례하므로, commitment loss $\beta \|z_e - \text{sg}[e]\|^2$가 $z_e$를 codebook 근처에 묶어 두면 bias도 작게 유지된다.
+
+```python
+# Straight-through in PyTorch
+z_q = z_e + (q_flat - z_e_flat).detach()
+```
+
+VQ-VAE의 total loss는 다음과 같다.
+
+$$
+\mathcal{L} = \underbrace{\|x - D(z_q)\|^2}_{\text{reconstruction}} + \underbrace{\|sg[z_e] - e\|^2}_{\text{codebook}} + \beta \underbrace{\|z_e - sg[e]\|^2}_{\text{commitment}}
+$$
+
+codebook loss는 $e$가 $z_e$를 따라가게 하고, commitment loss는 $z_e$가 $e$에서 멀어지지 않게 한다. 실제 학습에서는 gradient 기반 codebook 업데이트 대신 EMA 업데이트가 더 안정적으로 알려져 있다.
+
+<Callout type="warning" title="Codebook Collapse">
+일부 codebook entry만 반복 사용되고 나머지가 dead code가 되는 현상. 학습 초기 encoder의 랜덤 초기화로 인해 $z_e$ 분포 밖에 놓인 entry는 업데이트 기회를 잃는다. Random restart(dead entry를 batch에서 샘플링한 $z_e$로 교체)가 표준 mitigation이다.
+</Callout>
+
+## RVQ — 차원의 저주를 우회하는 방법
+
+Residual Vector Quantization의 알고리즘은 직관적이다.
+
+$$
+r_0 = x, \quad q_k = \text{VQ}(r_{k-1}; C_k), \quad r_k = r_{k-1} - q_k, \quad \hat{x} = \sum_{k=1}^K q_k
+$$
+
+각 stage가 이전 stage의 잔차(residual)를 quantize한다. $K$ stage, codebook 크기 $V$라면 전송 bits는 $K \log_2 V$다. 동일한 bitrate를 내는 단일 VQ의 codebook 크기 $V^K$와 비교하면 메모리는 $V^{K-1}/K$배 절감된다. $V = 1024$, $K = 8$이면 약 $10^{20}$배 차이다.
+
+<Theorem kind="proposition" number="2" title="RVQ의 Effective Codebook">
+$K$ stage, 각 stage codebook 크기 $V$인 RVQ의 표현 가능한 distinct output 수는 $V^K$다.
+</Theorem>
+
+<Proof>
+각 stage의 선택이 독립적이고 각각 $V$가지이므로 $K$ stage의 조합은 $V^K$다. $\square$
+</Proof>
+
+**Bitrate scalability**가 RVQ의 또 다른 핵심이다. 후반 stage를 drop하면 bitrate가 줄고 quality가 떨어지지만 degradation은 graceful하다. 학습 시 random하게 $K' \in \{1, \ldots, K\}$를 선택하는 quantizer dropout으로 single model이 multiple bitrate를 지원한다.
+
+SoundStream(Zeghidour 2021)은 이 구조를 처음으로 24kHz end-to-end audio codec에 적용했다. Causal CNN encoder로 24kHz waveform을 75Hz latent로 압축하고, 8 stage × 1024 codebook RVQ로 80 bits/frame = **6 kbps**를 달성했다. Opus 12kbps와 동등한 quality를 절반 bitrate에서 낸다.
+
+## Encodec — 위상(Phase)까지 학습한다
+
+Meta의 Encodec(Défossez 2022)은 SoundStream 위에 두 가지를 추가했다.
+
+첫째, **Multi-Scale STFT Discriminator**다. 단일 window size의 STFT는 한 time-frequency resolution만 본다. Encodec은 $n_\text{fft} \in \{64, 128, 256, 512, 1024, 2048\}$의 6개 scale에 각각 complex STFT discriminator를 배치한다. Real/imaginary 두 채널을 2D conv로 처리하므로 magnitude뿐 아니라 **위상 일관성**도 학습 대상이 된다.
+
+둘째, **Internal LM**이다. codec token 사이의 시간적 correlation을 small Transformer로 모델링하면, arithmetic coding으로 실제 전송 bits를 conditional entropy에 가깝게 줄일 수 있다. 경험적으로 6 kbps → ~4 kbps로 30~40% 절감된다.
+
+$$
+\text{실제 bitrate} = H(t_i \mid \text{context}) \leq \log_2 V
+$$
+
+<Callout type="note" title="트레이드오프">
+Internal LM은 quality 손실 없이 bitrate를 줄이지만 inference latency를 추가한다. Causal(streaming) 버전은 non-causal 대비 MUSHRA가 약 3점 낮지만 latency를 100ms 수준으로 유지한다. 실시간 voice 통신과 오프라인 고품질 생성 사이의 설계 분기점이다.
+</Callout>
+
+## Semantic Token과 Acoustic Token — 두 계층의 분리
+
+audio에는 서로 다른 성격의 정보가 섞여 있다.
+
+- **언어적 내용**(음운, 단어): speaker와 무관, 낮은 bitrate로 표현 가능
+- **음향 디테일**(timbre, prosody, F0): speaker 특성, 높은 bitrate 필요
+
+단일 RVQ codec으로 두 layer를 함께 표현하면 LM이 long-term linguistic coherence를 유지하기 어렵다. 600 token/sec(75Hz × 8 stage)의 시퀀스를 전부 attention해야 하기 때문이다.
+
+AudioLM(Borsos 2023)은 이를 계층으로 분리했다.
+
+$$
+P(\text{audio}) = P(\text{semantic}) \cdot P(\text{coarse acoustic} \mid \text{semantic}) \cdot P(\text{fine acoustic} \mid \text{semantic, coarse})
+$$
+
+w2v-BERT layer 7의 K-means cluster(50 cluster, 25Hz)가 semantic token, Encodec RVQ가 acoustic token을 담당한다. semantic stage는 25 token/sec로 long-term content를 모델링하고, acoustic stage는 conditional하므로 학습이 용이하다.
+
+| Token 종류 | 출처 | Vocab × Stage | Frame rate | bps |
+|---|---|---|---|---|
+| Semantic | HuBERT/w2v-BERT K-means | 50~1024 × 1 | 25 Hz | ~250 |
+| Coarse Acoustic | Encodec stage 1-4 | 1024 × 4 | 75 Hz | 3000 |
+| Fine Acoustic | Encodec stage 5-8 | 1024 × 4 | 75 Hz | 3000 |
+| Mimi (Moshi) | RVQ + w2v-BERT distill | 1024 × 8 | 12.5 Hz | 1000 |
+
+Kyutai의 Moshi(2024)는 다른 방향을 택했다. w2v-BERT feature를 첫 번째 RVQ stage에 distillation으로 녹여 넣은 **Mimi codec**이 semantic과 acoustic을 단일 스트림으로 통합한다. 12.5Hz frame rate로 LM의 context 부담을 줄이면서 200ms 수준의 실시간 latency를 달성한다.
+
+<Aside label="설계 철학">
+AudioLM의 계층 분리는 information을 명시적으로 분해한다. 각 stage가 전문화되어 quality가 높지만 3단계 순차 생성으로 latency가 크다. Moshi의 단일 스트림은 실시간 상호작용을 위한 선택이다. 두 paradigm은 "고품질 offline 생성"과 "실시간 대화형 AI" 사이의 trade-off를 반영한다.
+</Aside>
+
+## 정리
+
+- VQ는 continuous audio를 discrete token으로 변환하는 유일한 병목이다. 이 구조가 audio LM의 input/output을 text token과 같은 방식으로 처리 가능하게 한다.
+- RVQ는 차원의 저주를 $K \log_2 V$의 선형 cost로 우회하며, quantizer dropout 하나로 bitrate scalability를 공짜로 얻는다.
+- Encodec의 multi-scale STFT discriminator는 phase까지 학습 신호로 끌어들인다. Internal LM은 lossless bitrate 절감을 추가한다.
+- semantic token과 acoustic token의 분리는 long-term coherence와 fine-grained fidelity를 동시에 얻기 위한 architectural choice다.
+
+Lloyd 1957의 알고리즘이 2024년 audio LM의 핵심에 있는 이유는 단순하다 — continuous signal을 finite alphabet으로 변환하는 문제의 본질이 바뀌지 않았기 때문이다.
+
+<Reference
+  title="Neural Discrete Representation Learning"
+  authors="van den Oord et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1711.00937"
+/>
+
+<Reference
+  title="High Fidelity Neural Audio Compression"
+  authors="Défossez et al."
+  year={2022}
+  venue="TMLR"
+  url="https://arxiv.org/abs/2210.13438"
+/>
