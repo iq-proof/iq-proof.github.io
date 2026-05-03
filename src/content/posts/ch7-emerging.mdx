@@ -1,0 +1,132 @@
+---
+title: "Vision Transformer는 어떻게 픽셀을 넘어섰나"
+description: "토큰 기반 이미지 생성부터 Scaling Law, 3D 장면 표현, 영상 이해, 세계 모델까지 — Vision Transformer 설계 철학의 공통 실을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [vision-transformer, token-generation, scaling-law, nerf, video-transformer]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+ViT가 이미지를 패치 시퀀스로 다루기 시작한 순간, 시각 정보는 언어와 같은 문법을 갖게 됐다. 토큰화·스케일링·3D 표현·영상 이해·세계 모델이라는 서로 다른 주제처럼 보이지만, 그 아래에는 하나의 반복되는 통찰이 있다 — **픽셀 공간에서 의미 공간으로, 연속에서 이산으로, 개별 관측에서 세계 모델로**. 이 변환이 왜 이렇게 일관되게 작동하는가?
+
+## 토큰화: 이미지를 언어처럼 쓰는 법
+
+Parti(Google, 2022)와 Muse(Google, 2023)는 이미지 생성 문제를 "다음 토큰 예측"으로 환원했다. VQ-GAN 인코더 $E_\phi$가 이미지 $\mathbf{x}$를 256개의 정수 인덱스로 압축하면,
+
+$$\mathbf{t} = Q(E_\phi(\mathbf{x})) \in \{1, \ldots, K\}^{H \times W}$$
+
+생성 모델은 픽셀 대신 토큰을 예측한다. 256×256 이미지가 256개 토큰으로 압축되는 비율은 약 472:1이다. 그럼에도 고품질 생성이 가능한 이유는 **토큰이 픽셀보다 정보 밀도가 훨씬 높기** 때문이다.
+
+Parti는 이 토큰을 left-to-right으로 순차 예측한다:
+
+$$p_\theta(\mathbf{t} \mid \mathbf{c}) = \prod_{i=1}^{N} p_\theta(t_i \mid t_{<i}, \mathbf{c})$$
+
+Muse는 이 가정을 깨뜨렸다. 이미지는 언어처럼 엄격한 좌→우 의존성이 없다. 공간 지역성이 중요할 뿐이다. BERT-style masked prediction으로 90%의 토큰을 병렬 예측하고, confidence 기반으로 낮은 확신의 토큰을 재마스킹하는 반복 정제 과정을 8-16회 돌리면 Parti와 거의 동일한 FID를 32배 빠른 속도로 달성한다.
+
+<Callout type="note" title="트레이드오프: AR vs Masked">
+Autoregressive(Parti)는 정확한 조건부 분포를 학습하지만 256번의 순차 스텝이 필요하다. Masked(Muse)는 조건부 독립성 가정으로 약간의 이론적 편향이 생기지만, 이미지의 spatial locality 특성상 이 편향은 매우 작다(FID 기준 ~1%). 토큰 레벨에서는 32배 속도 향상이 품질 손실을 압도한다.
+</Callout>
+
+## 스케일링 법칙: 예산 배분의 과학
+
+Zhai et al.(2022)는 언어 모델의 스케일링 법칙을 비전으로 확장했다.
+
+$$\mathcal{L}(D, N, C) \approx A \cdot D^{-\alpha} \cdot N^{-\beta} \cdot C^{-\gamma}$$
+
+여기서 $\alpha \approx 0.10$, $\beta \approx 0.08$이다. log-log 공간에서 이 관계는 선형이고, task를 가로질러 보편적으로 관찰된다.
+
+고정 compute 예산 $C_\text{total} = c \cdot N \cdot D$ 아래서 최적 비율은 $D^* : N^* \approx 7$-$20$이다. 언어 모델의 Chinchilla 비율(~20:1)과 유사하지만, 비전은 약간 더 data-efficient하다.
+
+<Theorem kind="proposition" number="7.5" title="Compute-Optimal Allocation">
+주어진 compute 예산 $C$에서, model size $N^*$와 data size $D^*$의 최적 비율은 exponent 비 $\beta / \alpha$에 반비례한다. Vision의 경우 $D^* : N^* \approx 7$로, 언어 모델의 20보다 작다.
+</Theorem>
+
+더 흥미로운 발견은 **data quality**의 역할이다. DINOv2(Oquab et al., 2023)는 큐레이션된 142M 이미지(LVD-142M)가 1.3B 비정제 이미지와 비슷한 downstream 성능을 낸다는 것을 보였다. 유효 데이터 크기를 $D_\text{eff} = D \cdot q^{\lambda}$로 모델링하면, 품질 지수 $\lambda \approx 0.8$이다. 즉, 데이터를 10배 더 모으는 것과 품질을 상위 15%로 거르는 것이 동등한 효과를 낼 수 있다.
+
+<Aside label="설계 원칙">
+스케일링 법칙은 "얼마나 키울지"가 아니라 "어떻게 예산을 쓸지"의 과학이다. ViT-22B(Dehghani et al., 2023)는 이 법칙의 예측을 따라 22.5B 파라미터와 4B 이미지의 조합을 선택했고, 예측된 손실 값에 실제로 수렴했다.
+</Aside>
+
+## 3D 표현: 장면을 함수로 쓰다
+
+NeRF(Mildenhall et al., 2020)의 핵심 아이디어는 3D 장면 전체를 단일 MLP로 인코딩한다는 것이다.
+
+$$F_\Theta(\gamma(\mathbf{x}), \gamma(\mathbf{d})) \to (\mathbf{c}, \sigma)$$
+
+위치 $\mathbf{x}$와 시선 방향 $\mathbf{d}$를 Fourier 기저로 인코딩한 뒤 색과 밀도를 예측한다. Volume rendering integral을 discrete하게 근사하면,
+
+$$C(\mathbf{r}) \approx \sum_{i=1}^{N} T_i (1 - e^{-\sigma_i \delta_i}) \mathbf{c}_i$$
+
+이 수식은 완전히 미분 가능하므로, photometric loss $\|C(\mathbf{r}) - I_\text{gt}(\mathbf{r})\|^2$로 MLP 가중치를 직접 최적화할 수 있다.
+
+NeRF의 병목은 렌더링 속도다. 이미지 한 장에 pixel × sample 수만큼 MLP forward pass가 필요하다. 3D Gaussian Splatting(Kerbl et al., 2023)은 이를 explicit representation으로 대체했다. 장면을 수백만 개의 anisotropic Gaussian $(\boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j, \mathbf{c}_j, \alpha_j)$으로 저장하고, 카메라 변환 후 depth 순서로 2D에 rasterize한다. MLP forward pass 없이 GPU 병렬 연산만으로 60+ FPS 렌더링이 가능해진다.
+
+<Callout type="note" title="트레이드오프: Implicit vs Explicit">
+NeRF(implicit)는 메모리 효율적이고 연속 장면을 정확히 표현하지만 렌더링이 느리다. 3D GS(explicit)는 실시간 렌더링이 가능하지만 메모리를 더 쓰고, 훈련 분포 밖 뷰에서 외삽이 약하다. Generalizable NeRF(pixelNeRF 계열)는 ViT 인코더를 결합해 단일 이미지에서 3D를 예측하는 방향으로 진화했다.
+</Callout>
+
+## 영상 이해: 시간 차원의 토큰화
+
+이미지 ViT를 영상으로 확장하는 가장 단순한 방법은 $T \times H \times W$를 통째로 펼치는 것이다. 복잡도는 $O((THW)^2)$로 불가능하다.
+
+TimeSformer(Bertasius et al., 2021)는 **divided space-time attention**으로 이를 해결한다. 각 프레임에서 spatial attention을, 각 패치에 걸쳐 temporal attention을 순차로 적용하면,
+
+$$\text{복잡도: } O(THW(HW + T)) \quad \text{vs naive } O((THW)^2)$$
+
+$T=8$, $H'W'=196$에서 약 570배 감소한다.
+
+VideoMAE(Tong et al., 2022)는 masked video modeling에서 **tube masking**을 제안했다. 같은 spatial 위치의 패치를 모든 프레임에서 동시에 마스킹한다. 90% 이상을 마스킹해도 모델이 수렴하는 이유는 temporal coherence 덕분이다 — 인접 프레임은 매우 유사하므로, 마스크된 위치의 복원 신호가 temporal 방향에서 충분히 공급된다.
+
+Sora(OpenAI, 2024)는 이 위에 diffusion을 올렸다. U-ViT(skip connection이 있는 transformer 기반 diffusion)에 시공간 attention을 결합하고, DDIM으로 8-16 스텝 만에 고품질 영상을 생성한다. 영상의 temporal redundancy가 각 step당 정보 효율을 높여, 이미지 diffusion(50-1000 스텝)보다 훨씬 적은 스텝이 충분하다.
+
+## 공통 실: 차원 압축과 의미 밀도
+
+지금까지 살펴본 네 영역은 표면적으로 다르지만, 하나의 패턴이 반복된다.
+
+| 영역 | 압축 | 의미 공간 |
+|------|------|-----------|
+| 이미지 생성 | 픽셀 → VQ 토큰 (472:1) | 의미 단위로 생성 |
+| 스케일링 | 데이터 양 → 품질 보정 유효량 | $q^\lambda$ 배 압축 |
+| 3D 표현 | 고차원 픽셀 → Gaussian/MLP | 장면 implicit 인코딩 |
+| 영상 이해 | 시공간 full attention → divided | $O(THW(T+HW))$ |
+
+모든 설계 결정의 공통 동기는 **원본 공간의 차원을 줄이되 의미 밀도는 높이는 것**이다. VQ 토큰이 픽셀보다 정보가 밀집되어 있어서 생성이 빠르고, 큐레이션된 데이터가 효과적 크기를 키우며, NeRF MLP가 3D 장면을 수 MB에 압축하고, divided attention이 temporal redundancy를 이용한다.
+
+세계 모델(world model)은 이 방향의 논리적 종착점이다 — 영상을 단순히 이해하거나 생성하는 것을 넘어, 관측에서 잠재 dynamics를 추출하고 미래를 시뮬레이션한다.
+
+## 정리
+
+- VQ 토큰화는 이미지를 의미 단위로 변환해 생성 모델을 언어 모델처럼 설계 가능하게 한다. Masked parallel decoding은 이미지의 공간 구조가 언어의 순차 구조와 다르다는 통찰의 산물이다.
+- 스케일링 법칙 $\mathcal{L} \propto D^{-\alpha} N^{-\beta}$은 compute 예산의 최적 배분을 결정한다. 데이터 품질의 지수 효과($\lambda \approx 0.8$)는 큐레이션이 단순 수량 증가보다 효율적임을 보인다.
+- NeRF의 implicit MLP와 3D GS의 explicit Gaussian은 모두 고차원 픽셀 공간을 낮은 차원 의미 공간으로 투영하는 방식이며, 속도와 정확도의 tradeoff에서 서로 다른 점을 선택한다.
+- Divided space-time attention과 tube masking은 temporal redundancy를 활용해 영상의 복잡도를 이미지 수준으로 다루는 기법이다.
+
+각 챕터는 같은 질문의 다른 표현이다 — 어떻게 하면 시각 정보를 더 적은 차원에 더 많은 의미로 담을 수 있는가.
+
+<Reference
+  title="Scaling Vision Transformers"
+  authors="Zhai et al."
+  year={2022}
+  venue="CVPR"
+  url="https://arxiv.org/abs/2106.04560"
+/>
+
+<Reference
+  title="NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+  authors="Mildenhall et al."
+  year={2020}
+  venue="ECCV"
+  url="https://arxiv.org/abs/2003.08934"
+/>

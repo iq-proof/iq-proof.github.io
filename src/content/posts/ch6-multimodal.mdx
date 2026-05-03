@@ -1,0 +1,147 @@
+---
+title: "Vision-Language Model은 어떻게 이미지를 '이해'하는가"
+description: "CLIP의 대칭 손실부터 Flamingo의 gated cross-attention까지, 이미지와 텍스트를 하나의 공간에 정렬하는 핵심 메커니즘을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [vision-language, clip, contrastive-learning, multimodal, transformer]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+이미지를 "이해"하는 모델을 만들려면 무엇이 필요한가? 픽셀을 분류 레이블에 매핑하는 것으로는 부족하다. 모델이 "강아지 사진"이라는 자연어 설명과 실제 강아지 이미지를 **같은 공간의 같은 점**으로 인식해야 진정한 의미에서 이해라고 부를 수 있다. CLIP에서 Flamingo, LLaVA까지 — 이 챕터들은 모두 같은 질문을 다른 방식으로 풀고 있다. 어떻게 두 이질적인 모달리티를 하나의 표현 공간으로 정렬할 것인가?
+
+## 정렬 문제: 대칭 손실의 탄생
+
+CLIP이 해결한 핵심 문제는 **비대칭 학습을 막는 것**이었다. 이미지 인코더만 "텍스트 쪽으로" 밀리도록 학습하면, 텍스트 인코더는 이미지 공간을 전혀 고려하지 않는다. 두 인코더가 균등하게 학습되려면 손실이 양방향이어야 한다.
+
+배치 크기 $B$에 대해, 정규화된 이미지 임베딩 $\mathbf{z}_I^{(i)}$와 텍스트 임베딩 $\mathbf{z}_T^{(j)}$의 유사도 행렬을 다음과 같이 정의한다.
+
+$$
+S_{ij} = \tau \cdot (\mathbf{z}_I^{(i)})^\top \mathbf{z}_T^{(j)}
+$$
+
+여기서 $\tau$는 학습 가능한 온도 파라미터다. 그러면 CLIP 손실은 다음과 같다.
+
+$$
+L_{\text{CLIP}} = \frac{1}{2}(L_{i \to t} + L_{t \to i})
+= \frac{1}{2}\left(-\frac{1}{B}\sum_i \log \frac{e^{S_{ii}}}{\sum_j e^{S_{ij}}} - \frac{1}{B}\sum_j \log \frac{e^{S_{jj}}}{\sum_i e^{S_{ij}}}\right)
+$$
+
+대각선 원소 $S_{ii}$가 positive pair이고, 나머지는 minibatch 내 자동 생성된 hard negative다.
+
+<Theorem kind="proposition" number="1" title="대칭 손실과 상호 정보량">
+CLIP의 대칭 손실 $L_{\text{CLIP}}$은 두 InfoNCE 손실의 평균과 동치이며, 각각 이미지-텍스트 임베딩의 상호 정보량(mutual information)에 대한 variational lower bound를 구성한다.
+</Theorem>
+
+<Proof>
+Oord et al. (2018)의 InfoNCE 결과에 따르면, batch size $B$에서의 contrastive 손실은 $I(I; T) \geq \log B - L$의 하한을 형성한다. 대칭 손실은 이미지→텍스트, 텍스트→이미지 두 방향의 gradient를 모두 각 인코더에 전달한다. 편미분을 계산하면 $\partial L_{i \to t}/\partial S_{ij} = (p_{ij} - \delta_{ij})/B$이고, 대칭 손실은 이 gradient를 양쪽 인코더에 균등 분배한다. 따라서 $L_{\text{CLIP}}$을 최소화하는 것은 두 인코더 임베딩의 상호 정보를 최대화하는 것과 동치다. $\square$
+</Proof>
+
+온도 $\tau$의 역할도 수학적으로 명확하다. $\tau \to 0$이면 softmax가 one-hot에 수렴해 gradient가 소실되고, $\tau \to \infty$이면 uniform 분포로 정보가 사라진다. CLIP은 $\tau$를 학습 가능하게 하되 $[1/100, 100]$으로 clamp해 수치 안정성을 보장한다.
+
+## BLIP: 정렬만으로는 부족하다
+
+CLIP은 embedding을 **정렬**할 뿐이다. "이 이미지와 이 텍스트가 같은 대상인가?"라는 더 세밀한 질문에 답하거나, 이미지로부터 설명을 생성하는 능력은 없다. BLIP은 세 가지 손실을 동시에 학습해 이 한계를 돌파한다.
+
+$$
+L_{\text{BLIP}} = L_{\text{ITC}} + L_{\text{ITM}} + L_{\text{LM}}
+$$
+
+- **ITC** (Image-Text Contrastive): CLIP과 동일한 대칭 손실 — 전체적 정렬
+- **ITM** (Image-Text Matching): 이미지-텍스트 쌍의 이진 분류 — hard negative 구별
+- **LM** (Language Modeling): 이미지로부터 캡션 생성 — 생성 능력
+
+ITM은 CLIP이 놓치는 부분을 메운다. "강아지 사진"과 "숲 풍경"의 임베딩이 충분히 멀다는 것은 ITC로 학습되지만, 미묘하게 다른 두 설명이 **같은 이미지를 가리키는가**는 ITM이 담당한다. 검색 태스크에서 ITM이 없으면 성능이 눈에 띄게 떨어진다.
+
+BLIP-2는 여기서 더 나아가 frozen ViT와 frozen LLM 사이에 **Q-Former**라는 병목을 삽입한다. 32개의 학습 가능한 query 벡터가 cross-attention으로 ViT의 144개 토큰을 압축해 LLM의 prefix로 전달한다. 전체 8B+ 파라미터 중 학습되는 것은 ~200M뿐이다.
+
+## LLaVA: 가장 단순한 연결
+
+LLaVA는 더 극단적인 단순함을 선택한다. Frozen CLIP ViT → 선형 투영(혹은 2층 MLP) → Frozen LLM. Q-Former 같은 정교한 adapter 없이, 투영 행렬 $W \in \mathbb{R}^{D_v \times D_{\text{lm}}}$ 하나가 두 특징 공간을 연결한다.
+
+```python
+class LinearProjection(torch.nn.Module):
+    def __init__(self, d_vision=768, d_lm=4096):
+        super().__init__()
+        self.linear = torch.nn.Linear(d_vision, d_lm)
+    
+    def forward(self, vision_features):
+        # (B, 257, 768) → (B, 257, 4096)
+        return self.linear(vision_features)
+```
+
+왜 이 단순함이 작동하는가? ViT와 LLM의 임베딩 공간이 이미 같은 의미적 다양체(semantic manifold)를 표현하고 있다면, 선형 변환으로 정렬이 가능하다는 것이 CCA(Canonical Correlation Analysis) 계열 이론의 핵심이다.
+
+학습은 2단계로 나뉜다. Stage 1에서는 투영 레이어만 학습해 시각 임베딩을 언어 공간에 pre-align한다. Stage 2에서는 GPT-4로 생성한 합성 시각 instruction 데이터로 추론 능력을 학습한다. 2단계를 분리하지 않으면 "공간 정렬"과 "instruction 따르기"를 동시에 학습해야 해 수렴이 크게 느려진다.
+
+<Callout type="warning" title="합성 데이터의 함정">
+GPT-4로 생성한 150K 쌍은 문법적으로 깔끔하고 다양하지만, 실제 사용자의 모호하고 비정형적인 질문을 충분히 반영하지 못한다. LLaVA-1.5가 실제 human annotation을 추가해 ~2% 성능 향상을 얻은 것은 이 간극을 보여준다.
+</Callout>
+
+## Flamingo: 점진적 통합의 설계
+
+CLIP, BLIP, LLaVA는 모두 이미지 한 장과 텍스트를 처리한다. Flamingo는 `[image][text][image][text]...` 형식의 **인터리브 시퀀스**를 처리하며, few-shot in-context learning을 시각 태스크로 자연스럽게 확장한다.
+
+핵심은 **gated cross-attention**이다. Frozen LLM의 각 decoder 레이어 안에, 텍스트 hidden state를 query로 frozen vision encoder의 출력에 attend하는 cross-attention 블록을 삽입하되, 게이팅으로 초기 통합을 제어한다.
+
+$$
+\text{output} = \tanh(\alpha) \odot \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+$\alpha$는 학습 가능한 스칼라로, 초기값은 $\log(1/c)$ ($c \approx 0.01$)에 가깝게 설정한다. 초기화 시점에서 $\tanh(\alpha) \approx 0$이므로, 모델은 사실상 텍스트 전용 LM으로 동작하다가 학습이 진행되면서 $\alpha$가 증가해 시각 정보를 점진적으로 통합한다.
+
+<Aside label="왜 점진적 통합이 필요한가">
+Frozen ViT와 Frozen LLM은 서로 다른 목적함수로 별도 학습됐다. 두 표현 공간의 초기 mismatch는 크다. 게이트 없이 cross-attention을 바로 연결하면 early training에서 gradient가 폭발해 수렴이 불안정해진다. $\tanh(\alpha)$의 초기값을 0에 가깝게 설정하는 것은 이 정렬 문제를 warm-up 없이 해결하는 설계 선택이다.
+</Aside>
+
+## 트레이드오프: 분리 vs. 통합
+
+이 챕터들을 관통하는 핵심 긴장은 **분리된 인코더(adapter 방식) vs. 단일 네이티브 Transformer** 사이의 선택이다.
+
+<Callout type="note" title="트레이드오프">
+**Flamingo/LLaVA 방식 (분리)**
+- 장점: 검증된 pretrained 모델 재활용, 학습 가능 파라미터 최소화, 빠른 실험
+- 단점: 시각과 언어의 표현 공간이 여전히 분리됨; 시각 토큰이 언어 토큰에 attend할 수 없음 (단방향)
+
+**GPT-4V / Gemini 방식 (네이티브)**
+- 장점: 단일 attention space에서 양방향 추론; 더 자연스러운 cross-modal 이해
+- 단점: 이미지 토큰 수가 많아 $O(N^2)$ 비용 폭발; from-scratch 학습 비용 막대
+</Callout>
+
+실무에서는 모델 규모와 컴퓨팅 예산에 따라 선택이 갈린다. 7B-13B 규모에서는 LLaVA 방식이 현실적이고, 70B 이상에서는 frozen encoder 활용이 유리하다. Gemini 1.5처럼 네이티브 통합을 대규모로 구현하려면 그에 상응하는 엔지니어링 투자가 따른다.
+
+## 정리
+
+- CLIP의 대칭 InfoNCE 손실은 두 인코더를 균등하게 학습시키며, 배치 내 자동 생성된 hard negative가 학습 효율을 결정한다.
+- BLIP은 ITC+ITM+LM 세 손실로 정렬·판별·생성 능력을 동시에 획득하고, Q-Former는 이를 파라미터 효율적으로 LLM에 연결한다.
+- LLaVA는 선형 투영 하나로 두 frozen 모델을 연결하며, 2단계 학습(정렬→instruction)으로 수렴을 안정화한다.
+- Flamingo의 `tanh(α)` 게이팅은 분리된 pretrained 모델의 초기 mismatch를 점진적으로 해소하는 설계 선택이다.
+
+단순한 투영 하나부터 32개 학습 가능한 query까지 — 결국 이 모든 방법은 "두 이질적인 표현 공간 사이에서 의미를 보존하는 변환을 어떻게 학습할 것인가"라는 하나의 질문의 변주다.
+
+<Reference
+  title="Learning Transferable Visual Models From Natural Language Supervision"
+  authors="Radford et al."
+  year={2021}
+  venue="ICML"
+  url="https://arxiv.org/abs/2103.00020"
+/>
+
+<Reference
+  title="Flamingo: a Visual Language Model for Few-Shot Learning"
+  authors="Alayrac et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2204.14198"
+/>

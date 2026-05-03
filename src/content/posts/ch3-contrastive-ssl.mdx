@@ -1,0 +1,147 @@
+---
+title: "Self-Supervised Learning의 세 가지 얼굴"
+description: "Generative, Contrastive, Self-Distillation — label 없이 representation을 학습하는 세 패러다임의 손실함수, 수렴점, 그리고 트레이드오프를 하나의 프레임으로 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [self-supervised-learning, contrastive-learning, infonce, mutual-information, vision-transformer]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Self-Supervised Learning(SSL)은 label 없이 supervision signal을 만든다. 그런데 그 "만드는 방식"이 결정적이다 — 같은 데이터로도 Generative, Contrastive, Self-Distillation 세 패러다임은 서로 다른 정보를 representation에 담고, 서로 다른 downstream task에 강하다. 왜 이 세 가지가 implicit하게 최대화하는 목적함수가 다른가?
+
+## 세 패러다임의 출발점
+
+```
+1. GENERATIVE      x → [MASK] → encoder → decoder → x̂
+   Loss: ||x - x̂||²    (patch reconstruction)
+
+2. CONTRASTIVE     x → Aug₁ → f → z₁
+                   x → Aug₂ → f → z₂
+   Loss: -log(exp(sim(z₁,z₂)/τ) / Σexp(...))
+
+3. SELF-DISTILLATION
+                   x → Aug₁ → θ_s → z_s
+                   x → Aug₂ → θ_t(EMA) → z_t
+   Loss: 2 - 2·sim(q(z_s), sg[z_t])
+```
+
+세 패러다임은 배움의 동기가 근본적으로 다르다. Generative는 "빠진 부분을 채워라"이고, Contrastive는 "같은 것과 다른 것을 구분해라"이며, Self-Distillation은 "자신의 느린 버전을 따라가라"다. 이 차이는 수식 수준에서도 그대로 드러난다.
+
+## 손실함수와 암묵적 목적함수
+
+세 패러다임은 각각 다른 정보이론적 양을 implicit하게 최대화한다.
+
+**Generative (MAE-style)**:
+
+$$L_{\text{gen}} = \|x_{\text{masked}} - g(f(x_{\text{visible}}))\|^2$$
+
+MSE loss를 최소화하면 encoder $f$는 visible patch로부터 masked patch를 설명하는 spatial locality를 학습한다. 결과적으로 저주파 공간 구조와 patch correlation이 representation에 담긴다.
+
+**Contrastive (InfoNCE)**:
+
+$$L_{\text{cont}} = -\frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(\mathrm{sim}(z_i, z_j) / \tau)}{\sum_{k \neq i} \exp(\mathrm{sim}(z_i, z_k) / \tau)}$$
+
+<Theorem kind="theorem" number="1" title="InfoNCE와 Mutual Information 하한 (Poole 2019)">
+$N$개의 negative samples에 대해:
+$$I(X; Y) \geq \log N - L_{\text{InfoNCE}}$$
+</Theorem>
+
+<Proof>
+Optimal critic $f^*(x, y) = \log p(y|x)/p(y)$를 InfoNCE에 대입하고 Jensen 부등식(log의 오목성)을 적용하면, denominator의 기댓값이 $N$으로 수렴한다. 따라서 $L_{\text{InfoNCE}} \geq \log N - I(X;Y)$이고, 정리하면 위 부등식이 성립한다. $N \to \infty$일 때 bound는 tight해진다.
+</Proof>
+
+즉, InfoNCE를 최소화하는 것은 mutual information의 하한을 최대화하는 것이다. Negative가 많을수록($N$ 증가) 이 하한이 높아진다 — 이것이 SimCLR이 large batch(8K)를, MoCo가 queue(65536)를 필요로 하는 이유다.
+
+**Self-Distillation (BYOL/SimSiam)**:
+
+$$L_{\text{dist}} = 2 - 2 \cdot \mathrm{sim}(q_{\theta_s}(z_1), \mathrm{sg}[z_2'])$$
+
+여기서 $\mathrm{sg}[\cdot]$은 stop-gradient다. Negative 없이도 collapse하지 않는 이유는 Tian et al. (2021)의 saddle point 분석으로 설명된다 — predictor $q$와 stop-gradient의 비대칭 구조가 constant solution $z_s = z_t = c$(collapse)를 $\nabla L = 0$의 saddle point로 만들어, small perturbation만으로도 escape할 수 있다.
+
+## SimCLR과 MoCo: Negative의 경제학
+
+Contrastive 패러다임 내에서도 "어떻게 충분한 negative를 확보하는가"가 설계의 핵심이다.
+
+SimCLR은 답이 단순하다 — batch 자체를 키운다. Batch size 4096이면 $N = 8190$개의 negative가 생긴다. 이론적으로 $\log N \approx 9$ nats의 MI 하한을 보장한다. 대신 대가가 크다: 8K batch의 이미지 메모리는 수백 GB에 달한다.
+
+MoCo는 다른 답을 낸다 — 이미지 대신 **feature를 저장**한다. Queue size $K = 65536$이면 feature 메모리는 약 33MB에 불과하다($65536 \times 128 \times 4$ bytes). 그리고 queue를 신선하게 유지하기 위해 key encoder를 EMA로 천천히 업데이트한다.
+
+$$\theta_k^{(t)} = \tau \cdot \theta_k^{(t-1)} + (1 - \tau) \cdot \theta_q^{(t)}, \quad \tau = 0.999$$
+
+EMA coefficient $\tau = 0.999$는 effective lookback period를 $1/(1-\tau) = 1000$ steps로 만든다. Key encoder가 query encoder보다 "조금 느리게" 따라가도록 — 너무 느리면 stale, 너무 빠르면 inconsistent한 이 균형점이 MoCo의 핵심이다.
+
+<Aside label="MoCo v3의 선택">
+MoCo v3는 ViT backbone을 도입하면서 queue를 아예 버렸다. ViT의 global self-attention은 ResNet보다 representation이 안정적이어서, queue 없이도 학습이 수렴한다. Architecture의 inductive bias가 달라지면 필요한 engineering도 달라진다.
+</Aside>
+
+## BYOL과 SimSiam: Negative 없는 안정성
+
+Self-Distillation 패러다임의 본질적 질문은 하나다 — "왜 collapse하지 않는가?"
+
+BYOL은 EMA target으로 답한다. Student가 slow-moving target을 추격하는 구조가 implicit asymmetry를 만든다. SimSiam은 더 단순하다: predictor MLP와 stop-gradient만으로 충분하다.
+
+```python
+# SimSiam의 핵심: stop-gradient가 없으면 즉시 collapse
+loss = -(sim(p1, z2.detach()) + sim(p2, z1.detach())) / 2
+#                   ^^^^^^^^          ^^^^^^^^
+#                   이것이 없으면 z_s = z_t = c로 수렴
+```
+
+Stop-gradient를 제거하면 gradient가 순환 경로를 따라 흘러, 모든 레이어가 같은 collapse 방향으로 업데이트된다. Predictor를 제거해도 마찬가지 — landscape가 flat해져서 constant solution이 stable minimum이 된다.
+
+<Callout type="warning" title="Dimensional Collapse vs Full Collapse">
+Full collapse는 모든 샘플이 동일한 representation($z_i = c$)으로 수렴하는 것이다. Dimensional collapse는 representation이 저차원 subspace에 갇히는 것으로, 정보 손실은 적지만 semantic diversity가 감소한다. Contrastive의 uniformity term이 전자를 방지하고, Self-Distillation의 비대칭 구조가 주로 전자를 방지한다.
+</Callout>
+
+## 트레이드오프
+
+세 패러다임의 선택은 task와 자원에 따라 달라진다.
+
+| 항목 | Generative | Contrastive | Self-Distillation |
+|---|---|---|---|
+| Negative 필요 | No | Yes (large batch) | No |
+| Batch size 민감도 | Low | High | Low |
+| Fine-tune 성능 | High | Medium | High |
+| Dense task (segmentation) | Excellent | Medium | Good |
+| 이론적 명확성 | Reconstruction | MI bound (Poole 2019) | Saddle point (Tian 2021) |
+
+Generative(MAE)는 masked patch reconstruction을 통해 spatial locality를 학습하기 때문에 segmentation, depth estimation 같은 dense task에 강하다. Contrastive(SimCLR, MoCo)는 augmentation-invariant semantic feature를 학습하므로 linear probe evaluation에서 높은 성능을 보이지만, large batch 또는 queue가 필수다. Self-Distillation(BYOL, DINO)은 small batch에서도 작동하고 semantic representation이 강하다 — DINO의 attention map이 별도 supervision 없이 객체를 자동으로 분리하는 것이 이 특성의 증거다.
+
+세 패러다임은 mutually exclusive가 아니다. iBOT처럼 Self-Distillation + Masked Image Modeling을 결합한 hybrid도 있고, MoCo v3처럼 아키텍처가 바뀌면 필요한 메커니즘도 바뀐다.
+
+## 정리
+
+- Generative는 $\|x - \hat{x}\|^2$로 spatial locality를 학습하고, Contrastive는 InfoNCE로 mutual information 하한을 최대화하며, Self-Distillation은 predictor + stop-gradient의 비대칭으로 collapse를 회피한다.
+- InfoNCE의 $\log N$ 항은 negative count가 많을수록 MI 하한이 높아짐을 보장한다 — SimCLR의 large batch와 MoCo의 queue는 같은 목표의 다른 구현이다.
+- BYOL/SimSiam의 collapse 회피는 saddle point 기하학, SGD의 implicit regularization, Batch Normalization이 함께 작동한 결과이며 단일 요인으로 설명되지 않는다.
+- Dense task에는 Generative, linear probe에는 Contrastive, 자원이 제한되면 Self-Distillation이 유리한 출발점이다.
+
+세 패러다임은 결국 같은 질문에 다른 언어로 답한다 — "label 없이 무엇을 supervision으로 삼을 것인가?"
+
+<Reference
+  title="A Simple Framework for Contrastive Learning of Visual Representations"
+  authors="Chen et al."
+  year={2020}
+  venue="ICML"
+  url="https://arxiv.org/abs/2002.05709"
+/>
+
+<Reference
+  title="Representation Learning with Contrastive Predictive Coding"
+  authors="Oord et al."
+  year={2018}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1807.03748"
+/>

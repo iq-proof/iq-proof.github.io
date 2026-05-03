@@ -1,0 +1,132 @@
+---
+title: "ViT의 데이터 허기는 어떻게 채워지는가"
+description: "inductive bias 부재라는 ViT의 근본 제약부터, distillation·window attention·spatial reduction·hybrid·multi-scale까지 다섯 가지 해법의 설계 철학을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [vision-transformer, hierarchical-vit, attention, inductive-bias, efficient-attention]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+ViT는 강력하다. patch 단위 global attention으로 long-range dependency를 단 한 layer에서 포착한다. 그러나 CNN이 공짜로 갖는 것들 — locality, translation equivariance, hierarchical feature — 을 ViT는 전혀 갖지 않는다. 그 대가가 바로 **데이터 허기**다. ImageNet-1k만으로는 ResNet에도 미치지 못한다. 이 제약을 메우기 위해 2021년 한 해에만 다섯 갈래의 해법이 등장했다. 이 다섯 갈래는 서로 다른 언어로 같은 질문에 답한다 — **inductive bias 없이 어떻게 충분히 학습할 수 있는가?**
+
+## 문제의 뿌리: inductive bias 부재
+
+CNN의 convolution kernel은 locality를 강제한다. 인접 픽셀끼리만 연산하므로, 적은 데이터로도 "가까운 것이 관련 있다"는 편향이 학습에 내재된다. ViT의 self-attention은 그 반대다. 모든 patch 쌍이 동등하게 연결된다. 처음부터 어디가 중요한지 모른다. 1억 장 규모의 JFT-300M 같은 데이터가 있으면 이 편향의 부재가 오히려 유연성이 된다. 그러나 ImageNet-1k (130만 장) 수준에서는 CNN 대비 2-3% 낮은 정확도로 귀결된다.
+
+이 제약을 해결하는 방향은 크게 두 가지다. 하나는 **데이터 또는 신호를 보강하는 것** (DeiT), 다른 하나는 **architecture에 locality를 주입하는 것** (Swin, PVT, CvT/CoAtNet, MViT/Focal). 두 방향 모두 "inductive bias는 부여하거나 학습하게 할 수 있다"는 동일한 통찰에서 출발한다.
+
+## DeiT: teacher CNN의 편향을 토큰으로 주입하다
+
+Touvron et al. (2021)의 DeiT는 architecture를 건드리지 않는다. 대신 **distillation token** $x_{\text{dist}}$를 CLS token 옆에 추가하고, 이 토큰이 CNN teacher의 hard label을 학습하게 만든다.
+
+$$
+L_{\text{DeiT}} = \frac{1}{2} L_{\text{CE}}(z^{\text{cls}}, y) + \frac{1}{2} L_{\text{CE}}(z^{\text{dist}}, y_{\text{teacher}})
+$$
+
+CLS token은 ground truth $y$를, DIST token은 CNN teacher의 예측 $y_{\text{teacher}} = \arg\max_c f_{\text{teacher}}(x)$를 학습한다. 이 hard distillation이 soft distillation(KL divergence 기반)보다 효과적인 이유는 신호의 명확성에 있다. ImageNet-1k처럼 데이터가 적은 regime에서 teacher의 confidence가 높을 때, argmax로 추출한 hard label의 gradient norm이 soft distribution을 맞추려는 gradient보다 크다.
+
+두 번째 전략은 강한 augmentation이다. Mixup, CutMix, RandAugment, Random Erasing, Stochastic Depth의 조합은 유효 training set 크기를 약 2.5-3배 늘리는 효과를 낸다. 결과: ImageNet-1k만으로 ResNet-50과 EfficientNet-B5를 넘어섰다.
+
+<Callout type="note" title="distillation token의 역할">
+단순히 CLS token 하나로 두 신호(ground truth + teacher label)를 동시에 학습하면 gradient conflict가 발생한다. 별도 토큰은 이 두 신호를 독립적인 경로로 라우팅하는 gradient router다.
+</Callout>
+
+## Swin과 PVT: 복잡도를 선형으로 만드는 두 가지 방법
+
+ViT의 $O(n^2)$ attention은 고해상도 이미지나 dense prediction에서 실용적이지 않다. Liu et al. (2021)의 **Swin Transformer**와 Wang et al. (2021)의 **PVT**는 서로 다른 방식으로 이 복잡도를 줄인다.
+
+**Swin은 공간을 분할한다.** 이미지를 $w \times w$ window로 나누고, window 안에서만 attention을 계산한다. 복잡도는 $O(n \cdot w^2)$로 내려가고, $w=7$ 고정이면 사실상 $O(n)$이다. 문제는 window 경계다. 인접 window끼리 정보를 교환하지 않으면 receptive field가 layer를 거쳐도 $w$에 묶인다. 해결책이 **shifted window**: 홀수 layer에서 window partition을 $\lfloor w/2 \rfloor$만큼 cyclic shift하면, 이전 layer의 window 경계가 새 window 내부에서 만난다. $L$개 layer 후 receptive field는 $\Theta(L \cdot w)$로 확장된다.
+
+**PVT는 Key/Value를 압축한다.** Query는 full resolution을 유지하되, Key와 Value에만 stride-$R$ convolution을 적용한다.
+
+$$
+X_{\text{red}} = \text{Conv2d}_{\text{stride-}R}(X), \quad K = X_{\text{red}} W_K, \quad V = X_{\text{red}} W_V
+$$
+
+복잡도는 $O(n^2/R^2)$이다. 그리고 Query가 full resolution이므로, Swin처럼 shifted window 없이도 모든 patch가 globally attend할 수 있다. 대신 K/V 압축으로 일부 정보 손실이 생기고, 이 손실이 얼마나 허용 가능한지는 stage별 $R$ 값 조정으로 제어한다 (Stage 1: $R=8$, Stage 4: $R=1$).
+
+<Theorem kind="proposition" number="1" title="Swin window attention의 선형 복잡도">
+window size $w$를 고정했을 때, 총 patch 수 $n$에 대해 window attention의 복잡도는 $O(n \cdot w^2)$이다.
+</Theorem>
+
+<Proof>
+전체 window 수는 $M = n/w^2$개다. 각 window 안에서 $w^2$개 token 간 attention을 계산하므로 single window 복잡도는 $O(w^4)$. 전체 복잡도는 $M \cdot O(w^4) = (n/w^2) \cdot O(w^4) = O(n \cdot w^2)$. $w$가 상수라면 $O(n)$이다. $\square$
+</Proof>
+
+## CvT와 CoAtNet: CNN의 편향을 architecture에 녹이다
+
+DeiT가 외부 teacher를 통해 inductive bias를 주입했다면, CvT와 CoAtNet은 **architecture 자체에** CNN의 특성을 끼워 넣는다.
+
+**CvT** (Wu et al. 2021)는 두 곳을 바꾼다. Patch embedding에 overlapping convolution (`kernel=7, stride=4`)을 써서 인접 patch 간 공간 연속성을 확보하고, QKV projection을 depthwise convolution으로 계산한다. Input을 shift하면 depthwise conv output도 같은 방향으로 shift되므로, vanilla ViT의 position embedding 의존성이 줄고 translation equivariance가 부분적으로 회복된다.
+
+**CoAtNet** (Dai et al. 2021)은 4-stage를 물리적으로 분리한다. 앞 두 stage는 MBConv (CNN), 뒤 두 stage는 Transformer다. 직관은 명확하다: 저수준 특징 (edge, texture)은 고해상도 stage에서 CNN으로 효율적으로 추출하고, 고수준 의미론은 이미 downsampling된 저해상도 stage에서 Transformer가 global context를 포착한다. 같은 FLOPs에서 ResNet, EfficientNet, ViT를 모두 앞선다.
+
+<Aside label="설계 철학의 분기점">
+CvT는 "Transformer 안에 CNN을 주입"하는 방향, CoAtNet은 "CNN과 Transformer를 stage별로 분업"시키는 방향이다. 전자는 unified architecture의 단순함, 후자는 각 stage 최적화라는 유연함을 가진다.
+</Aside>
+
+## MViT와 Focal Transformer: attention 자체를 multi-scale로 만들다
+
+앞의 네 접근은 모두 "어떻게 efficient하게 만들 것인가"에 답했다. **MViT** (Fan et al. 2021)와 **Focal Transformer** (Yang et al. 2021)는 다른 질문을 던진다. **attention 자체를 multi-scale로 만들 수 있는가?**
+
+**MViT**는 Pool-based attention을 사용한다. Query는 full resolution을 유지하되, Key와 Value에 stride-$r$ average pooling을 적용한다.
+
+$$
+\mathrm{PoolAttn}(Q, K, V) = \mathrm{softmax}\left(\frac{Q(K_{\text{pool}})^\top}{\sqrt{d}}\right) V_{\text{pool}}
+$$
+
+4개 stage를 거치며 pooling이 누적되면 (Stage 1: $r=2$, Stage 4: $r=1$), FPN과 유사한 hierarchical feature pyramid가 architecture 설계 없이 자동으로 생성된다. Video domain에서는 이 pooling을 temporal + spatial 두 차원에 동시 적용한다. Temporal coherence는 fine하게, spatial은 coarse하게 처리하면 video의 방대한 token 수 문제가 자연스럽게 해결된다.
+
+**Focal Transformer**는 다른 방식으로 multi-scale을 구현한다. 각 query token이 두 종류의 이웃을 attend한다: **fine neighbors** (7×7 dense window)와 **coarse neighbors** (전체 이미지에서 sparse sampling한 32개 token). attention이 두 종류의 정보를 동시에 볼 수 있으므로, local detail과 global context가 하나의 layer 안에서 결합된다. 인간의 시각계에서 초점(focal)과 주변시(peripheral)가 동시에 작동하는 것과 유사하다.
+
+$$
+\mathrm{FocalAttn}(Q, [K_{\text{fine}}; K_{\text{coarse}}], [V_{\text{fine}}; V_{\text{coarse}}]) = \mathrm{softmax}\left(\frac{Q[K_{\text{fine}}; K_{\text{coarse}}]^\top}{\sqrt{d}}\right)[V_{\text{fine}}; V_{\text{coarse}}]
+$$
+
+## 트레이드오프
+
+다섯 접근 각각은 서로 다른 비용을 치른다.
+
+<Callout type="note" title="트레이드오프 비교">
+- **DeiT**: Teacher CNN이 반드시 필요하다. Teacher quality가 낮으면 distillation signal도 낮아진다. Fine-tuning 단계에서는 DIST token을 제거하는 것이 표준이다.
+- **Swin**: Window size가 고정되므로 다른 resolution으로 transfer 시 position bias 재조정이 필요하다. Cyclic shift + masking 구현이 복잡하다.
+- **PVT**: K/V의 공격적인 압축은 경계 정보 손실을 유발한다. Query가 full resolution이므로 메모리 사용량이 많아 batch size가 제약된다.
+- **CvT/CoAtNet**: Depthwise conv overhead와 CNN-Transformer stage transition에서 gradient flow가 명확하지 않다. Architecture 복잡도가 높다.
+- **MViT/Focal**: Pooling이나 sparse sampling으로 인한 정보 손실이 있다. Focal의 dense fine window는 window size가 커지면 여전히 quadratic이다.
+</Callout>
+
+## 정리
+
+- ViT의 inductive bias 부재는 **데이터 보강**(DeiT)이나 **architecture 수정**(Swin, PVT, CvT, CoAtNet, MViT, Focal) 두 경로로 보상할 수 있다.
+- Swin은 window partition으로, PVT는 K/V spatial reduction으로, 복잡도를 $O(n^2)$에서 선형에 가깝게 낮춘다.
+- CvT와 CoAtNet은 CNN의 locality와 translation equivariance를 architecture 안에 내재화해 data efficiency를 높인다.
+- MViT와 Focal은 attention 자체를 multi-scale로 재설계해 단일 mechanism으로 hierarchical representation을 만든다.
+
+"inductive bias는 학습 가능하다" — 이 다섯 챕터가 공유하는 핵심 통찰이다. 어떻게 주입하느냐의 방식이 다를 뿐, 모든 설계 결정은 같은 결론을 향한다.
+
+<Reference
+  title="Training data-efficient image transformers & distillation through attention"
+  authors="Touvron et al."
+  year={2021}
+  venue="ICML"
+  url="https://arxiv.org/abs/2012.12877"
+/>
+
+<Reference
+  title="Swin Transformer: Hierarchical Vision Transformer using Shifted Windows"
+  authors="Liu et al."
+  year={2021}
+  venue="ICCV"
+  url="https://arxiv.org/abs/2103.14030"
+/>

@@ -1,0 +1,126 @@
+---
+title: "ViT는 왜 이미지를 patch로 쪼개는가"
+description: "Dosovitskiy 2021의 수식 파이프라인부터 inductive bias 부족이 초래하는 데이터 요구량까지, Vision Transformer의 설계 결정을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [vision-transformer, patch-embedding, self-attention, inductive-bias]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Vision Transformer(ViT)는 convolution 없이 순수한 self-attention만으로 이미지를 처리한다. 이 선택은 단순한 구현 편의가 아니라 하나의 철학적 베팅이다 — "inductive bias를 걷어내고 데이터가 구조를 학습하게 하라." 그 베팅의 대가와 이득은 정확히 무엇인가?
+
+## 이미지를 token으로 만드는 법
+
+ViT의 출발점은 이미지 $x \in \mathbb{R}^{H \times W \times C}$를 $P \times P$ 크기의 겹치지 않는 patch로 분할하는 것이다. 각 patch를 flatten하면 $\tilde{x}_p^i \in \mathbb{R}^{P^2 C}$가 되고, learnable projection $E \in \mathbb{R}^{P^2 C \times D}$를 통해 embedding으로 변환된다.
+
+$$z_0^i = \tilde{x}_p^i E, \quad i = 1, \ldots, N, \quad N = \frac{HW}{P^2}$$
+
+ViT-B/16의 경우 $224 \times 224$ 이미지가 $P=16$으로 196개 patch로 나뉘고, 각각 $D=768$차원 벡터가 된다. 여기에 learnable CLS token $x_{\text{class}} \in \mathbb{R}^D$를 prepend하고 positional embedding $E_{\text{pos}} \in \mathbb{R}^{(N+1) \times D}$를 더하면 입력 시퀀스가 완성된다.
+
+$$z_0 = [x_{\text{class}};\, z_0^1;\, \ldots;\, z_0^N] + E_{\text{pos}}$$
+
+이 patch embedding은 `Conv2d(C, D, kernel_size=P, stride=P)`와 수학적으로 동일하다. 가중치를 $W_{\text{conv}}[d, c, p, q] \leftarrow E[\text{flat\_idx}(c,p,q), d]$로 reshape하면 두 연산의 출력이 bit-exact로 일치한다. 실제로 timm 라이브러리는 Conv2d로 patch embedding을 구현한다 — arithmetic complexity는 같지만 GPU 커널 최적화 덕분에 더 빠를 수 있기 때문이다.
+
+## Pre-LN Transformer block과 전체 forward pass
+
+ViT는 Post-LN이 아닌 **Pre-LN** 구조를 채택한다. Layer normalization을 attention과 MLP 앞에 배치하는 이 선택이 학습 안정성을 결정한다.
+
+$$\tilde{z}_\ell = \text{MultiHeadAttn}(\text{LN}(z_{\ell-1})) + z_{\ell-1}$$
+
+$$z_\ell = \text{MLP}(\text{LN}(\tilde{z}_\ell)) + \tilde{z}_\ell$$
+
+12개 block을 통과한 후 CLS token의 최종 hidden state $z_L^0 \in \mathbb{R}^D$만 classification head로 연결된다.
+
+$$\hat{y} = \text{softmax}(z_L^0 W_c)$$
+
+<Theorem kind="proposition" number="1" title="ViT forward pass의 구조">
+ViT의 전체 forward pass는 affine transformation, softmax attention, layer normalization의 composition이며, convolution이나 locality 같은 vision-specific inductive bias를 포함하지 않는다. Spatial 구조는 오직 $E_{\text{pos}}$로만 인코딩된다.
+</Theorem>
+
+<Proof>
+각 component는 미분 가능한 neural network module이다. Positional embedding을 제외한 모든 operation이 patch의 순서에 의존하지 않는다 — attention은 permutation-equivariant하므로 spatial structure는 $E_{\text{pos}}$의 절대 인덱스에만 의존한다. $\square$
+</Proof>
+
+ViT-B/16의 파라미터는 약 86M이다. ResNet-50(26M)의 3배가 넘지만, 이후 장에서 보겠지만 대규모 데이터에서의 효율성은 오히려 더 높다.
+
+## CLS token vs Global Average Pooling
+
+CLS token은 sequence의 첫 번째 위치에 놓인 learnable parameter다. 12개 block을 거치며 모든 patch와 attention을 주고받고, 최종적으로 이미지 전체의 representation이 된다.
+
+Touvron et al.(DeiT, 2021)은 CLS와 Global Average Pooling(GAP)을 직접 비교했다.
+
+| Pooling | ImageNet top-1 |
+|---------|---------------|
+| CLS | 81.8% |
+| GAP | 81.5% |
+
+차이는 0.3%에 불과하다. 이는 CLS token이 결국 "learned weighted average pooling"으로 해석될 수 있음을 시사한다. 각 layer에서 attention mechanism을 통해 모든 patch의 정보를 가중 합산하고, 그 가중치를 학습으로 결정하는 구조이기 때문이다. 그럼에도 ViT가 CLS를 표준으로 채택한 이유는 BERT처럼 downstream task에 재사용 가능한 단일 representation을 얻기 위해서다.
+
+## Positional Embedding의 선택지
+
+Self-attention은 permutation-equivariant하다. 입력 순서를 바꿔도 attention weight 구조는 동일하다. 따라서 patch의 공간 위치 정보를 별도로 인코딩해야 한다.
+
+**1D Learned(ViT 표준)**: $E_{\text{pos}} \in \mathbb{R}^{(N+1) \times D}$, 단순하고 대규모 pretraining에서 충분히 효과적이다.
+
+**Relative Positional Bias(Swin)**: window 내 두 patch 간 상대 거리 $(\Delta r, \Delta c)$를 attention score에 더한다.
+
+$$\text{Attn}_{ij} = \text{softmax}\!\left(\frac{Q_i K_j^\top}{\sqrt{d_k}} + B[\Delta r_{ij}, \Delta c_{ij}]\right)$$
+
+<Callout type="note" title="transfer learning에서의 interpolation">
+224×224로 학습한 모델을 384×384 이미지에 fine-tuning할 때, 1D learned PE는 196개 위치에서 576개 위치로 늘어야 한다. 이때 원래 position embedding을 2D grid로 해석한 뒤 bicubic interpolation으로 보간한다. Sinusoidal PE는 이 문제를 겪지 않지만, 실제 성능은 learned PE가 더 높다.
+</Callout>
+
+## Inductive Bias 부족 — ViT의 본질적 한계
+
+CNN은 수십 년에 걸쳐 vision에 최적화된 inductive bias를 내장한다. Translation equivariance($f(T_\delta x) = T_\delta f(x)$), locality(3×3 kernel에서 시작해 점진적으로 receptive field 확장), 계층적 composition이 그것이다.
+
+ViT는 이 모두를 걷어냈다. 첫 번째 layer부터 196개 patch가 전역적으로 attention을 주고받는다. Receptive field는 layer 1부터 이미 전체 이미지다.
+
+이 선택의 대가는 sample complexity로 나타난다. Inductive bias가 강할수록 VC dimension $d$가 작아 적은 데이터로 일반화가 가능하다. ViT의 hypothesis class는 CNN보다 훨씬 크다.
+
+$$m \propto \frac{d_{\text{VC}}}{\epsilon^2}, \quad d_{\text{VC, CNN}} \ll d_{\text{VC, ViT}}$$
+
+Dosovitskiy et al.(2021) Figure 3은 이를 명확하게 보여준다.
+
+| Dataset | ResNet-152 | ViT-B |
+|---------|-----------|-------|
+| ImageNet-1k (1.3M) | 84.0% | 77.9% |
+| ImageNet-21k→1k | 84.7% | 84.9% |
+| JFT-300M→1k | 84.5% | 88.6% |
+
+ImageNet-1k에서 ViT는 ResNet에 6% 이상 뒤진다. 약 10배 더 많은 데이터(ImageNet-21k, 14M)가 주어져야 비로소 ResNet과 동등해진다. JFT-300M에서는 역전된다.
+
+<Aside label="설계 철학">
+CNN의 inductive bias는 "공짜 점심"이 아니다. Translation equivariance는 weight sharing을 전제하고, locality는 global context를 늦게 수집한다는 제약이다. ViT는 이 제약을 걷어내는 대신 더 많은 데이터를 요구한다. 어느 쪽이 유리한가는 데이터 규모가 결정한다.
+</Aside>
+
+이 한계를 극복하는 방향은 세 가지다. 첫째, JFT-300M 같은 대규모 데이터로 scale한다. 둘째, Mixup·CutMix·RandAugment 같은 강한 augmentation으로 ImageNet-1k에서도 ViT가 동작하게 한다(DeiT). 셋째, CNN과 Transformer를 결합한 hybrid architecture(Swin, CoAtNet)로 둘의 장점을 취한다.
+
+## 정리
+
+- ViT의 핵심 수식: $z_0 = \text{Flatten}(x)E + E_{\text{pos}}$, $z_\ell = \text{TBlock}(z_{\ell-1})$, $\hat{y} = \text{softmax}(z_L^0 W_c)$.
+- Patch embedding은 `Conv2d(kernel=stride=P)`와 수학적으로 동일하다 — weight reshape로 bit-exact 등가.
+- CLS token과 GAP의 성능 차이는 0.3% 수준이다. CLS는 learnable pooling으로 해석된다.
+- ViT는 inductive bias 부재로 CNN보다 약 10배 더 많은 데이터를 필요로 한다. 대신 대규모 데이터에서의 scaling이 CNN을 넘어선다.
+
+다음 글에서는 이 inductive bias 부족 문제를 DeiT가 augmentation과 distillation으로 어떻게 극복했는지, 그리고 ImageNet-1k만으로 ViT-B > ResNet-50을 달성한 방법을 추적한다.
+
+<Reference
+  title="An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"
+  authors="Dosovitskiy et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2010.11929"
+/>

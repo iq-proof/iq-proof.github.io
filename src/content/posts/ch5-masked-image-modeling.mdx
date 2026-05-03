@@ -1,0 +1,143 @@
+---
+title: "Masked Image Modeling은 무엇을 학습하는가"
+description: "BEiT의 discrete token부터 MAE의 75% masking, SimMIM의 단순화, MaskFeat·MVP의 target 추상도까지 — MIM 계열의 설계 결정이 공유하는 하나의 원칙을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [vision-transformer, masked-image-modeling, mae, beit, self-supervised]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+BERT가 NLP에 가져온 변화는 단순했다 — 입력의 일부를 지우고 맞추게 하라. Vision에 이를 적용하려는 시도가 BEiT, MAE, SimMIM, MaskFeat로 이어지면서 네 개의 논문은 겉으로는 서로 다른 설계를 취한다. 그런데 이 차이들을 관통하는 질문은 하나다. **"무엇을 복원하게 할 것인가?"** — 그리고 이 선택이 어떤 representation을 만드는가?
+
+## 왜 이미지는 pixel을 그냥 mask할 수 없는가
+
+BERT MLM의 핵심은 **discrete prediction**이다. 단어는 자연스럽게 유한한 vocabulary를 가지므로 cross-entropy loss가 정의된다. 픽셀은 연속값이다. `[MASK]` 토큰을 놓고 "원래 intensity를 맞혀라"고 요구하면 regression loss가 되고, 이웃 픽셀과의 spatial correlation 때문에 trivially 쉬운 문제가 된다.
+
+BEiT(Bao et al. 2022)의 해결책은 DALL-E의 dVAE tokenizer를 빌리는 것이었다. 이미지를 8192개 codebook 중 가장 가까운 entry index로 양자화한다.
+
+$$
+k^* = \arg\min_k \|z - c_k\|^2
+$$
+
+이제 224×224 이미지는 28×28 = 784개의 정수 token sequence가 된다. vocabulary 크기 8192에 대한 cross-entropy를 정의할 수 있다. BERT의 40% masking(BERT 15%보다 큰 이유는 이웃 패치 상관이 높아서 15%는 너무 쉬운 문제가 되기 때문이다)으로 masked position의 token을 예측하게 한다.
+
+$$
+L_{\mathrm{BEiT}} = -\sum_{i \in M} \log p_\theta(\mathbf{t}^{(i)} \mid \tilde{\mathbf{t}}), \quad |M| = 0.4 \cdot N
+$$
+
+<Callout type="note" title="정보론적 ceiling">
+dVAE tokenization은 정보 손실을 수반한다. 정보이론적으로 $I(x; \mathbf{t}) \leq \log 8192 \approx 13$ bits/token이며, 이 ceiling 아래로는 어떤 pretrain도 넘어설 수 없다. tokenizer quality가 downstream performance의 상한을 결정한다.
+</Callout>
+
+## MAE: discrete를 버리고 75%를 mask하다
+
+He et al.(2022)의 MAE는 tokenizer를 완전히 제거하고 pixel 공간으로 돌아간다. 대신 두 가지 급진적인 선택을 한다.
+
+첫째, **75% masking**. 텍스트의 15%와 비교하면 5배다. 이것이 가능한 이유는 자연이미지의 극도의 spatial redundancy 때문이다. 인접 패치 상관계수 $\rho(1) \approx 0.8\text{-}0.95$이고, frequency domain에서 low-frequency가 dominant하므로(compressive sensing의 sparsity 조건), 25%의 visible patch만으로도 나머지를 복원하기에 충분한 정보가 있다.
+
+둘째, **asymmetric encoder–decoder**. 핵심은 encoder가 visible 25%만 처리한다는 것이다.
+
+<Theorem kind="proposition" number="1" title="Asymmetric encoder 속도 향상">
+75% masking + visible-only encoder를 사용할 때, self-attention의 FLOPs는 symmetric 대비 약 4× 감소한다.
+</Theorem>
+
+<Proof>
+Self-attention의 복잡도는 sequence length의 제곱에 비례한다. Symmetric 처리 시 $\propto N^2$, visible 25%만 처리 시 $\propto (0.25N)^2 = 0.0625N^2$. 이론적 비율은 16×이나, layer normalization과 MLP의 선형 항을 포함하면 실측 speedup은 약 $3.6\text{-}4\times$로 수렴한다(He et al. 2022).
+</Proof>
+
+Loss는 masked region에 대한 per-patch normalized MSE다.
+
+$$
+L_{\mathrm{MAE}} = \frac{1}{|M|} \sum_{i \in M} \left\| \frac{\hat{p}_i - \mu_i}{\sigma_i} - \frac{p_i - \mu_i}{\sigma_i} \right\|_2^2
+$$
+
+per-patch normalization은 분산이 큰 패치가 loss를 독점하지 않도록 균형을 맞춘다.
+
+MAE의 주목할 만한 결과는 **linear probe << fine-tuning** 패턴이다(79.0% vs 83.6%, ViT-L). contrastive SSL(DINO, SimCLR)은 linear probe ≈ fine-tuning인 것과 정반대다. MAE는 low-level detail(edge, texture)을 풍부하게 보존하므로, linear head 하나로는 이를 semantic으로 변환하지 못한다. fine-tuning 시 깊은 layer들이 그 변환을 수행하면서 큰 향상이 나타난다.
+
+## SimMIM: 단순함은 충분한가
+
+Xie et al.(2022)의 SimMIM은 MAE의 asymmetric 구조를 버리고 "모든 패치를 encoder에 통과시키고 single linear decoder로 복원하라"는 극단적 단순화를 택한다. masking ratio는 50-60%로 낮춘다.
+
+이 낮은 masking ratio는 필연적이다. encoder가 masked token embedding도 함께 처리하므로, attention을 통해 visible 패치가 masked position에 attend할 수 있다 — 즉 정보 누수가 발생한다. 75%를 mask하면 encoder 자체가 masked region을 "보는" 경로가 생겨 prediction이 trivially 쉬워지므로, challenge level을 유지하려면 masking ratio를 낮춰야 한다.
+
+$$
+\frac{\mathrm{FLOPs}_{\mathrm{SimMIM}}}{\mathrm{FLOPs}_{\mathrm{MAE}}} \approx \frac{N^2}{0.0625N^2} \approx 16\times \text{ (encoder 기준)}
+$$
+
+대신 decoder가 shallow하므로 전체 학습 시간은 MAE 대비 약 1.5×로 완화된다.
+
+<Callout type="note" title="트레이드오프">
+SimMIM은 **구현 단순성**과 **소형 모델 성능**에서 경쟁력이 있다. ViT-B에서는 MAE(83.6%)와 거의 동등(~83.8%)하다. 그러나 ViT-L 이상에서는 MAE의 asymmetric 구조와 8-layer decoder의 표현력이 우위를 가져간다. small model: SimMIM 충분, large model: MAE 권장.
+</Callout>
+
+## MaskFeat와 MVP: target의 추상도를 높이다
+
+BEiT → MAE → SimMIM의 논쟁이 "어떻게 mask할 것인가"에 집중했다면, MaskFeat(Wei et al. 2022)와 MVP는 질문 자체를 바꾼다 — **"무엇을 복원하게 할 것인가"**.
+
+MaskFeat는 pixel 대신 HOG(Histogram of Oriented Gradients)를 target으로 삼는다. HOG는 gradient 기반이므로 global brightness shift에 불변이고($\nabla(I+c) = \nabla I$), 정규화된 histogram이므로 contrast 변화에 robust하다. pixel target보다 구조적 정보(edge, orientation)에 focus하면서 semantic task에 더 가깝다.
+
+MVP는 한 단계 더 올라가 frozen CLIP ViT의 patch feature를 target으로 쓴다. 예측해야 할 것이 pixel intensity가 아니라 semantic embedding이므로, 학습된 encoder는 자연스럽게 high-level semantic에 align된다.
+
+$$
+L_{\mathrm{MVP}} = \frac{1}{|M|} \sum_{i \in M} \|\hat{\mathbf{t}}_i - \mathrm{CLIP}(p_i)\|_2^2
+$$
+
+target 추상도와 성능의 관계는 다음으로 요약된다.
+
+$$
+\text{Downstream performance} \approx \min(\text{Learned capability},\; \text{Target quality ceiling})
+$$
+
+CLIP target은 semantic task에서 ceiling이 높지만, CLIP 자체가 잘 못하는 task(fine-grained texture, 저수준 dense prediction)에서는 MVP도 제한된다. pixel target(MAE)은 ceiling이 낮은 대신 task 의존도가 없다.
+
+## 하나의 원칙으로 읽기
+
+네 방법의 설계 차이는 결국 같은 축 위에 있다.
+
+| 방법 | Target | Masking | 특기 |
+|---|---|---|---|
+| BEiT | discrete token (8192) | 40% | tokenizer ceiling 존재 |
+| MAE | pixel (normalized) | 75% | fine-tuning > linear probe |
+| SimMIM | pixel | 50-60% | 단순, small model |
+| MaskFeat | HOG (mid-level) | 50-75% | robust, balanced |
+| MVP | CLIP feature (high-level) | 50-75% | semantic ceiling |
+
+**"복원 target의 추상도"가 representation의 성격을 결정한다.** low-level target(pixel)은 detail을 보존하고 fine-tuning에서 빛난다. high-level target(CLIP)은 semantic에 align되어 linear probe에서 빛난다. 이 스펙트럼 위에서 task에 맞는 target을 고르는 것 — 혹은 여러 target을 동시에 쓰는 것 — 이 MIM 설계의 핵심 자유도다.
+
+## 정리
+
+- discrete token(BEiT)은 BERT MLM을 vision에 이식하는 가장 직접적 방법이지만, tokenizer quality라는 ceiling을 도입한다.
+- MAE는 pixel target + 75% masking + asymmetric 구조로 계산 효율과 fine-tuning 성능을 동시에 달성했다.
+- SimMIM은 단순화가 small/medium 모델에서 충분함을 보였고, large 모델에서는 asymmetric 구조의 가치가 드러난다.
+- target을 HOG(MaskFeat)나 CLIP feature(MVP)로 높이면 semantic alignment가 올라가지만 target encoder 품질에 ceiling이 생긴다.
+
+다음 글에서는 CLIP 자체 — 이미지와 텍스트를 동시에 학습하는 contrastive multimodal pretraining의 내부 동작을 추적한다.
+
+<Reference
+  title="Masked Autoencoders Are Scalable Vision Learners"
+  authors="He et al."
+  year={2022}
+  venue="CVPR"
+  url="https://arxiv.org/abs/2111.06377"
+/>
+
+<Reference
+  title="BEiT: BERT Pre-Training of Image Transformers"
+  authors="Bao et al."
+  year={2022}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2106.08254"
+/>

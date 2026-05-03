@@ -1,0 +1,117 @@
+---
+title: "DINO는 왜 레이블 없이도 객체를 '본다'"
+description: "Teacher-student 증류와 multi-crop 일관성 손실이 어떻게 semantic segmentation과 k-NN 분류 능력을 만들어내는지, DINO부터 DINOv2까지 붕괴 방지 메커니즘과 스케일링 법칙을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [self-supervised-learning, dino, vision-transformer, representation-learning]
+difficulty: advanced
+series:
+  slug: vision-transformer-deep-dive
+  title: Vision Transformer Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DINO는 segmentation label을 한 번도 보지 않았다. 그런데 학습이 끝난 뒤 마지막 레이어의 attention map을 꺼내 threshold를 적용하면, 이미지 속 객체의 윤곽이 떠오른다. 이것이 우연인가, 아니면 설계의 귀결인가? 그리고 어떻게 이 단순한 self-supervised 구조가 supervised 모델에 근접한 표현을 학습하는가?
+
+## 학습 구조: Teacher-Student와 Multi-Crop
+
+DINO의 핵심 아이디어는 하나의 이미지에서 **2개의 global crop과 8개의 local crop**을 만들고, student가 모든 10개 crop을 처리하는 동안 teacher는 global crop 2개만 본다는 것이다.
+
+$$
+\mathcal{L} = -\sum_{x_t \in V_g} \sum_{x_s \in V,\, x_s \neq x_t} p_t(x_t)^\top \log p_s(x_s)
+$$
+
+$p_t$는 teacher의 sharp 분포 ($\tau_t = 0.04$), $p_s$는 student의 soft 분포 ($\tau_s = 0.1$)다. Teacher의 가중치는 student를 gradient로 학습하지 않고 EMA로만 갱신된다.
+
+$$
+\theta_t \leftarrow \lambda(t)\, \theta_t + (1 - \lambda(t))\, \theta_s, \quad \lambda(t) = \text{cosine}(0.996 \to 1.0)
+$$
+
+이 구조의 핵심 효과는 **local-to-global alignment**다. local crop은 이미지의 일부만 보지만, teacher가 내놓은 global distribution을 맞혀야 한다. 귀 하나만 보고도 "고양이"라는 전체 맥락을 추론해야 하는 것이다. Attention mechanism은 이 task를 풀기 위해 자연스럽게 "어느 patch가 semantics에 중요한가"를 학습한다.
+
+## Attention이 Segmentation이 되는 이유
+
+<Theorem kind="proposition" number="1" title="Local-to-Global Loss와 Attention Segmentation">
+DINO의 local-to-global consistency loss 하에서, CLS token의 patch attention은 object semantic boundary에 집중하도록 수렴한다.
+</Theorem>
+
+<Proof>
+local crop이 global distribution을 예측하려면, 주변 문맥으로부터 masked region의 의미를 유추해야 한다. Attention은 이 유추 경로를 형성한다. Object 경계를 넘으면 semantic이 바뀌므로, attention weight는 자연스럽게 경계에서 변곡점을 가진다. 따라서 CLS-to-patch attention을 공간으로 reshape하고 threshold를 적용하면 segmentation mask가 나타난다. $\square$
+</Proof>
+
+이를 정량화하면, DINO ViT-S/8의 attention segmentation mIoU는 PASCAL VOC에서 약 58%에 달한다. 반면 global crop만 비교하는 SimCLR은 약 30% 수준이다. Multi-crop의 local-global alignment 항 없이는 이 gap이 생기지 않는다.
+
+## 붕괴를 막는 두 개의 자물쇠
+
+EMA teacher 혼자는 붕괴를 막지 못한다. DINO는 **centering**과 **sharpening** 두 메커니즘을 함께 사용한다.
+
+**Centering**은 teacher 출력의 running mean을 빼는 연산이다.
+
+$$
+\mathbb{C}^{(t)} = m\, \mathbb{C}^{(t-1)} + (1-m)\, \frac{1}{B}\sum_{i=1}^{B} \mathbf{z}_t^{(i)}
+$$
+
+출력의 mean이 0으로 유지되면, rank-1 collapse(모든 출력이 같은 방향으로 쏠리는 것)가 불가능해진다. SVD 분석에 따르면, mean-zero 제약은 $\text{rank}(\hat{\mathbf{Z}}) \geq 2$를 강제한다.
+
+**Sharpening**은 teacher와 student의 temperature gap에서 온다. $\tau_t \ll \tau_s$이므로 teacher 분포는 peaky하고 student 분포는 soft하다. teacher가 이미 sharp한 target을 제시하므로, student가 uniform distribution으로 무너지면 cross-entropy loss가 강한 gradient 신호를 보낸다.
+
+<Callout type="note" title="트레이드오프: Centering vs Sharpening의 기여">
+DINOv2 ablation에서 centering 제거 시 성능이 -2.9%p 하락하고, sharpening 제거 시 -2.0%p 하락한다. 두 가지를 모두 제거하면 -4.8%p다. Centering이 더 중요하지만, 둘 다 있어야 robust representation이 유지된다. 하나는 "공간의 치우침"을, 다른 하나는 "분포의 평탄화"를 막는 상호보완 구조다.
+</Callout>
+
+## DINO에서 DINOv2로: 세 가지 추가
+
+2021년 DINO가 제안한 이후, linear probe 77.1%와 supervised 81.8% 사이의 gap이 남았다. iBOT과 DINOv2는 세 가지 방향으로 이를 해소한다.
+
+**첫째, Masked Image Modeling 추가(iBOT)**. 전체 patch의 30%를 masking하고, student가 masked patch 위치에서 teacher 출력을 예측하도록 한다.
+
+$$
+\mathcal{L}_{\text{iBOT}} = \alpha\, \mathcal{L}_{\text{DINO}} + (1-\alpha)\, \mathcal{L}_{\text{masked}}
+$$
+
+이 항은 DINO의 "전체-전체 일관성"에 "문맥 기반 추론"을 더한다. student는 주변 visible patch만으로 masked 영역을 예측해야 하므로, 공간적 reasoning이 명시적으로 강제된다.
+
+**둘째, KoLeo 정규화**. Nearest neighbor distance를 최대화하는 항이다.
+
+$$
+\mathcal{R}_{\text{KoLeo}} = -\frac{1}{B} \sum_{i=1}^{B} \log \min_{j \neq i} \|\mathbf{z}_i - \mathbf{z}_j\|_2
+$$
+
+이 정규화는 feature space에서 sample들이 과도하게 몰리는 "dead zone"을 제거한다. Batch Normalization이 차원별 scale을 조정하는 것과 달리, KoLeo는 sample 공간 전체의 coverage를 강제한다.
+
+**셋째, 데이터 큐레이션과 모델 스케일링(DINOv2)**. 알고리즘 개선만으로는 한계가 있다. DINOv2는 CLIP ViT-L로 필터링한 1억 4200만 장의 LVD(Large Vision Dataset)를 사용하고, ViT-g(11억 파라미터)로 스케일한다. 결과 linear probe는 86%로, ImageNet-21k supervised 모델에 근접한다.
+
+<Aside label="스케일링 법칙">
+DINOv2 ablation은 모델 크기 단독으로는 수확 체감이 나타나지만, 고품질 데이터와 모델 크기를 동시에 키우면 지속적인 향상이 일어난다는 것을 보여준다. "더 큰 모델"이 아니라 "더 잘 큐레이션된 데이터 + 더 큰 모델"이 공식이다.
+</Aside>
+
+## 정리
+
+- DINO의 local-to-global consistency loss는 명시적 supervision 없이 CLS attention을 semantic boundary에 집중시킨다. Emergent segmentation은 우연이 아니라 multi-crop 설계의 필연이다.
+- Centering(rank-1 collapse 방지)과 sharpening(uniform collapse 방지)은 상호보완적이며, 둘 다 있어야 한다.
+- iBOT의 masked prediction 항은 공간적 reasoning을, KoLeo는 sample-level diversity를 명시적으로 강제한다.
+- DINOv2는 알고리즘과 데이터 큐레이션이 동등하게 기여함을 보인다. 레이블 없이 supervised에 근접한 표현을 얻는 데 필요한 것은 더 영리한 손실 함수만이 아니라, 더 엄밀하게 선별된 데이터이기도 하다.
+
+<Reference
+  title="Emerging Properties in Self-Supervised Vision Transformers"
+  authors="Caron et al."
+  year={2021}
+  venue="ICCV"
+  url="https://arxiv.org/abs/2104.14294"
+/>
+
+<Reference
+  title="DINOv2: Learning Robust Visual Features without Supervision"
+  authors="Oquab et al."
+  year={2024}
+  venue="TMLR"
+  url="https://arxiv.org/abs/2304.07193"
+/>
