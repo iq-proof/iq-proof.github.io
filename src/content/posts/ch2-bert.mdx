@@ -1,0 +1,145 @@
+---
+title: "BERT는 어떻게 언어를 '이해'하는가"
+description: "WordPiece 토크나이징부터 MLM 정보이론, 80/10/10 규칙, NSP의 실패, RoBERTa의 재검증, SpanBERT·DistilBERT·ALBERT 변주까지 — BERT 계열 설계 결정의 통일된 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [bert, masked-language-model, pretraining, transformer, nlp]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+BERT는 2018년에 등장했고, 그 이후로 NLP의 거의 모든 benchmark를 갈아엎었다. 그런데 이 모델의 진짜 설계 철학은 무엇인가? 개별 기법(WordPiece, MLM, NSP…)을 나열하는 것으로는 충분하지 않다. BERT의 모든 선택은 하나의 질문에 수렴한다 — **"어떻게 하면 레이블 없이 언어의 구조를 학습할 수 있는가?"**
+
+## 아키텍처의 출발점: 왜 Transformer Encoder인가
+
+Word2Vec, GloVe 같은 static embedding은 "bank"를 문맥과 무관하게 하나의 벡터로 표현한다. ELMo는 bi-LSTM으로 방향성을 추가했지만, 순차 계산 때문에 long-range context를 효율적으로 포착하지 못한다.
+
+BERT는 두 문제를 동시에 푼다. Transformer self-attention은 causal mask 없이 모든 토큰이 모든 토큰을 동시에 볼 수 있다 — 이것이 **bidirectional**의 정확한 의미다. 수식으로 쓰면:
+
+$$
+\text{Attn}_i = \text{softmax}\!\left(\frac{\{Q_i K_j : j \in [1,n]\}}{\sqrt{d_k}}\right) V
+$$
+
+GPT(decoder)는 $j \leq i$ 제약을 걸지만, BERT(encoder)는 제약이 없다. 이 단순한 차이가 discriminative task(분류, QA, STS)에 특화된 표현을 만든다.
+
+입력 표현은 세 임베딩의 합이다.
+
+$$
+\mathbf{e}_i = E_{\text{token}}(x_i) + E_{\text{pos}}(i) + E_{\text{seg}}(s_i)
+$$
+
+Position embedding을 sinusoidal 대신 learned로 쓴 것도 선택이다. 경험적으로 downstream task에서 약 0.2~0.5 GLUE point 이득이 있다. 대신 512 이상의 시퀀스로 extrapolation이 어렵다는 대가를 치른다.
+
+## MLM: 정보이론적 sweet spot
+
+BERT의 핵심 pretraining 목표는 Masked Language Modeling이다.
+
+$$
+\mathcal{L}_{\mathrm{MLM}} = -\mathbb{E}_{x \sim \mathcal{D}}\!\left[\sum_{i \in M} \log p_\theta(x_i \mid x_{\setminus M})\right], \quad |M| = 0.15n
+$$
+
+왜 15%인가? 정보이론적으로 설명할 수 있다. 마스킹 비율 $\rho$가 작으면 per-position conditional entropy $H(x_i \mid x_{\setminus M})$가 낮아져 gradient signal이 약해진다. 반대로 $\rho$가 크면 context가 희박해져 모델이 거의 무작위 추측을 하게 된다. 15%는 이 두 효과의 경험적 균형점이다.
+
+<Callout type="note" title="Mask ratio와 모델 크기">
+Wettig et al. (2023)은 더 큰 모델일수록 최적 mask ratio가 높아짐을 보였다. BERT-Base 수준에서는 15%이지만, 대형 모델에서는 25~40%가 더 좋다. 더 큰 capacity가 더 어려운 task를 소화할 수 있기 때문이다.
+</Callout>
+
+Vision의 MAE(He et al. 2021)가 75% masking을 쓰는 것과 대조적이다. 이미지 패치는 공간적 중복성이 높아 75%를 지워도 복원 가능하지만, 텍스트는 순차 의존성이 강해 그 비율에서는 context가 너무 희박해진다.
+
+## 80/10/10 규칙: pretrain-finetune gap 해소
+
+MLM 설계에는 숨겨진 문제가 있다. Pretraining에서 `[MASK]` 토큰을 자주 보지만, fine-tuning에서는 `[MASK]`가 전혀 등장하지 않는다. 이 분포 불일치가 성능을 깎는다.
+
+BERT의 해법은 마스킹 위치마다 세 갈래 노이즈를 적용하는 것이다.
+
+$$
+\tilde{x}_i = \begin{cases} [\mathrm{MASK}] & \text{80\%} \\ \text{random token} & \text{10\%} \\ x_i & \text{10\%} \end{cases}
+$$
+
+세 갈래의 역할이 각각 다르다. 80% `[MASK]`는 강한 학습 신호를 제공한다. 10% random token은 노이즈에 대한 robustness를 훈련한다. 그리고 10% unchanged — 이것이 핵심이다. 원본 토큰이 입력에 보이는데도 모델이 그것을 예측해야 하므로, 모든 위치의 hidden state가 "입력 그대로 복사"가 아니라 "문맥 안에서 해석"되도록 강제된다.
+
+Devlin et al.의 ablation에서 이 차이는 GLUE 기준 약 +1.4 point로 나타났다.
+
+## NSP의 실패와 RoBERTa의 교훈
+
+BERT에는 MLM 외에 Next Sentence Prediction(NSP)이 있었다. 두 문장이 연속인지를 `[CLS]` 표현으로 판단하는 task다.
+
+<Callout type="warning" title="NSP가 실제로 학습한 것">
+NSP의 negative sample이 corpus에서 무작위 문장이었기 때문에, 모델은 문장 간 담화 일관성(coherence)이 아니라 **주제 전환(topic shift) 감지**를 주로 학습했다. 이것은 NSP의 원래 의도와 다르다.
+</Callout>
+
+RoBERTa(Liu 2019)는 NSP를 제거하고 4가지를 체계적으로 재검증했다.
+
+| 변경 | GLUE 기여 |
+|---|---|
+| Dynamic masking | +0.4 |
+| NSP 제거 | +0.1 |
+| FULL-SENTENCES 입력 | +0.2 |
+| Batch 8K × 500K steps | +0.8 |
+
+Dynamic masking은 매 epoch마다 새로운 마스킹 위치를 샘플링해 regularization 효과를 높인다. Static masking은 같은 패턴을 반복해서 보기 때문에 representational 다양성이 떨어진다. ALBERT가 SOP(Sentence Order Prediction)로 NSP를 대체한 것도 같은 문제의식에서 나왔다 — positive와 negative가 같은 두 문장을 순서만 바꾼 것이라면, 주제 신호는 통제되고 coherence 신호만 남는다.
+
+## BERT 변주의 트레이드오프
+
+세 변주는 BERT의 서로 다른 약점을 공략한다.
+
+**SpanBERT**(Joshi 2020)는 연속 span masking과 Span Boundary Objective(SBO)를 추가했다.
+
+$$
+\mathcal{L}_{\mathrm{SBO}} = \sum_{j=i_s}^{i_e} -\log p_\theta(x_j \mid h_{i_s-1}, h_{i_e+1}, \mathbf{p}_{j-i_s+1})
+$$
+
+Span boundary의 hidden state와 relative position만으로 span 내부를 예측하게 함으로써, boundary 감지 능력이 명시적으로 학습된다. SQuAD F1에서 BERT 대비 +1.4가 나왔다.
+
+**DistilBERT**(Sanh 2019)는 지식 증류로 BERT-Base를 40% 줄였다.
+
+$$
+\mathcal{L}_{\text{distill}} = \alpha \, D_{\mathrm{KL}}(p_T \| p_S) + \beta \, \mathcal{L}_{\mathrm{MLM}} + \gamma \, \mathcal{L}_{\mathrm{cos}}
+$$
+
+GLUE 기준 BERT-Base의 97% 성능을 60% 빠른 속도로 달성한다. 배포 환경에서 latency가 중요할 때의 선택지다.
+
+**ALBERT**(Lan 2020)는 cross-layer parameter sharing으로 파라미터 수를 70% 줄였다. 모든 레이어가 같은 가중치를 공유하지만, 각 레이어의 activation은 다르기 때문에 representational capacity는 유지된다. 다만 training convergence가 느리고 GLUE에서 BERT-Large 대비 약 -0.9 point의 손실이 있다.
+
+<Aside label="왜 현대 LLM은 parameter sharing을 쓰지 않는가">
+GPT-3 이후의 대형 모델들은 모두 layer-specific weights를 쓴다. Attention pattern이 레이어마다 다른 역할을 한다는 것이 경험적으로 명확해졌고, 연산 자원이 충분해지면서 efficiency보다 표현력이 우선순위가 됐다. ALBERT는 memory-constrained 환경에서만 현실적인 선택지다.
+</Aside>
+
+## 정리
+
+BERT 계열의 설계 결정들은 모두 하나의 긴장에서 나온다 — **레이블 없이 언어 구조를 얼마나 효율적으로 학습할 것인가.** MLM의 15%는 정보이론적 sweet spot이고, 80/10/10은 pretrain-finetune 분포 불일치를 완화하는 implicit regularization이며, NSP의 실패는 pretext task 설계가 얼마나 신중해야 하는지를 보여준다.
+
+- BERT의 bidirectionality는 causal mask 제거 한 줄에서 나온다.
+- MLM 15%는 gradient signal과 context 밀도의 균형점이다.
+- 80/10/10은 pretrain-finetune 분포 갭을 메우는 노이즈 믹스다.
+- NSP는 직관적이었지만 틀린 설계였고, RoBERTa가 그것을 증명했다.
+- SpanBERT·DistilBERT·ALBERT는 각각 task alignment·배포 효율·파라미터 효율이라는 다른 축을 공략한다.
+
+다음 글에서는 이 encoder-only 패러다임을 넘어, GPT가 왜 decoder-only 단방향 구조를 선택했는지, 그리고 그 선택이 생성 능력과 어떻게 연결되는지 추적한다.
+
+<Reference
+  title="BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+  authors="Devlin et al."
+  year={2019}
+  venue="NAACL"
+  url="https://arxiv.org/abs/1810.04805"
+/>
+
+<Reference
+  title="RoBERTa: A Robustly Optimized BERT Pretraining Approach"
+  authors="Liu et al."
+  year={2019}
+  venue="arXiv"
+  url="https://arxiv.org/abs/1907.11692"
+/>

@@ -1,0 +1,141 @@
+---
+title: "In-Context Learning은 어떻게 작동하는가"
+description: "Weight 업데이트 없이 몇 개의 demo만으로 task를 수행하는 ICL의 현상부터, Attention이 Gradient Descent를 구현한다는 수학적 증명, 그리고 Task Vector가 task 정보를 encoding하는 방식까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [in-context-learning, transformer, attention, gradient-descent, mechanistic-interpretability]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-3 논문이 2020년에 공개됐을 때, NLP 커뮤니티가 받은 충격의 핵심은 성능이 아니었다. 진짜 충격은 **weight를 단 한 번도 업데이트하지 않고** 몇 개의 예시만으로 새로운 task를 수행했다는 사실이었다. 어떻게 이것이 가능한가? 그리고 이 현상의 내부에서 Transformer는 정확히 무슨 연산을 수행하는가?
+
+## 현상: Weight 없이 학습하는 모델
+
+In-Context Learning(ICL)의 구조는 단순하다. 고정된 파라미터 $\theta$를 가진 모델에 다음 형태의 prompt를 입력한다.
+
+$$
+P = [\text{Instruction}] \| (x_1, y_1) \| (x_2, y_2) \| \cdots \| (x_k, y_k) \| x_{\text{test}}
+$$
+
+모델은 forward pass 한 번으로 $\hat{y}_{\text{test}}$를 생성한다. $\theta$는 변하지 않는다. 이것이 fine-tuning과의 근본적 차이다.
+
+$$
+\hat{y}_{\text{test}} = f_\theta(P;\, \theta), \quad \theta_{\text{test}} = \theta_{\text{train}}
+$$
+
+Brown 2020의 핵심 발견은 이 능력이 **모델 크기에 대해 불연속적으로 등장**한다는 점이다. 1.3B 모델에서 few-shot은 zero-shot과 거의 같은 성능을 보인다. 175B에서는 $k$가 늘어날수록 성능이 급격히 향상되며 $k=16{\sim}32$에서 포화된다. 이 비선형적 jump가 Wei 2022가 명명한 **emergent ability**의 전형적 패턴이다.
+
+## 실증적 성질: Demo가 하는 일
+
+ICL이 "예시에서 입력-출력 관계를 학습한다"는 직관은 Min 2022에 의해 반박된다.
+
+<Theorem kind="theorem" number="1" title="Min et al. 2022 — Labels Don't Matter Much">
+동일한 입력 분포와 레이블 빈도를 가진 demo set에서, 레이블의 실제 정확성과 무관하게 ICL 성능이 거의 유지된다. SST-2에서 50% 레이블을 무작위로 뒤집었을 때 정확도 하락은 약 3\~5%에 그친다.
+</Theorem>
+
+<Proof>
+Min의 실험(Table 2)에서 SST-2(78.5% → 75.3%), MNLI(84.2% → 80.1%), WIQA(71.4% → 68.2%)로, 레이블을 무작위로 교체해도 gap이 5% 미만이었다. 반면 입력 분포를 바꾸거나(OOD) format을 제거하면 성능이 10\~30% 급락한다. 따라서 ICL의 주요 driver는 **label-text correspondence가 아니라 label frequency, input distribution, format**이다. $\square$
+</Proof>
+
+추가로 demo 순서가 성능에 ±10\~20% 영향을 미치는 **permutation sensitivity**가 존재한다. 마지막 demo일수록 영향이 크다(recency bias). 이는 표준 supervised learning에서 batch 순서가 무관한 것과 완전히 다른 성질이다.
+
+<Callout type="note" title="트레이드오프: ICL의 실제 제약">
+ICL은 format-robust하지만 distribution-sensitive하다. 레이블이 틀려도 동작하지만, demo와 test의 도메인이 다르면 성능이 급락한다. 또한 permutation sensitivity로 인해 동일한 demo set도 순서에 따라 결과가 달라진다. Lu 2022는 여러 순서로 평균을 내는 calibration으로 분산을 $\sqrt{M}$배 감소시킬 수 있음을 보였다.
+</Callout>
+
+## 메커니즘: Attention은 Gradient Descent다
+
+"그래서 모델은 실제로 무엇을 하고 있는가?"라는 질문에 Akyürek 2023과 von Oswald 2023이 답한다. Linear regression task에서 linear attention의 forward pass는 **정확히 1-step ridge regression gradient descent**와 동등하다.
+
+$$
+\text{Attention}(Q, K, V) = w_{\text{old}} - \eta \nabla L(w_{\text{old}})
+$$
+
+증명의 핵심은 weight matrix 구성에 있다.
+
+<Theorem kind="theorem" number="2" title="von Oswald 2023 — Attention Implements 1-Step GD">
+$W_Q = I$, $W_K = I$, $W_V = [x_1, y_1, \ldots, x_n, y_n]$로 설정된 single linear attention layer는 정확히 다음 ridge regression GD step을 구현한다.
+
+$$
+\text{Output} = w_{\text{old}} - \eta (XX^T w_{\text{old}} - Xy)
+$$
+
+여기서 $X = [x_1, \ldots, x_n]$, $y = [y_1, \ldots, y_n]$이다.
+</Theorem>
+
+<Proof>
+Query-Key interaction이 $QK^T = XX^T$(데이터 행렬의 gram matrix)를 생성한다. Linear attention으로 softmax를 근사하면 출력은 $\theta_{\text{old}} - \eta \cdot 2(XX^T \theta_{\text{old}} - Xy)$ 형태가 되며, 이는 MSE loss의 gradient step과 정확히 일치한다. Multi-layer Transformer는 $L$-step GD에 대응된다: 각 layer $\ell$에서 $w_\ell = w_{\ell-1} - \eta_\ell \nabla L(w_{\ell-1})$. $\square$
+</Proof>
+
+이 관점은 앞서 관찰한 실증적 성질들을 통합 설명한다. **Demo 순서가 중요한 이유**: GD에서 마지막 step이 가장 recent하기 때문. **레이블 noise에 robust한 이유**: GD는 gradient의 방향만 필요하고 절댓값은 덜 중요하기 때문.
+
+Olsson 2022는 이 메커니즘의 최소 구현을 발견했다. 2-layer Transformer에서 **induction head**라는 circuit이 자연스럽게 학습된다.
+
+```
+Layer 1 (Previous-token head):
+  각 position i에서 i-1번 token에 attend → (x_i, y_i) pair 구조 인식
+
+Layer 2 (Match-and-copy head):
+  test token과 동일한 demo token을 찾아 다음 token을 copy → pattern matching
+```
+
+단일 layer로는 "구조 학습"과 "패턴 매칭"을 동시에 수행할 수 없어, 2-layer가 최소 회로다.
+
+## Task Vector: Task 정보는 어디에 있는가
+
+GD 해석은 "어떻게 학습하는가"를 설명하지만, "task 정보가 어디에 저장되는가"는 답하지 않는다. Hendel 2023은 이 질문을 activation patching으로 해결한다.
+
+mid-layer(~$L/2$)의 특정 위치(주로 instruction token)에서 추출한 hidden state를 **task vector**라 정의한다.
+
+$$
+\mathbf{v}_{\text{task}} := h_{t^*}^{(\ell^*)}(P)
+$$
+
+동일 task family 내 prompt들의 task vector는 cosine similarity > 0.8로 clustering된다. 다른 task들과는 < 0.5로 거의 직교한다. 더 중요한 것은 task vector를 **다른 prompt에 inject하면 output의 task가 전환**된다는 causal 증명이다.
+
+$$
+\text{Output}(\text{Task A vector} + \text{Task B data}) \approx \text{Task A}(\text{Task B data})
+$$
+
+Todd 2024는 이를 attention head 수준으로 세분화해 **function vector**를 정의한다. 특정 head들이 task의 입출력 매핑 방식(예: "antonym을 찾는 head")을 encoding하며, semantic family가 같은 task들(antonym ↔ synonym) 사이에서는 partial transfer가 가능하다.
+
+<Aside label="세 관점의 통합">
+GD 해석(Ch3-4), induction head(Olsson 2022), task/function vector(Hendel-Todd)는 서로 경쟁하는 설명이 아니라 다른 해상도의 관찰이다. GD는 메커니즘 수준, induction head는 회로 수준, task vector는 표현 수준의 설명이다. ICL은 아마도 이 세 가지가 동시에 작동하는 multi-factor 현상이다.
+</Aside>
+
+## 정리
+
+- ICL은 $\theta$를 고정한 채 context의 token sequence만으로 task에 adapt한다. 이 능력은 ~10B parameter 이상에서 불연속적으로 등장하는 emergent ability다.
+- Demo의 레이블 정확성보다 input distribution, format, label frequency가 성능에 더 중요하다(Min 2022).
+- Linear attention의 forward pass는 1-step ridge regression GD와 수학적으로 동등하며(von Oswald 2023), 각 layer는 GD의 한 step에 대응된다.
+- mid-layer hidden state에서 task vector를 추출하고 inject하면 task가 전환된다. ICL은 표현(task vector), 메커니즘(GD), 회로(induction head) 세 수준에서 동시에 이해된다.
+
+이 프레임은 자연스럽게 다음 질문으로 이어진다 — instruction tuning은 이 ICL 능력을 어떻게 증폭하는가, 그리고 RLHF는 task vector의 분포를 어떻게 바꾸는가.
+
+<Reference
+  title="Language Models are Few-Shot Learners"
+  authors="Brown et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2005.14165"
+/>
+
+<Reference
+  title="Rethinking the Role of Demonstrations: What Makes In-Context Learning Work?"
+  authors="Min et al."
+  year={2022}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/2202.12837"
+/>

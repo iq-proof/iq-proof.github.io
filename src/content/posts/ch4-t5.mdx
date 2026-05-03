@@ -1,0 +1,129 @@
+---
+title: "T5는 왜 모든 NLP task를 text-to-text로 통일했는가"
+description: "T5의 text-to-text 패러다임부터 span corruption, Prefix LM, UL2의 Mixture-of-Denoisers, 그리고 encoder-decoder가 현대 LLM의 decoder-only로 수렴하지 못한 이유까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [t5, encoder-decoder, span-corruption, ul2, architecture]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+BERT는 분류에 강하지만 생성할 수 없고, GPT는 생성하지만 양방향 context가 약하다. Raffel et al. (2020)의 T5는 이 이분 구도를 "모든 task를 text 생성 문제로 환원하면 어떨까"라는 단 하나의 질문으로 허문다. 그렇다면 이 통일 프레임이 어떤 메커니즘으로 작동하고, 왜 현대 LLM은 결국 decoder-only로 수렴했는가?
+
+## Text-to-Text — 하나의 손잡이로 모든 task를
+
+T5의 핵심 아이디어는 단순하다. 모든 task를 다음 형식으로 변환한다.
+
+$$
+\text{prefix} + \text{input} \rightarrow \text{model} \rightarrow \text{output}
+$$
+
+분류 label도 문자열, 회귀 점수도 문자열, 번역 결과도 문자열이다. `"mnli premise: ... hypothesis: ..."` → `"entailment"`, `"stsb sentence1: ..."` → `"3.8"`, `"translate English to German:"` → 독일어 문장. task-specific head가 전부 사라지고 decoder의 next-token prediction 하나로 통일된다.
+
+$$
+\mathcal{L}_{\text{T5}} = -\mathbb{E}_{(x, y) \sim \mathcal{D}}\!\left[\sum_{i=1}^{|y|} \log p_\theta(y_i \mid y_{<i}, x)\right]
+$$
+
+encoder는 `task_prefix + input`을 bidirectional context로 이해하고, decoder는 그 표현 위에서 output을 자기회귀적으로 생성한다. task-specific head를 없앤 대신 **task prefix**가 task selector 역할을 맡는다. 같은 모델이 번역 · 요약 · 분류 · QA를 prefix 하나의 차이로 처리한다.
+
+## Span Corruption — MLM의 generative 버전
+
+T5 pretraining을 구별짓는 또 다른 결정은 **span corruption**이다. BERT의 MLM은 각 masked position을 독립적으로 예측한다. T5는 대신 연속된 token 묶음(span)을 하나의 sentinel token `<extra_id_0>`, `<extra_id_1>`, ...으로 대체하고, decoder가 sentinel-by-sentinel로 해당 span을 자기회귀적으로 복원하게 한다.
+
+```
+Original:   "Thank you for inviting me to your party next week"
+Corrupted:  "Thank you <extra_id_0> me to your party <extra_id_1> week"
+Target:     "<extra_id_0> for inviting <extra_id_1> last <extra_id_2>"
+```
+
+loss는 동일한 seq2seq likelihood다.
+
+$$
+\mathcal{L}_{\text{span}} = -\mathbb{E}_{x \sim \mathcal{D}}\!\left[\sum_{i=1}^{N} \log p_\theta(y_i \mid y_{<i}, x_{\text{corrupted}})\right]
+$$
+
+<Theorem kind="proposition" number="1" title="Span corruption과 MLM의 관계">
+span length가 모두 1일 때, span corruption은 sentinel token과 `[MASK]`의 차이를 제외하면 BERT MLM과 동등하다. mean span length가 커질수록 span 내 token들의 interdependence를 decoder가 명시적으로 모델링한다.
+</Theorem>
+
+<Proof>
+BERT MLM loss는 각 masked position $i$에서 $-\log p(x_i \mid x_{\setminus M})$를 독립적으로 합산한다. span length = 1이면 span corruption의 decoder target도 각 sentinel 뒤에 단 하나의 token만 생성하므로, 조건부 확률 구조가 동일해진다. span length $\geq 2$이면 decoder는 같은 span의 앞선 token을 conditioning으로 사용하므로 span 내 token 간 의존성이 모델링된다. $\square$
+</Proof>
+
+Raffel 2020의 ablation(Table 2)에서 mean span length 3이 최적점으로 나타났다. span이 너무 짧으면 BERT MLM 수준에 머물고, 너무 길면(8 이상) context만으로 복원이 어려워 학습 신호가 약해진다.
+
+## Prefix LM과 UL2 — objective의 혼합
+
+T5 이후 Tay et al. (2022)의 UL2는 단일 denoising objective를 세 개로 확장한다.
+
+**Prefix LM**은 먼저 중간 설계를 제안한다. sequence를 prefix와 suffix로 나눠 prefix는 bidirectional self-attention, suffix는 causal attention을 적용한다.
+
+$$
+M_{ij} = \begin{cases} 0 & \text{if } i \geq j \text{ (causal suffix)} \\ 0 & \text{if } j < p \text{ (bidirectional prefix)} \\ -\infty & \text{otherwise} \end{cases}
+$$
+
+UL2의 **Mixture-of-Denoisers**는 여기서 한 발 더 나아간다.
+
+| Denoiser | 설정 | 강점 |
+|---|---|---|
+| R (Regular) | 15% corruption, mean span 3 | 분류 · 번역 · 요약 범용 |
+| S (Sequential) | Prefix LM 형태 | in-context learning |
+| X (eXtreme) | 50% corruption, mean span 12 | 어려운 task, 압축 표현 |
+
+$$
+\mathcal{L}_{\text{UL2}} = \sum_{d \in \{R, S, X\}} w_d \mathcal{L}_d
+$$
+
+training time에 예제마다 denoiser를 동적으로 선택한다. 세 가지 난이도에 노출된 모델은 단일 objective보다 더 robust한 표현을 학습한다. Tay 2022에서 UL2-20B는 SuperGLUE 90.9로 당시 SOTA를 달성한다.
+
+## 왜 현대 LLM은 decoder-only로 수렴했는가
+
+<Callout type="warning" title="트레이드오프">
+Raffel 2020 Table 2에서 encoder-decoder는 번역(+10 BLEU)을 포함한 5개 벤치마크 평균 최고다. 그러나 이 결론은 downstream fine-tuning 기반 평가에 국한된다. ICL, scaling law, emergent ability의 관점에서는 decoder-only가 압도적으로 유리하다.
+</Callout>
+
+T5의 우위가 흔들린 이유는 세 가지다.
+
+**첫째, In-Context Learning(ICL)은 decoder-only 친화적이다.** ICL은 weight 업데이트 없이 prompt의 sequential flow만으로 few-shot 추론을 수행한다. encoder-decoder는 input과 output이 분리되므로 prompt를 자연스럽게 이어 붙이기 어렵다. decoder-only는 `[demo1][demo2]...[test]`를 단일 시퀀스로 처리한다.
+
+**둘째, scaling law는 decoder-only에 더 우호적이다.** Kaplan 2020과 Hoffmann 2022는 parameter 수 증가 시 decoder-only의 loss 감소가 더 효율적임을 보였다. encoder-decoder의 두 stack 조율 비용이 대규모에서 상대적으로 불리해진다.
+
+**셋째, instruction tuning과 emergent ability는 next-token prediction과 정렬된다.** Chain-of-Thought reasoning은 decoder-only 62B+ 이상에서 emergent하게 나타났다. 모델이 다음 token을 예측하는 방식 자체가 단계별 추론과 구조적으로 닮아 있다.
+
+<Aside label="설계 철학">
+Raffel 2020의 "encoder-decoder 최고"는 틀리지 않았다. 그 벤치마크 범위 안에서는 여전히 맞다. 현대 LLM의 수렴은 목표함수가 바뀐 것이다 — fine-tuning 성능에서 ICL·scaling·emergence로.
+</Aside>
+
+## 정리
+
+- T5의 text-to-text는 task-specific head를 제거하고 prefix로 task를 선택한다. 분류도 회귀도 번역도 같은 seq2seq likelihood 하나로 최적화된다.
+- span corruption은 MLM의 generative 확장이다. sentinel token이 span 경계를 명시하고, decoder가 span 내 token 간 의존성까지 학습한다.
+- UL2의 Mixture-of-Denoisers는 R/S/X 세 objective를 동적으로 혼합해 단일 denoiser 대비 더 robust한 표현을 획득한다.
+- encoder-decoder는 fine-tuning 기반 벤치마크에서 우수하지만, ICL·scaling·instruction tuning의 시대에는 decoder-only가 우위를 점한다. architecture 선택은 목표함수와 분리할 수 없다.
+
+<Reference
+  title="Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"
+  authors="Raffel et al."
+  year={2020}
+  venue="JMLR"
+  url="https://arxiv.org/abs/1910.10683"
+/>
+
+<Reference
+  title="Unifying Language Learning Paradigms"
+  authors="Tay et al."
+  year={2022}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2205.05131"
+/>

@@ -1,0 +1,155 @@
+---
+title: "GPT에서 LLaMA까지: Decoder-Only LLM의 설계 철학"
+description: "GPT-1의 generative pretraining 선택부터 GPT-3의 in-context learning 발현, 그리고 RoPE·GQA·RMSNorm으로 이어지는 modern LLM 최적화까지, decoder-only 패러다임이 어떻게 진화했는지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [gpt, decoder-only, in-context-learning, llm, rope]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-1이 decoder-only 구조를 선택한 2018년부터, LLaMA·Mistral·Qwen이 표준으로 자리 잡은 오늘까지 — 겉보기엔 서로 다른 모델들의 연속처럼 보이지만, 이 계보를 관통하는 하나의 질문이 있다. **"파라미터 업데이트 없이 얼마나 많은 것을 할 수 있는가?"** GPT-1의 generative pretraining부터 GPT-3의 in-context learning, 그리고 GQA의 inference 최적화까지 — 모든 설계 결정은 이 질문에 대한 다른 형태의 답이다.
+
+## Decoder-Only의 출발: 왜 단방향인가
+
+BERT가 bidirectional MLM을 선택한 시점에, GPT-1은 반대 방향을 택했다. unidirectional causal language modeling이다.
+
+$$
+L_{\text{CLM}}(\theta; x) = -\sum_{t=1}^T \log p_\theta(x_t \mid x_1, \ldots, x_{t-1})
+$$
+
+BERT의 bidirectional attention은 classification 성능에서 우수했다. 그러나 GPT-1의 선택에는 다른 동기가 있었다 — **pretraining과 inference가 동일한 구조**를 가져야 한다는 것. 생성 시 모델은 어차피 왼쪽에서 오른쪽으로만 token을 만들어낸다. causal mask는 이 사실을 학습 단계부터 구조적으로 반영한다.
+
+<Aside label="causal mask의 병렬성">
+RNN 기반 언어 모델은 $h_t = f(h_{t-1}, x_t)$ 로 인해 sequential depth $O(T)$가 피할 수 없다. causal mask를 가진 Transformer는 position $t$의 logit이 $x_{<t}$에만 의존하므로, 모든 position의 gradient를 single forward-backward pass에서 동시에 계산할 수 있다. depth $O(1)$, 완전한 병렬화.
+</Aside>
+
+GPT-1이 117M 파라미터로 이 구조를 확립하면서, 이후 수년간의 scaling 경쟁이 시작된다.
+
+## GPT-2: "Fine-tuning이 없어도 된다면?"
+
+GPT-2 (Radford et al. 2019)의 핵심 주장은 도발적이었다. "언어 모델은 unsupervised multitask learner다." 1.5B 파라미터와 WebText (Reddit upvote ≥3 기준으로 필터링한 40GB 텍스트)를 결합하면, 별도 fine-tuning 없이 prompt 구성만으로 다양한 task를 처리할 수 있다는 것이다.
+
+아키텍처 변화는 작지만 중요했다. Post-LN에서 **Pre-LN**으로의 전환이다.
+
+```
+Post-LN (GPT-1):
+  x → Attn → (x + Attn output) → LayerNorm → y
+  (깊어질수록 gradient norm ≈ √N으로 증가)
+
+Pre-LN (GPT-2):
+  x → LayerNorm → Attn → (x + Attn output) → y
+  (gradient norm이 N에 independent하게 bounded)
+```
+
+그리고 residual projection 초기화를 $1/\sqrt{N}$ ($N$은 layer 수)으로 scaling하여, 깊은 모델에서도 signal의 variance를 제어했다. 이 두 변화 덕분에 48 layer의 GPT-2 XL이 안정적으로 학습될 수 있었다.
+
+scaling law의 패턴도 이 시점에 실증되기 시작했다.
+
+$$
+L(N) \approx C \cdot N^{-\alpha}, \quad \alpha \approx 0.076
+$$
+
+파라미터 10배 증가는 loss를 약 20% 감소시킨다. "더 크면 더 좋다"는 직관이 수치로 뒷받침되었다.
+
+## GPT-3: In-Context Learning의 발현
+
+GPT-3 (Brown et al. 2020)는 질문을 바꾸었다. fine-tuning 없이, **prompt에 몇 개의 예시를 넣으면 어떻게 되는가?**
+
+$$
+y_{\text{pred}} = \arg\max_y \; p_\theta(y \mid x_1, y_1, \ldots, x_k, y_k, x_{\text{new}})
+$$
+
+파라미터 $\theta$는 업데이트되지 않는다. 순수하게 context만으로 task adaptation이 일어난다. 이것이 **in-context learning (ICL)**이다.
+
+<Theorem kind="proposition" number="1" title="Emergent In-Context Learning">
+모델 크기 $N$이 특정 임계값 $N_{\text{threshold}}$ 이상일 때, few-shot 성능이 demonstration 수 $k$에 단조 증가하는 능력이 나타난다. $N < N_{\text{threshold}}$에서는 $k$가 증가해도 성능 향상이 거의 없다.
+</Theorem>
+
+<Proof>
+Brown et al. (2020) Figure 3.4의 실증적 관찰. 124M~1.3B 범위 모델에서는 zero-shot과 few-shot 성능이 거의 동일하다. GPT-3 scale (~175B)에서 비로소 few-shot이 zero-shot을 유의미하게 초과하기 시작한다. 이 gap은 모델 크기에 대해 비선형적으로 증가한다. $\square$
+</Proof>
+
+175B 파라미터, 96 layer, hidden dimension 12288, context length 2048. GPT-3의 규모는 이전 모델과 질적으로 달랐다. 그리고 중요한 설계 선택이 하나 더 있었다 — strided + alternating pattern의 **sparse attention**으로 $O(T^2)$ 계산을 완화하는 것.
+
+<Callout type="warning" title="ICL의 한계">
+ICL은 prompt 길이에 제약이 있다. demonstration이 늘수록 attention window를 초과할 수 있고, label space가 모호하면 성능이 불안정해진다. "fine-tuning이 불필요하다"는 주장은 많은 task에서 여전히 supervised 방법에 뒤진다. GPT-3의 진짜 기여는 절대 성능이 아니라 "scale이 새로운 능력을 만들어낸다"는 증거였다.
+</Callout>
+
+## Modern LLM의 최적화: RMSNorm, SwiGLU, RoPE, GQA
+
+GPT-3 이후 LLaMA, Mistral, Gemma 같은 open LLM들이 공통적으로 채택한 네 가지 기법이 있다. 각각은 독립적인 개선이지만, 동일한 동기를 공유한다 — **더 깊고, 더 빠르고, 더 긴 context를**.
+
+**RMSNorm**은 LayerNorm에서 mean centering을 제거한다.
+
+$$
+\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{n}\sum_i x_i^2 + \epsilon}} \cdot \gamma
+$$
+
+mean 계산을 없애면 연산이 줄어들고, floating-point 정밀도 손실도 감소한다. Pre-LN과 결합하면 100+ layer 모델도 안정적으로 학습된다.
+
+**SwiGLU**는 feed-forward layer에 gating 구조를 더한다.
+
+$$
+\text{SwiGLU}(x) = \text{Swish}(xW_1) \odot (xW_2)
+$$
+
+multiplicative interaction이 activation에 조건적 정보 흐름을 가능하게 한다. 같은 파라미터 수에서 더 높은 표현력이 실증적으로 확인되었다.
+
+**RoPE** (Rotary Position Embedding)는 position encoding의 length extrapolation 문제를 해결한다. query $Q$와 key $K$에 rotation matrix $R_{\theta,m}$을 적용하면, attention score가 절대 위치가 아닌 상대 거리 $m-n$에만 의존하게 된다.
+
+$$
+\text{score}(m, n) = (R_{\theta,m}Q) \cdot (R_{\theta,n}K)^T = Q \cdot K^T \cdot f(m-n)
+$$
+
+training에서 본 적 없는 긴 sequence에서도 position 정보가 깨지지 않는다.
+
+**GQA** (Group Query Attention)는 inference를 겨냥한다. multi-head attention에서 K와 V를 $n_g$개 그룹으로 줄이면 KV cache가 $n_q / n_g$배 감소한다. LLaMA 3에서 $n_q = 96, n_g = 8$이면 12배 메모리 절감이다. 대신 attention의 expressiveness가 약간 감소하는 trade-off가 따른다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+이 계보 전체를 관통하는 핵심 tension은 **표현력 vs 효율**이다.
+
+- **Causal vs Bidirectional**: causal은 생성에 자연스럽지만 classification에서 BERT보다 불리하다.
+- **Scale vs Cost**: 파라미터 증가는 power-law로 성능을 높이지만, 훈련/서빙 비용은 그 이상으로 증가한다.
+- **ICL vs Fine-tuning**: ICL은 유연하지만 critical domain에서는 fine-tuning이 필수다.
+- **GQA vs MHA**: 12배 메모리 절감은 복잡한 reasoning task에서 약간의 정확도 하락을 감수한다.
+- **RoPE extrapolation**: 상대 위치 의존성은 긴 context를 가능하게 하지만 100k+ token에서는 여전히 성능 저하가 관찰된다.
+</Callout>
+
+## 정리
+
+- GPT-1의 decoder-only 선택은 "pretraining과 inference가 같은 구조여야 한다"는 철학의 귀결이다.
+- GPT-2의 Pre-LN과 scaled residual init은 depth를 늘리기 위한 필수 조건이었다.
+- GPT-3의 ICL은 "scale이 새로운 능력을 만들어낸다"는 가장 강력한 증거였다.
+- RMSNorm·SwiGLU·RoPE·GQA는 GPT-3의 구조를 더 깊고, 빠르고, 긴 context에서 작동하도록 정제한 기법들이다.
+
+decoder-only 패러다임은 단순함을 통해 확장 가능성을 극대화했다. 그리고 그 단순함의 누적이 오늘날의 LLM 생태계 전체를 만들었다.
+
+<Reference
+  title="Language Models are Unsupervised Multitask Learners"
+  authors="Radford et al."
+  year={2019}
+  venue="OpenAI Blog"
+  url="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf"
+/>
+
+<Reference
+  title="Language Models are Few-Shot Learners"
+  authors="Brown et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2005.14165"
+/>

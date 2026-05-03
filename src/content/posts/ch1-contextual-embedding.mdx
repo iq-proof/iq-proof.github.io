@@ -1,0 +1,133 @@
+---
+title: "Pretrained LM은 어떻게 '언어를 이해'하게 되었나"
+description: "Context-independent한 고정 벡터의 한계부터 Bi-LSTM, 3단계 fine-tuning recipe, Transformer의 병렬 self-attention까지 — 사전학습 언어모델 진화의 핵심 흐름을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [pretrained-lm, transformer, elmo, ulmfit, attention]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+"bank"라는 단어 하나에 단 하나의 벡터를 할당하면 어떤 일이 생기는가? Word2Vec과 GloVe는 그 질문을 수십 년간 회피했고, ELMo와 ULMFiT와 Transformer가 차례로 그 빚을 갚았다. 이 글은 그 상환 과정의 설계 결정들을 추적한다.
+
+## Static Embedding이 틀린 이유
+
+Word2Vec의 objective는 단순하다. Corpus 전체의 co-occurrence 통계를 바탕으로 각 단어 $w$에 고정 벡터 $E(w) \in \mathbb{R}^d$를 할당한다.
+
+$$\mathcal{L}_{\text{Skip-gram}} = -\sum_{(w,c) \sim \mathcal{D}} \log \frac{\exp(E(w) \cdot E(c))}{\sum_{c' \in \mathcal{V}} \exp(E(w) \cdot E(c'))}$$
+
+문제는 이 함수가 "bank"를 몇 번 보았든, 어떤 문장에서 등장했든 단 하나의 벡터로만 표현한다는 것이다.
+
+<Theorem kind="proposition" number="1" title="Static Embedding의 Polysemy 분리 불가능성">
+Static embedding $E: \mathcal{V} \to \mathbb{R}^d$에서 다의어 $w$의 context-wise variance는 정의상 0이다. 따라서 "bank (river)"와 "bank (financial)"를 서로 다른 벡터로 분리할 수 없다.
+</Theorem>
+
+<Proof>
+Static embedding은 $E(w, c) = E(w)$, 즉 모든 context $c$에서 동일한 벡터를 반환한다. Ideal representation이라면 $\text{sim}(v_{\text{river bank}}, v_{\text{financial bank}}) \ll 1$이어야 하지만, 단일 벡터 $E(\text{"bank"})$는 두 sense의 통계적 평균 근방에 수렴한다. 결과적으로 nearest neighbors에 "river"와 "account"가 동시에 등장한다. $\square$
+</Proof>
+
+GloVe도 global co-occurrence matrix $M_{ij}$를 least-squares로 분해하는 방식이라 동일한 한계를 갖는다. Objective 형태가 달라도 "하나의 단어 = 하나의 벡터"라는 전제가 유지되는 한 polysemy 분리는 불가능하다.
+
+## ELMo — 문맥이 벡터를 결정하다
+
+ELMo (Peters et al., 2018)의 핵심 아이디어는 Language Model의 중간 hidden state를 embedding으로 사용한다는 것이다. Bi-LSTM을 forward/backward 방향으로 독립 학습한 뒤 각 layer의 출력을 가중합한다.
+
+$$\text{ELMo}_t^{\text{task}} = \gamma^{\text{task}} \sum_{l=0}^{L} s_l^{\text{task}} h_t^{(l)}, \quad h_t^{(l)} = [\overrightarrow{h}_t^{(l)};\, \overleftarrow{h}_t^{(l)}]$$
+
+"The river bank was beautiful"에서의 `bank`와 "I opened a bank account"에서의 `bank`는 이제 서로 다른 $h_t^{(l)}$를 가진다. LSTM이 각각 다른 left/right context를 보기 때문이다.
+
+주목할 설계 결정이 두 가지다. 첫째, character-CNN으로 초기 임베딩을 구성해 OOV 단어도 형태론적 패턴으로 처리한다. "bankify"는 `[b,a,n,k]` 패턴을 공유하므로 "banking"과 유사한 초기 표현을 얻는다. 둘째, task별로 layer weight $s_l$을 학습한다. POS tagging은 lower layer를, semantic role labeling은 upper layer를 더 크게 활용한다 — 각 layer가 서로 다른 수준의 추상화를 표현하기 때문이다.
+
+<Callout type="note" title="ELMo의 한계">
+Bi-LSTM은 forward와 backward를 **독립적으로** 학습한 뒤 concatenate한다. Self-attention처럼 임의의 두 position이 직접 상호작용하지 않으므로, 학습이 sequential하고 병렬화가 어렵다. 또한 pretrained LM 전체가 frozen된 채로 downstream task에 embedding을 주입하는 **feature-based transfer**만 지원한다.
+</Callout>
+
+## ULMFiT — Fine-tuning을 하나의 Recipe로
+
+Howard & Ruder (2018)는 ELMo의 frozen 전략을 정면으로 거부했다. Pretrained LM의 파라미터를 downstream task에 맞게 직접 업데이트하는 **3단계 fine-tuning recipe**를 제안한다.
+
+1. General LM pretraining (Wikipedia)
+2. Target-domain LM fine-tuning (e.g., IMDb)
+3. Task classifier fine-tuning
+
+여기서 catastrophic forgetting — 기존에 학습한 지식이 새 학습으로 덮어씌워지는 현상 — 을 막기 위해 두 가지 기법을 도입한다.
+
+**Discriminative Learning Rates**: 각 layer $l$에 다른 학습률을 부여한다.
+
+$$\eta^l = \frac{\eta^{(L)}}{2.6^{L-l}}$$
+
+Lower layer는 일반적 언어 지식을 담고 있으므로 작은 LR로 천천히 조정하고, upper layer는 task-specific하므로 큰 LR로 빠르게 적응시킨다. 상수 2.6은 grid search의 경험적 결과다.
+
+**Gradual Unfreezing**: Top layer부터 epoch마다 한 층씩 해동한다. Task signal이 먼저 상위 layer에 정착한 뒤 점진적으로 하위 layer까지 전파되므로, 하위 layer의 일반 지식이 과도한 noise에 노출되지 않는다.
+
+<Aside label="2023+에서의 재등장">
+ULMFiT 자체는 BERT 이후 사라졌지만, 그 원칙은 현재 LLM에 살아 있다. Domain-adaptive pretraining, LoRA(일부 파라미터만 tune), layer-wise LR decay — 모두 ULMFiT의 계보다.
+</Aside>
+
+## Transformer — Sequential 처리의 구조적 한계를 끊다
+
+ELMo와 ULMFiT는 LSTM이라는 공통 기반을 공유한다. 그리고 LSTM은 근본적으로 sequential하다. Position $t$의 hidden state $h_t$를 계산하려면 $h_{t-1}$이 필요하므로 GPU 병렬화가 불가능하다.
+
+더 심각한 문제는 gradient flow다. Position 1의 정보가 position $T$의 loss에 도달하려면 $T-1$번의 chain rule을 통과해야 한다.
+
+$$\left|\frac{\partial L_T}{\partial x_1}\right| \leq \left|\frac{\partial h_t}{\partial h_{t-1}}\right|^{T-1}$$
+
+$T = 512$이고 LSTM gate의 gradient norm이 0.9라면 이 값은 $10^{-23}$ 수준으로 소실된다.
+
+Vaswani et al. (2017)의 self-attention은 이 구조를 완전히 바꾼다.
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+
+Position $i$에서 position $j$로의 연결은 **한 번의 행렬 곱셈**으로 완성된다. Gradient chain 길이가 $T$에서 상수로 줄고, 행렬 연산은 GPU에서 완전히 병렬화된다. Sequence length $T=512$ 기준으로 Transformer는 LSTM 대비 학습 속도가 수십 배 빠르다.
+
+Transformer의 또 다른 결정은 **causal mask**다. Position $t$가 future position $t+1, \ldots, T$를 볼 수 없도록 attention score에 $-\infty$를 채운다. 이 단순한 선택이 GPT 계열(decoder-only, autoregressive)과 BERT 계열(encoder-only, bidirectional)이라는 두 갈래를 만든다.
+
+$$M_{ij} = \begin{cases} 0 & i \geq j \\ -\infty & i < j \end{cases}$$
+
+같은 self-attention block에서 mask 전략과 objective만 바뀌었을 뿐인데, 한쪽은 생성에 강하고 다른 쪽은 이해에 강한 모델이 탄생한다.
+
+## 트레이드오프
+
+이 네 세대 — Static embedding, ELMo, ULMFiT, Transformer — 는 각각 다른 제약 조건 아래서 작동한다.
+
+<Callout type="note" title="트레이드오프 요약">
+**Static embedding**: $O(1)$ lookup, polysemy 불가. **ELMo**: context-dependent하지만 sequential LSTM, feature-based만 지원. **ULMFiT**: full fine-tuning 가능, 하지만 3단계 recipe의 hyperparameter(2.6, warmup 비율) 가 domain마다 다를 수 있음. **Transformer**: $O(T^2)$ memory — sequence가 길어질수록 attention matrix가 폭발한다. Sparse attention, RoPE, GQA 등이 이를 완화하지만 근본 복잡도는 유지된다.
+</Callout>
+
+한 가지 더: BERT(bidirectional)는 생성 task에 구조적으로 불리하다. Training 시 양방향을 모두 보도록 학습되었으므로, autoregressive generation을 위해 causal mask를 나중에 강제하면 distribution shift가 심각하다. 반대로 GPT는 분류 task에 사용할 수 있지만, bidirectional context를 단일 forward pass에서 온전히 활용하는 BERT만큼 효율적이지 않다.
+
+## 정리
+
+- Static embedding의 실패는 단어 수준이 아니라 **문장 수준의 의미**를 학습하지 못했기 때문이다.
+- ELMo는 LM hidden state를 embedding으로 재활용함으로써 context-dependence를 얻었고, ULMFiT는 그 위에서 전체 네트워크를 fine-tuning할 수 있음을 보였다.
+- Transformer는 sequential 처리를 병렬 self-attention으로 대체해 스케일의 문제를 열었다.
+- BERT와 GPT는 같은 블록에서 masking 전략 하나의 차이로 분기한다 — 구조적 결정이 모델의 운명을 결정한다.
+
+다음 글에서는 BERT의 내부 구조와 Masked Language Modeling objective가 어떻게 bidirectional representation을 만들어내는지 추적한다.
+
+<Reference
+  title="Deep contextualized word representations"
+  authors="Peters et al."
+  year={2018}
+  venue="NAACL"
+  url="https://arxiv.org/abs/1802.05365"
+/>
+
+<Reference
+  title="Attention Is All You Need"
+  authors="Vaswani et al."
+  year={2017}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1706.03762"
+/>

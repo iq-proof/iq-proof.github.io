@@ -1,0 +1,121 @@
+---
+title: "Instruction에서 Reasoning까지 — LLM은 어떻게 생각을 배우는가"
+description: "Instruction Tuning의 zero-shot 일반화 원리부터 Chain-of-Thought의 창발, Self-Consistency의 경로 앙상블, 그리고 'Emergent Abilities'가 측정 방법의 산물일 수 있다는 반론까지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [instruction-tuning, chain-of-thought, emergent-abilities, llm-reasoning]
+difficulty: advanced
+series:
+  slug: pretrained-lm-deep-dive
+  title: Pretrained Lm Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-3는 데모(demo) 몇 개를 보여주면 새 태스크를 수행했다. 그런데 데모 없이 "이걸 해줘"라고 말해도 되지 않을까? 그 질문에서 Instruction Tuning이 시작됐고, 이후 Chain-of-Thought, Self-Consistency, Tree of Thoughts가 차례로 등장하면서 "LLM이 정말 추론을 하는가"라는 논쟁이 불붙었다. 이 챕터들을 관통하는 하나의 질문이 있다 — **모델은 언제 생각하는가, 아니면 생각하는 척하는가?**
+
+## Instruction이라는 언어
+
+FLAN(Wei 2022)의 핵심 관찰은 단순하다. 태스크를 자연어 instruction으로 표현하고, 60개 이상의 다양한 태스크에 걸쳐 그 instruction들로 fine-tuning하면 — 학습에 없던 새 태스크도 instruction만으로 수행할 수 있게 된다. 이를 zero-shot generalization이라 부른다.
+
+이 학습 목표는 다음과 같이 쓸 수 있다.
+
+$$
+\mathcal{L}_{\mathrm{IT}} = \sum_i w_i \sum_{(x, y) \in D_i} \sum_{k=1}^{|I_i|} \log p_\theta(y \mid I_i^{(k)}, x)
+$$
+
+$I_i^{(k)}$는 태스크 $i$의 $k$번째 instruction template이다. 같은 태스크를 10가지 다른 표현으로 학습하면 그만큼 paraphrase 변동성에 강해진다. 직관적으로 이는 **암묵적 앙상블** 효과다 — 모델이 여러 관점에서 동시에 같은 태스크를 학습한다.
+
+<Callout type="note" title="트레이드오프">
+Instruction template의 다양성은 robustness를 높이지만, template이 서로 의미적으로 달라지면 오히려 모델을 혼란시킨다. FLAN이 수작업으로 template을 검증한 이유다. Super-NaturalInstructions(Wang 2022)는 declarative schema로 이 검증을 자동화했지만, 완전한 semantic correctness 보증은 여전히 어렵다.
+</Callout>
+
+중요한 경험적 결과가 있다. held-in 태스크 수가 10 → 60으로 증가할 때 held-out zero-shot 정확도는 약 $A_0 + B \log N$으로 증가한다 — 지수적이 아니라 **log-sublinear**다. 태스크 다양성에는 수익 체감이 있다.
+
+## Chain-of-Thought — 단계를 쓰면 답이 달라진다
+
+Instruction Tuning이 "무엇을 할지"를 가르쳤다면, Chain-of-Thought(Wei 2022)는 "어떻게 생각할지"를 묻는다. 데모에 중간 추론 단계($\tau$)를 포함하면, 모델이 테스트 시에도 단계를 생성하는 경향을 보이고 — 최종 답의 정확도가 크게 오른다.
+
+GSM8K(수학 문제)에서 PaLM 540B의 경우 17% → 57%로 뛰었다. Kojima 2022의 zero-shot CoT는 더 극적이다. 데모 없이 "Let's think step by step" 한 줄만 붙여도 유사한 효과가 나타난다.
+
+그런데 두 가지 관찰이 이 현상을 복잡하게 만든다.
+
+첫째, CoT는 약 62B 파라미터 미만 모델에서는 **효과가 없거나 오히려 악화**된다. 작은 모델에게 중간 단계 생성은 최종 답 생성 확률을 희석시키는 noise로 작동한다.
+
+둘째, 의도적으로 **잘못된 reasoning step**을 제공해도 모델은 그것을 신뢰하는 경향이 있다. 이는 모델이 step의 논리적 정확성을 검증하지 않고, format을 따를 뿐이라는 신호다.
+
+<Aside label="해석의 갈림길">
+CoT가 진짜 단계적 사고를 구현하는가, 아니면 training data에서 학습된 추론 패턴을 format-match로 재생산하는가 — 이 질문은 Schaeffer 2023의 반론과 맞닿아 있고, 현재도 논쟁 중이다.
+</Aside>
+
+## Self-Consistency와 ToT — 경로를 여러 개 만들면
+
+단일 CoT 경로는 fragile하다. Self-Consistency(Wang 2023)의 아이디어는 단순하다. 같은 질문에 대해 temperature sampling으로 $N$개의 reasoning path를 생성하고, 최빈 답을 선택한다.
+
+$$
+y_{\text{SC}} = \arg\max_y \sum_{i=1}^N \mathbb{1}[y_i = y]
+$$
+
+단일 경로 error rate가 $p < 0.5$이면, majority vote error는 $N$ 증가에 따라 지수적으로 감소한다. 실험적으로 $n=40$ 샘플에서 GSM8K 정확도가 추가로 약 15-20% 오른다. 단, marginal return은 $n$이 커질수록 빠르게 감소한다.
+
+Tree of Thoughts(Yao 2023)는 이 암묵적 탐색을 명시적 tree search로 구조화한다.
+
+```
+ToT = Thought Generator (LLM) + Value Function (LLM or PRM) + Search Algorithm (BFS/DFS)
+```
+
+병목은 Value Function이다. LLM이 state quality를 직접 평가하면 약 62% 정확도지만, step-level로 학습된 Process Reward Model(Lightman 2023)을 쓰면 약 85%까지 오른다. Value Function 정확도가 tree search 전체 효율의 상한을 결정한다.
+
+## Emergent Abilities — 진짜인가, 측정의 산물인가
+
+여기서 이 챕터들의 가장 날카로운 논쟁이 등장한다. Wei 2022는 BIG-Bench의 여러 태스크에서 모델 규모에 따라 능력이 "갑자기" 나타난다고 주장했다. 30B에서 0%, 60B에서 5%, 137B에서 45%처럼.
+
+Schaeffer 2023의 반론은 수학적으로 명확하다.
+
+<Theorem kind="theorem" number="1" title="Metric Artifact (Schaeffer 2023)">
+토큰 레벨 cross-entropy loss가 smooth하게 감소해도, sequence-level exact-match accuracy는 phase transition처럼 보일 수 있다.
+</Theorem>
+
+<Proof>
+토큰 오류율을 $p_t$, 시퀀스 길이를 $L$이라 하면, 시퀀스 정확도는
+
+$$
+\text{Acc}_{\text{seq}} = (1 - p_t)^L
+$$
+
+$p_t = 0.01$, $L = 100$이면 $0.99^{100} \approx 0.366$ — 토큰 99% 정확이어도 시퀀스는 37%다. $p_t$가 smooth하게 감소할 때, 시퀀스 정확도는 특정 구간에서 급격히 오르는 것처럼 보인다. Phase transition이 아니라 **비선형 합성의 결과**다. $\square$
+</Proof>
+
+즉, 같은 모델의 같은 능력이 어떤 metric으로 재느냐에 따라 "창발"처럼 보이기도, smooth curve처럼 보이기도 한다. BIG-Bench Hard(Suzgun 2023)는 이 문제를 정면으로 다뤄 "emergent"로 분류된 태스크 중 약 48%는 metric artifact, 35%만이 토큰 레벨에서도 sharp한 진짜 창발로 분류했다.
+
+## 정리
+
+- Instruction Tuning은 자연어 instruction을 통해 unseen 태스크로의 zero-shot 일반화를 가능케 한다. 핵심은 template 다양성과 태스크 coverage의 균형이다.
+- Chain-of-Thought는 중간 추론 단계를 명시하면 정확도가 오른다는 관찰이지만, 이것이 진짜 추론인지 pattern matching인지는 아직 열린 질문이다.
+- Self-Consistency와 Tree of Thoughts는 "한 번의 생성"이 아니라 "여러 경로의 합의"로 신뢰도를 높이는 접근이다.
+- "Emergent Abilities"는 실재할 수 있지만, exact-match 같은 binary metric이 smooth한 능력 향상을 phase transition처럼 보이게 만드는 artifact를 주의해야 한다.
+
+이 챕터들이 공유하는 철학은 하나다 — **모델이 무엇을 알고 있는지는, 어떻게 묻느냐에 달려 있다.**
+
+<Reference
+  title="Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"
+  authors="Wei et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2201.11903"
+/>
+
+<Reference
+  title="Are Emergent Abilities of Large Language Models a Mirage?"
+  authors="Schaeffer et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2304.15004"
+/>
