@@ -65,7 +65,7 @@ $$
 
 per-patch normalization은 분산이 큰 패치가 loss를 독점하지 않도록 균형을 맞춘다.
 
-MAE의 주목할 만한 결과는 **linear probe << fine-tuning** 패턴이다(79.0% vs 83.6%, ViT-L). contrastive SSL(DINO, SimCLR)은 linear probe ≈ fine-tuning인 것과 정반대다. MAE는 low-level detail(edge, texture)을 풍부하게 보존하므로, linear head 하나로는 이를 semantic으로 변환하지 못한다. fine-tuning 시 깊은 layer들이 그 변환을 수행하면서 큰 향상이 나타난다.
+MAE의 주목할 만한 결과는 **linear probe `<<` fine-tuning** 패턴이다(79.0% vs 83.6%, ViT-L). contrastive SSL(DINO, SimCLR)은 linear probe ≈ fine-tuning인 것과 정반대다. MAE는 low-level detail(edge, texture)을 풍부하게 보존하므로, linear head 하나로는 이를 semantic으로 변환하지 못한다. fine-tuning 시 깊은 layer들이 그 변환을 수행하면서 큰 향상이 나타난다.
 
 ## SimMIM: 단순함은 충분한가
 

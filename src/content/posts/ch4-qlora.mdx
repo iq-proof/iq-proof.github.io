@@ -84,7 +84,7 @@ LoRA rank의 sweet spot은 64 전후다. Aghajanyan 2020의 intrinsic dimension 
 세 기법을 결합할 때 감수해야 할 비용도 명확하다.
 
 <Callout type="note" title="트레이드오프 요약">
-**NF4 양자화**: 4비트 재구성 오차 ~0.5% (fine-tuning에서 LoRA가 부분 보정). **Double quantization**: scale 재압축 추가 오차 <0.01%이나, 극단적 weight 분포에서 오차 누적 가능. **Paged optimizer**: throughput 8-10% 손실(GPU-CPU transfer). **LoRA rank 제약**: intrinsic dimension을 초과하는 rank는 diminishing return — 작은 rank에서는 표현력 부족 가능. Pre-training에는 적용 불가(frozen base는 task 학습을 가정).
+**NF4 양자화**: 4비트 재구성 오차 ~0.5% (fine-tuning에서 LoRA가 부분 보정). **Double quantization**: scale 재압축 추가 오차 `<0.01%`이나, 극단적 weight 분포에서 오차 누적 가능. **Paged optimizer**: throughput 8-10% 손실(GPU-CPU transfer). **LoRA rank 제약**: intrinsic dimension을 초과하는 rank는 diminishing return — 작은 rank에서는 표현력 부족 가능. Pre-training에는 적용 불가(frozen base는 task 학습을 가정).
 </Callout>
 
 비용 관점에서 격차는 더 극적이다. 13B 모델 기준 Full FT는 4× A100에 약 $4,000, QLoRA는 1× A100에 약 $1,000 — 비용 1/4에 성능 99.26%다. 65B에서는 8× A100($8,000) 대 1× A100($1,000), 그리고 성능 격차는 1% 미만이다.

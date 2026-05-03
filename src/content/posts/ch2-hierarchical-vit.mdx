@@ -17,6 +17,7 @@ import Callout from '@/components/mdx/Callout.astro';
 import Theorem from '@/components/mdx/Theorem.astro';
 import Proof from '@/components/mdx/Proof.astro';
 import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
 
 ViT는 강력하다. patch 단위 global attention으로 long-range dependency를 단 한 layer에서 포착한다. 그러나 CNN이 공짜로 갖는 것들 — locality, translation equivariance, hierarchical feature — 을 ViT는 전혀 갖지 않는다. 그 대가가 바로 **데이터 허기**다. ImageNet-1k만으로는 ResNet에도 미치지 못한다. 이 제약을 메우기 위해 2021년 한 해에만 다섯 갈래의 해법이 등장했다. 이 다섯 갈래는 서로 다른 언어로 같은 질문에 답한다 — **inductive bias 없이 어떻게 충분히 학습할 수 있는가?**
 
