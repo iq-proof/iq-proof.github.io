@@ -1,0 +1,147 @@
+---
+title: "Bandit 알고리즘은 왜 로그 regret을 목표로 하는가"
+description: "탐색-활용 딜레마의 수학적 정의부터 Lai-Robbins 하한과 minimax 관점까지, stochastic bandit 이론의 핵심 구조를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, bandit, regret, ucb, exploration-exploitation]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Stochastic bandit 문제는 RL에서 state를 제거한 형태다. 남는 것은 오직 하나 — **불확실한 선택지 중 무엇을 얼마나 시도해야 하는가**. 이 질문에 답하는 과정에서 등장한 regret 이론은, UCB부터 Thompson Sampling까지 현대 탐색 알고리즘 전체의 뼈대가 된다. 왜 선형 regret은 피해야 하고, 왜 로그 regret이 달성 가능한 최선인가?
+
+## 문제의 정의: regret과 gap-decomposition
+
+$K$개의 팔이 각각 분포 $\nu_k$를 따르고, 팔 $k$의 평균 보상을 $\mu_k$라 하자. 최적 평균은 $\mu^* = \max_k \mu_k$. 시간 $T$ 동안 정책 $\pi$가 누적하는 **expected regret**은 다음과 같다.
+
+$$
+R_T = T\mu^* - \mathbb{E}\left[\sum_{t=1}^T X_{I_t, t}\right]
+$$
+
+이 식을 팔별로 분해하면 gap-decomposition이 나온다.
+
+$$
+R_T = \sum_{k=1}^K \Delta_k \cdot \mathbb{E}[N_k(T)]
+$$
+
+여기서 $\Delta_k = \mu^* - \mu_k$는 팔 $k$의 suboptimality gap, $N_k(T)$는 팔 $k$를 선택한 횟수다. 증명은 단순하다. 각 스텝에서의 손실이 $\mu^* - \mu_{I_t}$이므로, 팔별로 묶으면 $\Delta_k \cdot \mathbb{E}[N_k(T)]$의 합이 된다.
+
+이 한 식이 모든 bandit 분석의 출발점이다. **regret을 줄이려면 나쁜 팔을 적게 뽑아야 하고, 나쁜 팔을 적게 뽑으려면 좋은 팔을 빨리 찾아야 한다.** 탐색-활용 딜레마는 여기서 정량화된다.
+
+## 두 극단의 실패: 왜 둘 다 $\Theta(T)$인가
+
+Pure exploitation(greedy)과 pure exploration(uniform random)은 직관적으로 반대처럼 보이지만 regret 측면에서는 같은 결말에 이른다.
+
+**Greedy의 실패**는 초기 noise에서 비롯된다. $\mu = [0.5, 0.51, 0.7]$인 문제에서, 첫 몇 번의 시도 중 arm 2가 운 좋게 높은 표본 평균을 가지면 greedy는 이후 $T - O(1)$ 동안 arm 2만 선택한다. Gap-decomposition에서 $\mathbb{E}[N_2(T)] \approx T$이므로 $R_T \approx \Delta_2 \cdot T = \Theta(T)$.
+
+**Uniform random의 실패**는 명백하다. $\mathbb{E}[N_k(T)] = T/K$이므로,
+
+$$
+R_T = \sum_{k \neq k^*} \Delta_k \cdot \frac{T}{K} = \Theta(T)
+$$
+
+나쁜 팔을 계속 동등하게 뽑는 한 선형 손실은 피할 수 없다.
+
+$\epsilon$-greedy는 두 극단 사이의 타협이다. Constant $\epsilon$이면 $R_T = \Theta(\epsilon T)$로 여전히 선형이고, decaying $\epsilon_t = cK/t$이면 $R_T = O(K \log T / \Delta_{\min}^2)$로 로그 수렴이 가능하다. 그러나 상수 $c$를 설정하려면 $\Delta_{\min}$을 사전에 알아야 한다는 catch-22가 있다.
+
+<Callout type="warning" title="선형 vs 로그 regret의 실제 의미">
+$T = 10^6$, $\Delta = 0.1$이라 할 때, 선형 regret $\approx 10^5$인 반면 로그 regret $\approx 14$다. 지수적 차이다. 대규모 추천 시스템에서 이 차이는 매일 수억 원의 기회비용으로 나타난다.
+</Callout>
+
+## Lai-Robbins 하한: 로그 regret의 정보이론적 근거
+
+ε-greedy가 달성한 $O(\log T)$는 그냥 "좋은" 결과가 아니다. Lai & Robbins(1985)는 **모든 일관성 있는 알고리즘**에 대해 이 이하로 내려갈 수 없음을 증명했다.
+
+<Theorem kind="theorem" number="1" title="Lai-Robbins Lower Bound (1985)">
+모든 consistent 알고리즘 $\pi$와 모든 suboptimal arm $k \neq k^*$에 대해,
+
+$$
+\liminf_{T \to \infty} \frac{\mathbb{E}[N_k(T)]}{\log T} \geq \frac{1}{D_{\text{KL}}(\nu_k \| \nu^*)}
+$$
+
+따라서 cumulative regret은,
+
+$$
+R_T \geq \left(\sum_{k \neq k^*} \frac{\Delta_k}{D_{\text{KL}}(\nu_k \| \nu^*)}\right) \log T \cdot (1 - o(1))
+$$
+</Theorem>
+
+<Proof>
+핵심은 **change-of-measure 논증**이다. 원래 instance $\nu$에서 arm $k$를 최적으로 만드는 alternative instance $\nu'$를 구성한다. Consistent 알고리즘은 $\nu$에서 arm $k$를 적게 선택하면서 동시에 $\nu'$에서 arm $k^*$를 적게 선택해야 한다. 두 instance를 $N_k(T)$번의 관측으로 구별하는 오류 확률은 Bretagnolle-Huber inequality에 의해 $\exp(-N_k(T) \cdot D_{\text{KL}}(\nu_k \| \nu^*))$ 이하로 떨어지지 않는다. Consistency가 이 오류 확률에 하한을 주므로, $\mathbb{E}[N_k(T)] \geq (\log T) / D_{\text{KL}}(\nu_k \| \nu^*)$가 유도된다. $\square$
+</Proof>
+
+KL divergence가 분모에 등장하는 이유는 **정보이론적 구별 어려움**이다. $\mu_k = 0.49$와 $\mu^* = 0.50$인 두 Bernoulli 분포의 KL divergence는 약 $0.00012$로 극히 작다. 이는 두 분포를 구별하려면 $\log T / 0.00012 \approx 8333 \log T$번의 관측이 필요하다는 뜻이다. Gap이 작을수록 탐색 비용이 폭발적으로 늘어나는 이유가 여기 있다.
+
+## 두 가지 최적성: problem-dependent와 minimax
+
+하한이 존재하면 자연스럽게 질문이 생긴다. 이 하한에 도달하는 알고리즘이 있는가? 그리고 어떤 의미의 "최적"을 목표로 해야 하는가?
+
+**Problem-dependent 관점**은 주어진 instance의 gap 구조에 적응한다. UCB1의 상한은 다음과 같다.
+
+$$
+R_T^{\text{PD}} = O\left((\log T) \sum_{k \neq k^*} \frac{1}{\Delta_k}\right)
+$$
+
+Bernoulli 분포에서 $D_{\text{KL}} \approx \Delta^2 / 2$이므로, 이는 Lai-Robbins 하한에 $O(1)$ 상수 내에서 일치한다. UCB1은 problem-dependent optimal이다.
+
+**Minimax 관점**은 가장 나쁜 instance에 대한 보장을 목표로 한다.
+
+$$
+R_T^{\text{MM}}(K) = \inf_\pi \sup_\nu R_T(\pi, \nu)
+$$
+
+UCB1은 $O(\sqrt{KT \log T})$를 보장하지만, Audibert & Bubeck(2010)의 MOSS는 $\log$ factor를 제거해 $\Theta(\sqrt{KT})$를 달성한다. MOSS의 confidence radius에서 $\ln(t/K)$를 사용하는 이유가 여기 있다 — 초기에는 상수 탐색 budget으로 각 팔을 충분히 시도하고, 이후 $\ln t - \ln K$로 $\log$ factor를 상쇄한다.
+
+<Aside label="두 관점의 협력">
+Problem-dependent와 minimax는 경쟁 관계가 아니다. Gap이 명확하게 알려진 문제에서는 PD 분석이 더 tight하고, 문제 구조를 모르거나 arm 수가 많을 때는 minimax 보장이 중요하다. UCB1은 둘 다 만족하고, MOSS는 minimax를 더 날카롭게 최적화한다.
+</Aside>
+
+## 트레이드오프
+
+Gap-decomposition $R_T = \sum_k \Delta_k \mathbb{E}[N_k(T)]$는 단순해 보이지만, 그 안에 근본적인 긴장이 숨어 있다.
+
+<Callout type="note" title="탐색-활용의 핵심 트레이드오프">
+- **탐색 부족**: 나쁜 팔을 최적으로 오인 → $\mathbb{E}[N_{k \neq k^*}(T)] = \Theta(T)$ → 선형 regret
+- **탐색 과다**: 좋은 팔을 알면서도 나쁜 팔을 계속 시도 → uniform random과 동일
+- **최적 균형**: suboptimal arm $k$를 정확히 $O(\log T / \Delta_k^2)$번만 시도 → 로그 regret
+
+Gap이 작을수록 구별에 더 많은 샘플이 필요하다. Gap이 큰 팔은 빠르게 배제하고, 비슷한 팔들 사이에서는 더 오래 탐색한다 — 이것이 UCB와 Thompson Sampling이 공유하는 핵심 메커니즘이다.
+</Callout>
+
+ε-greedy의 근본적 한계는 **uniform exploration**이다. 모든 팔을 동등하게 탐색하기 때문에 gap이 큰 팔을 빨리 배제하지 못한다. UCB는 confidence bound를 통해 불확실성이 높은 팔(덜 탐색된 팔)에 자동으로 높은 가중치를 부여함으로써, 필요한 팔에만 탐색을 집중시킨다.
+
+## 정리
+
+- Regret은 $\sum_k \Delta_k \mathbb{E}[N_k(T)]$로 분해된다. 알고리즘 분석의 모든 것은 이 식의 각 항을 제어하는 문제다.
+- Pure exploitation과 pure exploration은 모두 $\Theta(T)$ regret에 수렴한다. 균형만이 $\Theta(\log T)$를 가능하게 한다.
+- Lai-Robbins(1985)는 $R_T \geq \Omega((\log T) \sum_k \Delta_k / D_{\text{KL}})$를 증명했다. 이는 달성 가능한 절대 하한이다.
+- UCB1은 problem-dependent와 minimax 두 기준 모두를 만족하며, MOSS는 minimax를 $\sqrt{KT}$까지 날카롭게 한다.
+
+로그 regret은 기적이 아니다. 분포의 KL divergence가 허용하는 구별 속도에 정확히 맞춰 탐색량을 조절한 결과다.
+
+<Reference
+  title="Asymptotically Efficient Adaptive Allocation Rules"
+  authors="Lai, T.L. and Robbins, H."
+  year={1985}
+  venue="Advances in Applied Mathematics"
+  url="https://www.sciencedirect.com/science/article/pii/0196885885900028"
+/>
+
+<Reference
+  title="Finite-time Analysis of the Multiarmed Bandit Problem"
+  authors="Auer, P., Cesa-Bianchi, N., and Fischer, P."
+  year={2002}
+  venue="Machine Learning"
+  url="https://link.springer.com/article/10.1023/A:1013689704352"
+/>

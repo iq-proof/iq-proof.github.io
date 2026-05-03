@@ -1,0 +1,173 @@
+---
+title: "MDP regret의 세 가지 얼굴 — UCRL2, PSRL, LSVI-UCB"
+description: "Bandit regret을 MDP로 확장할 때 등장하는 diameter D의 역할부터, Bayesian posterior sampling과 linear function approximation이 regret scaling을 어떻게 다르게 압축하는지 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, regret, ucrl2, psrl, linear-mdp]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Bandit에서 MDP로 넘어가면 regret의 정의 자체가 바뀐다. "최적 arm"이라는 단일 기준점 대신, 상태마다 다른 최적 행동과 그 행동들이 만들어내는 **경로의 비용**이 등장한다. 이 경로 비용을 결정하는 것이 MDP diameter $D$다. 그리고 이 $D$를 어떻게 다루느냐에 따라 세 가지 전혀 다른 알고리즘 철학이 갈린다.
+
+## Episodic Regret과 Diameter
+
+Episodic MDP에서 regret은 다음과 같이 정의된다.
+
+$$
+R_T := T \cdot V^*(s_1) - \sum_{t=1}^T \sum_{h=1}^H r_{t,h}
+$$
+
+$V^*(s_1)$은 초기 상태 $s_1$에서 최적 정책을 따랐을 때 한 에피소드에서 얻는 기대 보상이다. 실제로 얻은 보상과의 차이를 $T$개 에피소드에 걸쳐 누적한 것이 regret이다.
+
+여기서 핵심 복잡도가 등장한다.
+
+$$
+D := \max_{s, s'} \min_\pi \mathbb{E}[\text{hitting time } s \to s' \mid \pi]
+$$
+
+Diameter $D$는 "MDP에서 가장 먼 두 상태 사이의 거리"다. Exploration 중 새로운 상태에 도달하려면 최대 $D$ 스텝이 필요하고, 따라서 regret도 $D$에 비례한다. Bandit은 $S=1$, $D=1$인 특수 경우이고, chain MDP는 $D \approx S$가 되어 exploration 비용이 가장 높다.
+
+<Theorem kind="theorem" number="1" title="Regret Lower Bound">
+Communicating MDP에서 임의의 알고리즘에 대해 다음이 성립한다.
+
+$$R_T \geq \Omega(\sqrt{D \cdot S \cdot A \cdot T})$$
+</Theorem>
+
+<Proof>
+새로운 상태에 도달하려면 최대 $D$ 스텝이 필요하다. $S$개 상태를 충분히 탐색하려면 bandit lower bound와 동일한 $\Omega(\sqrt{SAT})$ regret이 필요하고, 여기에 상태 간 이동 비용 $D$를 곱하면 위 결과를 얻는다.
+</Proof>
+
+## UCRL2 — 신뢰 집합 위의 낙관주의
+
+UCRL2(Jaksch 2010)의 핵심 아이디어는 **Optimism Under Uncertainty(OFU)** 다. 알지 못하는 $(P, r)$ 전체에 대해 신뢰 집합 $M_t$를 구성하고, 그 안에서 가장 낙관적인 정책을 실행한다.
+
+$$
+M_t := \left\{ (P', r') : \forall (s,a),\ \|P'(\cdot|s,a) - \hat P_t(\cdot|s,a)\|_1 \leq \epsilon_t(s,a) \right\}
+$$
+
+신뢰 반경 $\epsilon_t(s,a) \propto 1/\sqrt{N_t(s,a)}$는 Hoeffding 부등식에서 직접 유래한다. 방문 횟수가 늘어날수록 반경이 좁아지고, 결국 진짜 $(P, r)$로 수렴한다.
+
+이 신뢰 집합 위에서 **Extended Value Iteration(EVI)**을 실행한다.
+
+$$
+V_{h}(s) = \max_{(P',r') \in M_t} \max_a \left[ r'(s,a) + \sum_{s'} P'(s'|s,a) V_{h+1}(s') \right]
+$$
+
+표준 Bellman과 달리 $(P', r')$도 최적화 변수다. 결과 bound는 다음과 같다.
+
+$$
+R_T \leq \tilde{O}(D S \sqrt{AT})
+$$
+
+<Callout type="warning" title="Union Bound의 대가">
+UCRL2는 모든 $(s,a)$ 쌍에 대해 **동시에** 신뢰 구간이 성립해야 하므로 union bound가 필요하다. 이 과정에서 factor $S$가 추가로 곱해지고, diameter $D$도 worst-case로 등장한다. Chain MDP($D = S$)에서 bound는 $\tilde{O}(S^2 \sqrt{AT})$까지 나빠진다.
+</Callout>
+
+## PSRL — Posterior Sampling의 철학
+
+PSRL(Osband 2013)은 완전히 다른 출발점을 택한다. 불확실성을 신뢰 집합으로 표현하는 대신, **확률분포**로 표현한다.
+
+에피소드 시작마다 posterior에서 MDP를 샘플링하고, 그 MDP에 대한 최적 정책을 실행한다.
+
+```
+Prior p(P,r)
+     ↓ 데이터 수집
+Posterior p(P,r|H_t)
+     ↓ 샘플링
+(P_t, r_t) ~ p(·|H_t)
+     ↓
+π*_t = OptimalPolicy(P_t, r_t) 실행
+```
+
+Dirichlet prior를 사용하면 conjugacy 덕분에 posterior가 closed form으로 업데이트된다.
+
+$$
+P(\cdot|s,a) | \mathcal{H}_t \sim \text{Dir}\!\left(\alpha_0 + N_{s'}(s,a) \text{ for all } s'\right)
+$$
+
+Bayesian regret bound는 다음이다.
+
+$$
+\mathbb{E}[R_T] \leq \tilde{O}(H \sqrt{SAT})
+$$
+
+UCRL2와 비교하면 diameter $D$가 사라졌다. Posterior sample이 **이미 불확실한 영역에 집중**하기 때문에 union bound가 불필요하고, information-theoretic 분석으로 $D$ 없이 bound를 얻는다.
+
+<Aside label="설계 철학">
+UCRL2는 "최악의 MDP 구조도 handle해야 한다"는 frequentist 입장이고, PSRL은 "평균적으로 잘 작동하면 된다, prior로 구조를 반영한다"는 Bayesian 입장이다. 같은 exploration-exploitation 문제를 완전히 다른 언어로 표현한 것이다.
+</Aside>
+
+단, PSRL의 bound는 **Bayesian regret** — prior에 대한 기댓값이다. 고정된 $(P^*, r^*)$에 대한 frequentist regret 분석은 2013년 당시 open problem으로 남았다.
+
+## LSVI-UCB — Feature Dimension으로의 탈출
+
+UCRL2와 PSRL은 모두 tabular MDP를 가정한다. 상태 공간 $|S|$가 크면 둘 다 실용적이지 않다. **Linear MDP**는 이 한계를 돌파하는 구조적 가정이다.
+
+$$
+P(s'|s,a) = \langle \phi(s,a), \mu(s') \rangle, \quad r(s,a) = \langle \phi(s,a), \theta^* \rangle
+$$
+
+feature vector $\phi(s,a) \in \mathbb{R}^d$가 알려져 있으면, 상태 공간 크기 $|S|$가 아니라 **feature dimension $d$** 만으로 문제를 압축할 수 있다.
+
+LSVI-UCB(Jin 2020)는 이 구조 위에서 least-squares value iteration과 UCB bonus를 결합한다.
+
+$$
+V_h(s) := \max_a \left[ \langle \phi(s,a), \hat{w}_h \rangle + \beta_t \|\phi(s,a)\|_{\Lambda_h^{-1}} \right]
+$$
+
+두 번째 항 $\beta_t \|\phi(s,a)\|_{\Lambda_h^{-1}}$이 UCB bonus다. $\Lambda_h = \lambda I + \sum \phi\phi^\top$는 방문한 feature들의 공분산 행렬이고, $\|\phi\|_{\Lambda^{-1}}$은 그 feature가 아직 "덜 탐색된" 방향에 있는지를 측정한다.
+
+$$
+R_T \leq \tilde{O}(\sqrt{d^3 H^3 T})
+$$
+
+tabular UCRL2 대비 비교하면 그 차이가 명확하다.
+
+| 알고리즘 | Regret Bound | 핵심 복잡도 |
+|---|---|---|
+| UCRL2 | $\tilde{O}(DS\sqrt{AT})$ | diameter + state space |
+| PSRL | $\tilde{O}(H\sqrt{SAT})$ | state-action space |
+| LSVI-UCB | $\tilde{O}(\sqrt{d^3H^3T})$ | feature dimension |
+
+$d \ll |S|$인 경우 LSVI-UCB는 지수적 개선을 준다. $d=10$, $|S|=10^6$이면 tabular 방법은 불가능하지만 LSVI-UCB는 실용적이다.
+
+<Callout type="note" title="트레이드오프">
+Linear MDP 가정은 강력하다. Reward와 transition 모두 $\phi(s,a)$의 **linear function**이어야 하고, feature $\phi$가 사전에 알려져야 한다. Deep RL에서 neural network로 feature를 학습하면 이 가정이 무너지고, 이론적 보장도 사라진다. NTK(Neural Tangent Kernel) regime에서 일부 분석이 가능하지만, 실용적 deep RL과의 이론적 간극은 여전히 열린 문제다.
+</Callout>
+
+## 정리
+
+- Episodic regret의 핵심 복잡도는 diameter $D$다. $D$는 MDP에서 탐색 비용을 결정하고, regret lower bound $\Omega(\sqrt{DSAT})$를 만든다.
+- UCRL2는 신뢰 집합 + EVI로 worst-case bound $\tilde{O}(DS\sqrt{AT})$를 얻는다. Union bound가 factor $S$와 $D$를 남긴다.
+- PSRL은 Bayesian posterior sampling으로 $D$를 제거하고 $\tilde{O}(H\sqrt{SAT})$를 달성한다. 단 이것은 Bayesian regret이다.
+- LSVI-UCB는 linear MDP 구조를 가정해 상태 공간 크기를 feature dimension $d$로 대체하고, $\tilde{O}(\sqrt{d^3H^3T})$를 얻는다.
+
+세 알고리즘은 같은 문제에 대한 세 가지 다른 언어다 — 집합, 분포, 선형 구조. 어떤 언어를 택하느냐가 어떤 복잡도를 지불하느냐를 결정한다.
+
+<Reference
+  title="Near-optimal Regret Bounds for Reinforcement Learning"
+  authors="Jaksch, Ortner, Auer"
+  year={2010}
+  venue="Journal of Machine Learning Research"
+  url="https://www.jmlr.org/papers/v11/jaksch10a.html"
+/>
+
+<Reference
+  title="Provably Efficient Exploration in Policy Optimization"
+  authors="Jin, Yang, Wang, Jordan"
+  year={2020}
+  venue="ICML"
+  url="https://arxiv.org/abs/1912.05830"
+/>

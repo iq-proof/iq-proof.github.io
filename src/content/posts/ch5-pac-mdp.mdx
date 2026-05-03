@@ -1,0 +1,151 @@
+---
+title: "PAC-MDP: RL에서 '충분히 탐색했다'는 것을 어떻게 증명하는가"
+description: "샘플 복잡도의 정형적 정의부터 R-MAX의 다항식 보장, 하한 증명까지 — PAC-MDP 이론이 탐색-활용 딜레마를 수학으로 환원하는 방식을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, pac-mdp, sample-complexity, exploration, r-max]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+DQN은 "충분히 오래 훈련하면 수렴한다"는 사실에 기댄다. 하지만 **얼마나** 오래 훈련해야 하는가? PAC-MDP 이론은 이 질문을 정확한 수학으로 바꾼다 — "확률 $1-\delta$로 $\epsilon$-최적 정책을 보장하는 데 필요한 최소 샘플 수는 얼마인가?"
+
+## 탐색의 비용을 정형화하기
+
+경험적 RL에는 탐색 비용에 대한 명시적 회계가 없다. PAC-MDP는 이를 **샘플 복잡도** $\zeta$로 정형화한다.
+
+알고리즘 $\mathcal{A}$가 $(\epsilon, \delta)$-PAC이 되려면 다음 조건을 만족해야 한다.
+
+$$
+P\!\left(V^{\pi_t}(s_t) \geq V^*(s_t) - \epsilon \quad \forall\, t \notin B\right) \geq 1 - \delta
+$$
+
+여기서 $B$는 "탐색 중" 시점의 집합이고 $|B| \leq \zeta(\epsilon, \delta, M)$이다. 핵심은 $B$의 존재 허용이다. 초기 탐색 단계를 명시적으로 허용하고, 그 이후 시점에서만 $\epsilon$-최적성을 요구한다. $B$가 없다면 어떤 알고리즘도 첫 방문 전부터 보장을 달성할 수 없으므로 정의 자체가 공허해진다.
+
+**Polynomial PAC-MDP**는 $\zeta$가 다음과 같이 상태 공간, 행동 공간, 정확도 파라미터들의 다항식으로 표현되는 경우다.
+
+$$
+\zeta \leq \text{poly}\!\left(|S|,\, |A|,\, \frac{1}{1-\gamma},\, \frac{1}{\epsilon},\, \frac{\log(1/\delta)}{\delta}\right)
+$$
+
+"다항식"이라는 조건은 지수적 복잡도와 구별되는 이론적 분기점이다.
+
+## R-MAX: 낙관주의를 통한 자동 탐색
+
+R-MAX (Brafman & Tennenholtz 2002)는 PAC-MDP를 처음으로 구체적으로 달성한 알고리즘이다. 아이디어는 단순하다 — **미방문 상태-행동 쌍은 최고로 가정한다**.
+
+threshold $m$을 기준으로 optimistic MDP $\tilde{M}$을 다음과 같이 구성한다.
+
+$$
+\tilde{r}(s,a) = \begin{cases} \hat{r}(s,a) & N(s,a) \geq m \\ R_{\max} & N(s,a) < m \end{cases}
+\qquad
+\tilde{P}(s' \mid s,a) = \begin{cases} \hat{P}(s' \mid s,a) & N(s,a) \geq m \\ \delta_{s}(s') & N(s,a) < m \end{cases}
+$$
+
+미방문 쌍에는 최고 보상 $R_{\max}$를 할당하고, self-loop 전이를 붙인다. self-loop의 효과는 미묘하다. `Q(s,a) = R_max + γV(s)` 구조에서 현재 상태의 가치를 반복적으로 끌어올려, uniform distribution보다 탐색 압력이 강하게 유지된다. 이 구조로부터 다음이 따른다.
+
+<Theorem kind="proposition" number="1" title="R-MAX Optimism">
+모든 시점 $t$에 대해 $V^{\tilde{M}_t}(s) \geq V^{M}(s)$.
+</Theorem>
+
+<Proof>
+미방문 $(s,a)$에 $\tilde{r} = R_{\max} \geq r(s,a)$가 할당된다. Bellman backup 연산자는 단조증가이므로, optimistic MDP에서의 value는 true MDP의 value를 항상 상회한다. $\square$
+</Proof>
+
+이 낙관주의가 탐색을 자동으로 유도한다. 알고리즘은 미방문 쌍을 "최고로 보이는 선택지"로 평가하므로 greedy policy가 자연스럽게 탐색으로 이어진다. 별도의 탐색 스케줄이 필요없다.
+
+## Simulation Lemma와 $(1-\gamma)^6$의 기원
+
+R-MAX의 샘플 복잡도 bound는 다음과 같다.
+
+$$
+T_{\text{PAC}} \leq \tilde{O}\!\left(\frac{|S|^2 |A|}{\epsilon^3(1-\gamma)^6}\right)
+$$
+
+왜 $(1-\gamma)^6$인가? 이 거듭제곱은 세 독립적인 $(1-\gamma)^{-2}$ 인자의 곱으로 나타난다.
+
+첫 번째 인자는 **Simulation Lemma**에서 나온다. 두 MDP $M$과 $\hat{M}$의 가치 차이는 전이 커널의 TV distance로 upper bound된다.
+
+$$
+|V_M^\pi - V_{\hat{M}}^\pi| \leq \frac{\gamma R_{\max}}{(1-\gamma)^2} \|P - \hat{P}\|_1
+$$
+
+이 식은 $\|V\| \leq R_{\max}/(1-\gamma)$라는 사실에서 도출된다. Bellman equation을 빼면 $|V_M - V_{\hat{M}}| \leq \gamma(\|P - \hat{P}\|\cdot \|V\| + \|V_M - V_{\hat{M}}\|)$가 되고, 정리하면 $(1-\gamma)$로 나누는 항이 두 번 등장한다.
+
+두 번째 인자는 **Hoeffding + Union bound**에서 나온다. 각 $(s,a)$를 $m$번 방문했을 때 $|\hat{P} - P|_1 \leq \epsilon_p$를 $|S||A|$개 쌍 전체에 동시 보장하려면, 각 쌍에 $\delta/(|S||A|)$의 실패 확률을 배정해야 한다. 이로부터
+
+$$
+m \geq \frac{1}{2\epsilon_p^2} \log\!\left(\frac{2|S||A|}{\delta}\right)
+$$
+
+이 되고, $\epsilon_p = \epsilon(1-\gamma)^2/(4R_{\max})$로 설정하면 또 다른 $(1-\gamma)^{-4}$가 등장한다.
+
+세 번째 인자는 **covering time** 분석에서 추가된다. 모든 $(s,a)$가 $m$번 방문되기까지의 시간이 $|S||A| \cdot m$에 비례하고, 여기에 optimism이 유도하는 탐색 효율이 곱해진다.
+
+<Callout type="note" title="$(1-\gamma)^6$은 필연인가">
+대부분 분석의 looseness다. Simulation lemma를 더 타이트하게 적용하면 $(1-\gamma)^{-3}$ 수준까지 줄일 수 있다는 증거가 있다. Jin et al. (2020)의 LSVI-UCB는 linear MDP 가정으로 $|S|$ 의존성 자체를 제거했다. 그러나 tabular setting에서 완전한 gap 폐쇄는 여전히 open problem이다.
+</Callout>
+
+## E³: 명시적 탐색의 대가
+
+E³ (Kearns & Singh 2002)는 R-MAX와 다른 철학을 택한다. 낙관주의 대신 상태 공간을 Known set $K_k$와 Unknown set $U_k$로 **명시적으로 분리**한다.
+
+```
+Phase Exploit: K_k 안에서 greedy policy 실행
+Phase Explore: balanced wandering으로 U_k 진입
+               — 가장 적게 실행된 행동 선택
+```
+
+balanced wandering은 각 $(s,a)$의 방문 빈도를 균등화한다. 직관적으로는 더 공정하지만, 대가가 있다. Diameter $D$인 MDP에서 covering time이 $O(|S|^2 \cdot D \cdot m)$이 되고, worst-case에서 $D = O(|S|)$이면 전체 bound는 $\tilde{O}(|S|^4|A|/\epsilon^3(1-\gamma)^8)$까지 커진다. R-MAX의 암묵적 낙관주의가 더 효율적인 탐색을 달성하는 셈이다.
+
+<Aside label="두 철학의 대비">
+R-MAX의 optimism은 "아직 모르는 것은 최고로 가정"하여 알고리즘 자신이 탐색 압력을 느끼게 한다. E³의 explicit exploration은 "이것을 탐색하라"고 명시한다. 이론 분석 면에서 E³가 더 명확하지만, 실제 샘플 효율은 R-MAX가 앞선다.
+</Aside>
+
+## 하한: 모든 알고리즘이 넘어야 할 벽
+
+PAC-MDP 이론은 상한만으로 완결되지 않는다. Kakade (2003)의 하한이 벽을 정의한다.
+
+$$
+T_{\text{PAC}}(\epsilon, \delta) \geq \Omega\!\left(\frac{|S||A|}{\epsilon^2(1-\gamma)^3} \log(1/\delta)\right)
+$$
+
+증명 전략은 adversarial construction이다. $|S||A|$개의 독립적인 Bernoulli arm처럼 동작하는 MDP를 구성한다. 각 arm의 reward probability가 0.4인지 0.6인지 구분하려면 Chernoff bound에 의해 $\Omega(\log(1/\delta))$번의 샘플이 필요하다. $|S||A|$개 arm을 동시에 구분해야 하므로 $|S||A| \cdot \Omega(\log(1/\delta)/\epsilon^2)$가 하한이 된다. $(1-\gamma)^{-3}$은 할인 factor가 가치 추정의 구별 가능성에 미치는 영향에서 나온다.
+
+R-MAX upper bound와 lower bound의 gap을 정리하면 다음과 같다.
+
+| | $|S|$ | $|A|$ | $\epsilon$ | $(1-\gamma)$ |
+|---|---|---|---|---|
+| **R-MAX upper** | $|S|^2$ | $|A|$ | $\epsilon^{-3}$ | $(1-\gamma)^{-6}$ |
+| **Lower bound** | $|S|$ | $|A|$ | $\epsilon^{-2}$ | $(1-\gamma)^{-3}$ |
+| **Gap** | $|S|$ | — | $\epsilon^{-1}$ | $(1-\gamma)^{-3}$ |
+
+$|A|$는 일치한다. $|S|$, $\epsilon$, $(1-\gamma)$에서 polynomial gap이 존재한다. 이 gap은 exponential이 아니므로 "이론적 승리"지만, 완전히 닫히지 않았다는 점에서 연구 과제로 남아 있다.
+
+## 정리
+
+- PAC-MDP는 탐색 비용을 $(\epsilon, \delta)$-보장과 샘플 복잡도 $\zeta$로 정형화한다. 탐색 구간 $B$를 명시적으로 허용하는 것이 핵심 설계 선택이다.
+- R-MAX의 낙관주의 원리 — 미방문 쌍에 $R_{\max}$를 할당하고 self-loop을 붙이는 것 — 는 별도의 탐색 스케줄 없이 자동 탐색을 달성한다.
+- Simulation lemma와 Hoeffding + union bound의 조합이 $(1-\gamma)^6$ 거듭제곱을 만든다. 이 중 상당 부분은 분석의 looseness이며, linear MDP(LSVI-UCB)에서는 $|S|$ 의존성 자체가 제거된다.
+- 하한 $\Omega(|S||A|/\epsilon^2(1-\gamma)^3 \log(1/\delta))$는 모든 알고리즘에 적용된다. R-MAX와의 polynomial gap은 여전히 열린 문제다.
+
+"충분히 오래 훈련했다"는 직관을 수학으로 바꾸면, 그 안에 환경의 크기, 요구 정확도, 실패 허용 확률, 할인 구조가 모두 얽혀 있다.
+
+<Reference
+  title="A New Q-value Lower Bound for PAC MDP"
+  authors="Brafman & Tennenholtz"
+  year={2002}
+  venue="JMLR"
+  url="https://www.jmlr.org/papers/v3/brafman02a.html"
+/>

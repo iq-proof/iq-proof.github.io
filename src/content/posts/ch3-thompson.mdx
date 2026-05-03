@@ -1,0 +1,143 @@
+---
+title: "Thompson Sampling은 왜 파라미터 없이도 최적인가"
+description: "Posterior sampling의 probability matching 원리부터 정보비율 최소화까지, Bayesian bandit 알고리즘의 통일 원리를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [reinforcement-learning, thompson-sampling, bayesian-bandit, information-theory, regret]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+UCB는 신뢰구간 상한이라는 **결정론적 규칙**으로 탐색과 활용을 조율한다. Thompson Sampling은 그 대신 **posterior에서 하나의 시나리오를 뽑아 그 시나리오 아래 최선을 다한다**. 두 방법은 점근적으로 같은 regret bound를 달성하지만, Thompson Sampling에는 파라미터가 없다. 왜 이 단순한 확률론적 아이디어가 정보이론적 최적에 도달하는가?
+
+## Posterior Sampling이라는 아이디어
+
+Multi-armed bandit에서 agent는 매 시점마다 "어떤 arm이 가장 좋을까?"라는 질문에 답해야 한다. UCB의 답은 "지금까지 데이터로 가능한 최대값을 arm마다 계산해 가장 큰 것"이다. Thompson Sampling의 답은 다르다 — **현재 믿음(posterior)에서 true parameter를 하나 추측하고, 그 추측 아래 가장 좋은 arm을 고른다**.
+
+$$I_t = \arg\max_k \tilde\mu_k, \qquad \tilde\mu_k \sim p_t(\mu_k \mid \mathcal{H}_t)$$
+
+이 단순함 뒤에 **probability matching**이라는 성질이 숨어 있다.
+
+<Theorem kind="proposition" number="1" title="Probability Matching (Thompson 1933)">
+Thompson Sampling 정책 $\pi$에서, arm $k$를 선택할 확률은 그 arm이 최적일 사후 확률과 정확히 같다.
+
+$$P_\pi(\text{arm } k \text{ chosen at time } t) = P(\mu_k = \mu^* \mid \mathcal{H}_t)$$
+</Theorem>
+
+<Proof>
+Thompson Sampling은 posterior $p_t(\mu)$에서 complete scenario $\tilde\mu$를 sample한다. 그 scenario 하에서 arm $k$가 선택되는 것은 $\tilde\mu_k > \tilde\mu_j$ for all $j \neq k$인 경우다. Posterior의 symmetry에 의해, 이 확률은 arm $k$가 posterior 하에서 실제로 최적일 확률과 같다. $\square$
+</Proof>
+
+이것이 "자동 calibration"이다. Posterior 불확실성이 크면 여러 arm을 골고루 탐색하고, 수렴하면 가장 좋아 보이는 arm에 집중한다 — 파라미터 조정 없이.
+
+## Beta-Bernoulli: 3줄로 끝나는 구현
+
+이 아이디어를 실제로 돌리려면 posterior를 업데이트할 수 있어야 한다. Bernoulli reward($r \in \{0, 1\}$)에 Beta prior를 쓰면 **conjugacy** 덕분에 posterior가 closed-form으로 유지된다.
+
+**Prior**: $\theta_k \sim \text{Beta}(\alpha_k, \beta_k)$
+
+관측 $r \in \{0, 1\}$ 후 posterior:
+
+$$\theta_k \mid r \sim \text{Beta}(\alpha_k + r,\ \beta_k + 1 - r)$$
+
+<Proof>
+Likelihood $p(r \mid \theta) = \theta^r(1-\theta)^{1-r}$와 prior $\theta^{\alpha-1}(1-\theta)^{\beta-1}$를 곱하면,
+
+$$p(\theta \mid r) \propto \theta^{\alpha + r - 1}(1-\theta)^{\beta + 1 - r - 1}$$
+
+이는 $\text{Beta}(\alpha + r,\ \beta + 1 - r)$의 kernel이다. $n$번 관측(성공 $S$, 실패 $F$)에 대해 귀납적으로 적용하면 $\text{Beta}(\alpha_0 + S,\ \beta_0 + F)$. $\square$
+</Proof>
+
+성공이면 $\alpha$ 에 1을 더하고, 실패면 $\beta$ 에 1을 더한다. $\alpha$는 "성공 횟수의 prior 누적"이고 $\beta$는 "실패 횟수의 prior 누적"이다. 코드로 쓰면:
+
+```python
+# posterior update — 3줄
+r_t = np.random.binomial(1, theta_true[I_t])
+alpha[I_t] += r_t
+beta[I_t] += 1 - r_t
+```
+
+<Aside label="Conjugacy의 역할">
+Beta-Bernoulli conjugacy는 단순한 구현 편의가 아니다. Posterior가 같은 family에 머문다는 사실이 순차 업데이트와 배치 업데이트를 동치로 만들고(교환 가능성), 이것이 regret 분석의 수학적 토대가 된다.
+</Aside>
+
+## Regret의 정보이론적 상한
+
+Thompson Sampling이 우아하다는 것은 오래 알려졌지만, 이론적 보장은 한동안 열린 문제였다. **2012년 Agrawal & Goyal**이 frequentist regret upper bound를 증명했고, 같은 해 **Kaufmann et al.**이 Lai-Robbins lower bound를 동일한 형태로 제시했다.
+
+$$\boxed{R_T \leq \tilde{O}\!\left(\sum_{i:\Delta_i>0} \frac{\Delta_i}{\mathrm{KL}(\mu_i \| \mu^*)}\right) \log T}$$
+
+증명의 핵심 구조는 세 단계다.
+
+**Step 1 — Bad event 정의.** Posterior sample이 true value로부터 $\sqrt{c \log t / N_i(t)}$ 이상 벗어나는 경우를 bad event $\mathcal{B}_{i,t}$로 정의한다. Chernoff bound에 의해 $P(\mathcal{B}_{i,t}) \leq t^{-c}$이고, 전체 합산은 $\sum_t t^{-c} = O(1)$에 그친다.
+
+**Step 2 — Good event에서의 regret.** Bad event가 아닌 경우, posterior가 true parameter 근방에 집중되어 있으므로 suboptimal arm $i$를 선택할 확률은 지수적으로 감소한다:
+
+$$\mathbb{E}[N_i(T)] \leq \frac{\log T}{\mathrm{KL}(\mu_i \| \mu^*)} + o(\log T)$$
+
+**Step 3 — 종합.** $R_T = \sum_i \Delta_i \cdot \mathbb{E}[N_i(T)]$에 Step 2를 대입하면 bound가 나온다. 이것이 Lai-Robbins lower bound와 같은 계수를 가지므로 Thompson Sampling은 **asymptotically optimal**이다.
+
+<Callout type="note" title="KL divergence가 결정하는 난이도">
+regret bound의 분모 $\mathrm{KL}(\mu_i \| \mu^*)$는 arm $i$와 최적 arm을 구별하기 위해 필요한 정보량이다. gap $\Delta_i$가 작아도 KL이 크면 빨리 구별할 수 있다. 반대로 $\Delta_i = 0.01$이고 KL도 작으면($\mu_i$와 $\mu^*$가 정말 비슷하면) regret coefficient가 커진다 — 이것이 narrow gap에서 bandit이 어려운 이유다.
+</Callout>
+
+## Bayesian Regret과 정보비율
+
+Russo & Van Roy (2014)는 다른 렌즈를 제시했다. Prior $P_0(\theta)$에 대한 **기대 regret**:
+
+$$\bar{R}_T := \mathbb{E}_{\theta \sim P_0}\left[\sum_{t=1}^T (\mu^*(\theta) - \mu_{I_t}(\theta))\right]$$
+
+그리고 각 시점의 **information ratio**:
+
+$$\Gamma_t(a) := \frac{\mathbb{E}[(\mu^* - \mu_a)^2]}{\mathbb{E}[I(a;\, X_t \mid \mathcal{H}_{t-1})]}$$
+
+분자는 action $a$의 기대 손실(제곱), 분모는 그 action으로 얻는 기대 mutual information이다. Cauchy-Schwarz를 적용하면:
+
+$$\bar{R}_T \leq O\!\left(\sqrt{T \cdot \Gamma^* \cdot \log K}\right)$$
+
+Thompson Sampling의 probability matching은 이 $\Gamma_t$를 **암묵적으로** 작게 유지한다. 불확실한 arm을 탐색할수록 regret은 커지지만 정보 획득도 커지므로 비율이 통제된다.
+
+이 관점에서 **Information Directed Sampling (IDS, Russo & Van Roy 2018)**이 나온다:
+
+$$a_t^* = \arg\min_a\, \Gamma_t(a)$$
+
+IDS는 정보비율을 **명시적으로 최소화**한다. Thompson Sampling과 같은 $O(\sqrt{T \log K})$ bound를 달성하지만, 구조가 있는 문제(linear bandit, contextual bandit)에서 더 작은 상수를 달성할 수 있다.
+
+<Callout type="note" title="트레이드오프: TS vs IDS">
+Thompson Sampling은 posterior sample 하나로 끝나므로 계산 비용이 낮고, probability matching으로 자동 calibration된다. IDS는 모든 action마다 regret과 information을 계산해야 하므로 비용이 높지만, 명시적 최적화가 특정 narrow-gap 인스턴스에서 더 좋은 상수를 준다. Pure bandit에서는 TS가, 고차원 구조 문제에서는 IDS 프레임워크가 더 자연스럽다.
+</Callout>
+
+## 정리
+
+- Thompson Sampling은 posterior sample로 probability matching을 구현한다 — arm $k$를 고를 확률이 arm $k$가 최적일 확률과 같다.
+- Beta-Bernoulli conjugacy는 3줄 업데이트로 exact posterior를 유지한다. 이것이 closed-form 구현의 토대다.
+- Agrawal & Goyal (2012)의 frequentist bound와 Kaufmann et al.의 Lai-Robbins lower bound가 계수 수준에서 일치한다 — Thompson Sampling은 asymptotically optimal이다.
+- Russo & Van Roy의 정보비율 프레임워크는 TS의 자동 calibration을 수식화하고, 이를 명시적으로 최적화한 IDS로 확장한다.
+
+Bayesian bandit의 깊은 메시지는 하나다 — **불확실성을 exploration 신호로 직접 사용하면, 별도의 튜닝 없이 정보이론적 최적에 도달할 수 있다**.
+
+<Reference
+  title="Thompson Sampling for Multi-armed Bandits with Conjugate Priors"
+  authors="Agrawal & Goyal"
+  year={2012}
+  venue="COLT"
+  url="https://proceedings.mlr.press/v23/agrawal12.html"
+/>
+<Reference
+  title="Learning to Optimize via Information-Directed Sampling"
+  authors="Russo & Van Roy"
+  year={2014}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/1403.5556"
+/>

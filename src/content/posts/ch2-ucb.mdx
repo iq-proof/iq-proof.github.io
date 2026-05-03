@@ -1,0 +1,153 @@
+---
+title: "UCB 알고리즘군은 왜 단순한 공식으로 near-optimal 탐색을 달성하는가"
+description: "OFU 원칙의 수학적 근거부터 UCB1 regret 증명, KL-UCB의 정보이론적 최적성, MOSS의 minimax 달성까지 — Bandit 탐색 이론의 통일 프레임워크를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [bandit, ucb, regret, exploration, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Multi-Armed Bandit 문제에서 탐색(exploration)과 착취(exploitation)의 균형을 맞추는 방법은 수십 년간 연구되어 왔다. 그런데 UCB1부터 KL-UCB, MOSS에 이르기까지 서로 다른 알고리즘들이 공통적으로 **단 하나의 공식 패턴** — `empirical mean + bonus` — 을 공유한다는 사실은 우연이 아니다. 왜 이 단순한 구조가 정보이론적 하한에 근접하는 regret 보장을 가능하게 하는가?
+
+## Optimism in the Face of Uncertainty
+
+모든 UCB 계열 알고리즘의 출발점은 **OFU(Optimism in the Face of Uncertainty) 원칙**이다.
+
+$$
+\text{UCB}_k(t) = \hat\mu_k(t) + \text{bonus}_k(t), \quad I_t = \arg\max_k \text{UCB}_k(t)
+$$
+
+여기서 $\hat\mu_k(t)$는 arm $k$의 경험적 평균, `bonus`는 불확실성을 반영한 상향 보정이다. 핵심은 두 가지다. 첫째, 탐색 횟수 $N_k(t)$가 작을수록 bonus가 크므로 덜 시도된 arm을 우선 선택한다. 둘째, arm이 실제로 나쁘면 $\hat\mu_k$가 낮아지므로 bonus가 아무리 커도 결국 선택에서 밀려난다. 이 **자동 해소(automatic elimination)** 메커니즘이 OFU를 단순한 낙관론과 구분짓는다.
+
+Hoeffding inequality를 사용하면 bonus의 형태가 자연스럽게 유도된다. 샘플 $N$개에서 신뢰수준 $\delta$를 보장하는 confidence radius는
+
+$$
+b = \sqrt{\frac{\ln(1/\delta)}{2N}}
+$$
+
+이다. 전체 시간과 arm에 union bound를 적용하면 $\delta = 1/t^2$으로 설정하는 것이 자연스럽고, 이로부터 UCB1의 bonus $\sqrt{2\ln t / N_k}$가 나온다.
+
+## UCB1 Regret 증명의 구조
+
+UCB1(Auer et al. 2002)의 regret bound는 다음과 같다.
+
+$$
+R_T \leq \sum_{k:\,\Delta_k > 0} \frac{8\ln T}{\Delta_k} + \left(1 + \frac{\pi^2}{3}\right)\sum_k \Delta_k
+$$
+
+여기서 $\Delta_k = \mu^* - \mu_k$는 sub-optimality gap이다.
+
+<Theorem kind="theorem" number="1" title="UCB1 Regret Bound">
+K-armed Bernoulli bandit에서 UCB1을 실행하면, 기대 regret은 $O(\sum_k \ln T / \Delta_k)$이다.
+</Theorem>
+
+<Proof>
+증명은 세 단계로 진행된다.
+
+**Step 1 — Good event 정의.** $\mathcal{E}$를 모든 arm $k$, 모든 시간 $t$에서 Hoeffding CI가 성립하는 사건으로 정의한다. Union bound에 의해 $\Pr(\mathcal{E}^c) = O(1/T)$.
+
+**Step 2 — 선택 횟수 상계.** $\mathcal{E}$ 위에서 sub-optimal arm $k$가 선택되면, confidence interval이 겹쳐야 한다. 이를 정리하면
+
+$$
+2\sqrt{\frac{2\ln t}{N_k(t)}} \geq \Delta_k \quad \Rightarrow \quad N_k(t) \leq \frac{8\ln t}{\Delta_k^2}
+$$
+
+따라서 arm $k$의 총 pull 횟수는 $N_k(T) \leq 8\ln T / \Delta_k^2 + O(1)$으로 bounded된다.
+
+**Step 3 — Regret 합산.** $R_T = \sum_k \Delta_k N_k(T)$에 Step 2 결과를 대입하면
+
+$$
+R_T \leq \sum_k \frac{8\ln T}{\Delta_k} + \left(1+\frac{\pi^2}{3}\right)\sum_k \Delta_k \qquad \square
+$$
+
+$\pi^2/6$ 상수는 $\sum_{t=1}^\infty 1/t^2 = \pi^2/6$ (Basel problem)에서 비롯된다.
+</Proof>
+
+Worst-case 분석에서 모든 gap을 $\Delta_k = \Theta(1/\sqrt{T})$로 설정하면 이 bound는 $O(\sqrt{KT\ln T})$가 된다. 한편 minimax lower bound는 $\Omega(\sqrt{KT})$이므로, UCB1은 $\sqrt{\ln T}$ factor만큼 최적에서 벗어난다.
+
+## KL-UCB — 정보이론적 최적성
+
+UCB1의 Hoeffding bound는 distribution-free이므로 상수가 느슨하다. Garivier & Cappé (2011)의 KL-UCB는 이를 KL divergence로 교체한다.
+
+$$
+\text{UCB}_k(t) = \sup\left\{q : N_k(t) \cdot D(\hat\mu_k(t) \| q) \leq \ln(t/\delta)\right\}
+$$
+
+Bernoulli KL divergence $D(\mu \| q) = \mu\ln(\mu/q) + (1-\mu)\ln((1-\mu)/(1-q))$는 Hoeffding보다 **약 2배** 좁은 confidence set을 만든다. 이 차이는 단순한 상수 개선이 아니라, distribution의 내부 구조를 활용하는 것이다.
+
+KL-UCB의 regret bound는 다음과 같다.
+
+$$
+R_T \leq (1+o(1))\sum_{k\neq k^*} \frac{\ln T}{D(\mu_k \| \mu^*)}
+$$
+
+이것이 중요한 이유는 Lai-Robbins lower bound와 정확히 일치하기 때문이다.
+
+$$
+\liminf_{T\to\infty} \frac{R_T}{\ln T} \geq \sum_{k\neq k^*} \frac{\Delta_k}{D(\mu_k \| \mu^*)}
+$$
+
+이 하한은 정보이론적으로 불가피하다. Arm $k$와 optimal arm $k^*$를 구분하려면 hypothesis test를 통과해야 하고, 그 비용은 정확히 $\ln T / D(\mu_k \| \mu^*)$만큼의 샘플을 요구한다. KL-UCB는 이 비용을 정확히 지불한다 — 더도 덜도 아니게.
+
+<Callout type="note" title="트레이드오프">
+KL-UCB는 distribution을 알아야 하고 (Bernoulli, Gaussian 등), supremum 계산에 binary search가 필요하다. 반면 UCB1은 closed-form이며 distribution-free다. 실전에서는 이 계산 비용과 최적성 사이의 균형을 고려해야 한다. Thompson Sampling은 비슷한 empirical 성능을 훨씬 단순하게 달성해 실무에서 더 자주 쓰인다.
+</Callout>
+
+## MOSS — $\sqrt{\ln T}$ 없이 Minimax 달성
+
+MOSS(Minimax Optimal Strategy in the Stochastic case, Audibert & Bubeck 2010)는 $\sqrt{\ln T}$ factor를 완전히 제거한다.
+
+$$
+\text{MOSS}_k(t) = \hat\mu_k(t) + \sqrt{\frac{\ln\!\left(T/(K \cdot N_k(t))\right)^+}{N_k(t)}}
+$$
+
+여기서 $(x)^+ = \max(x, 0)$이다. UCB1의 $\ln t$와 달리 MOSS는 $\ln(T/(KN_k))$를 사용한다. 이 차이는 작아 보이지만 결정적이다. $N_k > T/K$가 되면 log 항이 0이 되어 bonus가 사라진다 — arm이 "할당된 예산"을 다 썼다는 신호다.
+
+이 메커니즘은 각 arm에 $T/K$의 균등 예산을 암묵적으로 배분한다. 균형 gap $\Delta_k = \Theta(1/\sqrt{T})$ 위에서 MOSS의 regret은
+
+$$
+R_T = O\!\left(\sqrt{KT}\right)
+$$
+
+가 되어 lower bound $\Omega(\sqrt{KT})$와 정확히 맞아 떨어진다. 단, MOSS는 $T$를 미리 알아야 한다. UCB1의 anytime 성질을 잃는 대가로 $\sqrt{\ln T}$ factor를 제거한 것이다.
+
+<Aside label="설계 철학">
+UCB1 → KL-UCB → MOSS의 흐름은 점진적인 가정 강화다. UCB1은 distribution을 모르고 horizon도 모른다. KL-UCB는 distribution을 안다. MOSS는 horizon까지 안다. 가정이 늘어날수록 regret bound가 타이트해진다 — 정보를 주면 알고리즘이 더 잘한다는 직관과 일치한다.
+</Aside>
+
+## 정리
+
+- OFU 원칙은 `UCB = empirical mean + bonus` 형태로 UCB1, KL-UCB, MOSS, UCRL2, LSVI-UCB까지 이어지는 통일 프레임워크다.
+- UCB1의 regret 증명은 good event + case analysis + union bound의 세 단계로 구성되며, $N_k(T) \leq 8\ln T / \Delta_k^2$가 핵심 부등식이다.
+- KL-UCB는 distribution 고유의 KL divergence를 활용해 Lai-Robbins 하한을 달성한다 — problem-dependent 최적.
+- MOSS는 $\ln(T/(KN_k))$ bonus로 각 arm의 탐색 예산을 동적으로 조절해 $O(\sqrt{KT})$ minimax 최적을 달성한다.
+
+단순한 공식 뒤에는 통계적 신뢰와 정보이론적 필연이 함께 있다.
+
+<Reference
+  title="Finite-time Analysis of the Multiarmed Bandit Problem"
+  authors="Auer, Cesa-Bianchi, Fischer"
+  year={2002}
+  venue="Machine Learning"
+  url="https://link.springer.com/article/10.1023/A:1013998310652"
+/>
+
+<Reference
+  title="KL-UCB: Kullback-Leibler Upper Confidence Bound"
+  authors="Garivier, Cappé"
+  year={2011}
+  venue="COLT"
+  url="https://arxiv.org/abs/1102.2490"
+/>

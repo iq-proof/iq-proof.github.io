@@ -1,0 +1,145 @@
+---
+title: "Contextual Bandit에서 GP-UCB까지: 불확실성을 측정하는 하나의 원리"
+description: "MAB를 넘어 context, 선형 모델, 커널 함수로 확장되는 bandit 이론의 핵심 — confidence ellipsoid와 information gain이 같은 철학에서 나온다는 것을 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [contextual-bandit, linucb, gp-ucb, regret-bound, exploration]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Contextual Bandit, Linear Bandit, GP-UCB — 이 세 알고리즘은 겉으로 다르게 보인다. 하지만 안을 들여다보면 하나의 질문을 반복한다: **"지금 내가 모르는 것을 어떻게 수치화하고, 그것을 탐색 전략에 어떻게 끼워 넣는가?"** 불확실성을 측정하는 방법이 달라질 뿐, 원리는 같다.
+
+## MAB를 넘어서: context가 바꾸는 것
+
+Multi-Armed Bandit에서 최적 arm은 고정이다. $a^* = \arg\max_a \mu_a$. 하지만 현실에서 같은 뉴스 기사도 사용자에 따라 클릭률이 다르고, 같은 약도 환자의 특성에 따라 효과가 다르다.
+
+Contextual Bandit은 이 구조를 수식화한다. 매 step $t$마다 context $x_t \in \mathcal{X}$를 관측한 후 action $a_t$를 선택하고, reward $r_t = \mu(x_t, a_t) + \eta_t$를 받는다. 최적 action은 이제 context마다 다르다:
+
+$$a^*(x) = \arg\max_a \mu(x, a)$$
+
+Regret의 정의도 달라진다.
+
+$$R_T = \sum_{t=1}^T \left[\mu(x_t, a^*(x_t)) - \mu(x_t, a_t)\right]$$
+
+Context가 고정되면 ($x_t = x_0$ 모든 $t$) 이는 그대로 MAB regret으로 환원된다. Context가 변할 때 **per-context optimal arm**과의 차이를 누적한다는 점이 핵심이다.
+
+## 선형 모델: 무한 action space를 $d$차원으로 압축
+
+Context space가 연속이면 $(x, a)$ 쌍은 무한히 많아진다. 각 쌍마다 별도로 학습하는 건 불가능하다. Linear Bandit은 이 문제를 feature map으로 해결한다:
+
+$$\mu(x, a) = \langle \phi(x, a),\, \theta^* \rangle, \quad \phi \in \mathbb{R}^d,\; \theta^* \in \mathbb{R}^d$$
+
+$\theta^*$는 **모든 arm에 공유**된다. arm 1에서 얻은 데이터가 arm 2의 추정에도 기여한다. 이것이 선형 모델의 핵심 이득 — transfer다.
+
+Least squares로 $\theta^*$를 추정한다:
+
+$$\hat\theta_t = V_t^{-1} \sum_{s=1}^t \phi_s r_s, \quad V_t = \lambda I + \sum_{s=1}^t \phi_s \phi_s^\top$$
+
+$V_t$는 Gram matrix다. arm을 다양하게 선택할수록 $V_t$의 행렬식이 커지고, $V_t^{-1}$이 작아진다. 즉, **불확실성이 줄어든다**.
+
+<Aside label="MAB와의 관계">
+$K$-armed MAB는 linear bandit의 특수 경우다. $d = K$, $\phi(a) = e_a$ (standard basis vector)로 설정하면 $\langle \phi(a), \theta^* \rangle = \theta^*_a$ — arm별 독립 mean. Arm이 완전히 orthogonal하면 데이터 transfer가 없어 tabular MAB와 동일하다.
+</Aside>
+
+## OFUL: confidence ellipsoid가 탐색을 대체한다
+
+Linear Bandit에서 탐색 전략의 핵심은 **어떤 arm을 골랐을 때 $\theta^*$에 대한 정보를 가장 많이 얻는가**다. OFUL(Optimism in Face of Uncertainty for Linear bandits, Abbasi-Yadkori et al. 2011)은 이를 confidence ellipsoid로 구현한다.
+
+Self-normalized martingale concentration inequality로부터, 높은 확률로 다음이 성립한다:
+
+$$\|\hat\theta_t - \theta^*\|_{V_t} \leq \beta_t$$
+
+이는 $\theta^*$가 ellipsoid $\mathcal{E}_t = \{\theta: \|\theta - \hat\theta_t\|_{V_t} \leq \beta_t\}$ 안에 있음을 보장한다. OFUL은 이 ellipsoid 안에서 가장 낙관적인 $\theta$를 골라 UCB를 계산한다:
+
+$$\text{UCB}_a(t) = \langle \hat\theta_t, \phi_a \rangle + \beta_t \|\phi_a\|_{V_t^{-1}}$$
+
+두 번째 항 $\beta_t \|\phi_a\|_{V_t^{-1}}$이 탐색 보너스다. $\|v\|_{V^{-1}} = \sqrt{v^\top V^{-1} v}$는 arm $a$의 feature가 현재 불확실성 위에서 얼마나 "새로운" 정보인지를 측정한다. 이미 많이 본 방향이면 작고, 새로운 방향이면 크다.
+
+<Theorem kind="theorem" number="1" title="OFUL Regret Bound (Abbasi-Yadkori 2011)">
+Feature norm $\|\phi_a\| \leq L$, parameter norm $\|\theta^*\| \leq S$, $\sigma$-sub-Gaussian noise 하에서 OFUL은 다음을 달성한다:
+
+$$\mathbb{E}[R_T] \leq \tilde O(d\sqrt{T})$$
+
+Arm count $K$에 무관하다.
+</Theorem>
+
+<Proof>
+증명의 뼈대는 세 단계다.
+
+**1. Optimism**: Confidence ellipsoid가 $\theta^*$를 포함하므로, UCB$_t(a_t) \geq \max_a \langle \phi_a, \theta^* \rangle$ w.h.p.
+
+**2. Regret decomposition + Cauchy-Schwarz**: 각 step의 instantaneous regret을
+
+$$\delta_t \leq 2\beta_t \|\phi_{a_t}\|_{V_{t-1}^{-1}}$$
+
+로 bound한다. Ellipsoid bound $\|\hat\theta_t - \theta^*\|_{V_t} \leq \beta_t$와 Cauchy-Schwarz $|\langle u, v \rangle| \leq \|u\|_V \|v\|_{V^{-1}}$를 조합한 결과다.
+
+**3. Elliptical Potential Lemma**: 핵심 도구.
+
+$$\sum_{t=1}^T \min(1, \|\phi_t\|_{V_{t-1}^{-1}}^2) \leq 2\log\frac{\det(V_T)}{\det(\lambda I)} \leq O(d\log T)$$
+
+이로부터 $\sum_t \|\phi_{a_t}\|_{V_{t-1}^{-1}} \leq \sqrt{T \cdot O(d\log T)}$. 최종적으로 $R_T \leq 2\beta_T \cdot O(\sqrt{dT\log T}) = \tilde O(d\sqrt{T})$. $\square$
+</Proof>
+
+## GP-UCB: kernel이 ellipsoid를 대체한다
+
+Feature map $\phi$를 직접 설계하지 않고 함수 $f: \mathcal{X} \to \mathbb{R}$ 자체를 학습하고 싶다면? GP-UCB(Srinivas et al. 2010)는 Gaussian Process posterior를 confidence 측도로 사용한다.
+
+$$f(x) \mid \text{data}_t \sim \mathcal{N}(\mu_t(x), \sigma_t^2(x))$$
+
+탐색 전략은 구조적으로 OFUL과 같다:
+
+$$x_t = \arg\max_{x \in \mathcal{X}} \left[\mu_t(x) + \beta_t \sigma_t(x)\right]$$
+
+OFUL에서 `$\hat\theta_t^\top \phi_a$`가 exploitation이고 `$\beta_t \|\phi_a\|_{V^{-1}}$`이 exploration이었다면, GP-UCB에서는 $\mu_t(x)$와 $\beta_t \sigma_t(x)$가 그 자리를 차지한다. **형태가 동일하다**.
+
+Regret bound도 같은 구조다:
+
+$$\mathbb{E}[R_T] \leq \tilde O\left(\sqrt{T \gamma_T}\right)$$
+
+$\gamma_T$는 information gain이다:
+
+$$\gamma_T = \max_{|S| \leq T} \frac{1}{2} \log\det(I + \sigma_n^{-2} K_S)$$
+
+OFUL의 $d\log T$가 "feature dimension이 regret을 지배한다"는 메시지였다면, GP-UCB의 $\gamma_T$는 "kernel의 복잡도가 regret을 지배한다"는 메시지다. RBF kernel에서 $\gamma_T = O((\log T)^{d+1})$이므로, dimension이 늘어날수록 regret이 급격히 나빠진다 — curse of dimensionality의 kernel 버전이다.
+
+<Callout type="warning" title="트레이드오프">
+Linear Bandit은 feature map $\phi$가 고정되어 있어야 한다. 잘못 설계된 feature는 regret을 키운다. GP-UCB는 kernel만 지정하면 되지만, 고차원($d \gtrsim 10$)에서는 $\gamma_T$가 폭발한다. 두 방법 모두 "모델이 실제 구조를 얼마나 잘 포착하는가"에 regret이 의존한다.
+</Callout>
+
+## 정리
+
+- Contextual Bandit은 MAB를 **personalization** 구조로 확장한다. 최적 action이 context마다 다르고, regret은 per-context optimal과의 gap을 누적한다.
+- Linear Bandit은 feature dimension $d$만으로 sample complexity를 제어한다. Arm count $K$는 regret에 나타나지 않는다 — 선형 구조가 transfer를 가능하게 하기 때문이다.
+- OFUL의 핵심 도구는 **Elliptical Potential Lemma**다. $\sum_t \min(1, \|\phi_t\|_{V_{t-1}^{-1}}^2) \leq O(d\log T)$라는 이 부등식이 현대 bandit 및 RL 이론 전체에서 반복된다.
+- GP-UCB는 같은 "optimism" 원리를 커널 공간으로 옮긴다. $\sigma_t(x)$가 ellipsoid의 역할을, $\gamma_T$가 $d$의 역할을 한다.
+
+세 알고리즘이 공유하는 철학: **불확실성을 수치화하고, 그 수치만큼 낙관적으로 행동하라**. 다음 챕터에서는 이 원리가 MDP 전체로 확장될 때 어떤 새로운 도구가 필요한지 — LSVI-UCB와 linear MDP — 를 추적한다.
+
+<Reference
+  title="Improved Algorithms for Linear Stochastic Bandits"
+  authors="Abbasi-Yadkori, Pál, Szepesvári"
+  year={2011}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/2011/hash/e1d5be1caff5f578ab48bacb2f3b2fc6-Abstract.html"
+/>
+
+<Reference
+  title="Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design"
+  authors="Srinivas, Krause, Kakade, Seeger"
+  year={2010}
+  venue="ICML"
+  url="https://arxiv.org/abs/0912.3995"
+/>

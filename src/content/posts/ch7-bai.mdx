@@ -1,0 +1,139 @@
+---
+title: "Best Arm Identification는 어떻게 최적에 수렴하는가"
+description: "Pure Exploration의 두 프레임워크(Fixed-Confidence vs Fixed-Budget)의 근본적 차이부터 Instance-Optimal 알고리즘까지, BAI 이론의 핵심 구조를 추적한다."
+pubDate: 2026-05-03
+category: ai
+tags: [bandit, best-arm-identification, pure-exploration, thompson-sampling, information-theory]
+difficulty: advanced
+series:
+  slug: rl-theory-deep-dive
+  title: Rl Theory Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+밴딧 알고리즘 교재는 대부분 **누적 후회(cumulative regret)** 최소화에서 시작한다. 매 시점마다 좋은 arm을 골라야 하고, 탐색 자체가 비용이다. 그런데 실제 의료 임상시험이나 A/B 테스트에는 다른 논리가 작동한다 — 탐색 비용을 따로 예산으로 책정하고, 마지막에 단 한 번 최적을 제시하면 된다. 이것이 **Best Arm Identification(BAI)**이다. 이 프레임워크에서 "얼마나 빠르게, 얼마나 정확하게"는 어떻게 수학적으로 정의되는가?
+
+## Pure Exploration이 다른 이유
+
+Cumulative Regret 문제에서는 매 pull마다 penalty가 쌓인다. suboptimal arm을 선택할 때마다 $\Delta_k$만큼 잃는다. 반면 Pure Exploration에서는 탐색 단계 전체가 정보 수집에 전념하고, **오직 중단 시점의 식별 오류**만이 패널티다.
+
+이 구분이 알고리즘 설계의 철학 전체를 바꾼다. Regret 문제에서는 탐색과 활용을 동시에 해야 하므로 UCB나 Thompson Sampling이 arm 선택 매 순간을 신중하게 균형 잡는다. BAI에서는 그런 균형이 불필요하다 — 더 많이 탐색해도 탐색 자체로 인한 손실이 없다.
+
+세 프레임워크의 목표를 나란히 놓으면 차이가 선명해진다. Cumulative Regret은 고정된 $T$ 동안 전체 reward를 최대화한다. Fixed-Confidence PAC는 오류율 $\delta$ 이하를 보장하면서 기대 샘플 수 $\mathbb{E}[\tau]$를 최소화한다. Fixed-Budget BAI는 고정 예산 $T$ 안에서 오류 확률 $P_{\text{error}}$를 최소화한다.
+
+## 두 설정의 수학적 구조
+
+Fixed-Confidence와 Fixed-Budget은 이름만 다른 게 아니라 **lower bound의 형태 자체가 다르다**.
+
+Fixed-Confidence에서, Kaufmann et al.(2016)은 다음 instance-dependent lower bound를 증명했다.
+
+$$
+\mathbb{E}[\tau] \geq \frac{\log(1/\delta)}{H^*(\mathcal{I})}
+$$
+
+여기서 $H^*(\mathcal{I})$는 현재 instance를 "best arm이 바뀌는 대체 instance"와 구분하는 데 필요한 최소 KL divergence다. gap $\Delta_k$가 작을수록 KL이 작아지고, lower bound가 커진다. 결정적으로 $\log(1/\delta)$에 **로그 스케일**로 의존한다.
+
+Fixed-Budget에서는 형태가 완전히 다르다.
+
+$$
+P_{\text{error}}(T) \geq \Omega\!\left(e^{-cT}\right)
+$$
+
+$T$에 **지수 함수**로 의존한다. 그리고 모든 arm을 균등하게 봐야 하므로 instance 구조에 덜 민감하다.
+
+<Callout type="note" title="트레이드오프: 두 설정의 선택 기준">
+Fixed-Confidence는 "오류율 1% 이하"처럼 **정확도를 먼저 정하고** 필요 샘플을 최소화한다. 탐색 비용이 유연할 때 적합하다. Fixed-Budget은 "1개월 데이터"처럼 **예산을 먼저 정하고** 그 안에서 최대 정확도를 낸다. 예산이 고정된 광고 최적화나 하드웨어 검증에 적합하다. 두 설정의 lower bound가 로그 vs 지수로 다르기 때문에, 같은 예산을 FC 관점에서 쓰는 것이 FB보다 인스턴스 구조를 더 잘 활용할 수 있다.
+</Callout>
+
+## Successive Elimination에서 Instance-Optimal까지
+
+Even-Dar et al.(2002)의 **Successive Elimination(SE)**은 이 분야의 첫 번째 적응적 제거 알고리즘이다. 아이디어는 단순하다 — 매 라운드 active arm 전체를 한 번씩 pull하고, confidence interval로 "명백히 열등한" arm을 제거한다.
+
+$$
+\text{arm } k \text{ 제거} \iff \exists k' : \hat\mu_k + \text{conf}_k < \hat\mu_{k'} - \text{conf}_{k'}
+$$
+
+여기서 신뢰 반경은 Hoeffding 부등식에서 나온다.
+
+$$
+\text{conf}_k(t) = \sqrt{\frac{\log(2K/\delta)}{2n_{k,t}}}
+$$
+
+<Theorem kind="theorem" number="1" title="Successive Elimination — Even-Dar et al. 2002">
+SE 알고리즘은 $\Pr(\hat{k} \neq k^*) \leq \delta$를 보장하며, 기대 총 샘플 수는 다음을 만족한다.
+
+$$
+\mathbb{E}[N_{\text{total}}] = O\!\left(\frac{K}{\Delta_{\min}^2} \log\frac{K}{\delta}\right)
+$$
+</Theorem>
+
+<Proof>
+정확성 보장은 Hoeffding 부등식과 Union bound의 조합이다. 각 arm $k$에 대해 $\Pr(|\hat\mu_k - \mu_k| > \text{conf}_k) \leq \delta/K$이고, Union bound로 모든 arm에 동시 성립할 확률이 $1 - \delta$ 이상이다. 이 사건 하에서 최적 arm $k^*$는 절대 제거되지 않고, 모든 suboptimal arm은 gap $\Delta_k$에 비례하는 라운드 안에 제거된다.
+
+샘플 복잡도는 각 arm $k$의 제거 조건에서 나온다. Arm $k$가 제거되려면 $n_k \gtrsim \log(K/\delta) / \Delta_k^2$ 번 pull이 필요하다. 최악의 경우 모든 gap이 $\Delta_{\min}$으로 같으면 $(K-1)$개 arm 각각에 이 비용이 붙어 전체가 $O((K/\Delta_{\min}^2)\log(K/\delta))$가 된다. $\square$
+</Proof>
+
+SE의 한계는 명확하다. 모든 arm을 매 라운드 균등하게 pull하므로 $\log K$ 오버헤드가 붙는다. instance-dependent lower bound인 $\log(1/\delta)/H^*$보다 느리다.
+
+## LUCB와 Top-two Thompson Sampling
+
+**LUCB(Kalyanakrishnan et al. 2012)**는 핵심 통찰 하나로 SE를 개선한다 — 최적 arm을 식별하려면 **best와 runner-up 두 개만 구분하면 충분하다**. 다른 arm들은 이미 충분히 열등하다.
+
+매 라운드, LUCB는 optimistic estimate $\hat\mu_k + r_k$가 가장 높은 arm(best)과 그 다음(runner-up)만 pull한다. 이 두 arm의 confidence interval이 겹치지 않을 때 멈춘다. 모든 arm을 균등하게 다루는 SE와 달리, LUCB는 실제로 경쟁 중인 두 arm에 샘플을 집중한다.
+
+**Top-two Thompson Sampling(Russo 2020)**은 한 걸음 더 나아간다. 각 arm의 posterior(e.g., Beta 분포)에서 샘플 $\theta_k$를 뽑아, top-2를 선택한 뒤 50-50으로 하나를 pull한다. 단순히 항상 top-1을 pull하면 runner-up의 불확실성이 줄어들지 않아 구분이 느려진다. 50-50 random 선택은 이 문제를 해결하며, 정보 이론적으로 "best vs runner-up을 구분하는 KL divergence"를 정확히 소비한다.
+
+<Theorem kind="theorem" number="2" title="Top-two TS Instance-Optimality — Russo 2020">
+Fixed-Confidence 하에서 Top-two Thompson Sampling은 다음을 달성한다.
+
+$$
+\mathbb{E}[\tau] = \frac{\log(1/\delta)}{H^*} + o(\log(1/\delta))
+$$
+
+즉, Kaufmann et al.(2016)의 instance-dependent lower bound를 점근적으로 달성한다.
+</Theorem>
+
+세 알고리즘의 샘플 복잡도를 나란히 놓으면 진화의 방향이 보인다.
+
+| 알고리즘 | 기대 샘플 수 | 특징 |
+|---|---|---|
+| SE (2002) | $O\!\left(\tfrac{K}{\Delta_{\min}^2}\log\tfrac{K}{\delta}\right)$ | 모든 arm 균등, $\log K$ 오버헤드 |
+| LUCB (2012) | $O\!\left(\sum_{k\neq k^*}\tfrac{\log(1/\delta)}{\Delta_k}\right)$ | Best+Runner 집중 |
+| Top-2 TS (2020) | $\tfrac{\log(1/\delta)}{H^*}(1+o(1))$ | Instance-optimal |
+
+<Aside label="설계 철학">
+SE → LUCB → Top-2 TS의 20년 진화는 "어떤 정보가 BAI에 충분한가"에 대한 이해가 깊어지는 과정이다. SE는 모든 arm을 평등하게 봤고, LUCB는 경쟁 중인 두 arm만 보면 된다는 것을 알았으며, Top-2 TS는 그것을 KL divergence 기반 하한과 일치시켰다. 알고리즘의 단순화가 이론적 최적성과 일치하는 드문 사례다.
+</Aside>
+
+## 정리
+
+- Pure Exploration은 탐색 비용을 허용하고 **최종 식별 오류**만을 최소화한다. 이 구조가 cumulative regret과 근본적으로 다른 알고리즘 설계를 요구한다.
+- Fixed-Confidence의 lower bound는 KL divergence 기반 instance-dependent이고 $\log(1/\delta)$에 로그 스케일로 의존한다. Fixed-Budget의 lower bound는 $e^{-cT}$로 지수 스케일이다.
+- SE는 Hoeffding + Union bound로 PAC를 보장하지만 $\log K$ 오버헤드가 있다.
+- LUCB와 Top-two Thompson Sampling은 "best와 runner-up만 구분하면 된다"는 통찰로 instance-optimal에 도달한다.
+
+BAI 이론의 핵심은 결국 하나다 — 어떤 arm 쌍을 구분하는 데 얼마나 많은 정보가 필요한지를 KL divergence로 정량화하고, 그 양에 딱 맞는 샘플만 소비하는 것이다.
+
+<Reference
+  title="Complexity of Stochastic Search in the Model-Based Setting"
+  authors="Kaufmann, Cappé, Garivier"
+  year={2016}
+  venue="Journal of Machine Learning Research"
+  url="https://jmlr.org/papers/v17/14-416.html"
+/>
+
+<Reference
+  title="Simple Bayesian Algorithms for Best-Arm Identification"
+  authors="Russo"
+  year={2020}
+  venue="Operations Research"
+  url="https://pubsonline.informs.org/doi/10.1287/opre.2019.1911"
+/>
