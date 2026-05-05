@@ -1,0 +1,139 @@
+---
+title: "Rebase는 왜 새 commit을 만드는가"
+description: "commit immutability의 cascade 구조부터 interactive rebase의 todo 파일, --onto의 세 인자, 충돌 해결 전략까지 — rebase의 내부 동작 원리를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, rebase, commit-graph, interactive-rebase]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git rebase는 "history를 다시 쓴다"고 표현된다. 그런데 실제로는 다시 쓰는 게 아니다 — **새로 만든다**. 왜 rebase는 기존 commit을 수정하지 않고 전혀 다른 SHA의 commit을 생성하는가? 그리고 이 사실이 force push, 충돌, interactive rebase의 동작을 어떻게 결정하는가?
+
+## Commit은 왜 immutable인가
+
+Git의 commit SHA는 다음 입력값의 해시다.
+
+```python
+def commit_sha(tree, parents, author, committer, message):
+    content = f"tree {tree}\n"
+    for p in parents:
+        content += f"parent {p}\n"
+    content += f"author {author}\ncommitter {committer}\n\n{message}"
+    return sha1(f"commit {len(content)}\0{content}")
+```
+
+`parent`가 SHA 계산 입력에 **포함**된다. 따라서 부모를 바꾸면 새로운 SHA가 나온다. "기존 commit의 parent를 바꾼다"는 것은 불가능하고, 같은 변경 내용에 새 parent를 붙이면 그것은 다른 commit이다. 이 cascade가 rebase의 본질이다.
+
+## Rebase의 내부 알고리즘
+
+`git rebase main`은 다음 과정을 거친다.
+
+```
+Before:
+  main ──→ C4
+  feature ──→ F1 ── F2 ── F3
+              (C1에서 분기)
+
+After:
+  main ──→ C4 ── F1' ── F2' ── F3' ←── feature
+  원본 F1, F2, F3은 객체 저장소에 그대로 (reachable 아님)
+```
+
+각 단계는 cherry-pick과 동일하다 — `F1`의 diff(F1과 그 parent 사이의 변경)를 추출해 `C4` 위에 적용하고 새 commit `F1'`을 생성한다. author는 보존되고 committer는 rebase 실행자로 갱신된다. 원본 `F1`, `F2`, `F3`는 사라지지 않는다. `git reflog`와 객체 저장소에 남아 있으며 `gc.reflogExpire`(기본 90일) 안에는 복구할 수 있다.
+
+<Callout type="warning" title="force push가 위험한 이유">
+원격에 이미 `F3`를 fetch한 협업자는 로컬에 `F3`를 기준으로 작업을 쌓았을 수 있다. Alice가 force push로 `F3'`을 올리면 Bob의 로컬 `F3`와 원격 `F3'`은 같은 변경의 다른 SHA다. `git pull`이 이 둘을 merge하려 하면 conflict가 발생하거나 history가 지저분해진다. **공유 branch에서 rebase 후 force push는 항상 협업자에게 영향을 미친다.**
+</Callout>
+
+## Rebase vs Merge — 충돌 단위의 차이
+
+같은 변경도 rebase와 merge는 충돌을 다른 방식으로 처리한다.
+
+**Rebase (patch 순차 적용)**: commit마다 diff를 하나씩 적용하므로, 5개 commit을 rebase하면 최대 5번의 충돌 해결 세션이 생긴다. 각 충돌은 작은 단위지만 누적된다.
+
+**Merge (3-way 한 번)**: LCA를 기준으로 ours와 theirs를 한 번에 비교한다. 충돌은 한 번에 모두 표시되고 한 번에 해결한다. 대신 merge commit이 생겨 linear history를 잃는다.
+
+| 기준 | Rebase | Merge |
+|------|--------|-------|
+| 충돌 횟수 | commit 수만큼 | 1회 |
+| History | linear | non-linear |
+| SHA 변경 | 있음 | 없음 |
+| 협업자 영향 | force push 필요 | 없음 |
+
+작은 PR(10개 이내 commit)이라면 rebase가 깔끔하다. 50개 이상이거나 누적 충돌이 예상된다면 merge나 squash가 낫다.
+
+## Interactive Rebase — todo 파일의 구조
+
+`git rebase -i HEAD~5`를 실행하면 `.git/rebase-merge/git-rebase-todo` 파일이 생성된다. 위에서 아래로 순서대로 실행된다.
+
+```
+pick abc C1
+reword def C2    # 메시지만 수정
+squash ghi C3    # 앞 commit과 합침 (메시지 결합)
+fixup jkl C4     # 앞 commit과 합침 (메시지 무시)
+drop mno C5      # 이 commit 건너뛰기
+exec npm test    # shell 명령 실행 (commit 안 만듦)
+```
+
+각 액션이 만드는 객체를 정확히 알아야 의도한 결과를 얻을 수 있다. `pick`은 같은 tree와 message를 가진 새 SHA의 commit이다. `squash`와 `fixup`은 둘 다 앞 commit과 합쳐 단일 commit을 만들지만, `squash`는 두 메시지를 결합하는 에디터를 열고 `fixup`은 앞 commit의 메시지만 유지한다. `drop`은 commit을 건너뛸 뿐 객체 저장소에서 즉시 삭제하지 않는다 — reflog에 남아 90일 안에는 복구 가능하다.
+
+<Aside label="autosquash">
+`git commit --fixup=<SHA>`로 만든 commit은 메시지가 `fixup! <원본 subject>` 형태다. `git rebase -i --autosquash`를 실행하면 이 패턴을 인식해 todo 파일에서 해당 commit을 원본 바로 아래로 이동시키고 명령을 `fixup`으로 바꿔준다. `git config rebase.autosquash true`로 기본 활성화해두면 WIP commit 정리가 훨씬 빠르다.
+</Aside>
+
+## --onto — 어디서 잘라내고 어디에 붙일 것인가
+
+`git rebase --onto <newbase> <upstream> <branch>`의 세 인자는 각각의 역할이 있다.
+
+- `upstream..branch` 범위의 commit을 추출한다
+- `newbase` 위에 새로 적용한다
+
+일반 `git rebase main feature`는 `git rebase --onto main main feature`와 동일하다. `--onto`가 유용한 시나리오는 **잘못된 base에서 분기한 branch를 올바른 위치로 옮길 때**다.
+
+```
+Before: feature가 wrong-base에서 분기됨
+  main ──→ M
+  wrong-base ──→ W
+                  └── F1 ── F2 ── F3 ←── feature
+
+git rebase --onto main wrong-base feature
+
+After:
+  main ──→ M ── F1' ── F2' ── F3' ←── feature
+  wrong-base의 W 변경은 포함되지 않음
+```
+
+`upstream`을 잘못 지정하면 의도하지 않은 commit이 포함되거나 빠진다. 잘못 사용했다면 `git reset --hard ORIG_HEAD`로 즉시 복구할 수 있다.
+
+## 충돌 해결 — continue / skip / abort의 정확한 의미
+
+rebase 도중 충돌이 나면 세 가지 선택지가 있다.
+
+**`--continue`**: conflict marker를 편집하고 `git add` 후 실행한다. 해결한 working tree 상태를 그대로 commit으로 만들어 다음 todo를 진행한다.
+
+**`--skip`**: 이 commit의 변경을 포기하고 건너뛴다. "이 변경이 main에 이미 반영됐다"는 확신이 있을 때만 써야 한다. 의미 있는 commit을 skip하면 변경이 history에서 빠진다 — reflog에 원본은 남아 있으므로 `git cherry-pick <SHA>`로 복구할 수 있지만, 발견이 늦어지면 디버깅이 어렵다.
+
+**`--abort`**: `.git/rebase-merge/orig-head`에 저장된 rebase 시작 직전 상태로 완전히 복귀한다. 모든 진행이 취소되지만 만들어진 `F1'`, `F2'` 같은 중간 commit들은 reflog에 남아 `git branch saved HEAD@{N}`으로 보존할 수 있다.
+
+<Callout type="note" title="트레이드오프">
+rebase는 linear history와 깔끔한 PR을 얻는 대신 SHA 변경, 협업자 영향, 누적 충돌 가능성이라는 비용을 치른다. merge는 SHA를 보존하고 충돌을 한 번에 처리하는 대신 non-linear history와 merge commit을 남긴다. 어느 쪽이 "더 좋다"가 아니라, 팀의 branch 전략과 PR 크기에 따라 선택하는 문제다.
+</Callout>
+
+## 정리
+
+- Commit SHA 계산 입력에 parent가 포함되므로 parent를 바꾸면 새 commit이 된다 — 이것이 rebase가 새 SHA를 만드는 유일한 이유다.
+- 원본 commit은 즉시 사라지지 않는다. reflog에서 추적 가능하고 90일 안에는 `git reset --hard <SHA>`로 복구된다.
+- rebase는 commit마다 충돌을 해결하고, merge는 한 번에 해결한다. 큰 PR일수록 merge나 squash가 실용적이다.
+- `--onto`의 세 인자 순서는 `<newbase> <upstream> <branch>` — "upstream 이후 branch의 commit을 newbase 위에"다.
+- 충돌 시 의심되면 `--abort`가 항상 안전하다. `--skip`은 그 commit이 진짜 필요 없다는 확신이 있을 때만 쓴다.
+
+다음 글에서는 `git reset`의 세 모드(`--soft`, `--mixed`, `--hard`)가 HEAD, index, working tree를 각각 어떻게 다르게 조작하는지 추적한다.

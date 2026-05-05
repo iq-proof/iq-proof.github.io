@@ -1,0 +1,113 @@
+---
+title: "Git 워크플로우의 선택은 왜 팀 규모와 신뢰 수준에 달려 있는가"
+description: "Centralized에서 Forking까지, Git Flow에서 Trunk-Based까지 — 워크플로우 모델의 본질적 차이를 push 권한과 통합 빈도라는 두 축으로 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, workflow, branch-strategy, trunk-based, stacked-pr]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git 워크플로우 선택은 도구의 문제가 아니라 **신뢰와 통합 빈도의 문제**다. Centralized, Feature Branch, Forking, Git Flow, GitHub Flow, Trunk-Based — 이름은 달라도 각 모델은 결국 "누가 어디에 얼마나 자주 push할 수 있는가"라는 하나의 질문에 다르게 답한다. 왜 빅테크는 Trunk-Based를 쓰고, OSS는 Forking을 고집하며, 스타트업은 GitHub Flow로 충분한가?
+
+## Push 권한 모델이 워크플로우를 결정한다
+
+세 base 워크플로우의 본질적 차이는 **push 권한의 분산 정도**다.
+
+**Centralized**는 모든 팀원이 `main`에 직접 push한다. 장점은 단순함이다. 단점은 충돌이 잦고 리뷰 없이 코드가 들어간다. 1~3인의 신뢰 높은 팀에서 prototype을 빠르게 치는 상황에 맞는다.
+
+**Feature Branch**는 모두가 `main` push 권한을 갖되, 암묵적 약속으로 항상 feature 브랜치를 만들고 PR을 통해 통합한다. Branch protection으로 이 약속을 강제할 수 있다. 5~50인 규모의 표준 팀에 맞는 패턴이다.
+
+**Forking**은 `upstream`에 push 권한이 없다. 각자 fork한 레포에서 작업 후 upstream에 PR을 보낸다. upstream을 maintainer만 merge한다. 외부 contributor의 신뢰 수준이 검증되지 않은 OSS 환경에서 표준이 된 이유다.
+
+<Callout type="note" title="Branch protection의 역설">
+Centralized에 branch protection(PR 필수, review 필수, CI 통과 필수)을 붙이면 사실상 Feature Branch와 동일해진다. 워크플로우는 기술적 제어와 팀 문화의 합산이다.
+</Callout>
+
+## 통합 빈도가 branch 모델을 결정한다
+
+같은 Feature Branch 기반이어도 **배포 빈도**에 따라 Git Flow, GitHub Flow, Trunk-Based로 갈라진다.
+
+**Git Flow**는 `master`, `develop`, `feature/*`, `release/*`, `hotfix/*` 다섯 종류의 브랜치를 운용한다. release 브랜치에서 안정화 후 배포하고, hotfix는 `master`와 `develop` 양쪽에 머지한다. 복잡한 graph, 긴 사이클. 분기 또는 월 단위로 배포하는 enterprise나 앱스토어 소프트웨어에 맞는다.
+
+**GitHub Flow**는 `main` + `feature/*`만 쓴다. PR merge가 곧 배포다. 단순하고 빠르다. SaaS와 웹 서비스에서 사실상 기본값이다.
+
+**Trunk-Based Development**는 `main`에 직접, 혹은 하루를 넘기지 않는 매우 짧은 브랜치로 작업한다. 미완성 코드는 feature flag로 숨긴다. 매일, 매시간 배포가 가능하다. 이 모델의 전제조건은 **강한 CI**와 **feature flag infrastructure**다. 빅테크와 모노레포 환경에서 자연스럽게 수렴하는 패턴이다.
+
+```python
+# Trunk-Based: 미완성 기능도 main에 commit, flag로 비활성
+def new_checkout_flow(user):
+    if feature_flag("new-checkout-v2", user):
+        return new_logic()
+    return old_logic()
+```
+
+## 다수 버전을 유지하는 조직의 선택 — Release Train과 Backport
+
+여러 release 버전을 동시에 지원하는 환경(브라우저, enterprise 소프트웨어, PostgreSQL 등)에서는 **Release Train 모델**이 필요하다. 6주 사이클이라면: 3주 개발 → release 브랜치 fork → stabilize → tag + 배포 → 이후 security patch만 적용.
+
+이 구조에서 hotfix를 여러 active release에 동시 적용하는 것이 **backport**다. `git cherry-pick -x`의 `-x` 옵션은 커밋 메시지 끝에 출처 SHA를 기록해 추적을 가능하게 한다.
+
+```bash
+# main에서 fix 후 active release 전체에 backport
+fix_sha=$(git rev-parse HEAD)
+for v in v1.3 v1.4 v1.5; do
+  git switch release/$v
+  git cherry-pick -x $fix_sha
+done
+```
+
+backport 우선순위는 명확해야 한다. critical security와 data loss bug는 모든 active release에 적용하고, new feature는 `main`에만 넣는다. Mergify나 GitHub Actions의 backport-bot으로 label 기반 자동화가 가능하다.
+
+## 큰 변경을 작게 쪼개는 Stacked PR
+
+단일 거대 PR은 reviewer에게 수천 줄을 한 번에 읽도록 강요한다. **Stacked PR**은 큰 feature를 의존성 있는 작은 PR 시퀀스로 분할한다.
+
+```
+PR-1 (base=main):    data model + migration
+PR-2 (base=PR-1):    API endpoints
+PR-3 (base=PR-2):    business logic
+PR-4 (base=PR-3):    UI + tests
+```
+
+PR-1이 merge되면 PR-2의 base를 `main`으로 변경하고 rebase한다. 이 작업이 수동으로는 번거롭다. Graphite(`gt create / submit / sync`)나 Meta의 Sapling이 자동화하는 부분이다. GitHub은 PR base 표시를 자동 갱신하지만 실제 git history의 rebase는 여전히 사람(또는 도구)이 해야 한다.
+
+<Aside label="Stacked PR의 함정">
+스택의 아래 PR이 reject되면 위 PR 전체를 다시 작성해야 한다. 가장 안정적인 foundation을 PR-1에 두고, reject 가능성이 낮은 변경부터 쌓는 것이 핵심이다.
+</Aside>
+
+## 회사 규모에 따른 진화 경로
+
+워크플로우는 팀이 성장하면서 진화해야 한다. 전환 신호를 알고 있어야 적절한 시점에 개입할 수 있다.
+
+| 단계 | 규모 | 표준 패턴 | 도구 |
+|---|---|---|---|
+| Prototype | 1~5인 | GitHub Flow + 가벼운 hooks | Husky + lint |
+| Scaling | 5~20인 | + CODEOWNERS + required reviews | Commitlint + secret scan |
+| Mature | 20~100인 | + feature flags + auto-merge | Mergify + Gitleaks |
+| Scale | 100+  | Trunk-Based + 모노레포 | Nx/Bazel + Merge Queue |
+| Big Tech | 1000+ | 자체 도구 + sparse/partial | Sapling + Bazel |
+
+OSS는 별도의 축이다. Forking이 필수이고, DCO(sign-off)나 CLA로 라이선스 동의를 명시한다. CI는 외부 PR에 안전하게 실행되어야 하고, maintainer의 review 속도(1주일 이내)가 contributor 경험을 결정한다.
+
+<Callout type="warning" title="트레이드오프">
+규칙이 단순할수록 팀이 작을 때는 빠르지만 규모가 커지면 일관성이 무너진다. 반대로 자동화와 정책이 많아질수록 overhead가 생기고 비상 상황에서 병목이 된다. Branch protection에 admin override를, merge queue에 emergency bypass를 설계해두는 것은 선택이 아니라 필수다.
+</Callout>
+
+## 정리
+
+- push 권한의 분산 정도가 Centralized → Feature Branch → Forking을 가른다.
+- 통합 빈도와 CI 성숙도가 Git Flow → GitHub Flow → Trunk-Based를 결정한다.
+- 다수 버전 지원이 필요하면 Release Train + `cherry-pick -x` 기반 backport 전략이 필요하다.
+- Stacked PR은 거대 PR의 review 부담을 해결하지만 도구 없이는 rebase overhead가 크다.
+- 워크플로우는 한 번 정하면 바꾸기 어렵다 — 팀이 성장하는 신호를 미리 알고 단계별로 전환하라.
+
+다음 글에서는 이 시리즈의 기술적 기반이 되는 Git 객체 모델 — commit, tree, blob, ref가 내부적으로 어떻게 연결되는지 추적한다.

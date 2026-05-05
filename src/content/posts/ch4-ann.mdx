@@ -1,0 +1,155 @@
+---
+title: "벡터 검색은 어떻게 빠를 수 있는가"
+description: "Exact NN의 O(N·d) 한계부터 LSH, IVF, PQ, HNSW, 그리고 Qdrant·Milvus까지 — Recall-Latency 트레이드오프를 지배하는 설계 원리를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [vector-search, ann, hnsw, ivf, product-quantization]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+100만 개의 문서 임베딩에서 가장 가까운 벡터를 찾으려면 무엇이 필요한가? 단순히 모든 벡터와의 거리를 계산하면 된다 — 이론적으로는. 하지만 `d=768`, `N=100M` 규모에서 단일 쿼리에 200ms 이상이 걸리는 linear scan은 production SLA를 만족하지 못한다. 이 글은 그 병목에서 출발해, 현대 벡터 데이터베이스가 `<10ms`를 달성하는 설계 원리를 추적한다.
+
+## Exact NN이 비현실적인 이유
+
+Linear scan의 복잡도는 단순하다.
+
+$$
+T_{\text{exact}} = O(N \cdot d)
+$$
+
+A100 GPU 기준 메모리 대역폭 1.55 TB/s에서 `N=100M, d=768, FP32`를 sequential access하면:
+
+$$
+L \geq \frac{100\text{M} \times 768 \times 4}{1.55 \times 10^{12}} \approx 200\text{ms}
+$$
+
+10K QPS 시스템에서 이 수치는 즉시 비현실이 된다. 더 심각한 문제는 고차원 기하학에 있다. 단위 구면에서 균등하게 뽑은 두 점의 거리 분포는 `d → ∞`일 때 다음을 만족한다.
+
+$$
+\mathbb{P}\left[\left|\|x - y\| - \sqrt{2}\right| > t\right] \leq 2\exp\left(-\frac{d\,t^2}{4}\right)
+$$
+
+`d=768`이면 모든 점 간 거리가 표준편차 `<0.03` 수준으로 집중된다. top-10과 top-11의 거리 차이가 무의미해지는 것이다. 역설적으로, **거리 정렬의 의미가 사라지는 바로 그 차원에서 ANN의 근사 오차도 정당화된다**.
+
+## 알고리즘 삼각형: LSH, IVF, HNSW
+
+세 알고리즘은 같은 Recall-Latency 트레이드오프에 접근하는 방식이 다르다.
+
+**LSH** (Indyk & Motwani 1998)는 random projection으로 collision probability를 거리의 함수로 만든다.
+
+$$
+\Pr[h(x) = h(y)] = 1 - \frac{\theta(x, y)}{\pi}
+$$
+
+`L`개의 hash table을 쌓아 recall을 높이지만, 상수항이 크고 실제 embedding 분포가 균등 구면 가정에서 벗어나면 이론적 보장이 약해진다. 현재 실무에서는 niche용도(스트리밍, 이론적 보장 필요)에만 쓰인다.
+
+**IVF**는 k-means로 `K`개의 centroid를 만들고 `nprobe`개만 탐색한다. `K = √N`으로 설정하면:
+
+$$
+T_{\text{IVF}} = O(K \cdot d) + O\!\left(\text{nprobe} \cdot \frac{N}{K} \cdot d\right) = O(\sqrt{N} \cdot d)
+$$
+
+nprobe를 query time에 명시적으로 조정할 수 있어 recall-latency 트레이드오프가 투명하다. `N=100M, K=10K, nprobe=10`이면 전체의 0.1%만 탐색한다.
+
+**HNSW** (Malkov & Yashunin 2018)는 skip-list를 metric space로 확장한 계층적 그래프다. 각 노드가 layer `l`에 포함될 확률은 기하급수적으로 감소한다.
+
+$$
+\Pr[p \text{ appears in layer } l] = m_L^{-l}
+$$
+
+greedy search가 상위 layer에서 long-range jump를 하고 하위 layer에서 local refinement를 하면:
+
+$$
+T_{\text{HNSW}} = O\!\left((M + \log N) \cdot d\right)
+$$
+
+`ef` (search expansion factor)를 query time에 조정할 수 있어 IVF의 nprobe와 같은 역할을 한다.
+
+<Callout type="note" title="트레이드오프">
+세 알고리즘의 포지션은 명확하다. **LSH**는 이론적 보장, **IVF**는 메모리 효율(`nprobe` 명시적 제어), **HNSW**는 동적 삽입과 낮은 latency. 실무에서는 대부분 IVF-PQ(메모리 제약 환경)와 HNSW(낮은 latency 환경) 중 하나를 고른다.
+</Callout>
+
+## PQ: 235배 압축의 원리
+
+HNSW는 원본 벡터를 그대로 저장하므로 `N=100M, d=768`이면 약 307 GB가 필요하다. **Product Quantization** (Jégou et al. 2011)은 이 병목을 해결한다.
+
+벡터 `x ∈ ℝ^d`를 `m`개의 subvector로 쪼개고 각각 독립적으로 k-means quantization한다.
+
+$$
+x = (x^{(1)}, \ldots, x^{(m)}), \quad x^{(j)} \in \mathbb{R}^{d/m}
+$$
+
+`d=768, m=96, k=256`이면 각 벡터는 96개의 8-bit code로 표현된다 — 원본 대비 **32배 압축**. 거리 계산은 reconstruction 없이 가능하다(Asymmetric Distance Computation, ADC).
+
+$$
+d_{\text{ADC}}(q, \mathbf{code}(x)) = \sum_{j=1}^m \|q^{(j)} - c^{(j)}_{\text{code}_j}\|^2
+$$
+
+query와 각 centroid 간 거리를 미리 계산해두면(`O(k·d)` 한 번), 각 candidate에 대해 `O(m)` lookup만 하면 된다.
+
+IVF와 PQ를 결합한 IVF-PQ는 `N=100M` 기준 메모리를 307 GB에서 **1.3 GB**로 줄인다 — 약 235배 압축. recall@10은 90-95% 수준으로 유지된다.
+
+<Theorem kind="proposition" number="1" title="IVF-PQ 메모리 복잡도">
+`K`개의 IVF centroid, `m`개의 PQ subspace, codebook size `k`, 데이터베이스 크기 `N`에서:
+
+$$
+M_{\text{IVF-PQ}} \approx K \cdot d \cdot 32 + N \cdot m \cdot \log_2 k \quad \text{(bits)}
+$$
+
+`N`이 충분히 크면 두 번째 항이 지배하고, `k=256`이면 벡터당 `m` bytes다.
+</Theorem>
+
+<Proof>
+centroid 저장은 `K×d` FP32 값 = `K·d·32` bits. database code는 각 벡터마다 `m`개의 `log₂k`-bit code = `N·m·log₂k` bits. 두 항의 합. `N=100M, m=96, k=256`이면 `100M×96×8 bits = 96 GB bits = 12 GB → 96 bytes/vector`로 환산된다. 원본 `768×32 bits = 3072 bytes`와 비교하면 32배 압축. $\square$
+</Proof>
+
+## Production 시스템의 선택
+
+알고리즘 하나를 선택하는 게 아니라, scale과 제약에 따라 시스템을 고른다.
+
+**FAISS**는 단일 머신 기준으로 가장 유연하다. `IndexIVFPQ`(메모리 제약), `IndexHNSWFlat`(latency 우선)을 조합해 prototyping부터 production까지 커버한다.
+
+**ScaNN** (Google)은 **anisotropic quantization**을 도입한다. 일반 PQ는 모든 방향에서 균등하게 오차를 최소화하지만, ScaNN은 query가 자주 오는 방향의 오차를 우선적으로 줄인다. 같은 메모리에서 recall이 1-3% 향상된다.
+
+**Qdrant**와 **Milvus**는 vector index에 payload filtering을 결합한다. vector index에서 large candidate set을 뽑고 metadata 조건을 적용한다. filter 조건을 만족하는 비율 `α`가 `0.1%` 미만이면 full scan에 가까워지므로, 자주 필터링하는 필드는 별도 payload index를 구성해야 한다.
+
+<Aside label="선택 기준">
+`N < 1M, latency critical` → HNSW. `N > 100M, memory critical` → IVF-PQ (FAISS 또는 Milvus). `streaming insertion + filtering` → Qdrant HNSW. 이 세 축이 결정을 지배한다.
+</Aside>
+
+## 정리
+
+- Exact NN은 메모리 대역폭에 bound된다. `N=100M, d=768`에서 단일 쿼리 `~200ms`는 피할 수 없다.
+- 고차원 거리 집중(concentration of measure)은 ANN 근사 오차를 정당화한다 — 1등과 100등의 거리 차이가 작아질수록 근사 손실도 작아진다.
+- IVF는 `O(√N·d)`, HNSW는 `O((M + log N)·d)` — 둘 다 nprobe/ef로 query time에 트레이드오프를 조정한다.
+- PQ는 벡터를 subspace로 쪼개 32배 압축하면서 recall 90-95%를 유지한다. IVF-PQ는 현대 벡터 데이터베이스의 backbone이다.
+
+다음 글에서는 이 vector index 위에서 RAG 파이프라인이 어떻게 구성되는지 — chunking 전략부터 retrieval 품질 평가까지 — 를 추적한다.
+
+<Reference
+  title="Product Quantization for Nearest Neighbor Search"
+  authors="Jégou, Douze, Schmid"
+  year={2011}
+  venue="IEEE TPAMI"
+  url="https://inria.hal.science/inria-00514462/document"
+/>
+
+<Reference
+  title="Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs"
+  authors="Malkov, Yashunin"
+  year={2018}
+  venue="IEEE TPAMI"
+  url="https://arxiv.org/abs/1603.09320"
+/>

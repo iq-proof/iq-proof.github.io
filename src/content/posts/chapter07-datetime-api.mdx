@@ -1,0 +1,162 @@
+---
+title: "Java 날짜/시간 API는 왜 이렇게 설계됐을까"
+description: "LocalDate·ZonedDateTime·Instant의 타입 선택 기준부터 불변성 보장 메커니즘, TemporalAdjuster 패턴, 레거시 마이그레이션 전략까지, java.time 패키지의 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, datetime, immutability, timezone, migration]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`java.util.Date`는 왜 그토록 오래 욕을 먹었는가? 그리고 Java 8이 내놓은 `java.time` 패키지는 무엇을 바꿨는가? 답은 하나의 원칙으로 수렴한다. **"시간의 의미를 타입에 박아라."** `LocalDate`와 `Instant`가 다른 타입인 이유, `setYear()`가 없는 이유, `TemporalAdjuster`가 함수형 인터페이스인 이유 — 전부 같은 철학의 표현이다.
+
+## 타입이 곧 의미다
+
+`java.time`의 핵심 설계 결정은 시간 개념을 타입으로 분리한 것이다.
+
+- **`LocalDate`** — `(year, month, day)` 숫자 트리플. 타임존 없음. "생일", "계약 종료일"처럼 날짜 자체가 의미인 경우.
+- **`LocalDateTime`** — `LocalDate + LocalTime`. 여전히 타임존 없음. UI 입력처럼 사용자가 "14:00"을 입력했을 때의 중간 표현.
+- **`ZonedDateTime`** — `LocalDateTime + ZoneId`. DST(서머타임)를 자동으로 처리한다. 사용자별 선호 시간대를 표시할 때.
+- **`Instant`** — 에포크(1970-01-01T00:00:00Z) 이후 나노초. 전 세계 어디서나 같은 값. DB 저장, 로그, 이벤트 타임스탬프의 기본값.
+
+변환 방향은 단방향으로 강제된다.
+
+```
+LocalDateTime
+    ↓ atZone(ZoneId)        ← 타임존 없이 Instant 직접 변환 불가
+ZonedDateTime
+    ↓ toInstant()
+Instant
+    ↓ atZone(ZoneId)
+ZonedDateTime
+    ↓ toLocalDateTime()
+LocalDateTime
+```
+
+`LocalDateTime.now().toInstant()`는 컴파일 오류다. `atZone()`을 반드시 거쳐야 한다. 이것이 의도적 설계다 — "타임존을 명시하지 않으면 컴파일도 안 된다."
+
+<Callout type="warning" title="DB에 LocalDateTime을 저장하면">
+`LocalDateTime.of(2024, 2, 14, 14, 0)`을 DB에 그대로 저장하면 타임존 정보가 사라진다. 서버 JVM의 기본 타임존이 UTC와 다르면 읽을 때 다른 시각으로 해석된다. **DB 저장의 기본값은 `Instant`다.** 표시가 필요할 때만 `atZone()`으로 변환한다.
+</Callout>
+
+## 불변성 — setter가 없는 이유
+
+`LocalDate`에는 `setYear()`가 없다. `withYear(2025)`만 있고, 이는 새 인스턴스를 반환한다. 이것도 의도적 설계다.
+
+```java
+// java.time.LocalDate 구조
+public final class LocalDate {
+    private final int year;    // final
+    private final short month; // final
+    private final short day;   // final
+
+    public LocalDate withYear(int year) {
+        return new LocalDate(year, month, day); // 새 인스턴스
+    }
+}
+```
+
+`final class` + `final fields` + `private 생성자` + `with*` 메서드. 이 조합이 불변성을 보장한다. 그 결과는 세 가지다.
+
+**스레드 안전성.** 불변 객체는 읽기가 항상 안전하다. `synchronized` 없이도 여러 스레드가 동시에 접근할 수 있다.
+
+**HashMap 안전성.** 가변 키는 `put()` 이후 변경되면 hashCode가 달라져 `get()`이 `null`을 반환한다. `LocalDate`는 변경 불가이므로 Map 키로 완전히 안전하다.
+
+**함수형 체인.** `date.withHour(17).withMinute(0).plusDays(7)` — 각 단계가 새 인스턴스를 반환하므로 사이드이펙트 없이 조합할 수 있다.
+
+`java.util.Date`가 가변(mutable)이었던 것은 Java 커뮤니티가 수십 년간 고통받은 설계 실수다. `java.time`은 그 실수를 타입 시스템으로 원천 차단한다.
+
+## 전략 패턴으로서의 TemporalAdjuster
+
+복잡한 날짜 계산 — "다음 월요일", "이번 달 마지막 영업일", "반기 시작일" — 을 어떻게 표현할까? `java.time`의 답은 `TemporalAdjuster`다.
+
+```java
+@FunctionalInterface
+public interface TemporalAdjuster {
+    Temporal adjustInto(Temporal temporal);
+}
+```
+
+함수형 인터페이스이므로 람다로 구현하고 `with()`로 적용한다.
+
+```java
+// 표준 라이브러리
+LocalDate nextMonday = date.with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+LocalDate lastDay    = date.with(TemporalAdjusters.lastDayOfMonth());
+
+// 커스텀: 다음 영업일
+TemporalAdjuster nextBusinessDay = temporal -> {
+    LocalDate d = LocalDate.from(temporal);
+    do { d = d.plusDays(1); }
+    while (d.getDayOfWeek().getValue() > 5);
+    return d;
+};
+
+// 조합
+LocalDate result = date
+    .with(TemporalAdjusters.firstDayOfMonth())
+    .plus(1, ChronoUnit.MONTHS)
+    .with(TemporalAdjusters.lastDayOfMonth()); // 다음 달 말일
+```
+
+직접 조건문으로 날짜를 계산하는 코드는 매직 넘버와 요일 인덱스 오류의 온상이다. `TemporalAdjuster`로 의도를 이름에 담으면 테스트하기 쉽고 재사용하기 쉽다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+`with*` 메서드는 호출마다 새 인스턴스를 생성한다. 체인이 길면 중간 객체가 다수 만들어진다. 하지만 `LocalDate`는 12바이트짜리 작은 객체고, Young Generation GC가 빠르게 정리하므로 실제 성능 영향은 무시할 수준이다. 반면 얻는 것은 스레드 안전성과 HashMap 안전성이다. 극한의 핫패스가 아닌 한 불변 설계를 선택하는 것이 옳다.
+
+`ZonedDateTime`은 `LocalDateTime`(24바이트)보다 두 배 무겁다(48바이트). DST 자동 조정을 원하지 않고 고정 오프셋으로 충분하다면 `OffsetDateTime`(40바이트)이 더 가볍다. DB 저장에는 `Instant`(16바이트)가 가장 경제적이다.
+</Callout>
+
+## 레거시 마이그레이션의 원칙
+
+레거시 코드에는 `java.util.Date`와 `Calendar`가 섞여 있다. 변환 규칙은 단순하다.
+
+```java
+// Date → Instant (항상 안전, UTC 절대값 보존)
+Instant instant = date.toInstant();
+
+// Instant → Date
+java.util.Date date = java.util.Date.from(instant);
+
+// LocalDateTime → Instant (타임존 반드시 명시)
+Instant inst = localDateTime.atZone(ZoneId.of("Asia/Seoul")).toInstant();
+```
+
+마이그레이션 전략의 핵심은 **경계에서만 변환**이다. 비즈니스 로직 내부는 `Instant`/`LocalDateTime`만 사용하고, 레거시 API와의 접점에서만 `Date`로 변환하는 Facade를 둔다.
+
+```java
+public class DateTimeFacade {
+    public static Instant fromLegacy(java.util.Date date) {
+        return date.toInstant();
+    }
+    public static java.util.Date toLegacy(Instant instant) {
+        return java.util.Date.from(instant);
+    }
+}
+```
+
+JPA에서는 `Instant` 필드를 그대로 쓰면 Hibernate가 자동으로 `TIMESTAMP UTC`로 처리한다. `@Temporal`은 `LocalDateTime`에는 필요 없고, 레거시 `Date` 타입에만 쓴다. Jackson 직렬화에서는 `Instant`가 ISO-8601 UTC로 자동 직렬화되므로 타임존 문제가 없다. `LocalDateTime`을 응답에 실어 보내면 클라이언트가 어느 타임존인지 알 수 없다.
+
+<Aside label="설계 철학">
+`java.time`의 모든 결정 — 타입 분리, 불변성, 함수형 인터페이스 — 은 하나의 목표로 수렴한다. "잘못된 사용을 컴파일 타임에 막아라." `LocalDateTime.toInstant()`가 없는 것, `setYear()`가 없는 것 전부 의도적 제약이다. 제약이 명확할수록 버그가 줄어든다.
+</Aside>
+
+## 정리
+
+- 타입을 선택하는 기준: "타임존이 필요한가?" → `Instant`/`ZonedDateTime`. "날짜/시각 자체가 의미인가?" → `LocalDate`/`LocalDateTime`.
+- DB 저장은 `Instant` 기본. 표시가 필요할 때만 `atZone()`으로 변환한다.
+- 불변성은 스레드 안전성과 HashMap 안전성을 공짜로 준다. 성능 비용은 무시할 수준이다.
+- `TemporalAdjuster`는 날짜 계산 로직을 이름 있는 전략으로 분리한다.
+- 레거시 마이그레이션은 경계(Facade)에서만 변환하고, 내부는 신규 API로 일관되게 유지한다.
+
+다음 글에서는 Java 16의 `record`가 이 불변성 설계를 언어 레벨에서 어떻게 지원하는지, 그리고 패턴 매칭과 어떻게 연동되는지 추적한다.

@@ -1,0 +1,122 @@
+---
+title: "LLM Reasoning의 세 가지 도약 — o1, o3, R1이 만든 새 균형점"
+description: "Hidden CoT로 시작해 test-time search와 open distillation까지, 추론 모델의 세 가지 설계 결정이 만들어낸 경제·안전·신뢰성의 트레이드오프를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [llm-reasoning, chain-of-thought, test-time-scaling, distillation, reasoning-models]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-4까지의 언어 모델은 단일 순전파로 답을 생성했다. o1은 그 전제를 깼다 — 수만 토큰의 내부 추론을 숨긴 채, 사용자에게는 요약만 돌려준다. 그리고 이 패러다임은 불과 몇 달 사이에 o3의 test-time search, DeepSeek R1의 오픈소스 복제로 이어졌다. 이 세 모델이 각각 다른 방향에서 같은 질문에 답하고 있다면 — 그 질문은 무엇인가?
+
+## 추론 계산을 API의 차원으로
+
+o1의 핵심 변화는 모델 아키텍처가 아니라 **추론 계산을 사용자가 조절 가능한 축으로 만든 것**이다. `reasoning_effort: low/medium/high`는 단순한 파라미터가 아니다 — thinking 토큰이 약 1K, 10K, 100K으로 달라지고, 비용은 최대 100배 차이가 난다.
+
+결과는 즉각적이었다. AIME 2024에서 GPT-4o의 12%가 o1에서 74%로 뛰었다. MATH 벤치마크는 60%에서 94%로. 이 도약은 단순히 더 큰 모델의 결과가 아니다 — Snell 2024가 "inference scaling axis"로 예측한 것의 산업적 구현이다.
+
+<Aside label="Hidden CoT의 역설">
+o1의 내부 추론은 사용자에게 보이지 않는다. 그런데 OpenAI는 이것이 오히려 안전 모니터링에 유리하다고 주장한다 — RLHF로 학습되지 않은 미가공 추론이 그대로 남아, 내부 감시가 가능하다는 논리다. 숨기는 것이 감시를 가능하게 한다는 역설이다.
+</Aside>
+
+visible CoT였다면 모델이 RLHF를 통해 "보여주기 좋은 추론"을 학습했을 것이다. hidden CoT는 그 왜곡을 방지한다 — 단, 제공자만 볼 수 있다는 조건 아래.
+
+## Test-time Search — ARC-AGI의 ImageNet 순간
+
+o3는 o1의 long CoT에 MCTS 유사 탐색을 추가한 것으로 추측된다. 공식 발표는 없지만, o3-high의 사고 시간이 CoT 길이에 선형이 아니라 super-linear로 증가한다는 간접 증거가 있다 — 탐색 오버헤드의 흔적이다.
+
+결과는 극적이었다. ARC-AGI에서 이전 SOTA가 31.5%였고, o3-low는 76%, o3-high는 87.5%를 달성했다. 인간 평균(80%)을 넘은 것이다.
+
+<Theorem kind="proposition" number="1" title="o3의 test-time compute scaling">
+o3의 ARC-AGI 정확도는 추론 계산량의 로그에 비례한다.
+
+$$
+\text{Accuracy} \propto \log(\text{thinking compute})
+$$
+
+o3-low에서 o3-high로 약 $10^5$배 compute 증가 시 11.5%p 정확도 향상이 관측됐다.
+</Theorem>
+
+<Proof>
+OpenAI 발표 수치 기준: o3-low(~50K tokens, ~$20/task)와 o3-high(~50M tokens, ~$3000/task)의 ARC-AGI 점수가 각각 76%, 87.5%다. compute 비율 $\approx 10^5$, 정확도 차이 11.5%p. 이는 Snell 2024의 power-law 추정과 일치하며, diminishing returns는 있으나 saturation은 아직 아니다. $\square$
+</Proof>
+
+ARC-AGI는 pretraining으로 "암기"할 수 없도록 설계된 벤치마크다. 추상적 규칙 귀납이 필요하다. 이 벤치마크에서의 도약은 단순한 수치 향상이 아니라 탐색이 필요한 reasoning 문제에 test-time compute가 실제로 작동함을 보여준다.
+
+## R1 — 오픈소스가 프런티어와 동급이 된 날
+
+DeepSeek R1은 2025년 초에 Apache 2.0 라이선스로 공개됐다. AIME 2024 기준 R1(79.8%)은 o1(79.2%)과 동급이었다. 비용은 $2/1M 토큰 — o1의 $60/1M 대비 30배 저렴하다.
+
+더 중요한 것은 distillation이다. R1(671B MoE)이 생성한 80만 개의 추론 trace를 SFT 데이터로 삼아 작은 모델에 전이했다:
+
+| 모델 | AIME 2024 | MATH-500 | 비용 |
+|------|-----------|----------|------|
+| GPT-4o | 12% | 60% | $5/1M |
+| R1-Distill-Qwen-7B | 55.5% | 92.8% | $0.05/1M |
+| R1-Distill-Qwen-32B | 72.6% | 94.3% | $0.30/1M |
+| R1 (671B) | 79.8% | 97.3% | $2/1M |
+
+7B 모델이 GPT-4o의 AIME 성능을 4.6배 능가한다. 메커니즘은 단순하다 — GPT-4o는 single-pass 추론, R1-Distill은 test time에 long CoT를 자발적으로 생성한다. 모델 크기가 아니라 **추론 스타일**의 차이가 성능의 차이를 만든다.
+
+## 트레이드오프 — 네 가지 한계
+
+세 모델이 만든 capability 도약은 동시에 네 가지 경계를 드러낸다.
+
+<Callout type="warning" title="Reasoning 모델의 구조적 한계">
+**경제적 한계**: o3-high의 $3000/task는 mass market에서 비현실적이다. 단, R1 등장 이후 역사적 궤적은 1-2년마다 10배 비용 감소를 보여준다.
+
+**도메인 편향**: verifiable reward(수학, 코드)로 학습했기에 검증이 어려운 창작·윤리 영역에서는 reasoning gain이 미미하다.
+
+**할루시네이션 증폭**: step 정확도 99%의 모델도 100단계 chain에서 chain 정확도는 37%로 떨어진다 — $P(\text{chain}) \leq P(\text{step})^T$.
+
+**투명성 vs 모니터링**: hidden CoT(o1/o3)는 사용자 검증이 불가능하고, visible CoT(R1)는 커뮤니티 감사가 가능하지만 distillation 공격에 노출된다.
+</Callout>
+
+할루시네이션 문제는 수학적으로 피할 수 없다. long CoT의 신뢰성은 step 정확도의 지수 함수다. 이것이 PRM(Process Reward Model)이 필수인 이유다 — 잘못된 경로를 조기에 차단해야 chain 전체의 붕괴를 막는다.
+
+## 미래 — 세 가지 수렴
+
+이 한계들이 가리키는 방향은 세 가지다.
+
+**효율적 추론**: R1-Distill이 이미 경로를 보였다. teacher의 reasoning trace → SFT → small model. 2027년까지 R1급 추론 능력이 cents 단위 비용에 도달할 것으로 추정된다.
+
+**Verifiable domain 확장**: 수학의 sympy 같은 도메인별 verifier가 없는 곳에 LLM-as-judge 앙상블이나 process verifier 일반화가 필요하다. 이것이 달성되지 않으면 reasoning의 도약은 math/code에 영원히 묶인다.
+
+**Agent와의 통합**: reasoning 단독으로는 single-query 문제만 다룬다. retrieval, tool use, multi-step execution과의 통합이 real-world deployment의 조건이다. ReAct 수준의 통합은 이미 있지만, reasoning 모델 특유의 long CoT를 agent loop에 효율적으로 끼워 넣는 방법은 아직 nascent하다.
+
+## 정리
+
+- o1은 추론 계산을 API의 독립 차원으로 만들었다 — hidden CoT는 그 trade-off다.
+- o3는 test-time search로 ARC-AGI에서 인간 평균을 넘었다 — $3000/task의 비용은 그 trade-off다.
+- R1은 open weights + distillation으로 프런티어 추론 능력을 democratize했다 — visible CoT는 distillation 공격의 trade-off다.
+- 세 모델 모두 같은 축을 따른다: inference compute가 많을수록 reasoning이 좋아진다. 차이는 누가, 얼마에, 어떤 투명성으로 그 계산을 판다는 것이다.
+
+reasoning capability의 다음 frontier는 능력 자체보다 **비용·도메인·신뢰성·통합**의 네 축에서 결정된다. 그리고 그 균형점은 open과 closed 양쪽의 경쟁 압력 아래 계속 이동 중이다.
+
+<Reference
+  title="Scaling LLM Test-Time Compute Optimally Can be More Effective than Scaling Model Parameters"
+  authors="Snell et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2408.03314"
+/>
+
+<Reference
+  title="DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+  authors="DeepSeek-AI"
+  year={2025}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2501.12948"
+/>

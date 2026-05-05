@@ -1,0 +1,191 @@
+---
+title: "Git Hook은 어디서 막고 어디서 통과시키는가"
+description: "client-side 13종 hook의 실행 시점과 server-side pre-receive/update/post-receive의 stdin 구조부터 Husky + lint-staged 자동화까지, 정책 강제의 다층 방어를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, hooks, husky, lint-staged, automation]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git hook은 "자동화 도구"라고 부르기엔 너무 낮은 위치에 있다. hook은 git 워크플로 자체에 박힌 인터셉트 포인트다. commit이 생기기 전, push가 서버에 닿기 전, ref가 갱신된 후 — 각 시점마다 쉘 스크립트 하나가 exit code로 작업을 막거나 통과시킨다. 그렇다면 13종 client hook과 3종 server hook은 정확히 언제 개입하고, `--no-verify`는 어디까지 무력화할 수 있는가?
+
+## Hook의 두 세계 — client와 server
+
+client-side hook은 개발자 머신의 `.git/hooks/` 안에 산다. commit 흐름을 따라가면 다음 순서로 호출된다.
+
+```
+git commit:
+  1. pre-commit         인자 없음, exit non-0이면 거부
+  2. prepare-commit-msg <msg-file> [<source>] [<SHA>]
+  3. (사용자 메시지 작성)
+  4. commit-msg         <msg-file>, exit non-0이면 거부
+  5. (commit 객체 생성)
+  6. post-commit        인자 없음, 실패해도 commit 유지
+
+git push:
+  1. pre-push           stdin: <local-ref> <local-SHA> <remote-ref> <remote-SHA>
+  2. (서버로 객체 전송)
+  3. server-side hooks
+```
+
+`post-checkout`, `post-merge`, `post-rewrite`, `pre-rebase` 등 나머지 7종도 같은 원칙을 따른다. **`pre-*`는 실패하면 작업을 막고, `post-*`는 실패해도 이미 끝난 작업을 되돌리지 않는다.**
+
+server-side hook은 다르다. `git push`가 서버에 도달하면 `git-receive-pack`이 세 hook을 순서대로 호출한다.
+
+```
+pre-receive   stdin: <old> <new> <ref> (push한 모든 ref, 한 줄씩)
+              exit non-0 → 모든 ref 원자적 거부
+
+update        인자: <ref> <old> <new>  (ref 하나마다 한 번씩 호출)
+              exit non-0 → 그 ref만 거부
+
+post-receive  stdin: pre-receive와 동일
+              실패해도 ref 갱신은 이미 완료
+```
+
+`pre-receive`와 `update`의 차이가 핵심이다. `pre-receive`는 push된 모든 ref를 한 번에 검사하고 원자적으로 막는다. `update`는 ref별로 호출되므로 "release/* 브랜치는 admin만"처럼 ref 단위 정책을 쓸 때 적합하다.
+
+## `--no-verify`는 어디까지 통하는가
+
+`--no-verify`가 우회하는 hook은 다음으로 한정된다.
+
+```
+우회 가능:
+  pre-commit
+  commit-msg
+  pre-push (--no-verify)
+
+우회 불가:
+  post-* hooks (이미 작업 완료)
+  server-side hooks (전혀 다른 프로세스)
+```
+
+<Callout type="warning" title="client hook은 정책 강제 수단이 아니다">
+`--no-verify`는 git 자체 옵션이다. 개발자가 마음먹으면 언제든 client hook을 건너뛸 수 있다. commit message 컨벤션, secret 누출 방지, branch 보호를 **반드시** 강제하려면 server-side `pre-receive`에 동일 검증을 구현해야 한다.
+</Callout>
+
+server hook에서 거부 메시지를 client에게 전달하는 방법은 단순하다. `stderr`로 출력하면 client 콘솔에 `remote:` 접두사와 함께 표시된다.
+
+```bash
+#!/bin/sh
+while read old new ref; do
+    if [ "$ref" = "refs/heads/main" ] && \
+       [ "$old" != "0000000000000000000000000000000000000000" ]; then
+        echo "Direct push to main not allowed!" >&2
+        exit 1
+    fi
+done
+```
+
+client 출력:
+```
+remote: Direct push to main not allowed!
+To <url>
+ ! [remote rejected] main -> main (pre-receive hook declined)
+```
+
+## 자동화 패턴 — 무엇을 어디에 넣을 것인가
+
+좋은 hook 자동화는 검사 위치를 계층별로 분리한다.
+
+**client `pre-commit`** — 수 초 안에 끝나는 빠른 검사만. staged 파일의 lint, format 자동 수정.
+
+```bash
+#!/bin/sh
+files=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$')
+if [ -n "$files" ]; then
+    black --check $files || exit 1
+fi
+```
+
+**client `commit-msg`** — Conventional Commits 패턴 검증.
+
+```bash
+#!/bin/sh
+pattern='^(feat|fix|docs|style|refactor|test|chore)(\([a-z0-9-]+\))?: .{1,100}$'
+if ! head -1 "$1" | grep -qE "$pattern"; then
+    echo "Commit message must follow Conventional Commits" >&2
+    exit 1
+fi
+```
+
+**server `pre-receive`** — 모든 push에서 실행되는 강제 정책. 큰 파일 차단, secret 탐지, branch 보호.
+
+```bash
+#!/bin/sh
+MAX_SIZE=10485760   # 10MB
+while read old new ref; do
+    [ "$old" = "0000000000000000000000000000000000000000" ] && continue
+    git rev-list --objects "$old..$new" | while read sha path; do
+        [ -z "$sha" ] && continue
+        size=$(git cat-file -s "$sha" 2>/dev/null)
+        if [ "$size" -gt $MAX_SIZE ]; then
+            echo "File too large: $path ($size bytes)" >&2
+            exit 1
+        fi
+    done
+done
+```
+
+**server `post-receive`** — ref 갱신 후 CI trigger, Slack 알림, 배포 자동화.
+
+## Husky + lint-staged — client hook의 자동 배포
+
+팀 전체가 동일한 client hook을 쓰려면 hook 자체를 버전 관리해야 한다. Husky는 `core.hooksPath`를 `.husky/`로 설정해 이를 해결한다.
+
+설치 흐름은 다음과 같다.
+
+```bash
+npm install husky --save-dev
+npm pkg set scripts.prepare="husky install"
+npx husky add .husky/pre-commit "npx lint-staged"
+```
+
+`prepare` script가 핵심이다. 신규 협업자가 `npm install`을 실행하면 post-install 단계에서 `prepare`가 자동으로 호출되고, `husky install`이 `git config core.hooksPath .husky`를 설정한다. `.husky/` 디렉토리가 git에 커밋되어 있으므로 clone 직후 별도 안내 없이 hook이 활성화된다.
+
+lint-staged는 staged 파일만 처리한다는 점에서 단순한 lint 호출과 다르다.
+
+```json
+// package.json
+{
+  "lint-staged": {
+    "*.{js,ts}": ["eslint --fix", "prettier --write"],
+    "*.py": ["black", "flake8"]
+  }
+}
+```
+
+실행 흐름: `git diff --cached --name-only` → 패턴 매칭 → 명령 실행 → 수정된 파일 자동 `git add` → 실패 시 `exit 1`. 전체 파일을 스캔하지 않으므로 레포가 커져도 commit 시간이 일정하게 유지된다.
+
+<Aside label="모노레포 주의">
+`core.hooksPath`는 단일 디렉토리만 지정할 수 있다. 여러 도구(lint-staged, pre-commit framework, Gitleaks)를 동시에 쓰려면 `.husky/pre-commit` 하나에서 순차 호출하는 방식으로 통합한다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**client hook**은 빠른 피드백을 주지만 `--no-verify`로 우회된다. 환경 의존성도 있어 협업자 머신마다 다를 수 있다.
+
+**server hook**은 절대 우회 불가능하고 환경이 일관되지만, 모든 push에서 실행되므로 성능이 중요하다. 5초짜리 server hook은 사용자 경험을 망친다 — 무거운 검사(full build, integration test)는 `post-receive`로 CI에 위임하고, `pre-receive`에는 밀리초 단위 검사만 넣어야 한다.
+
+GitHub의 branch protection rules와 status checks는 이 server hook 계층의 추상화다. 자가 호스팅(GitLab, Gitea)은 hook을 직접 작성하고, GitHub Enterprise는 admin 전용 pre-receive hook을 제공한다.
+</Callout>
+
+## 정리
+
+- `pre-*` hook은 실패하면 작업을 막고, `post-*` hook은 실패해도 이미 완료된 작업을 되돌리지 않는다.
+- `--no-verify`는 `pre-commit`, `commit-msg`, `pre-push`만 우회한다. server-side hook은 client 옵션과 무관하다.
+- server `pre-receive`는 모든 ref를 원자적으로 검사하고, `update`는 ref별로 호출된다. 정책 강제는 server에서 해야 한다.
+- Husky는 `core.hooksPath`를 `.husky/`로 지정해 hook을 버전 관리하고, `prepare` script로 신규 협업자의 자동 onboarding을 처리한다.
+- lint-staged는 staged 파일만 처리하므로 레포 크기와 무관하게 commit 시간이 일정하다.
+
+다음 글에서는 Git이 객체 그래프를 어떻게 추적하고, reflog와 GC가 어떤 관계인지 살펴본다.

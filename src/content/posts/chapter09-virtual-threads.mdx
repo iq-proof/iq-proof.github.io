@@ -1,0 +1,119 @@
+---
+title: "Virtual Thread는 왜 수백만 개가 가능한가"
+description: "Platform Thread의 1:1 OS 매핑 비용부터 Continuation 기반 M:N 스케줄링, Pinning 진단, Structured Concurrency 도입까지, Virtual Thread의 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, virtual-thread, continuation, project-loom, concurrency]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 21의 Virtual Thread는 "스레드를 수백만 개 만들 수 있다"는 말로 소개된다. Platform Thread는 수천 개가 한계인데, 왜 Virtual Thread는 다른가? 그리고 그 차이가 만들어내는 새로운 함정은 무엇인가?
+
+## 1:1 매핑의 비용
+
+Platform Thread는 Java 스레드 하나가 OS 스레드 하나에 묶인다. OS 스레드는 커널 스택으로 기본 8MB를 요구하고, JVM 스택은 별도로 1MB를 쓴다. 10,000개를 만들면 커널 메모리만 80GB다. 실제 서버에서는 수천 개가 현실적 상한선이다.
+
+컨텍스트 스위칭도 문제다. CPU 코어 8개에 스레드 10,000개가 붙으면 OS 스케줄러가 초당 수만 번 전환을 수행한다. 각 전환마다 TLB 리셋과 캐시 미스가 따라붙는다. "Thread per Request" 모델에서 스레드 풀 크기 200개, 요청당 응답 시간 160ms라면 초당 처리량은 1,250 req/s가 상한이다. 메모리를 늘려도 수천 개 스레드가 한계여서 처리량은 크게 늘지 않는다.
+
+## Continuation — 스택을 힙으로
+
+Virtual Thread는 이 구조를 뒤집는다. 캐리어 스레드(ForkJoinPool, CPU 코어 수만큼)는 여전히 OS 스레드다. 하지만 Virtual Thread의 스택은 OS 커널에 있지 않고 JVM 힙의 `Continuation` 객체에 저장된다.
+
+```
+Virtual Thread (언마운트 상태):
+  Continuation {
+    StackChunk frames;   // 스택 프레임 전체
+    int sp;              // 스택 포인터
+    int pc;              // 프로그램 카운터
+  }
+```
+
+Virtual Thread가 블로킹 I/O를 호출하면 JVM은 현재 스택을 `StackChunk` 배열로 직렬화해 힙에 저장하고 캐리어 스레드를 반환한다(언마운트). I/O가 완료되면 다른 캐리어 스레드가 그 `StackChunk`를 복원해 중단 지점 바로 다음부터 재개한다(마운트). 이 과정이 `yield()`/`run()` 쌍으로 구현된다.
+
+결과적으로 Virtual Thread 1개는 ~1-2KB다. 100만 개를 만들어도 2-4GB면 충분하고, 컨텍스트 스위칭은 캐리어 수(8개)만큼만 발생한다. I/O 대기 시간이 처리량 상한을 결정하지 않고, CPU 활용도가 결정한다.
+
+## Pinning — 새로운 함정
+
+그런데 기존 코드를 그대로 Virtual Thread로 옮기면 이 이점이 사라질 수 있다. **Pinning**이다.
+
+`synchronized` 블록 안에서 블로킹 I/O를 호출하면 JVM은 `yield()`를 실행할 수 없다. `synchronized`의 monitor lock은 스택 프레임 주소와 묶여 있는데, Virtual Thread의 스택은 힙의 `StackChunk`에 있어서 호환되지 않는다. 결국 캐리어 스레드 자체가 OS 수준에서 블로킹된다.
+
+```java
+// Pinning 발생
+synchronized(cache) {
+    String value = httpClient.get(url);  // 블로킹 I/O
+    cache.put(key, value);
+}
+
+// Pinning 없음
+lock.lock();
+try {
+    if (cache.containsKey(key)) return cache.get(key);
+} finally {
+    lock.unlock();
+}
+String value = httpClient.get(url);  // lock 밖에서 I/O
+lock.lock();
+try { cache.putIfAbsent(key, value); } finally { lock.unlock(); }
+```
+
+<Callout type="warning" title="Pinning 진단">
+`-Djdk.tracePinnedThreads=full` 플래그를 붙이면 JVM이 Pinning 발생 시 스택 트레이스를 출력한다. JFR의 `jdk.VirtualThreadPinned` 이벤트로도 추적할 수 있다. Virtual Thread로 전환하기 전에 이 진단을 먼저 실행하라.
+</Callout>
+
+`ReentrantLock`은 `LockSupport.park()` 기반으로 동작하므로 Virtual Thread가 lock을 놓는 순간 `yield()`가 가능하다. JNI 호출 중 블로킹은 회피할 수 없지만, `synchronized` → `ReentrantLock` 교체만으로도 대부분의 Pinning을 제거할 수 있다.
+
+## Structured Concurrency — 생명주기 관리
+
+Virtual Thread로 수백만 개의 task를 만들 수 있게 되면, 다음 문제는 그것들의 생명주기 관리다. `CompletableFuture` 방식은 하나가 실패해도 나머지가 계속 실행되고, 취소와 리소스 정리가 수동이다.
+
+`StructuredTaskScope`는 부모-자식 관계를 명시적으로 구조화한다.
+
+```java
+// 모두 성공해야 하는 경우
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Future<User>    user    = scope.fork(() -> backendA.getUser(id));
+    Future<Address> address = scope.fork(() -> backendB.getAddress(id));
+    scope.join();
+    scope.throwIfFailed();
+    return new Profile(user.resultNow(), address.resultNow());
+}  // 스코프 종료 → 미완료 task 전부 cancel, 리소스 자동 정리
+```
+
+`ShutdownOnFailure`는 하나가 실패하면 나머지를 cancel하고(AND 의미론), `ShutdownOnSuccess`는 하나가 완료되면 나머지를 cancel한다(OR 의미론). `try-with-resources`로 스코프를 닫으면 미완료 task에 interrupt 신호가 전파되고 `ThreadLocal` 값이 정리된다.
+
+<Aside label="설계 철학">
+Virtual Thread와 Structured Concurrency는 함께 나온 개념이다. VT가 "수백만 개 task를 만들 수 있다"고 말할 때, Structured Concurrency는 "그러면 그것들을 어떻게 안전하게 끝낼 것인가"라는 질문에 답한다. 생성 비용이 0에 가깝더라도, 생명주기를 관리하지 않으면 메모리와 리소스 누수는 발생한다.
+</Aside>
+
+## 마이그레이션 전략
+
+기존 Platform Thread 코드를 Virtual Thread로 전환할 때 가장 빠른 경로는 두 단계다.
+
+첫째, `Executors.newFixedThreadPool(200)`을 `Executors.newVirtualThreadPerTaskExecutor()`로 교체한다. Virtual Thread의 생성 비용은 `~10μs`로 Platform Thread의 `~1ms`와 비교해 100배 저렴하므로, 풀을 유지할 이유가 없다. 매번 생성하고 GC가 회수하게 두면 된다.
+
+둘째, `synchronized` 블록을 `ReentrantLock`으로 교체한다. 특히 lock 범위 안에 블로킹 I/O가 있으면 반드시 lock 밖으로 빼야 한다.
+
+Spring Boot에서는 `spring.threads.virtual.enabled=true` 한 줄로 Tomcat 서블릿 스레드, `@Async` 실행기, RestClient가 모두 Virtual Thread로 전환된다. 단, HikariCP connection pool은 여전히 유한하므로 대량 동시 요청이 들어올 때 DB 연결이 병목이 될 수 있다.
+
+<Callout type="note" title="트레이드오프">
+Virtual Thread는 I/O 바운드 작업에서만 이점을 발휘한다. CPU 100%를 쓰는 연산은 Platform Thread와 차이가 없다. `ThreadLocal`에 무거운 객체를 저장하면 100만 VT가 각각 독립 인스턴스를 가져서 메모리가 폭발할 수 있다. 기존 ThreadLocal 패턴은 로컬 변수나 Structured Concurrency 파라미터로 교체해야 한다.
+</Callout>
+
+## 정리
+
+- Platform Thread는 1:1 OS 매핑으로 수천 개가 한계다. 스택 메모리와 컨텍스트 스위칭 비용이 선형으로 쌓인다.
+- Virtual Thread는 스택을 JVM 힙의 `Continuation`에 저장해 블로킹 중 캐리어를 반환한다. 생성 비용은 거의 0, 처리량은 CPU 활용도가 결정한다.
+- `synchronized` + 블로킹 I/O는 Pinning을 유발한다. `ReentrantLock`으로 교체하고 I/O를 lock 밖으로 빼라.
+- `StructuredTaskScope`로 task 생명주기를 구조화하면 취소와 리소스 정리가 자동화된다.
+
+Platform Thread의 한계는 메모리가 아니라 설계였다. Virtual Thread는 그 설계를 바꿨고, 그 대가로 새로운 규칙을 요구한다.

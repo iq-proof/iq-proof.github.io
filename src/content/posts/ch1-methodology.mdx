@@ -1,0 +1,129 @@
+---
+title: "Mechanistic Interpretability는 무엇을 증명하는가"
+description: "해석 가능성 4대 패러다임의 차이부터 activation patching의 인과 추론, 회로 발견 알고리즘까지 — 신경망을 역공학하려는 과학적 프로그램의 핵심을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, activation-patching, circuits, transformer, probing]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+"GPT-2의 layer 10이 sentiment를 인코딩한다 — probing accuracy 95%." 이 문장은 맞는가, 틀리는가? 답은 **질문이 잘못됐다**는 것이다. 정보가 인코딩되어 있다는 것과, 모델이 그 정보를 실제로 *사용한다*는 것은 전혀 다른 주장이다. 이 차이를 구분하지 못하면, 신경망 해석 가능성 연구의 절반은 헛수고가 된다.
+
+## 4가지 패러다임, 4가지 다른 질문
+
+해석 가능성 연구는 하나의 목표를 공유하지 않는다. 네 가지 근본적으로 다른 질문을 던지는 네 개의 패러다임이 공존한다.
+
+**Behavioral** 패러다임은 "모델이 무엇을 했는가?"를 묻는다. SHAP, LIME 같은 도구로 input-output 관계를 통계적으로 분석한다. 빠르고 저비용이지만, black box를 열지 않는다.
+
+**Representational** 패러다임은 "내부에서 정보가 어떻게 인코딩되는가?"를 묻는다. hidden state에 linear probe를 올려 concept가 벡터 공간에 새겨져 있는지 확인한다. 여기서 핵심 함정이 나온다 — probe accuracy가 높다고 해서 모델이 그 방향을 *사용*한다는 뜻이 아니다. Bolukbasi et al.(2016)이 보인 것처럼, gender bias가 embedding에 인코딩되어 있어도 최종 예측에 영향을 주지 않을 수 있다.
+
+**Mechanistic** 패러다임은 "정확히 어떤 회로가 이 행동을 야기하는가?"를 묻는다. intervention(개입)으로 인과 관계를 검증한다. 비용이 높고 탐색 공간이 지수적이지만, 인과 증거를 제공하는 유일한 방법이다.
+
+**Developmental** 패러다임은 "학습 중에 이 회로가 어떻게 형성되었는가?"를 묻는다. training dynamics를 추적하고 phase transition을 감지한다. 가장 비싸고 empirical benchmark도 드물다.
+
+<Callout type="note" title="패러다임 선택의 함의">
+"Probing accuracy가 높다"는 Representational 답변이다. "이 head가 행동을 야기한다"는 Mechanistic 주장이다. 이 두 문장은 서로를 함축하지 않는다. 논문의 주장이 어느 패러다임에 속하는지 먼저 확인하라.
+</Callout>
+
+## 관찰에서 개입으로 — Activation Patching의 수학
+
+Mechanistic interpretability의 핵심 도구는 **activation patching**이다. Pearl(2000)의 causal intervention framework를 신경망에 적용한 것으로, "이 뉴런의 activation을 다르게 바꾼다면 output은 어떻게 변하는가?"라는 질문에 답한다.
+
+세 가지 run이 필요하다.
+
+```
+Clean run:      x_clean     → [모델 전체]  → Loss_clean
+Corrupted run:  x_corrupted → [모델 전체]  → Loss_corrupted
+Patched run:    x_corrupted + h_clean[C]   → Loss_patched
+```
+
+Patched run에서는 손상된 입력을 주되, 특정 component $C$의 activation만 clean run에서 복사해 심는다. 그 결과로 **Indirect Effect**를 정의한다.
+
+$$\text{IE}(C) := \mathbb{E}[L_{\text{patched}} - L_{\text{corrupted}}]$$
+
+IE가 음수이면 — 즉, $C$를 clean 값으로 복구했을 때 loss가 낮아지면 — $C$가 인과적 역할을 한다는 증거다.
+
+<Theorem kind="proposition" number="1" title="Patching Estimand = Causal Mediation Effect">
+SUTVA(Stable Unit Treatment Value Assumption)를 만족할 때, IE($C$)는 Pearl의 Natural Indirect Effect(NIE)와 동등하다.
+</Theorem>
+
+<Proof>
+각 forward pass는 독립적이므로 SUTVA가 만족된다. clean/corrupted input 외의 confounding이 없고, Pearl의 3번째 법칙(intervention-after-observing)이 적용 가능하다. 따라서 patching은 합법적인 causal identification technique이다. $\square$
+</Proof>
+
+주의할 비대칭성이 있다. 같은 component에 대해 noising(clean→corrupted) 방향과 denoising(corrupted→clean) 방향으로 patching하면 일반적으로 $|\text{IE}_\text{noise}| \neq |\text{IE}_\text{denoise}}|$이다. 신경망이 비선형이기 때문이다. 어떤 corruption scheme을 선택하느냐가 결과를 바꿀 수 있다.
+
+## 회로란 무엇인가 — Feature, Circuit, Universality
+
+Mechanistic interpretability의 과학적 프로그램은 세 가지 핵심 개념 위에 선다.
+
+**Feature**는 hidden activation $h \in \mathbb{R}^d$에서 의미 있는 방향 $e$, $\|e\|=1$이다. $e^T h$가 크면 해당 concept이 강하게 존재한다. 문제는 대부분의 뉴런이 **polysemantic** — 여러 무관한 개념을 동시에 인코딩한다는 것이다(Elhage et al. 2022). 이것이 Sparse Autoencoder(SAE)를 고안하게 된 동기다. 768차원을 32,000개의 sparse feature로 분해하면 각 feature가 하나의 의미를 가질 가능성이 높아진다.
+
+**Circuit**은 특정 행동을 야기하는 최소 충분 부분 네트워크다. formal하게는 DAG $C = (N, E)$로 표현하며, faithfulness와 minimality를 모두 만족해야 한다.
+
+$$L(f_{C^*}(x), y) \approx L(f(x), y) \quad \text{and} \quad |C^*| \ll |C|$$
+
+그런데 optimal circuit을 찾는 것은 NP-hard다. search space가 $2^{O(\text{# components})}$이고, 각 candidate의 faithfulness 검사마다 forward pass가 필요하다. 따라서 ACDC(Conmy et al. 2023) 같은 greedy algorithm은 heuristic이며, 최적 보장이 없다.
+
+**Universality**는 GPT-2 small에서 발견한 feature direction이 GPT-2 medium에서도 유사하게 나타나는가의 문제다. Procrustes alignment로 측정하면 작은 모델 사이에서는 유사도 0.8~0.9로 높지만, 더 큰 모델로 갈수록 감소하는 경향이 있다. 이는 interpretability 연구가 scale에 취약할 수 있음을 시사한다.
+
+## Path Patching과 Causal Scrubbing — 회로를 검증하는 법
+
+Activation patching이 "어떤 component가 중요한가?"를 묻는다면, **path patching**은 "정보가 어떤 경로를 따라 흐르는가?"를 묻는다. path $p = (c_0, c_1, \ldots, c_k)$를 따라만 clean information을 흘려 보내고, 그 path effect(PE)를 측정한다. edge-disjoint paths에서 선형성이 성립하면 $\sum \text{PE}(p_i) \approx \text{Total IE}$가 된다.
+
+**Causal scrubbing**은 한 단계 더 나아가, 주어진 가설 회로 $H$가 충분한 설명인지를 정량적으로 검증한다.
+
+$$\text{Sufficiency}(H) := \frac{L_\text{clean} - L_\text{scrubbed}}{L_\text{clean} - L_\text{corrupted}}$$
+
+Sufficiency가 1에 가까울수록 가설이 손상의 대부분을 설명한다. 0.5라면 절반만 설명하고, 음수라면 가설이 오히려 해롭다.
+
+<Aside label="도구 스택">
+실무에서는 **TransformerLens**(`run_with_hooks`, `run_with_cache`)로 activation을 읽고 쓰고, **CircuitsVis**로 attention pattern을 시각화하고, **Neuronpedia**로 SAE feature를 탐색한다. 10B+ 모델에는 nnsight가 필요하다. 도구 선택이 연구 가능 범위를 직접 결정한다.
+</Aside>
+
+## 트레이드오프
+
+이 분야의 핵심 긴장은 **faithfulness vs completeness** 사이에 있다.
+
+Faithful circuit은 clean run과 corrupted run의 loss를 모두 재현한다. 그런데 "all causal paths를 포함하는가"(completeness)는 별개의 문제다. faithful하지만 incomplete한 회로는 존재한다 — 중요한 경로를 빠뜨려도 나머지가 보상할 수 있기 때문이다.
+
+또 다른 긴장은 **representation level**의 선택이다. attention head 수준에서 회로를 찾을 것인가, SAE feature 수준에서 찾을 것인가? head 수준은 계산이 빠르지만 polysemanticity를 해소하지 못한다. SAE feature 수준은 더 세밀하지만 훈련 비용이 24~48시간이다.
+
+가장 근본적인 한계는 **linearity assumption**이다. 대부분의 probe와 feature 분석은 정보가 선형 방향으로 인코딩된다고 가정한다. 실제 계산이 비선형이면 이 가정이 깨진다.
+
+## 정리
+
+- 4가지 패러다임(Behavioral, Representational, Mechanistic, Developmental)은 서로 다른 종류의 증거를 제공한다. probing accuracy는 representational 답변이지, mechanistic 증거가 아니다.
+- Activation patching은 Pearl의 causal intervention framework를 신경망에 적용한 것으로, IE = $\mathbb{E}[L_\text{patched} - L_\text{corrupted}]$로 인과 효과를 정량화한다.
+- Circuit 발견은 NP-hard다. ACDC 같은 greedy algorithm은 근사일 뿐이다.
+- Universality, polysemanticity, SAE — 이 세 개념은 "모델이 실제로 어떤 표현을 사용하는가"를 추적하는 현재 최전선이다.
+
+"해석 가능성을 증명했다"는 주장을 만날 때마다 물어야 한다 — 이것이 관찰인가, 개입인가?
+
+<Reference
+  title="Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small"
+  authors="Wang et al."
+  year={2022}
+  venue="ICLR 2023"
+  url="https://arxiv.org/abs/2211.00593"
+/>
+
+<Reference
+  title="Towards Automated Circuit Discovery for Mechanistic Interpretability"
+  authors="Conmy et al."
+  year={2023}
+  venue="NeurIPS 2023"
+  url="https://arxiv.org/abs/2304.14997"
+/>

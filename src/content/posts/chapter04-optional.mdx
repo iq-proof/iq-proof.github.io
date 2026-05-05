@@ -1,0 +1,137 @@
+---
+title: "Optional은 왜 메서드 반환 타입으로만 써야 하는가"
+description: "Optional의 final class 설계부터 직렬화 금지, Functor/Monad 패턴, 안티패턴, ORM·Jackson 통합까지 — 하나의 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, optional, functional-programming, jpa, jackson]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+
+Optional은 Java 8이 null을 다루는 방식을 바꿨다. 그런데 이 클래스는 놀랍도록 제한적으로 설계됐다 — `final`이라 상속할 수 없고, `Serializable`을 구현하지 않아 직렬화도 안 된다. 왜 이렇게 잠가놨을까? 그리고 그 제약들이 하나의 철학으로 연결된다면, 그 철학은 무엇인가?
+
+## 단 하나의 필드, 하나의 철학
+
+Optional의 내부 구조는 단순하다.
+
+```java
+public final class Optional<T> {
+    private static final Optional<?> EMPTY = new Optional<>(null);
+    private final T value;  // 단 하나의 필드
+
+    public static <T> Optional<T> empty() {
+        return (Optional<T>) EMPTY;  // 싱글톤 재사용
+    }
+}
+```
+
+`value` 필드 하나, `EMPTY` 싱글톤 하나. 빈 Optional을 만들 때마다 새 객체를 생성하지 않고 `EMPTY`를 재사용한다. 이 단순함은 우연이 아니다.
+
+`final class`로 봉인한 이유도 같은 맥락이다. Optional은 "값을 담는 컨테이너"일 뿐, 확장의 대상이 아니다. 서브클래스가 필드를 추가하는 순간 `EMPTY` 싱글톤이 깨지고, 값 기반 동등성(`@ValueBased`)이 흔들린다. 그래서 아예 막았다.
+
+<Aside label="@ValueBased">
+Optional은 `@jdk.internal.ValueBased`로 표시된다. 인스턴스의 동등성은 참조 주소가 아니라 `value` 필드만으로 결정한다. `==` 비교는 문법적으로 가능하지만 의미가 없다 — 항상 `equals()`를 써야 한다. 예외는 `EMPTY` 싱글톤뿐이다.
+</Aside>
+
+## 세 팩토리 메서드의 계약
+
+`Optional.of()`, `ofNullable()`, `empty()` — 세 메서드는 각각 다른 계약을 표현한다.
+
+```java
+Optional.of(value)         // "value는 절대 null이 아니다" → null이면 즉시 NPE
+Optional.ofNullable(value) // "value는 null일 수 있다" → null이면 EMPTY 반환
+Optional.empty()           // "값이 없다" → EMPTY 싱글톤 반환
+```
+
+`of(null)`이 `NullPointerException`을 던지는 건 버그가 아니라 설계다. "나는 이 값이 절대 null이 아님을 확신한다"는 프로그래머의 선언이고, 틀렸을 때 즉시 드러내는 장치다. `ofNullable()`로 모든 곳을 도배하면 이 의도 구분이 사라진다.
+
+<Callout type="note" title="팩토리 메서드 선택 기준">
+필드가 생성자에서 검증됐거나 `final`이면 `of()`. DB 쿼리 결과나 외부 입력이면 `ofNullable()`. 조건부로 "없음"을 표현해야 하면 `empty()`. 코드 리뷰에서 `ofNullable()` 남용을 발견하면 "이 값이 정말 null일 수 있나?"를 물어라.
+</Callout>
+
+## map과 flatMap — Functor와 Monad
+
+Optional의 `map`과 `flatMap`은 함수형 프로그래밍의 두 핵심 패턴을 구현한다.
+
+```java
+// map: T → U 변환 (Functor). 결과가 Optional이 아닌 값.
+Optional<Integer> age = user.map(u -> u.getAge());  // Optional<Integer>
+
+// flatMap: T → Optional<U> 변환 (Monad). 결과가 이미 Optional.
+Optional<Email> email = user.flatMap(u -> findEmailByUserId(u.getId()));
+// flatMap이 없으면: Optional<Optional<Email>> — 중첩이 생긴다.
+```
+
+<Theorem kind="proposition" number="1" title="Optional의 중첩 규칙">
+`map(f)`에서 `f`가 `Optional<U>`를 반환하면 결과는 `Optional<Optional<U>>`가 된다. `flatMap(f)`는 이 중첩을 자동으로 제거해 `Optional<U>`를 반환한다.
+</Theorem>
+
+<Proof>
+`flatMap`의 구현을 보면 `mapper.apply(value)`가 이미 `Optional<U>`를 반환하므로, 추가로 래핑하지 않고 그대로 반환한다. `map`은 `Optional.ofNullable(mapper.apply(value))`로 결과를 항상 한 번 더 감싼다. 다음 단계가 Optional을 반환한다면 반드시 `flatMap`을 써야 하는 이유다.
+</Proof>
+
+Monad 법칙은 이 체이닝이 수학적으로 안전함을 보장한다. `opt.flatMap(f).flatMap(g)`와 `opt.flatMap(x -> f(x).flatMap(g))`는 항상 동등하다 — 중간 순서를 바꾸거나 리팩토링해도 결과가 달라지지 않는다.
+
+Java 9부터 추가된 `Optional::stream`은 이 관계를 더 선명하게 드러낸다. `List<Optional<String>>`에서 빈 Optional을 걷어내려면 `flatMap(Optional::stream)`으로 충분하다 — Optional이 0개 또는 1개 원소의 Stream이기 때문이다.
+
+## 안티패턴 — 세 가지 금지 구역
+
+Brian Goetz(Optional 설계자)가 명시한 원칙은 하나다: **메서드 반환 타입으로만 사용하라**. 이걸 어기는 패턴 세 가지가 반복적으로 등장한다.
+
+**필드 사용**: Optional은 `Serializable`을 구현하지 않는다. JPA 엔티티 필드에 쓰면 Hibernate가 매핑을 못 하고, 직렬화 캐시에 올리면 `NotSerializableException`이 터진다. 메모리도 객체당 16바이트씩 낭비된다. 해결책은 단순하다 — 필드는 일반 타입, 반환은 Optional.
+
+**매개변수 사용**: `updateEmail(Long id, Optional<String> email)`을 만들면 호출자가 `Optional.of("...")` 를 생성해서 넘겨야 한다. 의도도 불명확하다. 오버로드나 `@Nullable` 어노테이션이 더 직관적이다.
+
+**컬렉션 사용**: `Optional<List<T>>`는 의미가 중복이다. 빈 리스트가 이미 "없음"을 표현한다. `List<Optional<T>>`는 메모리 오버헤드와 코드 복잡도만 늘린다 — `filter(Objects::nonNull)`이나 `flatMap(Optional::stream)`이 정답이다.
+
+<Callout type="warning" title="트레이드오프">
+Optional은 `final`이라 JVM 최적화(Valhalla 값 타입)의 후보가 될 수 있지만, 서브클래싱이 불가능하다. `Serializable` 미구현은 필드 사용 안티패턴을 강제로 차단하지만, Jackson·JPA와의 통합에 추가 설정이 필요하다. 이 제약들은 "옳은 방향으로만 쓰게 만드는" 설계 압력이다.
+</Callout>
+
+## 직렬화·ORM·Jackson 통합
+
+실무에서 Optional은 여러 계층을 통과한다. 각 계층의 처리 원칙은 일관된다 — **직렬화 경계에서는 Optional을 벗기고, Java 내부에서만 Optional을 쓴다**.
+
+```java
+// JPA 엔티티
+@Entity
+class User {
+    @Column(nullable = true)
+    String email;  // 필드는 일반 타입
+
+    @Transient
+    public Optional<String> getEmail() {
+        return Optional.ofNullable(email);  // Java API만 Optional
+    }
+}
+
+// Jackson 설정 (jackson-datatype-jdk8)
+ObjectMapper mapper = new ObjectMapper();
+mapper.registerModule(new Jdk8Module());
+mapper.setSerializationInclusion(JsonInclude.Include.NON_ABSENT);
+// Optional.empty() → 필드 생략 / Optional.of(값) → 값 직렬화
+```
+
+Redis 캐시도 마찬가지다. `@Cacheable`에 Optional을 그대로 올리면 직렬화 실패다. 값을 꺼내 캐시하고, 반환 시 `Optional.ofNullable()`로 감싸는 패턴이 표준이다.
+
+GraphQL은 한 가지 한계를 드러낸다. JSON은 `null`(명시적 없음)과 필드 자체의 부재(missing)를 구분할 수 없고, Optional도 마찬가지다. 이 구분이 필요하다면 명시적 플래그 필드나 Union 타입을 스키마 수준에서 설계해야 한다 — Optional이 해결해줄 영역이 아니다.
+
+## 정리
+
+- Optional은 `value` 하나, `EMPTY` 싱글톤 하나로 구성된 의도적으로 단순한 클래스다.
+- `of()` / `ofNullable()` / `empty()`는 각각 다른 계약을 표현한다 — 혼용하면 의도가 사라진다.
+- `map`은 Functor(값 변환), `flatMap`은 Monad(중첩 제거). 다음 단계가 Optional을 반환하면 반드시 `flatMap`.
+- 필드·매개변수·컬렉션에 Optional을 쓰면 직렬화, ORM, API 명확성이 모두 깨진다.
+- 직렬화 경계(JPA, Jackson, Redis)에서는 Optional을 벗기고 값으로 다루는 것이 표준이다.
+
+Optional의 모든 제약 — `final`, `Serializable` 미구현, `@ValueBased` — 은 한 문장으로 수렴한다: **"값 컨테이너를 영구 저장 대상으로 쓰지 말라."** 다음 글에서는 이 철학이 `CompletableFuture`에서 어떻게 이어지는지 추적한다.

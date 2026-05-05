@@ -1,0 +1,128 @@
+---
+title: "LLM Agent는 어떻게 도구를 쓰고, 실패에서 배우고, 함께 생각하는가"
+description: "ReAct의 Thought-Action-Observation 루프부터 Reflexion의 verbal RL, Voyager의 lifelong 스킬 축적, Multi-Agent Debate까지 — LLM agent 진화의 공통 철학을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [llm-agent, react, reflexion, voyager, multi-agent]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+CoT, ToT 같은 reasoning 기법은 모두 **closed-world**다. 외부 정보 없이 모델 내부 지식만으로 추론한다. 그런데 현실의 문제는 closed-world가 아니다. 웹 검색이 필요하고, 코드를 실행해야 하며, 실패에서 배워야 하고, 때로는 여러 에이전트가 협력해야 한다. ReAct에서 시작해 Reflexion, Voyager, Multi-Agent Debate까지 이어지는 이 흐름의 공통 철학은 무엇인가?
+
+## 행동과 추론의 결합 — ReAct
+
+ReAct(Yao 2022)의 핵심 발상은 단순하다. **Thought(추론)와 Action(도구 호출)을 번갈아 실행하라.** 각 스텝은 세 요소로 구성된다.
+
+```
+Thought: "Microsoft 창업자를 찾아야 한다."
+Action: search("founder of Microsoft")
+Observation: "Bill Gates and Paul Allen co-founded Microsoft."
+```
+
+이 루프는 RL의 POMDP와 정확히 대응된다. Thought가 belief state $b_t$의 verbal 표현이고, Action이 tool API 호출이며, Observation이 환경 응답이다. 수식으로 쓰면:
+
+$$
+b_{t+1}(s) \;\propto\; P(o_t \mid s, a_t) \sum_{s'} P(s \mid s', a_t)\, b_t(s')
+$$
+
+Belief update가 자연어로 수행되는 셈이다. Yao 2022의 HotpotQA 실험에서 reasoning-only(CoT)가 27.4%, acting-only가 21.0%일 때 ReAct는 35.1%를 달성했다. 추론과 행동의 **시너지**가 각각을 능가한다는 정량적 증거다.
+
+<Callout type="note" title="트레이드오프">
+ReAct는 verifiable task에 한정된다. Finish criterion이 모호한 open-ended task에서는 루프가 언제 끝나야 하는지 알 수 없다. Tool API 설계 비용도 환경마다 발생하고, long-horizon(10+ step)에서는 history가 길어지며 earlier context를 잃는다.
+</Callout>
+
+## 도구 학습의 자동화 — Toolformer
+
+ReAct가 tool을 수동 prompt로 시연했다면, Toolformer(Schick 2023)는 **모델 스스로 tool use를 학습**한다. 핵심은 utility filter다.
+
+$$
+\mathrm{utility}(p, \text{call}) \;=\; L_{\text{without}} - L_{\text{with}} \;>\; \tau \;\;\Rightarrow\;\; \text{keep}
+$$
+
+corpus의 각 위치에서 API call 후보를 삽입하고 실행한 뒤, call 결과가 이후 텍스트 예측에 도움이 된 경우만 남겨 fine-tuning에 사용한다. External supervision 없이 "이 call이 prediction에 유용했는가"를 implicit reward로 삼는 self-supervised 방식이다.
+
+GPT-J 6B 기준으로 TriviaQA에서 vanilla 28.0%에서 Toolformer 적용 후 48.8%로 상승했다. OpenAI의 function calling API와 Anthropic의 tool use는 Toolformer의 inline notation `[api(args) → result]`을 JSON structured format으로 산업화한 것이다.
+
+## 실패에서 배우는 루프 — Reflexion
+
+ReAct는 single-trial이다. 실패하면 끝. Reflexion(Shinn 2023)은 **실패 trajectory를 LLM이 분석해 교훈을 뽑고, 그 교훈을 다음 시도의 prompt에 추가**한다.
+
+```
+M_{t+1} = M_t \cup \{\text{reflect}(\tau_t, \text{outcome}_t)\}
+```
+
+파라미터 업데이트 없이 in-context memory만으로 policy가 개선된다. HumanEval에서 GPT-4 baseline 67%가 3 trial 후 91%로 오른 것이 대표적 결과다.
+
+<Theorem kind="proposition" number="1" title="In-context policy improvement">
+Reflection이 informative하다면, episodic memory $M_t$가 증가할수록 effective policy의 기대 보상도 단조 증가한다.
+</Theorem>
+
+<Proof>
+Reflection이 이전 시도의 wrong action을 "explicit failure mode"로 명시한다. In-context에서 모델은 해당 action을 회피하도록 generation distribution을 이동시킨다. 따라서 $J(\pi(\cdot \mid s, M_{t+1})) \geq J(\pi(\cdot \mid s, M_t))$가 성립한다. 단, reflection의 질이 임계 이상일 때만 $\square$
+</Proof>
+
+그러나 ceiling이 존재한다. Same-model self-critique는 모델 자신의 blindspot을 볼 수 없다. Different-model critic이나 external verifier만이 이 ceiling을 돌파할 수 있다.
+
+## 누적되는 역량 — Voyager
+
+Reflexion은 동일 task 내 multi-trial이다. Voyager(Wang 2023)는 **across-task lifelong learning**으로 도약한다. 세 컴포넌트가 결합된다.
+
+- **Automatic Curriculum**: 현재 inventory를 보고 LLM이 다음 학습 목표를 스스로 제안한다.
+- **Skill Library**: 성공한 코드를 vector store에 저장하고, 새 task에서 관련 skill을 RAG로 retrieve한다.
+- **Iterative Prompting**: 환경 피드백 + 실행 에러를 반복 주입해 코드를 refine한다.
+
+Minecraft 실험에서 ReAct가 수집한 unique item 16개, Reflexion이 22개일 때 Voyager는 63개를 수집하며 diamond tier(기술 트리 5단계)까지 도달했다. Skill library 크기가 0일 때 새 task 성공률 30%가 200 skill 이후 90%로 오른다 — 축적이 역량을 만든다.
+
+<Aside label="설계 철학">
+Voyager의 진짜 기여는 Minecraft 점수가 아니라 **외부 메모리(skill library)와 자동 커리큘럼의 결합**이라는 architecture다. Prompt history가 working memory라면 skill library는 long-term memory다. 이 구분이 single-task adaptation과 lifelong learning의 차이를 만든다.
+</Aside>
+
+## 여러 에이전트가 서로를 비판할 때 — Multi-Agent Debate
+
+단일 에이전트의 self-critique는 같은 모델의 같은 편향을 반복할 뿐이다. Multi-Agent Debate(Du 2023)는 K개 에이전트가 독립적으로 답을 낸 뒤 서로의 추론을 비판하고 업데이트하는 과정을 R라운드 반복한다.
+
+Self-Consistency는 독립 샘플의 majority vote다. 모든 샘플이 같은 wrong direction으로 편향되면 majority도 틀린다. Debate는 cross-critique가 그 편향을 조기에 잡는다. Du 2023의 GSM8K 실험에서 같은 compute($K \cdot R = 15$) 조건에서 Self-Consistency 78%에 비해 Debate가 85%를 달성했다.
+
+<Callout type="warning" title="트레이드오프">
+Multi-agent 방식은 $K \times R$배의 API 호출 비용이 든다. 또한 critique가 의미 있는 verifiable task(수학, 코드)에서만 SC를 능가한다. Open-ended 창작 task에서는 cross-critique 자체가 무의미해 single-agent + self-refine과 차이가 없다.
+</Callout>
+
+## 정리
+
+네 챕터를 관통하는 공통 구조가 있다. **외부 신호를 내부 추론에 통합하는 방식의 진화**다.
+
+- ReAct: tool observation을 belief update로 — single trial.
+- Toolformer: utility filter가 valuable tool call을 self-supervised로 식별.
+- Reflexion: 실패 trajectory를 verbal RL의 gradient로 — weight update 없는 policy improvement.
+- Voyager: 성공한 skill을 누적해 lifelong capability 증가.
+- Multi-Agent: cross-critique로 single-agent self-blindspot을 우회.
+
+각 방법이 해결하는 문제가 다르다. Closed-world reasoning으로는 충분하지 않을 때 ReAct, tool 습득을 자동화하려면 Toolformer, 반복 실패에서 배우려면 Reflexion, 태스크 간 역량을 쌓으려면 Voyager, 편향의 echo chamber를 깨려면 Multi-Agent Debate다. 이 도구들은 경쟁하지 않는다 — 조합된다.
+
+<Reference
+  title="ReAct: Synergizing Reasoning and Acting in Language Models"
+  authors="Yao et al."
+  year={2022}
+  venue="ICLR 2023"
+  url="https://arxiv.org/abs/2210.03629"
+/>
+
+<Reference
+  title="Reflexion: Language Agents with Verbal Reinforcement Learning"
+  authors="Shinn et al."
+  year={2023}
+  venue="NeurIPS 2023"
+  url="https://arxiv.org/abs/2303.11366"
+/>

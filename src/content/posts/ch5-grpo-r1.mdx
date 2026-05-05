@@ -1,0 +1,178 @@
+---
+title: "GRPO는 어떻게 PPO의 Critic을 없앴는가"
+description: "PPO의 4-network 부담부터 GRPO의 group-relative advantage 유도, R1-Zero의 aha moment, R1의 5-stage pipeline, 그리고 RLOO/REINFORCE++까지 — LLM 추론 RL의 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [grpo, ppo, rlhf, llm-reasoning, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+PPO는 InstructGPT와 ChatGPT를 만든 RLHF의 backbone이다. 그런데 DeepSeek-R1은 PPO 대신 GRPO를 쓴다. 왜인가? 그리고 PPO의 critic을 group-relative advantage로 대체하는 것이 수학적으로 어떻게 정당화되는가?
+
+## PPO가 LLM Scale에서 부담인 이유
+
+PPO는 네 개의 네트워크를 동시에 유지한다 — policy $\pi_\theta$, critic $V_\phi$, reward model $R_\psi$, reference $\pi_\mathrm{ref}$. Critic은 policy와 같은 크기여야 한다. 이유는 value function이 policy가 보는 것과 동일한 표현력으로 state value를 예측해야 하기 때문이다. 결과적으로 70B 모델 기준 메모리 요구량은 다음과 같다.
+
+```
+Network         상태       메모리 (FP16 + Adam optimizer)
+policy          trainable  ~560 GB
+critic          trainable  ~560 GB
+reward          frozen     ~140 GB
+reference       frozen     ~140 GB
+                           ─────────
+                           ~1.4 TB (+ activation, KV cache)
+```
+
+메모리 문제보다 더 근본적인 것이 있다. Reasoning 태스크에서는 reward가 **최종 답의 정오(0 또는 1)** 하나뿐이다. 중간 step에 reward signal이 없다. 이 환경에서 critic이 학습하는 TD target은 다음과 같다.
+
+$$
+\hat{V}_t \;=\; r_t + \gamma V(s_{t+1})
+$$
+
+$t < T$이면 $r_t = 0$이므로, early step의 critic target은 $\gamma^{T-t}$ 배 감쇠된 final reward의 bootstrap이다. 체인 길이 $T = 100$이면 early step의 critic이 학습하는 신호는 사실상 noise다.
+
+<Callout type="warning" title="Critic instability in long-chain reasoning">
+Chain-of-thought 길이가 길수록 early step의 TD bootstrap variance는 $\gamma^{2(T-t)}$에 비례해 폭발한다. 70B scale에서 critic 학습 자체가 RL 학습보다 어려워진다.
+</Callout>
+
+## GRPO — Critic을 Group으로 대체하기
+
+GRPO(Shao 2024)의 핵심 아이디어는 단순하다: **같은 query에 대해 $G$개의 rollout을 생성하고, 그 reward의 분포 자체를 baseline으로 쓴다.**
+
+$$
+A_i \;=\; \frac{r_i - \mathrm{mean}_j(r_j)}{\mathrm{std}_j(r_j) + \epsilon}
+$$
+
+이것이 수학적으로 valid한 이유는 policy gradient theorem의 baseline arbitrariness에 있다.
+
+<Theorem kind="proposition" number="1" title="Group Mean은 Valid Baseline이다">
+Policy gradient estimator에서 baseline $b$는 action에 독립이기만 하면 gradient를 bias하지 않는다.
+$$
+\mathbb{E}_{a \sim \pi(\cdot|s)}\bigl[\nabla \log \pi(a|s) \cdot b\bigr] = 0
+$$
+</Theorem>
+
+<Proof>
+$$
+\mathbb{E}_{a \sim \pi}\bigl[\nabla \log \pi(a|s) \cdot b\bigr]
+= b \sum_a \pi(a|s) \nabla \log \pi(a|s)
+= b \sum_a \nabla \pi(a|s)
+= b \cdot \nabla 1 = 0 \quad \square
+$$
+
+Group mean $b = \frac{1}{G}\sum_i r_i$는 query에 conditioning되어 있지만 파라미터 업데이트와 독립이므로 unbiased baseline이다.
+</Proof>
+
+Variance 측면에서도 group mean은 최적 baseline의 empirical 추정값이다. Optimal baseline은 $b^* = \mathbb{E}[R]$이고, 충분히 큰 $G$에서 $\frac{1}{G}\sum r_i \to \mathbb{E}[R]$이 성립한다.
+
+결과적으로 GRPO의 loss는 PPO clipping + group-relative advantage + unbiased KL penalty의 조합이다.
+
+$$
+L^{\mathrm{GRPO}}(\theta) \;=\; \mathbb{E}_q\left[\frac{1}{G}\sum_i \frac{1}{|o_i|}\sum_t \min\bigl(\rho_{i,t} A_i,\; \mathrm{clip}(\rho_{i,t}, 1\pm\epsilon) A_i\bigr)\right] - \beta \cdot \widehat{\mathrm{KL}}_u(\pi \| \pi_\mathrm{ref})
+$$
+
+KL항에는 standard estimator($\mathbb{E}[\log\pi - \log\pi_\mathrm{ref}]$) 대신 unbiased estimator를 사용한다.
+
+$$
+\widehat{\mathrm{KL}}_u \;=\; \mathbb{E}\!\left[\frac{\pi_\mathrm{ref}}{\pi} - \log\frac{\pi_\mathrm{ref}}{\pi} - 1\right] \;\geq\; 0 \quad \forall \pi
+$$
+
+$f(u) = u - \log u - 1$이 $u=1$에서 minimum $0$을 가지며 convex이므로, 이 estimator는 단일 sample에서도 항상 non-negative다. Standard estimator는 sample별로 음수가 될 수 있어 variance가 5~10배 크다.
+
+DeepSeekMath 7B 실험에서 GRPO는 PPO 대비 GSM8K +3%, MATH +5%를 기록했다.
+
+## R1-Zero — SFT 없이 RL만으로
+
+GRPO가 충분히 안정적이라면 SFT cold-start도 필요 없지 않을까? R1-Zero는 이 질문을 실험으로 답한다. DeepSeek-V3-Base에서 SFT 없이 GRPO를 직접 적용했다.
+
+Reward는 두 항으로 구성된다.
+
+$$
+r = r^\mathrm{format} + r^\mathrm{acc}
+$$
+
+Format reward는 `<think>...</think><answer>...</answer>` 형식 준수 여부, accuracy reward는 최종 답의 정오다.
+
+훈련 과정에서 "aha moment"가 관찰됐다. 약 step 4000~8000 구간에서 평균 reasoning 길이가 ~500 token에서 5000~15000 token으로 급격히 증가한다. Self-reflection, backtracking 같은 행동이 reward signal 없이 emergent한다.
+
+<Aside label="Aha moment의 동역학">
+Length spike가 점진적이 아닌 sudden jump로 나타난다는 것은 loss landscape의 basin transition을 시사한다. Short reasoning basin에서 long reasoning basin으로의 이동이 critical mass의 gradient update 이후 일어난다는 가설이 제안된다.
+</Aside>
+
+R1-Zero는 AIME 2024에서 71.0%(cons@64)를 달성했다. SFT 없이 base model에서 직접 달성한 결과다. 단, language mixing(영어/중국어 혼재)과 가독성 저하가 부작용으로 남는다. Verifiable reward가 언어 일관성을 요구하지 않기 때문이다.
+
+## R1의 5-Stage Pipeline
+
+R1-Zero의 capability를 production-ready로 만들기 위해 R1은 5단계를 거친다.
+
+```
+Stage 1  Cold-start SFT   ~10K 고품질 예시 (format + 영어 anchor)
+Stage 2  First GRPO       Verifiable reward로 capability 학습
+Stage 3  Rejection Sampling  RL checkpoint의 best-of-N output 60만 + general 20만
+Stage 4  Second SFT       확장 데이터로 base 재학습 (generalization)
+Stage 5  Final GRPO       helpfulness + harmlessness multi-objective
+```
+
+Stage 1이 해결하는 것은 capability가 아니라 **format과 언어 일관성**이다. 구조가 정렬된 상태에서 Stage 2의 RL이 효율적으로 capability를 키운다.
+
+Stage 3~4의 rejection sampling + second SFT가 RL을 단순히 더 길게 돌리는 것보다 나은 이유는 distribution shift 때문이다. PPO clipping은 step size를 제한해 Stage 1 SFT prior에 anchored된 상태에서 큰 분포 이동이 어렵다. Rejection sampling으로 RL checkpoint의 best output을 SFT data로 만들고 base를 재학습하면, 새 SFT가 RL의 분포로 base를 bake-in한다.
+
+결과적으로 R1은 AIME 2024에서 79.8%, MATH-500에서 97.3%를 달성해 R1-Zero 대비 모든 benchmark에서 향상됐다.
+
+## RLOO, REINFORCE++ — Reward Design이 Algorithm보다 중요하다
+
+GRPO 이후 RLOO(Ahmadian 2024)와 REINFORCE++(Hu 2024)가 제안됐다. 핵심 차이는 baseline 계산 방식이다.
+
+RLOO는 leave-one-out baseline을 사용한다.
+
+$$
+b_i \;=\; \frac{1}{G-1}\sum_{j \neq i} r_j, \quad A_i = r_i - b_i
+$$
+
+std normalization 없이 self를 exclude한 mean을 baseline으로 쓴다. REINFORCE++는 KL penalty를 별도 loss term이 아닌 reward shaping으로 통합한다.
+
+$$
+r'_i = r_i - \beta \log(\pi_\theta / \pi_\mathrm{ref})
+$$
+
+세 알고리즘의 실증 결과는 1% 이내 차이를 보인다(Hu 2024 ablation, 7B model, math reasoning). 이 결과가 시사하는 바는 명확하다. **Algorithm의 선택보다 reward design이 capability의 main driver다.**
+
+<Callout type="note" title="트레이드오프">
+세 알고리즘 모두 trajectory-level reward만 활용하는 critic-free family다. 공통 한계는 PRM 같은 step-level reward와 결합 시 추가 설계가 필요하다는 점이다. GRPO는 PPO clipping retention으로 large update를 방지하지만 구현이 복잡하고, RLOO는 더 단순하지만 clip이 없어 update 안정성을 직접 관리해야 한다. REINFORCE++는 단일 loss term으로 가장 단순하지만 KL coefficient의 explicit 튜닝과 logging이 어렵다.
+</Callout>
+
+## 정리
+
+- PPO의 critic은 LLM reasoning에서 memory 2×와 sparse reward하의 TD variance 폭발이라는 이중 부담이다.
+- GRPO는 policy gradient theorem의 baseline arbitrariness를 활용해 group mean으로 critic을 대체한다. 수학적으로 valid하고, 실증적으로 PPO보다 우수하다.
+- R1-Zero는 SFT 없이 base + GRPO + verifiable reward만으로 reasoning을 emergent시킨다. Aha moment는 RL dynamics의 basin transition이다.
+- R1의 5-stage는 R1-Zero의 capability를 format 정렬, generalization, alignment 순서로 production-ready로 만든다. 각 stage가 specific failure mode를 해결한다.
+- RLOO, REINFORCE++, GRPO 중 무엇을 쓰든 성능 차이는 작다. 설계 에너지는 reward design에 투자하라.
+
+<Reference
+  title="DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+  authors="DeepSeek-AI et al."
+  year={2025}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2501.12948"
+/>
+
+<Reference
+  title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models"
+  authors="Shao et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2402.03300"
+/>

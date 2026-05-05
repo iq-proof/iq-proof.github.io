@@ -1,0 +1,113 @@
+---
+title: "객체는 데이터가 아니라 책임으로 정의된다"
+description: "절차지향의 God Object부터 책임 주도 설계의 협력 공동체까지, 객체지향의 본질이 '데이터가 아닌 행동'임을 티켓 판매 시스템과 영화 예매 시스템으로 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [object-oriented, design, responsibility, encapsulation, cohesion]
+difficulty: intermediate
+series:
+  slug: object
+  title: Object
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`Theater.enter(audience)`가 관람객의 가방을 직접 열어보고, 판매원의 매표소를 마음대로 뒤지는 코드를 본 적 있는가? 기능은 돌아간다. 그런데 관람객이 지갑으로 바꾸는 순간, `Theater`까지 손을 대야 한다. 이 챕터들이 추적하는 질문은 하나다 — 왜 데이터를 먼저 정의하면 설계가 무너지는가?
+
+## 절차지향의 함정: Theater가 모든 것을 안다
+
+`Theater.enter()`의 첫 번째 버전을 보면 즉각 불편함을 느낀다.
+
+```java
+public void enter(Audience audience) {
+    if (audience.getBag().hasInvitation()) {
+        Ticket ticket = ticketSeller.getTicketOffice().getTicket();
+        audience.getBag().setTicket(ticket);
+    } else {
+        Ticket ticket = ticketSeller.getTicketOffice().getTicket();
+        audience.getBag().minusAmount(ticket.getFee());
+        ticketSeller.getTicketOffice().plusAmount(ticket.getFee());
+        audience.getBag().setTicket(ticket);
+    }
+}
+```
+
+`Theater`는 `Audience`, `Bag`, `TicketSeller`, `TicketOffice`, `Ticket`, `Invitation` — 6개 클래스의 내부 구조를 꿰고 있다. 이것이 **절차지향**의 본질이다. 데이터 객체들이 상태만 보관하고, 프로세스 객체(Theater)가 모든 것을 처리한다. 관람객은 자신의 가방을 스스로 열지 못한다. 판매원은 티켓을 스스로 꺼내지 못한다. 전부 수동적이다.
+
+결과는 예측 가능하다. 관람객이 가방 대신 지갑을 쓰기로 결정하면, `Audience`만 바꾸면 될 것 같지만 실제로는 `Theater`의 `enter()` 메서드 전체를 뒤집어야 한다. **하나의 변경이 여러 클래스의 수정을 요구하는 것** — 이것이 높은 결합도의 정체다.
+
+## 책임을 돌려주기: 캡슐화의 출발점
+
+개선의 방향은 명확하다. 각 객체가 자신의 데이터를 스스로 처리해야 한다.
+
+```java
+// Before: Theater가 직접 조작
+audience.getBag().hasInvitation();
+ticketSeller.getTicketOffice().getTicket();
+
+// After: 메시지만 전달
+ticketSeller.sellTo(audience);   // Theater
+audience.buy(ticket);            // TicketSeller
+bag.hold(ticket);                // Audience
+```
+
+`Theater`는 이제 `sellTo()`라는 메시지만 보낸다. *어떻게* 판매하는지는 `TicketSeller`가 결정한다. `Audience`는 `buy()`를 통해 자신의 가방을 스스로 연다. `Bag`은 `hold()`로 초대장 유무를 스스로 판단하고 돈을 차감한다.
+
+`Theater`의 의존성은 6개 클래스에서 **2개**로 줄어든다. 관람객이 지갑으로 교체해도 `Audience.buy()` 내부만 바뀌고, `Theater`는 손댈 필요가 없다.
+
+<Callout type="note" title="캡슐화의 진짜 의미">
+`private` 필드에 `getter/setter`를 달아두는 것은 캡슐화가 아니다. `public Bag getBag()`은 "`Bag`을 내부에 가지고 있다"는 사실을 외부에 그대로 노출한다. 진정한 캡슐화는 **변경 가능성이 있는 모든 것**을 인터페이스 뒤로 숨기는 것이다.
+</Callout>
+
+## 협력이 객체를 만든다: 역할과 책임
+
+영화 예매 시스템은 이 원칙을 더 정교하게 보여준다. `Movie`는 놀랍게도 할인 정책의 종류를 모른다.
+
+```java
+public Money calculateMovieFee(Screening screening) {
+    return fee.minus(discountPolicy.calculateDiscountAmount(screening));
+}
+```
+
+`discountPolicy`가 `AmountDiscountPolicy`인지 `PercentDiscountPolicy`인지 `Movie`는 신경 쓰지 않는다. **메시지**(`calculateDiscountAmount`)를 보낼 뿐이고, **어떻게** 계산하는지는 수신 객체가 결정한다. 이것이 다형성이다.
+
+이 설계가 가능한 이유는 **역할(Role)**이라는 추상화 덕분이다. `AmountDiscountPolicy`와 `PercentDiscountPolicy`는 둘 다 "할인 금액을 계산한다"는 동일한 책임을 수행한다. 이 공통 책임을 `DiscountPolicy` 인터페이스로 추출하면, `Movie`는 역할에만 의존하고 구체적인 정책과 분리된다.
+
+책임 주도 설계(RDD)의 순서는 이렇다. 먼저 협력 시나리오를 파악한다("영화를 예매한다"). 필요한 메시지를 식별한다("예매하라"). 그 정보를 가장 잘 아는 정보 전문가를 찾아 책임을 할당한다(`Screening`). 새로운 필요가 생기면 반복한다. **객체가 먼저가 아니라 메시지가 먼저**다.
+
+## 데이터 중심 설계의 숨겨진 비용
+
+같은 영화 예매 시스템을 데이터 중심으로 구현하면 어떻게 되는가. `Movie`는 `MovieType` 열거형으로 타입을 구분하고, `discountAmount`와 `discountPercent`를 동시에 보관한다. 모든 필드에 `getter/setter`가 붙는다.
+
+```java
+public enum MovieType {
+    AMOUNT_DISCOUNT, PERCENT_DISCOUNT, NONE_DISCOUNT
+}
+```
+
+`ReservationAgency`는 45줄짜리 `reserve()` 메서드 안에서 `Movie`의 타입을 꺼내 `switch`로 분기하고, `DiscountCondition`의 타입을 꺼내 `if-else`로 분기한다. 여기에 "조조 할인"을 추가한다면? `MovieType` 열거형 수정, `Movie`에 필드 추가, `ReservationAgency`의 `switch`문 수정 — 최소 3개 클래스를 동시에 열어야 한다.
+
+책임 중심 설계에서는 `EarlyBirdDiscountPolicy extends DiscountPolicy` 하나만 추가하면 끝이다. 기존 코드는 단 한 줄도 바뀌지 않는다.
+
+<Aside label="응집도와 결합도">
+응집도와 결합도는 "얼마나"가 아니라 **변경의 관점**에서 측정해야 한다. 높은 응집도란 하나의 변경이 하나의 모듈만 수정하게 만드는 것이다. 낮은 결합도란 다른 모듈의 내부 구현이 바뀌어도 내 코드가 영향받지 않는 것이다. 캡슐화를 강화하면 응집도는 올라가고 결합도는 내려간다.
+</Aside>
+
+## 트레이드오프: 완벽한 설계는 없다
+
+`TicketOffice`를 자율적으로 만들면 어떨까? `sellTicketTo(Audience audience)` 메서드를 주면 `TicketSeller`가 단순해진다. 하지만 이 순간 `TicketOffice`는 `Audience`에 의존하게 된다. 매표소는 관람객이라는 개념 없이도 존재할 수 있어야 한다. 도메인적으로 부자연스럽고, `TicketOffice`의 재사용성도 떨어진다.
+
+결론은 `TicketOffice`의 자율성을 포기하고 기존 구조를 유지하는 것이다. **`TicketOffice`의 자율성 `<` `Audience`와의 결합도 제거.** 설계는 트레이드오프의 산물이다. 모든 것을 완벽하게 만들 수 없다. 무엇이 더 중요한지 판단하고, 때로는 한 쪽을 포기해야 한다.
+
+## 정리
+
+- 객체는 데이터를 보관하는 곳이 아니라 **책임을 수행하는 주체**다.
+- 협력이 문맥을 결정하고, 문맥이 객체의 행동을 결정하고, 행동이 필요한 데이터를 결정한다.
+- `getter/setter`는 캡슐화가 아니다. 변경 가능성이 있는 모든 것 — 타입, 자료구조, 구현 방식 — 을 인터페이스 뒤로 숨겨야 한다.
+- 새로운 기능 추가 시 기존 코드를 수정하지 않고 새 클래스만 추가할 수 있다면, 그 설계는 올바른 방향이다.
+
+다음 글에서는 이 원칙들이 상속과 다형성 레이어에서 어떻게 깨지고 또 어떻게 복구되는지 — 합성이 상속보다 나은 이유를 코드로 추적한다.

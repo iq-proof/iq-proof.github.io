@@ -1,0 +1,142 @@
+---
+title: "상속은 왜 코드 재사용의 도구가 아닌가"
+description: "OCP와 DIP부터 취약한 기반 클래스 문제, 합성의 런타임 조합까지 — 상속이 만들어내는 결합도와 그것을 해체하는 방법을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [object-oriented, inheritance, composition, solid, design-pattern]
+difficulty: intermediate
+series:
+  slug: object
+  title: Object
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+객체지향 교과서는 상속을 "코드 재사용의 핵심 메커니즘"으로 소개한다. 그런데 실무에서 상속 계층이 깊어질수록 코드는 더 이해하기 어려워지고, 변경은 더 위험해진다. 왜 강력한 도구가 오히려 짐이 되는가?
+
+## 추상화가 OCP를 만든다
+
+개방-폐쇄 원칙(OCP)의 핵심 질문은 하나다 — "코드를 수정하지 않고 어떻게 동작을 추가할 수 있는가?" 답은 **컴파일타임 의존성을 고정하고 런타임 의존성을 변경하는 것**이다.
+
+```java
+// 컴파일타임: Movie는 DiscountPolicy 추상화에만 의존
+public class Movie {
+    private DiscountPolicy discountPolicy;
+
+    public Money calculateMovieFee(Screening screening) {
+        return fee.minus(discountPolicy.calculateDiscountAmount(screening));
+    }
+}
+```
+
+런타임에는 `AmountDiscountPolicy`, `PercentDiscountPolicy`, `NoneDiscountPolicy` 어떤 구체 클래스든 주입된다. `Movie` 코드는 한 줄도 바뀌지 않는다. 추상화가 변하지 않는 부분(조건 체크 루프)과 변하는 부분(할인 금액 계산)을 분리하기 때문이다.
+
+추상화만으로는 부족하다. OCP가 성립하려면 **변경되지 않을 부분을 신중하게 골라 추상화에 정의**해야 한다. 이 선택이 틀리면 확장할 때마다 추상화 자체를 수정해야 한다.
+
+## 생성과 사용을 분리하라
+
+OCP가 무너지는 가장 흔한 지점은 객체 생성이다. `Movie` 생성자 안에서 `new AmountDiscountPolicy(...)`를 직접 호출하는 순간, `Movie`는 추상화가 아닌 구체 클래스에 결합된다.
+
+해결책은 **생성 책임을 사용 책임에서 분리**하는 것이다. 생성을 클라이언트로 이동하거나, 더 나아가 Factory 객체에 위임한다. Factory는 도메인 개념이 아니다 — 영화도 아니고 상영도 아니다. 순수하게 기술적인 이유로 도입된 **순수한 가공물(PURE FABRICATION)**이다.
+
+객체지향이 실세계의 모방이라는 말은 절반만 옳다. 실제 애플리케이션에서는 도메인 개념을 반영한 객체보다 설계자가 임의로 창조한 인공적 추상화가 더 많은 비중을 차지하는 경우가 흔하다.
+
+## 의존성은 명시적이어야 한다
+
+의존성 주입(DI)의 반대편에 SERVICE LOCATOR 패턴이 있다. SERVICE LOCATOR는 의존성을 생성자 시그니처 뒤에 숨긴다.
+
+```java
+// ❌ 의존성이 숨겨짐
+public Movie(String title, Duration runningTime, Money fee) {
+    this.discountPolicy = ServiceLocator.discountPolicy(); // 내부에서 조회
+}
+```
+
+퍼블릭 인터페이스만 보면 `Movie`가 무엇에 의존하는지 알 수 없다. 오류는 컴파일이 아닌 런타임에 발생하고, 테스트 간 상태가 공유되어 격리가 깨진다. **명시적인 의존성이 숨겨진 의존성보다 항상 낫다.** 생성자 주입이 기본이고, 선택적 의존성에만 Setter를 허용한다.
+
+의존성 역전 원칙(DIP)은 한 걸음 더 나아간다. 추상화(`DiscountPolicy`)를 하위 수준 패키지(`pricing`)가 아니라 **상위 수준 클라이언트 패키지(`movie`)에 배치**해야 한다. 그래야 `pricing` 패키지가 `movie` 패키지에 의존하는 방향이 되어, 상위 수준 클래스를 재사용할 때 하위 수준 클래스를 강제로 끌어올 필요가 없어진다.
+
+## 상속은 캡슐화를 희생한다
+
+10장이 보여주는 취약한 기반 클래스 문제는 상속의 본질적 한계다. `InstrumentedHashSet`이 `addAll`에서 `addCount`를 6으로 세는 이유는 `HashSet.addAll`이 내부에서 `add`를 호출하기 때문이다 — 오버라이딩된 버전으로. 부모의 내부 구현을 알아야만 올바르게 오버라이딩할 수 있다면, 캡슐화는 이미 무너진 것이다.
+
+`Stack extends Vector`는 더 직접적이다. `Vector`의 `add(int, E)` 메서드가 `Stack`의 LIFO 규칙을 아무 저항 없이 깨뜨린다. 상속받은 부모의 메서드가 자식의 내부 규칙과 충돌한다.
+
+```
+경고 1: super 호출 → 부모 구현에 강하게 결합
+경고 2: 불필요한 인터페이스 상속 → 규칙 위반 가능
+경고 3: 메서드 오버라이딩 오작용 → 부모 내부 구현에 의존
+경고 4: 부모-자식 동시 수정 → 캡슐화 붕괴
+```
+
+10장의 Phone/NightlyDiscountPhone 예제에서 올바른 방향은 **코드를 아래로 내리는 것이 아니라 위로 올리는 것**이다. 공통 로직을 추상 클래스로 끌어올리고, 차이점만 추상 메서드로 남겨 자식이 구현하게 한다. 이것이 템플릿 메서드 패턴이다.
+
+<Callout type="warning" title="트레이드오프">
+상속은 코드 재사용을 위해 캡슐화를 희생한다. 완벽한 캡슐화를 원한다면 합성을 선택해야 한다. 설계는 트레이드오프 활동이다 — 상속이 적합한 경우는 진정한 is-a 관계와 다형성이 필요한 타입 계층 구조화일 때에 한정된다.
+</Callout>
+
+## 합성이 클래스 폭발을 막는다
+
+일반 요금제와 심야 할인 요금제에 세금 정책과 기본 요금 할인 정책을 조합해야 한다고 가정하자. 상속 방식으로는 `TaxableRegularPhone`, `TaxableNightlyDiscountPhone`, `RateDiscountableRegularPhone` ... 기하급수적으로 클래스가 증가한다. 세금 로직이 여러 클래스에 중복되고, 세금 정책이 바뀌면 모든 Taxable* 클래스를 수정해야 한다.
+
+합성은 이 문제를 구조적으로 해결한다.
+
+```java
+public interface RatePolicy {
+    Money calculateFee(Phone phone);
+}
+
+public abstract class AdditionalRatePolicy implements RatePolicy {
+    private RatePolicy next; // 다음 정책
+
+    public AdditionalRatePolicy(RatePolicy next) {
+        this.next = next;
+    }
+
+    @Override
+    public Money calculateFee(Phone phone) {
+        Money fee = next.calculateFee(phone); // 위임
+        return afterCalculated(fee);
+    }
+
+    protected abstract Money afterCalculated(Money fee);
+}
+```
+
+`TaxablePolicy`와 `RateDiscountablePolicy`는 각각 클래스 하나다. 조합은 런타임에 생성자 호출로 결정된다.
+
+```java
+// 일반 요금제 + 할인 + 세금
+Phone phone = new Phone(
+    new TaxablePolicy(0.05,
+        new RateDiscountablePolicy(Money.wons(1000),
+            new RegularPolicy(Money.wons(100), Duration.ofSeconds(10))
+        )
+    )
+);
+```
+
+새로운 요금제나 부가 정책을 추가할 때 클래스 하나만 추가하면 된다. 기존 코드는 변경하지 않는다. **합성은 인터페이스를 재사용하고, 상속은 구현을 재사용한다.** 전자가 결합도가 낮다.
+
+## 다형성의 엔진: self 참조
+
+12장이 밝히는 다형성의 실제 메커니즘은 **self 참조와 동적 메서드 탐색**이다. 메시지를 수신한 객체는 self가 가리키는 자신의 클래스에서 탐색을 시작하고, 없으면 parent 포인터를 따라 상속 계층을 거슬러 올라간다.
+
+self 전송이 핵심이다. `Lecture.stats()` 내부에서 `getEvaluationMethod()`를 호출할 때, 이것은 `Lecture`의 메서드를 직접 호출하는 것이 아니라 **self가 가리키는 객체에게 메시지를 전송하는 것**이다. self가 `GradeLecture` 인스턴스이면 `GradeLecture.getEvaluationMethod()`가 실행된다. 부모 클래스에 정의된 메서드가 자식 클래스의 메서드를 실행시키는 것 — 이것이 다형성이 코드 변경 없이 기능을 확장할 수 있게 하는 이유다.
+
+<Aside label="설계 우선순위">
+의존성 관리는 역할, 책임, 협력이 명확해진 다음 단계다. 협력 구조가 불분명한 상태에서 Factory나 DI를 먼저 고민하면 불필요한 복잡성만 쌓인다. 순서는 협력 → 책임 → 의존성 → 생성이다.
+</Aside>
+
+## 정리
+
+- OCP는 추상화로 컴파일타임 의존성을 고정하고 런타임 의존성을 변경함으로써 달성된다.
+- 생성과 사용의 분리, DI, DIP는 모두 "명시적 의존성"이라는 하나의 원칙의 다른 표현이다.
+- 상속은 취약한 기반 클래스 문제와 클래스 폭발을 일으킨다. 코드 재사용 목적이라면 합성이 올바른 선택이다.
+- 다형성의 실체는 self 참조 기반 동적 메서드 탐색이다. 상속은 타입 계층을 구조화해 이 탐색 경로를 정의하는 도구다.
+
+다음 글에서는 서브클래싱과 서브타이핑의 차이, 그리고 리스코프 치환 원칙이 상속의 올바른 사용 조건을 어떻게 규정하는지 추적한다.

@@ -1,0 +1,145 @@
+---
+title: "거대 레포는 어떻게 git을 견디는가"
+description: "Pack file의 이진 포맷부터 LFS의 Clean/Smudge 필터, Batch API, Partial Clone의 promisor remote, Sparse Index의 100배 가속까지 — git이 거대 저장소 문제를 해결한 방식을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, pack-file, lfs, partial-clone, sparse-checkout]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Linux 커널 레포는 수십만 개의 커밋과 수백만 개의 파일을 담고 있다. `git clone`을 실행하면 수 GB가 내려온다. 그런데도 git은 동작한다 — 수십 초, 때로는 수 분 만에. 이것이 가능한 이유는 "큰 데이터를 어떻게 저장하고, 어떻게 전송하고, 어떻게 보여주는가"에 대한 일련의 설계 결정 덕분이다. 그 결정들은 어떤 공통 철학 위에 세워져 있는가?
+
+## 저장의 기본 단위: Pack file
+
+git의 객체는 처음에는 느슨한 파일(loose object)로 저장된다. 커밋이 쌓이면 git은 이를 `.pack` 파일 하나로 압축한다. 포맷은 단순하지 않다.
+
+```
+.pack 구조
+
+  ┌─────────────────────────┐
+  │ Header (12 bytes)        │
+  │   "PACK" magic (4)       │
+  │   version=2 (4)          │
+  │   object count (4)       │
+  ├─────────────────────────┤
+  │ Object Entry (반복)       │
+  │   type 3-bit + size 가변  │
+  │   delta info (해당 시)    │
+  │   content (zlib)         │
+  ├─────────────────────────┤
+  │ Trailer: SHA-1 (20 bytes)│
+  └─────────────────────────┘
+```
+
+각 객체 엔트리의 첫 바이트에서 상위 3비트가 타입(commit/tree/blob/tag/delta)을, 나머지 비트가 크기를 가변 길이로 인코딩한다. delta 타입(ofs-delta, ref-delta)은 기준 객체와의 차이만 저장해 중복을 극적으로 줄인다.
+
+`.idx` 파일은 `.pack`의 인덱스다. 핵심은 **팬아웃 테이블** — SHA의 첫 바이트별 누적 객체 수를 256개 엔트리로 기록한다. 객체를 찾을 때 팬아웃으로 범위를 즉시 좁히고, 그 범위에서 이진 탐색한다. 결과: O(log N).
+
+```bash
+# 팬아웃 → 이진 탐색 → 오프셋 → .pack 점프
+git verify-pack -v .git/objects/pack/pack-*.idx | head -5
+```
+
+Pack file은 git 저장의 철학을 잘 보여준다: **모든 것을 내용 기반 SHA로 주소 지정하되, 실제 디스크 표현은 delta와 zlib로 최대한 압축하라.**
+
+## 큰 바이너리의 분리: LFS
+
+Pack file이 아무리 효율적이라도 100MB짜리 PSD 파일 100개를 delta-압축하면 한계가 있다. LFS는 이 문제를 다른 방식으로 푼다 — 실제 파일을 git 밖으로 꺼내고, git에는 130바이트짜리 **포인터 텍스트**만 남긴다.
+
+```
+version https://git-lfs.github.com/spec/v1
+oid sha256:abc1234567890abcdef...
+size 10485760
+```
+
+이 분리는 두 개의 필터로 구현된다.
+
+- **Clean filter** (`git add` 시): 큰 파일 → SHA-256 계산 → `.git/lfs/objects/`에 저장 → 포인터 생성 → git blob으로
+- **Smudge filter** (`git checkout` 시): 포인터 읽기 → SHA로 LFS 오브젝트 찾기 → 없으면 서버에서 다운로드 → 실제 파일로
+
+`.gitattributes` 한 줄이 이 필터를 특정 패턴에 연결한다.
+
+```bash
+*.psd filter=lfs diff=lfs merge=lfs -text
+```
+
+<Callout type="note" title="트레이드오프">
+LFS는 clone을 가볍게 만들고(`checkout`한 파일만 다운로드), 일반 git 워크플로우를 그대로 유지한다. 대신 외부 LFS 서버에 의존하므로 서버가 내려가면 smudge가 실패하고 working tree에 포인터 텍스트가 그대로 남는다. 비용도 변수다 — GitHub LFS는 1GB 초과분부터 유료다.
+</Callout>
+
+LFS 전송은 **Batch API**를 통한다. `git push` 시 포인터 blob은 git 프로토콜로, 실제 파일은 별도 HTTPS 요청으로 전송한다. 서버는 `POST /objects/batch`에 presigned URL을 응답하고, 클라이언트는 그 URL로 S3 같은 스토리지에 직접 업로드한다. 서버를 거치지 않으므로 빠르고, presigned URL은 짧은 유효기간을 가지므로 안전하다.
+
+## 객체 자체를 미루기: Partial Clone
+
+LFS가 "큰 파일을 처음부터 분리하는" 전략이라면, Partial Clone은 "일반 git 객체를 일단 미루는" 전략이다. Git 2.19+에서 지원한다.
+
+```bash
+git clone --filter=blob:none <url>
+```
+
+이 명령은 commit과 tree는 모두 받지만 blob은 받지 않는다. `.git/config`에 `promisor = true`가 기록된 remote가 이후 lazy fetch의 책임자가 된다.
+
+```
+[partial clone 흐름]
+
+git cat-file -p <blob-SHA>
+  ↓ "blob is missing"
+  ↓ remote.origin.promisor?  true
+  ↓ 그 객체만 fetch
+  ↓ .git/objects/에 저장
+  ↓ 원래 명령 계속
+```
+
+`git log --oneline`은 blob 없이도 동작한다. `git show`나 `git checkout`처럼 실제 파일 내용이 필요한 순간에만 서버에 요청이 간다. 한 번 받은 blob은 캐시에 남아 반복 요청이 없다.
+
+`--missing=allow-promisor` 옵션은 이 구조를 다른 명령에서도 안전하게 사용할 수 있게 해준다 — missing 객체가 있어도 promisor remote가 처리할 수 있다면 오류로 취급하지 않는다.
+
+필터에는 여러 변형이 있다.
+
+| 필터 | 효과 |
+|---|---|
+| `blob:none` | 모든 blob lazy |
+| `blob:limit=1m` | 1MB 초과 blob만 lazy |
+| `tree:0` | tree도 lazy (root tree만) |
+
+## Working Tree를 줄이기: Sparse Checkout
+
+Partial clone이 "받는 객체"를 줄인다면, Sparse Checkout은 "보이는 파일"을 줄인다. 둘은 다른 차원에서 같은 문제를 공략한다.
+
+```bash
+git sparse-checkout init --cone
+git sparse-checkout set src/api docs/api
+```
+
+`--cone` 모드는 디렉토리 단위로 포함 여부를 결정한다. 설정된 디렉토리만 working tree에 나타나고, 나머지 파일에는 내부적으로 `skip-worktree` 플래그가 붙는다.
+
+Git 2.32+의 **Sparse Index**는 여기서 한 걸음 더 나간다. 일반 index는 모든 파일을 개별 엔트리로 기록한다. Sparse Index는 sparse 밖의 디렉토리 전체를 단일 tree 엔트리로 압축한다.
+
+```
+일반 index: src/web/page.html, src/web/style.css, ... (수만 엔트리)
+Sparse index: src/web/ (tree 엔트리 1개)
+```
+
+결과는 index 크기 100배 감소, `git status` 속도 100배 향상이다. Microsoft가 Windows 모노레포를 운영하는 데 이 조합을 사용한다.
+
+<Aside label="전략의 조합">
+Partial clone + Sparse checkout + Sparse index를 함께 쓰면 거대 모노레포를 "마치 작은 레포처럼" 다룰 수 있다. blob은 lazy, working tree는 작고, index도 작다. Microsoft의 `scalar`는 이 조합에 fsmonitor와 commit-graph까지 더해 자동화한 도구다.
+</Aside>
+
+## 정리
+
+- Pack file은 delta + zlib + 팬아웃 인덱스로 저장 효율과 조회 속도를 동시에 잡는다.
+- LFS는 큰 바이너리를 git 밖으로 분리하고, Clean/Smudge 필터와 Batch API로 투명하게 연결한다.
+- Partial clone은 git 객체 자체를 lazy하게 만들고, promisor remote가 그 책임을 진다.
+- Sparse checkout은 working tree를, Sparse index는 index 자체를 줄여 일상적인 git 명령을 빠르게 만든다.
+
+네 가지 메커니즘은 모두 같은 철학을 공유한다 — **지금 당장 필요하지 않은 것은 미루거나 숨겨라.** git은 완전한 히스토리를 보장하면서도, 그 비용을 "필요한 순간"으로 최대한 늦춘다.

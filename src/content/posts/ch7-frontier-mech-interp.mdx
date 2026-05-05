@@ -1,0 +1,152 @@
+---
+title: "신경망을 해부할 수 있는가 — Mechanistic Interpretability의 세 장면"
+description: "IOI Circuit의 완전한 역공학부터 Grokking의 학습 동역학, Transcoder·Crosscoder의 자동화된 회로 발견까지, '신경망은 해석 가능하다'는 명제를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, circuit-discovery, grokking, sparse-autoencoder, transformer]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망은 블랙박스가 아닐 수도 있다. GPT-2가 "John and Mary went to the store" 문장에서 간접 목적어를 맞히는 데 관여하는 attention head를 정확히 26개로 특정하고, 그 각각의 역할을 알고리즘 수준으로 기술할 수 있다면? 그리고 모델이 modular arithmetic을 학습하는 정확한 순간을 테스트 성능이 개선되기 **전에** 내부 신호로 감지할 수 있다면? 이 세 사례는 하나의 질문을 공유한다 — 실제 신경망의 계산을 완전히 역공학할 수 있는가?
+
+## 회로 발견의 출발점 — IOI Circuit
+
+Wang et al. (2022)의 IOI(Indirect Object Identification) 실험은 mechanistic interpretability의 첫 번째 강력한 증거다. 과제는 단순하다.
+
+```
+Input:  "When John and Mary went to the store, John gave the bag to ___"
+Target: Mary  (indirect object)
+Decoy:  John  (subject, high frequency)
+```
+
+모델이 올바른 답을 내놓는 데 관여하는 회로를 찾기 위해 두 가지 지표를 사용한다. 첫 번째는 **logit difference**다.
+
+$$
+\Delta L(x) := \log P(\text{Mary}|x) - \log P(\text{John}|x)
+$$
+
+두 번째는 head $h$의 **Indirect Effect(IE)**다.
+
+$$
+\text{IE}(x, h) := \frac{\Delta L(\text{patch}_h) - \Delta L(\text{corrupted})}{\Delta L(\text{clean}) - \Delta L(\text{corrupted})}
+$$
+
+$\text{IE} = 1$이면 해당 head가 완전히 필수적이고, $\text{IE} = 0$이면 무관하다. Activation patching — 특정 head의 활성화만 clean run에서 복사하고 나머지는 corrupted로 유지하는 기법 — 으로 각 head의 IE를 측정하면 144개 head 중 26개가 유의미한 기여를 한다.
+
+이 26개는 기능에 따라 네 종류로 분류된다.
+
+| 유형 | 역할 | 레이어 |
+|------|------|--------|
+| Duplicate Token Heads | `John`의 위치 추적 | 0–1 |
+| S-Inhibition Heads | 주어 `John` 억제 | 1–3 |
+| Name Mover Heads | `Mary` → `[END]` 이동 | 7–10 |
+| Negative/Backup Name Movers | 잔여 신호 정리, 복구 경로 | 9–11 |
+
+<Theorem kind="theorem" number="1" title="Circuit Completeness">
+26개 head 집합 $H$에 대해, 이들의 활성화만 clean에서 복사하고 나머지를 corrupted로 유지하면:
+
+$$\mathbb{E}_{x \sim \text{IOI}}[\Delta L(\text{patch } H)] \geq 0.99 \cdot \Delta L(\text{clean})$$
+</Theorem>
+
+<Proof>
+각 head를 activation patching으로 교체하면 logit difference 회복률이 99% 이상임을 empirical 측정으로 확인한다. 역으로 임의의 head $h_i$를 제거하면 회복률이 99% 미만으로 떨어지므로, 이 집합은 (약한 의미의) minimal circuit이다. $\square$
+</Proof>
+
+회로 발견이 가능하다는 것을 증명했다. 그렇다면 모델은 이 회로를 어떻게 **학습**하는가?
+
+## 학습의 내부 — Grokking과 Progress Measures
+
+Nanda et al. (2023)의 Grokking 실험은 학습 동역학을 해부한다. 과제는 $a + b \mod p$($p = 113$)다. 흥미로운 현상은 학습 초반에 training loss는 빠르게 수렴하지만 test loss는 수천 epoch 동안 높게 유지되다가, 특정 시점에 급격히 떨어진다는 것이다.
+
+왜 이렇게 지연되는가? 모델이 내부적으로 발견하는 알고리즘을 추적하면 답이 나온다. 최종 해는 **삼각함수 항등식**을 활용한 Fourier 기저 표현이다.
+
+$$
+\cos(\alpha + \beta) = \cos\alpha\cos\beta - \sin\alpha\sin\beta
+$$
+
+토큰 $a$의 embedding을 $[\cos(2\pi k a/p),\, \sin(2\pi k a/p)]$ 형태로 학습하면, 두 embedding의 element-wise product가 $a + b \bmod p$의 embedding을 직접 만들어낸다. 모델은 임의의 $(a, b)$ 쌍을 암기하는 대신 이 대수적 구조를 발견하는 것이다.
+
+<Callout type="note" title="Progress Measure의 핵심">
+삼각함수 회로가 형성되는 시점은 test loss가 떨어지는 시점보다 **수백 epoch 앞선다**. Fourier embedding의 trig identity 정확도를 progress measure로 추적하면, test loss drop을 사전에 예측할 수 있다.
+
+$$t(\text{trig circuit 완성}) < t(L_{\text{test}} \text{ 급감})$$
+</Callout>
+
+이는 단순한 관찰이 아니다. 신경망의 일반화 능력 획득을 **외부 성능 지표 없이 내부 신호만으로** 예측할 수 있다는 것을 의미한다. memorization(단순 저장) → generalization(알고리즘 발견)의 전환을 기계적으로 이해할 수 있게 된 셈이다.
+
+## 확장을 향해 — Transcoder, Crosscoder, ACDC
+
+IOI Circuit은 수동 분석이었다. Grokking은 특정 task에 한정됐다. 2023-2024년의 frontier 연구들은 이 방법론을 **자동화하고 일반화**하려 한다.
+
+**Transcoder**는 Sparse Autoencoder(SAE)를 layer 내 정보 변환에 적용한다. 768차원 hidden state를 16,000차원 이상의 sparse 공간으로 확장해 각 feature가 mechanistically meaningful한 단위가 되도록 학습한다.
+
+$$
+x_\ell \xrightarrow{E_\ell} z_\ell \in \mathbb{R}^{k_\ell},\quad k_\ell \gg d_\ell, \quad \|z_\ell\|_0 \approx \text{small}
+$$
+
+개별 neuron은 polysemantic하지만(하나의 neuron이 여러 개념에 반응), sparse feature는 특정 개념에 집중하는 경향이 있다.
+
+**Crosscoder**(Lindsey et al. 2024, Anthropic)는 이를 모델 간으로 확장한다. GPT-2 Small(768-dim)과 GPT-2 Medium(1024-dim)의 활성화를 공유 encoder로 projection하면, **두 모델이 공통으로 사용하는 feature**를 발견할 수 있다. 다른 크기의 모델이 유사한 계산 구조를 공유한다는 것은 sparse feature가 architecture-independent한 표현일 수 있음을 시사한다.
+
+**ACDC**(Conmy et al. 2023)는 회로 발견 자체를 자동화한다. Greedy algorithm으로 marginal IE가 가장 높은 component를 반복적으로 추가해 회로를 구성한다.
+
+```
+circuit = []
+for iteration in range(budget):
+    best = argmax_{h ∉ circuit} IE(circuit ∪ {h})
+    if IE improvement < threshold: break
+    circuit.append(best)
+```
+
+최적해를 보장하지는 않지만, 실험적으로 90% 이상의 completeness를 빠르게 달성한다.
+
+## 트레이드오프와 미해결 문제
+
+<Callout type="warning" title="트레이드오프">
+**Activation patching의 선형성 가정**: 특정 head를 교체하는 것이 다른 계산에 영향을 미치지 않는다고 암묵적으로 가정한다. 실제로는 head 간 상호작용이 있어 IE가 인과성의 proxy에 불과할 수 있다.
+
+**Sparse feature의 해석가능성**: hidden dim이 클수록 dead feature(`>99%`)가 급증한다. 이들이 진짜 의미 있는 단위인지, 과파라미터화의 artifact인지 불명확하다.
+
+**Scaling 한계**: GPT-2 Small(125M)에서는 잘 작동하지만, GPT-4 규모에서 SAE 학습 자체가 매우 비싸고, 회로 발견이 여전히 가능한지 검증되지 않았다.
+</Callout>
+
+<Aside label="세 사례의 공통 철학">
+IOI Circuit, Grokking, Frontier는 모두 같은 질문을 다른 각도에서 공격한다 — *신경망의 계산이 알고리즘적으로 기술 가능한가?* IOI는 "가능하다"를 증명했고, Grokking은 "학습 과정도 추적 가능하다"를 보였으며, Frontier는 "자동화할 수 있다"를 탐색한다. 해석가능성은 사후 해석이 아니라 인과적 검증의 문제다.
+</Aside>
+
+## 정리
+
+- IOI Circuit은 26개 head의 완전하고 최소한인 집합으로 GPT-2의 간접 목적어 처리를 기술한다. 완전성(`≥99%` logit difference 회복)과 최소성(임의 head 제거 시 성능 저하)이 activation patching으로 검증된다.
+- Grokking에서 삼각함수 progress measure는 test loss drop보다 수백 epoch 앞서 내부 알고리즘 완성을 신호한다. memorization에서 generalization으로의 전환은 내부 신호로 예측 가능하다.
+- Transcoder는 sparse feature를 회로의 기본 단위로, Crosscoder는 모델 간 universal feature를, ACDC는 greedy 자동화를 제공한다. 개별 neuron 기반 해석에서 sparse feature 기반 해석으로의 패러다임 전환이다.
+- 핵심 한계는 선형성 가정, dead feature 폭증, GPT-4 이상으로의 scaling 미검증이다.
+
+신경망 해부학은 이제 방법론을 갖췄다. 남은 질문은 이 방법론이 실제로 안전한 AI를 만드는 데 어떻게 기여할 수 있는가다.
+
+<Reference
+  title="Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small"
+  authors="Wang et al."
+  year={2022}
+  venue="ICLR 2023"
+  url="https://arxiv.org/abs/2211.00593"
+/>
+
+<Reference
+  title="Progress measures for grokking via mechanistic interpretability"
+  authors="Nanda et al."
+  year={2023}
+  venue="ICLR 2023"
+  url="https://arxiv.org/abs/2301.05217"
+/>

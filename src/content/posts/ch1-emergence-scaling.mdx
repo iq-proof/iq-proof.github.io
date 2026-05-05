@@ -1,0 +1,142 @@
+---
+title: "LLM Reasoning의 모든 기법은 하나의 질문에서 나온다"
+description: "CoT의 latent variable 정식화부터 inference-time scaling law까지, reasoning chain z를 어떻게 다룰 것인가라는 공통 프레임을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [llm-reasoning, chain-of-thought, self-consistency, inference-scaling, emergent-ability]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Self-Consistency, Tree-of-Thought, PRM, GRPO — LLM reasoning 의 모든 기법은 표면적으로 각자 다른 문제를 해결하는 것처럼 보인다. 그러나 파고들면 동일한 질문으로 수렴한다. **reasoning chain $z$ 를 어떻게 다룰 것인가.** CoT 가 $z$ 를 latent variable 로 노출하는 순간, 이후의 모든 기법은 그 $z$ 를 샘플링하고, 집계하고, 평가하는 방법의 변주다. 이 구조가 왜 작은 모델에서는 해롭고, 큰 모델에서는 추론 성능을 폭발시키며, 결국 새로운 경제적 패러다임까지 만들어내는가?
+
+## CoT는 무엇을 바꾸었나
+
+Standard prompting 은 $y \sim P(y \mid x)$ 다. 모델이 입력 $x$ 에서 답 $y$ 로 바로 매핑한다. reasoning 은 모델 내부 hidden state 에 묻혀 있고, 사용자는 그 경로를 볼 수 없다.
+
+Chain-of-Thought 는 이 구조를 바꾼다.
+
+$$
+P(y \mid x) \;=\; \sum_z P(y \mid z, x)\, P(z \mid x)
+$$
+
+reasoning chain $z$ 를 explicit latent variable 로 surface text 에 끌어올린다. 실제 sampling 은 marginalize 하지 않고 single chain 을 뽑는다.
+
+$$
+z \sim P(z \mid x;\,\theta), \quad y \sim P(y \mid z, x;\,\theta)
+$$
+
+이 한 줄의 차이가 모든 것을 만든다. 모델이 자신이 생성한 reasoning 을 attend 할 수 있게 되고, test-time compute 가 품질에 기여하기 시작하며, 이후의 모든 기법이 이 $z$ 를 어떻게 가공할지를 고민하는 문제로 환원된다.
+
+Zero-shot CoT 는 이 변화의 극단을 보여준다. "Let's think step by step" 단 여섯 단어가 InstructGPT 의 GSM8K 정확도를 17.7% 에서 78.7% 로 끌어올린다. reasoning capacity 는 모델 안에 이미 있었고, trigger 만 필요했다.
+
+## Emergence — 왜 작은 모델에서는 해로운가
+
+CoT 가 모든 모델에 도움이 되는 것은 아니다. 이것이 가장 중요한 실증적 발견이다.
+
+<Theorem kind="proposition" number="1" title="Small Model에서 CoT의 역효과">
+모델이 충분히 크지 않으면 $P(z \mid x;\,\theta)$ 가 부정확한 reasoning chain 을 생성한다. 틀린 $z$ 에 conditioning 하면 오히려 $H(Y \mid X, Z) > H(Y \mid X)$ 가 되어 standard prompting 보다 성능이 낮아진다.
+</Theorem>
+
+<Proof>
+CoT 가 효과적이려면 $I(Y;\,Z \mid X) > 0$ 이어야 한다 — $z$ 가 $y$ 에 대한 mutual information 을 추가해야 한다. 작은 모델에서는 $P(z \mid x)$ 가 plausible-but-wrong chain 을 생성하고, 이 hallucinated reasoning 에 conditioning 하면 entropy 가 오히려 증가한다. $\square$
+</Proof>
+
+PaLM 실험에서 CoT gain 이 나타나는 threshold 는 약 62B 파라미터다. 이 아래에서는 CoT 가 standard 보다 더 나쁘다.
+
+이 emergence 가 metric artifact 인지 진짜 capability 변화인지를 둘러싼 논쟁이 Wei 2022 와 Schaeffer 2023 사이에 있다. Schaeffer 의 핵심 주장은 다음과 같다.
+
+$$
+S(N) \;=\; M(C(N))
+$$
+
+underlying capability $C(N)$ 이 smooth power law 여도, 측정 metric $M$ 이 nonlinear 하면 $S(N)$ 은 급격한 jump 처럼 보인다. $k$-step exact match 의 경우 $S = C^k$ 이므로, $C$ 가 0.5 근방을 지날 때 $S$ 는 수십 배 증가한다.
+
+<Callout type="note" title="논쟁의 통합적 해석">
+두 입장 모두 부분적으로 옳다. Metric artifact 는 실재하지만, GSM8K 와 MATH 에서는 log-likelihood metric 으로도 capability jump 가 robust 하다. Verifiable multi-step task 에서의 emergence 는 mirage 로 환원되지 않는다. **결론**: reasoning capability 는 scale 에 strongly nonlinear 하고, metric 선택이 그 모양을 증폭한다.
+</Callout>
+
+## Single Chain의 한계와 Self-Consistency
+
+CoT 의 single chain sampling 은 이 expectation 의 single-sample estimator 다. Variance 가 크다. 같은 질문에 temperature > 0 으로 sampling 하면 매번 다른 chain, 다른 답이 나온다.
+
+Self-Consistency 는 가장 단순한 해결책이다 — N 개 sample 의 majority vote.
+
+<Theorem kind="theorem" number="2" title="Majority Vote 수렴 (Hoeffding)">
+single-sample correctness $p > 0.5$ 이면:
+$$
+P(\text{majority correct}) \;\geq\; 1 - \exp\bigl(-2N(p - 0.5)^2\bigr) \;\to\; 1
+$$
+</Theorem>
+
+<Proof>
+$K = \sum_{i=1}^N X_i$, $X_i \sim \text{Bernoulli}(p)$. Majority correct $\iff \bar{X} = K/N > 0.5$. Hoeffding inequality 에서 $P(\bar{X} \leq 0.5) \leq \exp(-2N(p-0.5)^2)$. Complement 를 취하면 성립. $\square$
+</Proof>
+
+$p = 0.6$ 이면 $N = 40$ 에서 수렴 확률이 사실상 1 에 도달한다. PaLM 540B 에서 greedy decoding 56.5% 가 Self-Consistency $N = 40$ 으로 74.4% 가 된다.
+
+그러나 조건이 있다. $p > 0.5$ 여야만 올바른 답으로 수렴한다. $p < 0.5$ 이면 wrong answer 로 수렴한다. 이것이 PRM 이 등장하는 동기다 — single sample 이 약한 모델에서도 step-level quality score 로 weighted aggregation 을 하면 더 나은 답을 고를 수 있다.
+
+## Inference Compute는 별도의 Scaling Axis다
+
+Kaplan 2020 과 Hoffmann 2022 의 scaling law 는 training compute 라는 단일 축의 power law 였다. Snell 2024 는 여기에 두 번째 축을 추가한다.
+
+$$
+\log L \;=\; -\alpha_1(d)\,\log C_{\mathrm{train}} \;-\; \alpha_2(d)\,\log C_{\mathrm{inference}} \;+\; c(d)
+$$
+
+task difficulty $d$ 에 따라 두 exponent 가 달라진다. 그리고 fixed total budget $B$ 에서 loss 를 최소화하는 optimal allocation 은 closed form 으로 구해진다.
+
+$$
+\frac{C_{\mathrm{train}}^*}{C_{\mathrm{inference}}^*} \;=\; \frac{\alpha_1(d)}{\alpha_2(d)}
+$$
+
+easy task 는 train-favoring, hard task 는 inference-favoring 이다. MATH 수준의 어려운 문제에서는 inference compute 를 $10\times$ 늘리는 것이 model size 를 $\sqrt{10}\times$ 늘리고 training token 을 $\sqrt{10}\times$ 늘리는 것과 동등한 효과를 낸다.
+
+이는 deployment 의 경제적 구조를 바꾸는 발견이다.
+
+$$
+\text{TCO (per query)} \;=\; \frac{C_{\mathrm{pretrain}}}{Q} \;+\; C_{\mathrm{inference}} \;\xrightarrow{Q \to \infty}\; C_{\mathrm{inference}}
+$$
+
+query 수 $Q$ 가 커질수록 pretraining cost 는 amortize 되고, per-query inference cost 가 지배한다. 10억 query 를 처리하는 서비스는 small model + heavy inference 가 large model + greedy 보다 경제적으로 우월해지는 crossover 가 존재한다.
+
+<Aside label="새 패러다임">
+o1/o3 의 "thinking compute" 는 Kaplan 시대의 연장이 아니다. 새로운 economic regime 이다. 작은 모델 + 많은 inference 가 큰 모델 + greedy 보다 hard task 에서 더 나은 결과를 낼 수 있다는 것, 그리고 R1-Distill 이 frontier model 의 reasoning 을 작은 모델에 transfer 할 수 있다는 것 — 이 두 사실이 결합하면 democratization 의 경로가 보인다.
+</Aside>
+
+## 정리
+
+- CoT 는 reasoning chain $z$ 를 explicit latent 로 노출한다. 이후의 모든 기법은 이 $z$ 를 어떻게 샘플링하고 집계하고 평가할지의 변주다.
+- Emergence 는 metric artifact 와 real capability jump 의 혼합이다. Verifiable multi-step task 에서의 jump 는 mirage 가 아니다.
+- Self-Consistency 는 $p > 0.5$ 조건 하에 $N$ 에 exponential 로 수렴한다. $p < 0.5$ 영역이 PRM 과 step-level reward 의 존재 이유다.
+- Inference compute 는 training compute 와 독립적인 scaling axis 다. Hard task 에서 optimal 은 inference-favoring 이고, 이것이 o1/o3/R1 의 이론적 토대다.
+
+모든 reasoning 기법의 공통 구조는 결국 하나다 — $z$ 를 어디서 멈출지 결정하는 것.
+
+<Reference
+  title="Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"
+  authors="Wei et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2201.11903"
+/>
+
+<Reference
+  title="Scaling LLM Test-Time Compute Optimally Can be More Effective than Scaling Model Parameters"
+  authors="Snell et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2408.03314"
+/>

@@ -1,0 +1,161 @@
+---
+title: "PRM은 왜 ORM을 이기는가 — Step-Level Reward의 수학"
+description: "Outcome Reward의 sparse signal이 Long CoT에서 credit assignment를 망치는 원리부터, PRM이 value function과 수학적으로 동치임을 보이는 Bellman 증명까지 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [llm-reasoning, process-reward-model, credit-assignment, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM의 추론 품질을 높이는 방법은 크게 두 갈래다. 더 많은 후보를 생성해서 골라내거나, 생성 과정 자체를 더 촘촘히 평가하거나. ORM(Outcome Reward Model)은 전자에 머물렀고, PRM(Process Reward Model)은 후자로 나아갔다. 두 접근이 실제로 얼마나 다른가? 그리고 PRM이 단순한 "더 세밀한 점수 함수"가 아니라 **RL의 value function과 수학적으로 동일한 것**임을 어떻게 보일 수 있는가?
+
+## 신호의 밀도 — ORM이 놓치는 것
+
+ORM의 작동 방식은 단순하다.
+
+$$
+\mathrm{ORM}(z) = P(\text{final\_answer}(z) = y^* \mid x)
+$$
+
+chain 전체를 읽고, 최종 답이 맞는지만 본다. 100-step CoT에서 final answer 1비트만 사용한다. 문제는 이 구조가 만드는 두 가지 결함이다.
+
+**첫째, fluke correct를 걸러내지 못한다.** 추론 과정이 틀렸는데 우연히 정답에 도달한 chain이 높은 ORM 점수를 받는다. Best-of-N reranking에서 이런 chain이 선택되면, 모델은 잘못된 추론 패턴을 강화한다.
+
+**둘째, credit assignment가 불가능하다.** step 50에서 치명적 오류가 발생해도 ORM은 step 1부터 100까지 동일한 reward를 준다. RL 학습에서 이는 gradient noise로 직결된다. 100-step chain에서 ORM의 advantage variance는 단계별 reward 분산의 100배까지 폭발한다.
+
+$$
+\mathrm{Var}_{\mathrm{ORM}}[A_t] = T \cdot \mathrm{Var}[R]
+$$
+
+PRM은 이 문제를 step-level reward로 해결한다.
+
+$$
+\mathrm{PRM}(z_{1:t}) = P(\text{eventually correct} \mid z_{1:t}, x)
+$$
+
+각 step의 prefix까지 읽었을 때 결국 정답에 도달할 확률. Lightman 2023은 같은 GPT-4 생성, $N=1860$ 샘플에서 ORM 72.4% 대 PRM 78.2%라는 6%p 격차를 보고했다. 이 격차는 $N$이 클수록 더 벌어진다.
+
+## PRM은 Value Function이다
+
+이 섹션이 전체 글의 핵심이다. PRM과 RL의 value function은 **동일한 것**이다.
+
+추론을 MDP로 정의한다. state $s_t$는 reasoning prefix $z_{1:t}$, action $a_t$는 다음 step $z_{t+1}$, terminal reward $r_T \in \{0, 1\}$는 최종 정답 여부, 중간 reward는 0, discount $\gamma = 1$이다.
+
+<Theorem kind="theorem" number="1" title="PRM = Value Function">
+위 reasoning MDP 설정에서:
+
+$$
+V^\pi(z_{1:t}) = \mathrm{PRM}(z_{1:t})
+$$
+</Theorem>
+
+<Proof>
+
+$$
+\begin{align}
+V^\pi(z_{1:t}) &= \mathbb{E}_\pi\Bigl[\sum_{k=0}^\infty \gamma^k r_{t+k} \mid z_{1:t}\Bigr] \\
+&= \mathbb{E}_\pi[r_T \mid z_{1:t}] \quad (\text{중간 } r = 0,\; \gamma = 1) \\
+&= P(r_T = 1 \mid z_{1:t}, \pi) \\
+&= P(\text{eventually correct} \mid z_{1:t}, \pi) \\
+&= \mathrm{PRM}(z_{1:t}) \quad \square
+\end{align}
+$$
+
+</Proof>
+
+이 동치성에서 두 가지가 따라온다.
+
+**Bellman equation**: PRM은 Bellman equation을 만족한다.
+
+$$
+\mathrm{PRM}(z_{1:t}) = \mathbb{E}_{a \sim \pi(\cdot \mid z_{1:t})}\bigl[\mathrm{PRM}(z_{1:t} \oplus a)\bigr]
+$$
+
+PRM 학습이 Bellman residual minimization과 동치라는 뜻이다. TD learning 계열의 모든 value-based 방법을 PRM 학습에 그대로 적용할 수 있다.
+
+**TD reward decomposition**: PRM의 step-level reward는 value function의 변화량, 즉 TD error다.
+
+$$
+r_t^{\mathrm{PRM}} = V^\pi(z_{1:t}) - V^\pi(z_{1:t-1}) = \mathrm{PRM}(z_{1:t}) - \mathrm{PRM}(z_{1:t-1})
+$$
+
+critical step은 이 값이 가장 크게 음수인 지점이다. 추론의 어디서 잘못됐는지 pinpoint할 수 있다.
+
+## Discount가 생기면 무슨 일이 벌어지는가
+
+동치성은 $\gamma = 1$ 가정 위에 성립한다. $\gamma < 1$을 도입하면 분기가 생긴다.
+
+$$
+V^\pi(s) = \mathbb{E}_\pi\Bigl[\sum \gamma^k r_k\Bigr] \neq P(\text{eventually correct})
+$$
+
+같은 정답에 도달하는 두 chain이 있다고 하자. A는 5 step, B는 50 step. PRM(A) = PRM(B) = 1이다. 그런데 $\gamma = 0.9$라면 $V(A) > V(B)$다. B는 더 오래 걸렸으므로 더 낮은 value를 받는다.
+
+<Callout type="note" title="트레이드오프">
+PRM은 **"정답에 도달하는가"만 평가하고 "얼마나 효율적으로"는 무시한다.** Long chain의 wasteful reasoning도 PRM = 1을 받는다. efficiency가 중요한 task에서는 discount를 도입한 value function이 더 적합하다. 반대로 정확성이 전부인 수학 문제에서는 $\gamma = 1$인 PRM이 정확히 원하는 것을 측정한다.
+</Callout>
+
+또 다른 한계는 **policy stationarity**다. PRM은 학습 시점의 base policy $\pi_b$에 conditioned되어 있다. RL 학습 중 policy가 변하면 PRM이 approximating하는 value가 달라진다. 이것이 PRM을 RL critic의 완전한 대체로 쓰기 어려운 이유다. GRPO가 group-relative advantage를 쓰는 것도 이 문제와 무관하지 않다.
+
+## $1M 주석에서 자동화로 — Math-Shepherd
+
+PRM이 이론적으로 우월해도, Lightman 2023의 PRM800K는 800K step-level 수동 주석, 비용으로 약 $1M USD가 든다. 재현과 도메인 확장이 모두 막힌다.
+
+Wang 2024의 Math-Shepherd는 이 장벽을 Monte Carlo rollout으로 우회한다.
+
+$$
+\hat{P}(\text{correct} \mid z_{1:t}) = \frac{1}{N}\sum_{i=1}^N \mathbb{1}[\text{check}(c_i, y^*)]
+$$
+
+각 prefix에서 base model이 $N$번 완성을 시도하고, 정답을 맞힌 비율이 곧 PRM target이다. 이 estimator는 unbiased다 — 각 rollout이 i.i.d. Bernoulli이므로 sample mean이 true probability의 MLE다.
+
+결과는 놀랍다. DeepSeekMath-7B + Math-Shepherd가 MATH에서 48.1%를 달성했는데, 수동 주석 PRM800K의 약 51%에 근접한다. 주석 비용 없이.
+
+self-improvement loop도 가능하다. PRM으로 필터링한 chain으로 모델을 fine-tune하고, 개선된 모델로 다시 rollout해 PRM을 업데이트하는 반복이다. 3-5 iter 후 plateau에 이르지만, 추가 hard problem이나 외부 signal 없이 ceiling을 넘기는 어렵다. 이 한계는 이후 GRPO와 R1-Zero의 verifiable RL이 풀어야 할 문제로 이어진다.
+
+## PRM의 세 가지 얼굴
+
+<Aside label="통합 view">
+PRM은 하나의 모델이지만 세 역할을 동시에 한다. **inference reranking**(Best-of-N에서 chain 선택), **step-level beam search**(decoding 중 wrong path 조기 제거), **RL training의 dense reward**(GRPO의 signal). 이 세 역할이 모두 "value function"이라는 하나의 정체성으로 통합된다.
+</Aside>
+
+Step-level beam search는 PRM의 inference 활용 중 가장 강력한 형태다. Best-of-N이 $N$개 chain을 끝까지 생성한 뒤 reranking하는 반면, step-beam은 매 step마다 beam을 pruning한다.
+
+$N = 64$, $B = K = 4$, $T = 10$ 기준으로 Best-of-N의 token 비용이 $64 \times 10$인 데 비해 step-beam은 $4 \times 4 \times 10 = 160$으로 4배 저렴하다. Snell 2024에서 같은 compute 예산 안에서 step-beam이 Best-of-N + PRM 대비 MATH에서 2%p 우위를 보였다. 단 latency는 불리하다 — step-beam은 sequential하게 확장하므로 BoN의 완전 병렬화보다 wall-clock time이 길다.
+
+## 정리
+
+- PRM은 step-level reward로 ORM의 sparse signal 문제를 해결한다. Lightman 2023에서 MATH 6%p 격차의 원인은 **fluke correct 제거**와 **credit assignment**다.
+- $\gamma = 1$, terminal-only reward 설정에서 $V^\pi(z_{1:t}) = \mathrm{PRM}(z_{1:t})$다. PRM 학습은 Bellman residual minimization과 동치이고, step-level reward는 TD error다.
+- Math-Shepherd는 $N$ rollout의 Monte Carlo로 수동 주석 없이 PRM target을 생성한다 — unbiased estimator이며 품질은 PRM800K의 94% 수준.
+- PRM의 한계는 $\gamma = 1$ 가정(efficiency 무시)과 policy stationarity(RL 중 value drift)다.
+
+PRM이 value function이라는 사실은 단순한 수학적 우연이 아니다. reasoning chain을 MDP로 보는 순간, inference와 training의 평가 기준이 하나로 수렴한다는 설계 필연이다.
+
+<Reference
+  title="Let's Verify Step by Step"
+  authors="Lightman et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2305.20050"
+/>
+
+<Reference
+  title="Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations"
+  authors="Wang et al."
+  year={2024}
+  venue="ACL"
+  url="https://arxiv.org/abs/2312.08935"
+/>

@@ -1,0 +1,156 @@
+---
+title: "Git은 어떻게 실수를 복구하는가"
+description: "reflog 파일 구조와 만료 정책부터 fsck 기반 마지막 복구, GC grace period까지 — git 안전망의 전체 설계를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, reflog, gc, recovery, fsck]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git reset --hard`를 실행한 순간, 커밋이 사라졌다고 느낀다. 그런데 git은 30일 안에 그 커밋을 복원할 수 있다. 왜 가능한가? reflog, fsck, GC — 세 메커니즘이 함께 작동하는 안전망 설계 때문이다. 이 설계를 모르면 복구가 가능한 순간에도 데이터를 영구 손실로 오해한다.
+
+## 안전망의 기반: reflog 파일 구조
+
+git은 ref가 변경될 때마다 `.git/logs/` 아래 텍스트 파일에 그 기록을 남긴다.
+
+```
+.git/logs/
+├── HEAD                        HEAD 위치 변경 이력 전체
+└── refs/
+    ├── heads/
+    │   ├── main                main이 가리킨 SHA 변화
+    │   └── feature/foo
+    ├── remotes/origin/main     fetch 시 갱신
+    └── stash
+```
+
+각 줄의 포맷은 다음과 같다.
+
+```
+<old-SHA> <new-SHA> <author> <email> <unix-ts> <tz-offset>\t<reason>
+```
+
+`reason` 필드가 핵심이다. `commit`, `reset: moving to HEAD~`, `checkout: moving from main to feature`, `rebase finished` 등 어떤 명령이 실행됐는지 기록된다.
+
+**HEAD reflog와 branch reflog는 다른 정보를 담는다.** HEAD reflog는 사용자가 어느 브랜치에 있었든 HEAD가 움직인 모든 기록이다. `refs/heads/main`의 reflog는 main 브랜치 자체의 SHA 변화만 담는다. `git branch -D feature`를 실행하면 `feature`의 branch reflog는 삭제되지만, HEAD reflog에는 feature에서 작업했던 흔적이 남는다. 이 차이가 복구 절차에서 결정적이다.
+
+## 복구 절차: reflog를 거슬러 올라가기
+
+`git reset --hard HEAD~3`으로 커밋 3개를 잃었다고 하자. 복구는 한 줄이다.
+
+```bash
+$ git reflog
+abc HEAD@{0}: reset: moving to HEAD~3
+def HEAD@{1}: commit: C5        # ← 여기로 돌아가면 된다
+
+$ git reset --hard HEAD@{1}
+```
+
+브랜치 삭제 후 복구도 같은 원리다.
+
+```bash
+$ git reflog show HEAD | grep feat-1
+abc HEAD@{3}: commit: feat-1
+
+$ git branch feature abc
+```
+
+force push로 원격 커밋이 사라졌을 때는 원격 추적 reflog를 쓴다.
+
+```bash
+$ git reflog refs/remotes/origin/main
+abc origin/main@{0}: fetch: forced-update
+def origin/main@{1}: fetch        # ← 이전 정상 SHA
+
+$ git push origin def:main --force
+```
+
+<Callout type="warning" title="unstaged 변경은 reflog로 복구 불가">
+`git reset --hard`로 사라진 변경사항 중 한 번이라도 `git add`된 것은 blob 객체로 남아있어 fsck로 찾을 수 있다. 그러나 한 번도 staged되지 않은 working directory 변경은 어디에도 기록되지 않는다 — 복구가 거의 불가능하다.
+</Callout>
+
+## 만료 정책: 복구 가능한 시간의 한계
+
+reflog는 영구 보존되지 않는다. 두 개의 만료 기간이 있다.
+
+- `gc.reflogExpireUnreachable` (기본 **30일**): 현재 어떤 ref에서도 도달할 수 없는 커밋의 reflog 항목 만료
+- `gc.reflogExpire` (기본 **90일**): reachable한 커밋의 reflog 항목 만료
+
+`git reset --hard`로 잃은 커밋은 unreachable이므로 30일 기준이 적용된다. 그리고 만료는 `git gc` 실행 시 일어난다 — 활동이 적은 레포는 gc가 몇 달째 돌지 않을 수도 있다.
+
+```bash
+# 즉시 만료 처리 (보안 사고 시)
+$ git reflog expire --expire=now --expire-unreachable=now --all
+
+# 영구 보존 (중요 레포)
+$ git config gc.reflogExpire never
+$ git config gc.reflogExpireUnreachable never
+```
+
+<Aside label="설계 의도">
+두 기간이 분리된 이유가 있다. reachable한 커밋은 브랜치 자체가 가리키고 있어 객체는 살아있다 — reflog로의 시간 기반 접근(`HEAD@{yesterday}`)만 잃는다. unreachable한 커밋은 reflog만이 유일한 참조이므로 더 짧게 보존한다.
+</Aside>
+
+## fsck: 마지막 복구 수단
+
+reflog가 만료된 후에도 커밋 객체 자체는 `gc.pruneExpire` (기본 **2주**) grace period 안에 살아있다. 이 기간에 `git fsck`가 마지막 수단이 된다.
+
+```bash
+$ git fsck --lost-found
+dangling commit abc1234567890abcdef
+
+$ ls .git/lost-found/commit/
+abc1234567890abcdef
+
+$ git show abc1234567890abcdef    # 내용 확인
+$ git switch -c rescue abc1234567890abcdef
+```
+
+`--no-reflogs` 옵션을 추가하면 reflog를 무시하고 reachability를 계산하므로 더 많은 dangling 객체를 보고한다.
+
+fsck는 객체 무결성(SHA 재계산)도 검증한다. `error: sha1 mismatch` 메시지가 나오면 객체가 손상된 것 — 다른 clone이나 원격에서 해당 객체를 다시 가져와야 한다.
+
+## GC: 안전망과 효율의 균형
+
+`git gc`의 실행 순서는 다음과 같다.
+
+1. reflog 만료 처리 (90일/30일)
+2. 갱신된 reflog 기준으로 reachability 재계산
+3. loose 객체 → pack으로 통합
+4. unreachable 객체 prune (`gc.pruneExpire` 만료된 것만)
+
+4단계에서 grace period가 중요한 이유가 있다. 커밋 생성은 원자적 연산이 아니다 — blob, tree, commit 객체를 순서대로 저장하고 마지막에 ref를 갱신한다. GC가 중간에 실행되면 아직 ref가 갱신되지 않은 객체들이 unreachable로 잡힐 수 있다. 2주 grace period가 이 race condition을 막는다.
+
+복구 가능 시간을 정확히 정리하면 이렇다.
+
+```
+Day  0     : reset 실행 → 100% 복구 가능 (reflog)
+Day  0~30  : reflog + 객체 모두 살아있음
+Day 30+gc  : reflog 항목 만료, 객체는 grace 보호 중
+Day 30~44  : git fsck --lost-found 로 복구 가능
+Day 44+gc  : 객체 prune → 영구 손실
+             (다른 clone, 원격, 백업만 의존 가능)
+```
+
+<Callout type="note" title="트레이드오프">
+**보수적 설정** (`gc.reflogExpire never`): 디스크 무한 증가, 절대 손실 없음. 거대 모노레포에서 GB 단위 reflog 누적 위험.\
+**기본 설정** (30일/90일/14일): 대부분 시나리오에서 복구 + 디스크 관리 균형.\
+**즉시 만료** (`--expire=now --prune=now`): 보안 사고(시크릿 누출) 응급 처치. 일상 사용 시 위험.
+</Callout>
+
+## 정리
+
+- `.git/logs/` 아래 텍스트 파일이 ref 변경 이력을 담는다. HEAD reflog와 branch reflog는 다른 정보를 제공한다.
+- 대부분의 복구는 `git reflog`로 SHA를 찾은 후 `git reset --hard` 또는 `git switch -c rescue <SHA>` 한 줄로 끝난다.
+- reflog 만료(30일) 후에도 객체 grace period(14일) 안에는 `git fsck --lost-found`가 마지막 수단이 된다.
+- `git gc`는 reflog 만료 → reachability 재계산 → pack → prune 순서로 동작한다. grace period는 race condition 보호다.
+- 복구 가능 시간은 정확히 Day 44(30+14)다. 그 이후에는 다른 clone이나 백업만이 남는다.

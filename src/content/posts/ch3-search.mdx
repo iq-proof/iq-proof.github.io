@@ -1,0 +1,139 @@
+---
+title: "LLM이 나무를 타고 답을 찾는 법"
+description: "CoT 단일 경로의 한계부터 ToT·GoT·RAP·MCTS·Best-of-N까지, LLM 추론을 명시적 탐색 문제로 재정의하는 다섯 가지 전략을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [llm-reasoning, tree-of-thoughts, mcts, search, inference-scaling]
+difficulty: advanced
+series:
+  slug: llm-reasoning-deep-dive
+  title: Llm Reasoning Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Chain-of-Thought는 LLM에게 "생각하는 척"을 허용했다. 그러나 생각의 경로가 하나뿐이라면, 초반 선택이 틀렸을 때 되돌아올 방법이 없다. Game of 24에서 CoT의 정확도가 4%에 머문 이유가 바로 이것이다. 어떻게 하면 LLM이 경로를 탐색하고, 막힌 길에서 되돌아오고, 여러 부분 해를 결합할 수 있을까?
+
+## 단일 경로의 벽
+
+CoT·Self-Consistency·Decomposition은 모두 **단일 궤적**이거나 독립 궤적의 단순 집계다. 이 구조에서 LLM은 각 추론 단계를 되돌릴 수 없다. 한 번 "9+10=19"라고 썼으면 그 노드에서 다른 분기를 시도할 수단이 없다.
+
+문제의 본질은 탐색 공간이다. Game of 24처럼 특정 순서로 연산을 선택해야 풀리는 문제에서는, 가능한 경로의 수가 깊이에 지수적으로 증가한다. 단일 경로 샘플링은 이 공간에서 복권을 한 장 사는 것과 같다.
+
+## Tree of Thoughts — 명시적 탐색의 첫 단계
+
+ToT(Yao 2023)는 추론 상태를 트리의 노드로 정의한다. 각 노드는 지금까지의 사고 시퀀스 $s = [t_1, \ldots, t_k]$이고, 엣지는 다음 사고 $t$를 추가하는 행위다.
+
+핵심은 LLM을 **생성기와 평가기로 동시에 사용**한다는 점이다.
+
+$$
+\{t_i\}_{i=1}^b \sim \pi(\cdot \mid s,\, \tau_{\text{gen}}), \qquad v(s) \in \{\text{sure},\, \text{maybe},\, \text{impossible}\}
+$$
+
+BFS 모드에서 ToT는 매 깊이마다 상위 $B$개 노드만 유지한다. 가지치기 없는 전체 탐색이 $b^D$개 노드를 열어야 한다면, beam 크기 $B$를 적용하면 $B \cdot b \cdot D$개만 평가하면 된다.
+
+<Theorem kind="theorem" number="1" title="Game of 24에서의 ToT 도약">
+IO 프롬프팅 7.3%, CoT 4.0%, Self-Consistency(k=100) 9.0%인 반면, ToT(b=5, B=5)는 **74.0%**를 달성한다. 18배의 도약은 탐색이 필요한 과제에서 단일 경로 추론의 구조적 한계를 드러낸다.
+</Theorem>
+
+평가기의 품질도 결정적이다. 평가기의 진양성률을 $\alpha$라 하면, 정답 발견 확률의 하한은 다음과 같다.
+
+$$
+P(\text{solution found}) \;\geq\; 1 - (1-\alpha)^{B \cdot D}
+$$
+
+평가기가 불완전해도 beam과 깊이가 충분하면 정답에 도달할 수 있다.
+
+## Graph of Thoughts — 트리에서 DAG로
+
+ToT의 트리 구조는 "단일 부모" 제약을 가진다. 두 경로에서 얻은 부분 해를 합칠 수 없고, 같은 하위 문제를 서로 다른 분기에서 중복으로 푼다.
+
+GoT(Besta 2023)는 이를 DAG로 일반화한다. 핵심 추가 연산은 **Aggregate**다.
+
+$$
+s' \sim \pi(\cdot \mid s_1, \ldots, s_n,\, \tau_{\text{agg}})
+$$
+
+정렬 과제에서 이 위력이 드러난다. 32개 원소 리스트 정렬에서 ToT는 60%, GoT는 80%를 달성하면서 LLM 호출 수는 50회에서 40회로 줄어든다. 분할-정렬-병합의 자연스러운 알고리즘 구조가 Aggregate 연산과 정확히 매핑되기 때문이다. 하위 문제 공유로 중복 계산도 사라진다.
+
+<Callout type="note" title="트레이드오프">
+GoT의 강점은 태스크의 알고리즘 구조가 명확할 때 극대화된다. 반면 스키마 설계 비용이 발생하고, Aggregate 품질이 LLM의 다중 입력 처리 능력에 의존한다. 작은 모델은 긴 Aggregate 프롬프트에서 중간 내용을 누락시킨다(lost-in-the-middle 문제).
+</Callout>
+
+## RAP와 MCTS — 추론을 계획 문제로
+
+ToT·GoT가 탐색의 **구조**를 정의했다면, RAP(Hao 2023)는 탐색의 **알고리즘**을 바꾼다. 추론을 명시적 MDP로 재정의한다.
+
+```
+MDP 요소          추론 대응
+─────────────     ──────────────────────────────
+상태 s_t          현재 추론 상태 (부분 체인)
+행동 a_t          다음 추론 단계 (사고)
+전이 P(s'|s,a)    LLM-as-world-model 예측
+보상 r_t          LLM 자기 평가
+가치 V(s)         목표까지의 거리 평가
+```
+
+BFS는 모든 노드를 동등하게 확장한다. MCTS의 UCT는 방문 횟수와 품질을 조합해 유망한 경로를 우선 탐색한다. AlphaLLM(Xie 2024)은 여기서 한 걸음 더 나아가 LLM의 정책 사전확률 $\pi(a \mid s)$를 탐색에 직접 활용하는 PUCT를 적용한다.
+
+$$
+\mathrm{PUCT}(s, a) \;=\; Q(s, a) \;+\; c \cdot \pi(a \mid s) \cdot \frac{\sqrt{\sum_{a'} N(s, a')}}{1 + N(s, a)}
+$$
+
+UCB1이 무정보 탐색이라면, PUCT는 LLM의 언어적 직관을 탐색 방향으로 변환한다. 사전확률이 유효한 행동 집합을 좁혀주므로 유효 분기 인수가 크게 줄어든다.
+
+Blocksworld 6단계 계획에서 CoT가 1%인 반면 RAP는 45%를 달성한다. 단계가 깊어질수록 격차는 폭발적으로 커진다.
+
+## Best-of-N — 탐색 없는 집계의 상한
+
+앞선 네 가지 방법이 탐색 구조를 정교화하는 방향이라면, Best-of-N은 반대편 끝점이다. N개의 독립 샘플을 생성하고 검증기가 정답을 가려낸다.
+
+단 하나라도 정답이 나올 확률의 공식은 단순하다.
+
+$$
+P(\text{BoN 정답}) \;=\; 1 - (1-p)^N
+$$
+
+$p = 0.3$, $N = 16$이면 이미 99.7%다. 검증기가 완벽하다면 Best-of-N은 **모든 집계 방법의 상한**이다. 같은 예산에서의 계층 구조는 다음과 같다.
+
+$$
+\mathrm{Acc}(\text{oracle BoN}) \;\geq\; \mathrm{Acc}(\text{PRM-weighted}) \;\geq\; \mathrm{Acc}(\text{Majority}) \;\geq\; \mathrm{Acc}(\text{greedy})
+$$
+
+탐색(ToT·MCTS)이 Best-of-N을 앞서는 조건은 명확하다. 정답 경로가 구조적으로 좁아서 무작위 샘플링으로는 거의 도달하지 못할 때다. Game of 24나 Blocksworld처럼 탐색이 필수인 과제에서는 ToT·MCTS가 우월하고, 수학 단어 문제처럼 다양한 경로가 정답에 닿는 과제에서는 Best-of-N + PRM이 비용 대비 더 효율적이다. Best-of-N은 샘플을 병렬로 생성할 수 있어 wall-clock 지연도 낮다.
+
+<Aside label="설계 철학">
+이 다섯 장의 챕터는 하나의 질문을 다른 각도에서 묻는다 — "LLM의 추론 예산을 어디에 쓸 것인가?" ToT는 트리 너비에, RAP는 시뮬레이션 깊이에, Best-of-N은 샘플 다양성에 예산을 배분한다. AlphaLLM의 self-improvement는 추론 시간 탐색을 학습 신호로 전환해 학습 후에도 검증기 없이 같은 능력을 쓸 수 있게 한다.
+</Aside>
+
+## 정리
+
+- CoT의 단일 경로는 탐색이 필요한 과제에서 구조적 한계를 가진다. ToT는 BFS/DFS + LLM 평가기로 이 한계를 처음 돌파했다.
+- GoT는 트리를 DAG로 일반화해 부분 해 병합과 하위 문제 공유를 가능하게 했다. 알고리즘 구조가 명확한 과제에서 정확도와 비용 모두 개선된다.
+- RAP는 추론을 명시적 MDP로 재정의하고 MCTS를 적용했다. AlphaLLM의 PUCT는 LLM 정책을 탐색의 사전확률로 활용해 유효 분기를 좁힌다.
+- Best-of-N + 완벽 검증기는 모든 집계의 이론적 상한이다. 어떤 방법을 선택할지는 과제가 "탐색 형태"인지 "샘플링 형태"인지로 결정된다.
+
+탐색 구조의 설계에서 추론 능력의 자기개선으로 — 다음 장에서는 이 탐색 신호를 학습에 되먹이는 Process Reward Model을 다룬다.
+
+<Reference
+  title="Tree of Thoughts: Deliberate Problem Solving with Large Language Models"
+  authors="Yao et al."
+  year={2023}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2305.10601"
+/>
+
+<Reference
+  title="Scaling LLM Test-Time Compute Optimally"
+  authors="Snell et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2408.03314"
+/>

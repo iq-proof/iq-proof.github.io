@@ -1,0 +1,137 @@
+---
+title: "Transformer의 내부는 어떻게 작동하는가 — Mechanistic Interpretability 의 수학적 기초"
+description: "Residual stream의 선형 구조부터 QK·OV 분해, Head Composition, Linear Representation Hypothesis까지 — Transformer 내부 메커니즘을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, transformer, attention, residual-stream, linear-representations]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Transformer를 "블랙박스"가 아니라 해석 가능한 회로(circuit)로 이해하려는 시도가 Mechanistic Interpretability다. 이 관점의 출발점은 하나의 단순한 관찰이다 — Transformer의 모든 layer는 **하나의 공유 벡터 버스(residual stream)에 덧셈으로 기여**한다. 이 구조가 왜 중요한가? 그리고 이 구조를 따라가면 LLM의 내부에서 무엇이 보이는가?
+
+## Residual Stream — 정보의 공유 버스
+
+Transformer의 핵심 구조는 생각보다 단순하다. 각 layer의 Attention과 MLP는 독립적으로 계산을 수행한 뒤, 그 결과를 **기존 벡터에 더한다**. Elhage et al. (2021)이 "Mathematical Framework for Transformer Circuits"에서 제시한 이 관점에 따르면, 최종 representation은 다음과 같다.
+
+$$
+x_L = x_0 + \sum_{\ell=0}^{L-1} \left[\text{Attn}_\ell(x_\ell) + \text{MLP}_\ell(x_\ell)\right]
+$$
+
+$x_0$는 token embedding과 positional embedding의 합이고, 각 layer는 이 stream에 **write**하고 다음 layer는 **read**한다. 최종 logit은 $x_L W_U^\top$로 계산된다.
+
+이 구조가 주는 핵심 이점은 **선형성의 근사 가능성**이다. Attention pattern이 고정되면 가중 합은 선형이고, MLP의 활성화 패턴이 고정되면 MLP도 선형으로 근사된다. "Frozen circuit" 가정 하에서 residual stream은 입력 token embedding들의 선형 결합으로 표현된다.
+
+<Aside label="Logit Lens">
+이 선형성 덕분에 어느 layer $\ell$에서든 $x_\ell W_U^\top$를 계산하면 "중간 예측(intermediate logit)"을 얻을 수 있다. Nostalgebraist(2020)의 Logit Lens는 이 아이디어를 활용해 각 layer에서 모델이 어떤 token을 예측하는지 시각화한다.
+</Aside>
+
+## Attention Head의 분해 — QK와 OV
+
+Attention head는 두 개의 독립적인 회로로 분해된다. Elhage et al. (2021)의 QK·OV 분해가 이 구조를 명확하게 한다.
+
+$$
+W_{QK}^h = W_Q^{h\top} W_K^h, \qquad W_{OV}^h = W_O^h W_V^h
+$$
+
+**QK 회로**는 "어느 token 위치를 선택하는가"를 결정한다. Query와 Key의 내적이 attention pattern을 만들고, 이 패턴이 어디를 볼지를 결정한다. **OV 회로**는 "선택된 위치에서 무엇을 추출하는가"를 결정한다. Value와 Output projection의 합성이 실제로 residual stream에 기여하는 내용을 결정한다.
+
+<Theorem kind="proposition" number="1" title="QK·OV 분해의 독립성">
+Head $h$의 출력은 다음과 같다.
+
+$$
+\text{out}_t^h = \sum_s \text{softmax}_s\!\left(\frac{x_t^\top W_{QK}^h x_s}{\sqrt{d_h}}\right) W_{OV}^h x_s
+$$
+
+QK와 OV는 수학적으로 독립적인 factorization이다. Attention pattern $A \in \mathbb{R}^{seq \times seq}$는 QK에만, 값 변환은 OV에만 의존한다.
+</Theorem>
+
+<Proof>
+Attention 계산은 $\text{out} = A \cdot (V W_O^\top)$로 분리된다. 패턴 행렬 $A_{t,s} = \text{softmax}_s(x_t^\top W_{QK} x_s / \sqrt{d_h})$는 $W_Q, W_K$에만 의존하고, 값 변환 $W_{OV} x_s = W_O W_V x_s$는 $W_O, W_V$에만 의존한다. 학습 시 두 가중치 집합이 서로 다른 방향으로 gradient를 받으므로 독립적으로 최적화된다. $\square$
+</Proof>
+
+실제 GPT-2의 $W_{QK}$와 $W_{OV}$에 SVD를 적용하면, 대부분의 head는 full rank($d_{model} = 768$)가 아니라 effective rank가 수십 수준에 불과하다. 이는 정보 병목(information bottleneck) 구조가 학습을 통해 자연스럽게 형성됨을 뜻한다.
+
+## Head Composition — 회로가 만들어지는 방식
+
+단일 head의 분석만으로는 Transformer의 복잡한 행동을 설명할 수 없다. 핵심은 **multi-layer composition**이다. Layer $\ell$의 head output이 residual stream에 더해지면, layer $\ell+1$의 Q, K, V 계산은 이 수정된 stream을 입력으로 받는다.
+
+세 가지 composition 유형 중 **K-composition**이 가장 중요하다.
+
+$$
+K_1 = \left(x_\ell + \text{out}_{h_0}(x_\ell)\right) W_K^{\ell+1, h_1}
+$$
+
+이전 layer의 head $h_0$가 쓴 정보가 다음 layer head $h_1$의 key에 영향을 미친다. 이 구조가 **induction circuit**의 기초다 — $h_0$가 특정 위치의 정보를 복사(copy)하면, $h_1$은 그 복사된 정보를 key로 사용해 이전 패턴이 등장한 위치를 찾는다. 결과적으로 시퀀스의 반복 구조를 인식하는 회로가 형성된다.
+
+<Callout type="note" title="트레이드오프">
+Head composition의 분석은 강력하지만 두 가지 제약이 따른다. 첫째, composition score는 선형 근사이므로 softmax의 비선형성을 무시한다. 둘째, 특정 데이터에서 측정된 score는 다른 입력 분포에서 달라질 수 있다. Causal intervention (특정 head output을 제거한 뒤 성능 변화 측정)을 함께 사용해야 분석의 신뢰도가 높아진다.
+</Callout>
+
+## QK 패턴의 분류와 SVD
+
+QK 회로의 $W_{QK} = U \Sigma V^\top$ SVD에서 가장 큰 singular value에 대응하는 $(u_1, v_1)$ 쌍은 해당 head가 가장 강조하는 Q-K 매칭 방향을 나타낸다. 이를 바탕으로 attention pattern을 세 유형으로 분류할 수 있다.
+
+- **Positional pattern**: attention이 고정된 상대 위치(예: 항상 $t-1$)에 집중. $u_1$이 positional embedding 방향과 정렬됨.
+- **Content-based pattern**: 토큰의 의미적 유사성에 따라 변동. $u_1$이 semantic embedding 방향과 정렬됨.
+- **Induction pattern**: K-composition을 통해 받은 정보와 query를 비교해 반복 구조를 탐색.
+
+실제 GPT-2 layer 0에서는 초기 layer일수록 positional head가 많고, 깊은 layer일수록 content-based 및 induction head가 많이 나타난다. 이는 초기 layer가 구문 구조를, 깊은 layer가 의미적 처리를 담당한다는 가설과 일치한다.
+
+## Linear Representation Hypothesis
+
+Park, Choe, Veitch (2024)는 Mechanistic Interpretability의 근본 가정을 명확하게 정식화한다. Residual stream은 $d_{model}$차원의 벡터 공간이지만, 의미 있는 정보는 훨씬 낮은 차원의 선형 부분공간에 집중된다.
+
+Feature $f$는 방향 벡터 $v_f \in \mathbb{R}^{d_{model}}$로 정의되고, 그 activation은 다음과 같다.
+
+$$
+a_f^{\ell,t} = \langle v_f, x_\ell^t \rangle
+$$
+
+이 가정이 성립하면 두 가지 실용적 귀결이 따른다. **Linear probe**로 해당 feature를 높은 정확도로 예측할 수 있고, 동시에 그 방향을 residual stream에 더하는 **steering**으로 모델의 출력을 예측 가능하게 변경할 수 있다.
+
+<Theorem kind="proposition" number="2" title="Probe와 Steering의 동치성">
+Linear probe $\hat{y} = w^\top x_\ell + b$가 feature $y$를 높은 정확도로 예측한다면, 방향 $v \propto w$를 layer $\ell$에서 residual stream에 더하는 steering은 최종 logit에서 $y$에 대응하는 방향을 강화한다.
+</Theorem>
+
+<Proof>
+Feature가 선형이면, probe의 가중치 벡터 $w$와 steering의 방향 $v$는 같은 부분공간에 놓인다. Residual stream의 선형성 하에서 $x_\ell' = x_\ell + \alpha v$는 logit에 $\alpha \langle w, v \rangle$만큼의 선형 변화를 일으킨다. $\square$
+</Proof>
+
+한계도 명확하다. Attention의 softmax와 MLP의 ReLU는 비선형이므로 완전한 선형성은 근사다. 또한 한 방향이 여러 의미를 동시에 담는 **polysemanticity** 문제가 존재하며, 이는 Sparse Autoencoder 기반 분석(다음 글의 주제)이 필요한 이유이기도 하다.
+
+## 정리
+
+- Residual stream은 Transformer의 정보 공유 버스다. 각 layer는 이 버스에 덧셈으로 기여하고, 선형성 가정 하에서 중간 layer의 representation을 해석할 수 있다.
+- Attention head는 QK 회로("어디를 보는가")와 OV 회로("무엇을 복사하는가")로 독립적으로 분해된다. 두 행렬의 SVD effective rank는 실제 정보 병목 구조를 드러낸다.
+- Multi-layer K-composition은 단순한 head들이 협력해 induction 같은 복잡한 회로를 형성하는 메커니즘이다.
+- Linear Representation Hypothesis는 "residual stream의 의미 있는 정보는 선형 방향으로 표현된다"는 가정으로, linear probe와 activation steering의 이론적 기초를 제공한다.
+
+이 구조들이 더 복잡한 행동 — superposition, polysemanticity, induction head의 등장 — 과 어떻게 연결되는지는 다음 글에서 추적한다.
+
+<Reference
+  title="A Mathematical Framework for Transformer Circuits"
+  authors="Elhage et al."
+  year={2021}
+  venue="Transformer Circuits Thread"
+  url="https://transformer-circuits.pub/2021/mathematical-framework/index.html"
+/>
+
+<Reference
+  title="Linear Representations of Sentiment in Large Language Models"
+  authors="Park, Choe, Veitch"
+  year={2024}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2310.15154"
+/>

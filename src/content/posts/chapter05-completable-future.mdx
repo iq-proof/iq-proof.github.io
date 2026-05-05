@@ -1,0 +1,111 @@
+---
+title: "CompletableFuture는 왜 Future를 버렸는가"
+description: "블로킹 get()의 한계부터 Treiber 스택 콜백 체인, thenApply/thenCompose/thenCombine 선택 기준, Executor 설계, 예외 처리 3가지, allOf/anyOf 패턴까지 비동기 파이프라인 설계의 핵심을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, completable-future, async, executor, event-driven]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`Future.get()`은 결과를 기다린다. 스레드를 붙잡고, 아무것도 하지 않으면서, 그냥 기다린다. `CompletableFuture`는 다른 철학을 선택했다 — "기다리지 말고, 완료되면 나를 불러라." 이 전환이 어떤 내부 구조 위에서 작동하는가?
+
+## Future가 막혀 있던 곳
+
+`Future<T>`는 Java 5에서 등장했다. `submit()`으로 작업을 던지고, `get()`으로 결과를 받는다. 단순하지만 결정적인 약점이 있다 — `get()`은 항상 블로킹이다. 결과가 나올 때까지 호출 스레드는 멈춘다. 스레드 풀에서 10개의 작업을 동시에 기다리면 10개의 스레드가 전부 대기 상태가 된다.
+
+더 큰 문제는 **연결**이 불가능하다는 점이다. "A가 끝나면 B를 시작하고, B가 끝나면 C에 결과를 넘겨라"는 패턴을 `Future`로 표현하면 `get()` 호출이 중첩되고, 예외 처리는 `try-catch`로 흩어진다. Callback Hell은 `Future`를 억지로 연결하려는 시도에서 나온다.
+
+## Treiber 스택과 두 개의 volatile 필드
+
+`CompletableFuture`의 핵심은 두 필드다.
+
+```java
+volatile Object result;    // null | T | AltResult(Throwable)
+volatile Completion stack; // 등록된 콜백들의 연결 리스트 (Treiber 스택)
+```
+
+`result`가 `null`이면 미완료다. `complete(value)`를 호출하면 CAS(Compare-And-Swap) 한 번으로 `result`를 `value`로 바꾼다. 이 CAS가 성공하는 건 딱 한 번뿐이다. 이후의 `complete()` 호출은 전부 실패한다.
+
+`stack`은 **Treiber 스택** — 락 없는 LIFO 자료구조다. `thenAccept(fn)`을 호출할 때마다 `UniAccept` 노드를 CAS로 스택 맨 위에 쌓는다. `complete()` 호출 시 스택을 순회하며 모든 콜백을 실행한다. 락이 없으므로 여러 스레드가 동시에 콜백을 등록해도 안전하다.
+
+이미 완료된 `CompletableFuture`에 콜백을 등록하면 스택에 쌓지 않는다. `result != null`을 확인하고 즉시 실행한다.
+
+## thenApply, thenCompose, thenCombine — 세 가지 연결
+
+세 메서드의 차이는 **함수의 반환 타입**에서 나온다.
+
+- `thenApply(T → U)`: 동기 변환이다. 이전 결과를 받아 새 값으로 바꾼다. `Function`이 `CompletableFuture`를 반환하면 `CompletableFuture<CompletableFuture<U>>`라는 중첩 구조가 생긴다.
+- `thenCompose(T → CompletionStage<U>)`: 비동기 체인이다. Optional의 `flatMap`과 같다. 함수가 반환한 내부 `CompletableFuture`의 결과를 평탄화해서 전달한다.
+- `thenCombine(CF<U>, (T,U) → V)`: 두 개의 독립 future를 병렬로 실행하고, 둘 다 완료되면 `BiFunction`으로 결합한다.
+
+```java
+// 1000ms짜리 작업 두 개
+cf1.thenCompose(r1 -> cf2.thenApply(r2 -> r1 + r2)); // 순차: ~2000ms
+cf1.thenCombine(cf2, (r1, r2) -> r1 + r2);           // 병렬: ~1000ms
+```
+
+`thenRun`, `thenAccept`, `thenApply`도 같은 맥락이다. 값이 필요 없으면 `Runnable`(`thenRun`), 값을 소비만 하면 `Consumer`(`thenAccept`), 값을 변환하면 `Function`(`thenApply`). 반환 타입이 `CompletableFuture<Void>`냐 `CompletableFuture<U>`냐가 다음 체인 가능 여부를 결정한다.
+
+## Executor 설계 — commonPool의 함정
+
+`CompletableFuture.supplyAsync(fn)` 기본값은 `ForkJoinPool.commonPool()`이다. 4코어 머신이면 스레드가 4개다. `parallelStream()`도 같은 풀을 쓴다. 여기서 `supplyAsync`로 네트워크 I/O를 처리하면서 `join()`으로 블로킹하면 **스레드 기아(starvation)** 가 발생한다. 부모 태스크가 자식 태스크를 기다리는 동안, 자식 태스크를 실행할 스레드가 없는 상태다.
+
+I/O 바운드 작업의 최적 스레드 수는 다음 공식으로 계산한다.
+
+$$
+\text{스레드 수} = N \times \left(1 + \frac{W}{C}\right)
+$$
+
+$N$은 CPU 코어 수, $W$는 평균 I/O 대기 시간, $C$는 평균 계산 시간이다. 네트워크 API 호출(`W = 500ms`, `C = 50ms`)이라면 4코어 기준 44개 스레드가 필요하다. commonPool의 4개로는 턱없이 부족하다.
+
+<Callout type="warning" title="프로덕션에서 commonPool 기본값은 위험하다">
+`supplyAsync(fn)`에 executor를 명시하지 않으면 commonPool을 쓴다. I/O 바운드 작업에는 반드시 전용 `ExecutorService`를 `thenApplyAsync(fn, executor)` 형태로 지정하라. Java 19 이상이라면 `Executors.newVirtualThreadPerTaskExecutor()`가 메모리 효율과 확장성 모두 우수하다.
+</Callout>
+
+## 예외 처리 — 세 개의 메서드, 세 개의 의도
+
+비동기 파이프라인에서 예외는 발생 지점이 아닌 콜백 체인 어딘가에서 처리된다. CompletableFuture는 세 가지 도구를 제공한다.
+
+- **`exceptionally(Throwable → T)`**: 예외가 발생했을 때만 실행된다. 복구 값을 반환하면 이후 체인은 정상 경로를 탄다.
+- **`handle((T, Throwable) → U)`**: 성공과 실패 모두 처리한다. `BiFunction`이므로 값을 변환할 수 있다. 조건부로 기본값을 반환하거나 에러 메시지를 생성할 때 쓴다.
+- **`whenComplete((T, Throwable) → void)`**: 성공과 실패 모두 처리하되 값을 변환하지 않는다. 원본 값 또는 예외가 그대로 다음으로 전파된다. 로깅, 메트릭 수집 같은 부작용 전용이다.
+
+`whenComplete` 내부에서 예외를 던지면 원본 예외를 덮어쓰므로 주의해야 한다.
+
+## allOf와 anyOf — AND와 OR
+
+`allOf(CF...)` 는 내부에서 이진 트리(AND tree)를 구성한다. 잎 노드가 future, 내부 노드가 `BiRelay`다. 모든 future가 완료되면 루트가 `Void`로 완료된다. 하나라도 예외가 발생하면 즉시 그 예외를 전파한다.
+
+`allOf`는 결과를 직접 담지 않는다. 결과 수집은 별도로 해야 한다.
+
+```java
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+    .thenApply(v -> futures.stream()
+        .map(CompletableFuture::join) // allOf 후라 블로킹 없음
+        .collect(toList()));
+```
+
+`anyOf(CF...)` 는 OR tree다. 첫 번째로 완료된 future의 결과를 반환한다 — 성공이든 예외든 상관없이. 가장 빠른 future가 예외라면 `anyOf`도 예외가 된다.
+
+<Aside label="설계 철학">
+CompletableFuture의 모든 설계는 하나의 원칙으로 수렴한다 — "완료 시점을 호출자가 아닌 작업 자체가 결정하게 하라." `volatile result`와 Treiber 스택은 그 원칙의 구현이다. 블로킹 없이 콜백을 연결하고, CAS 하나로 상태를 전환하고, 락 없이 동시 접근을 처리한다.
+</Aside>
+
+## 정리
+
+- `Future`는 결과를 당긴다(pull). `CompletableFuture`는 결과가 오면 밀어준다(push).
+- 내부 구조는 `volatile result`(상태)와 Treiber 스택(콜백 체인)으로 이루어진다.
+- `thenApply`는 동기 변환, `thenCompose`는 비동기 평탄화, `thenCombine`은 병렬 결합이다.
+- I/O 바운드 작업에는 `N × (1 + W/C)` 공식으로 전용 Executor를 설계하고 commonPool에 의존하지 마라.
+- 예외 복구는 `exceptionally`, 조건부 변환은 `handle`, 부작용 처리는 `whenComplete`로 역할을 분리하라.
+
+다음 글에서는 Java 인터페이스의 `default` 메서드가 다중 상속 문제를 어떻게 해결하는지, 그리고 다이아몬드 문제에서 JVM이 어떤 선택을 강제하는지 추적한다.

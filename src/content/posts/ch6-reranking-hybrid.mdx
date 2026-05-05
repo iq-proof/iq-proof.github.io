@@ -1,0 +1,131 @@
+---
+title: "RAG 검색은 왜 두 단계인가"
+description: "Dense retriever의 recall 한계부터 LLM-as-Reranker의 비용까지, 두 단계 검색 파이프라인의 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [rag, reranking, hybrid-search, cross-encoder, rrf]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Dense retriever는 수백만 문서를 embedding 해 밀리초 안에 후보를 좁힌다. 하지만 top-5 안에 정답이 있다는 보장은 없다. 왜 retrieval만으로는 부족하고, 그 위에 reranking 레이어가 필요한가?
+
+## Recall과 Precision의 분리
+
+Dense retrieval의 근본 한계는 하나의 비교 연산으로 두 가지를 동시에 잡으려는 데 있다. `score(q, d) = emb(q)⊤ emb(d)` 는 query와 document를 독립적으로 인코딩한다. 이 구조는 FAISS 같은 ANN 인덱스로 수백만 문서를 밀리초 안에 검색할 수 있게 해준다. 대신 대가가 있다 — query와 document가 **함께 인코딩되지 않는다**.
+
+두 문서가 같은 임베딩 공간에서 비슷한 위치에 있어도, 특정 질문에 대해 실제 관련도는 완전히 다를 수 있다. 이것이 recall 중심으로 k를 크게 잡는 이유다. top-100을 꺼내 놓으면 정답이 포함될 확률은 높지만, 그 정답이 rank 1이라는 보장은 없다.
+
+<Theorem kind="proposition" number="1" title="Cross-Encoder의 Contextual Ranking">
+Cross-encoder $f_\theta$에서 relevance score는 joint representation에 기반하므로, 동일 문서도 다른 질문에서 상이한 점수를 받는다.
+
+$$
+s(q_1, d) \neq s(q_2, d) \quad \text{in general}
+$$
+
+반면 dense retriever는 $d$의 embedding이 고정되어, query-specific scaling만 적용된다.
+</Theorem>
+
+이 비대칭성이 two-stage pipeline의 출발점이다. Stage 1은 recall을 책임지고, Stage 2는 precision을 책임진다.
+
+## Cross-Encoder: (q, d)를 함께 읽는다
+
+MonoBERT와 MonoT5는 같은 목적에 대해 서로 다른 방식을 택한다.
+
+$$
+s(q, d) = f_\theta([CLS] \; q \; [SEP] \; d \; [SEP])
+$$
+
+MonoBERT는 이 joint representation의 `[CLS]` 벡터를 2-class softmax에 통과시켜 relevance 확률을 낸다. MonoT5는 "true" / "false" 토큰의 생성 확률로 같은 문제를 푼다.
+
+$$
+\mathcal{L}_{\text{gen}} = -\log P(\text{"true"} | q, d^+) - \log P(\text{"false"} | q, d^-)
+$$
+
+생성 방식의 장점은 calibration이다 — MonoT5의 확률은 "정말로 관련 있을 확률"과 더 잘 일치한다. 대신 T5 decoding은 BERT forward pass보다 느리다. MS MARCO 기준으로 dense-only MRR@10 = 0.73에서 MonoT5 reranking 후 0.88(+20.5%)로 뛰어오른다.
+
+<Callout type="warning" title="Top-k 이상의 정답은 구제 불가">
+Reranker는 retriever가 넘겨준 top-k 안에서만 작동한다. retriever가 정답을 top-100 밖에 두었다면, reranker가 아무리 뛰어나도 그 정답은 영원히 rank 1이 될 수 없다. 시스템 전체의 MRR 상한은 retriever의 recall이다.
+</Callout>
+
+## RRF: 점수 없이 순위만으로 합친다
+
+BM25와 Dense retriever는 서로 보완적이다. BM25는 정확한 키워드(인명, 약 이름)에 강하고, Dense는 의역과 의미 문맥에 강하다. BEIR zero-shot 평가에서 각각 NDCG@10 = 0.42, 0.40이지만 RRF로 합치면 0.50(+19~25%)이 된다.
+
+두 시스템을 합칠 때의 문제는 scale이다. BM25 점수는 0~50 범위, dense similarity는 0~1. 단순 합산은 BM25가 지배한다. Reciprocal Rank Fusion은 이 문제를 우회한다.
+
+$$
+\mathrm{RRF}(d) = \sum_{i=1}^{n} \frac{1}{k + \mathrm{rank}_i(d)}
+$$
+
+$k = 60$(Cormack 2009 empirical default)은 harmonic decay를 완만하게 만든다. $k=0$이면 rank 1과 rank 2의 점수 차이가 2배, $k=60$이면 1.6%에 불과하다. 상위 문서에 지나치게 집중하지 않고, 두 시스템에서 **일관되게 상위에 오른 문서**를 선택하는 전략이다.
+
+<Aside label="SPLADE의 위치">
+SPLADE는 BM25의 sparse representation과 Dense의 semantic embedding을 단일 모델로 학습한다. BERT MLM head의 logits에 log-softmax를 적용해 어휘 공간에서의 sparse expansion을 만들고, `[CLS]` embedding으로 dense similarity를 동시에 계산한다. MS MARCO 기준 NDCG@10 = 0.375로 BM25+Dense RRF(0.380)에 근접하면서, 저장량(50MB vs 500MB)과 latency(30ms vs 51ms)를 줄인다.
+</Aside>
+
+## LLM-as-Reranker: 이해가 있는 정렬
+
+RankGPT는 reranking을 다른 방식으로 접근한다. 점수를 내는 대신, 문서 목록 전체를 LLM에 보여주고 **직접 순서를 출력**하게 한다.
+
+$$
+\pi^* = \arg\max_{\pi} f_{\text{LLM}}(\text{prompt}_{\text{list}}(q, [d_{\pi(1)}, \ldots, d_{\pi(k)}]))
+$$
+
+Pointwise(각 문서 독립 평가, O(k) calls), Pairwise(쌍 비교, O(k log k) calls), Listwise(전체 한 번에, O(⌈k/w⌉ × rounds) calls) 중 listwise가 비용 대비 정확도가 가장 우수하다. GPT-3.5-turbo 기준 NDCG@10 = 0.62, GPT-4 기준 0.65 — MonoT5(0.49) 대비 +26% 상대 향상이다.
+
+k가 context window를 초과할 때는 sliding window를 쓴다. window_size=5, 3 rounds로 100문서를 처리하면 60 LLM call, pointwise의 100 call보다 적다.
+
+## 트레이드오프
+
+각 레이어는 다른 비용 구조를 갖는다.
+
+| 방식 | NDCG@10 | Latency | 비용/100docs |
+|---|---|---|---|
+| BM25 only | 0.42 | `<1ms` | $0 |
+| Dense + MonoT5 | 0.49 | 50ms | $0 (self-hosted) |
+| BM25+Dense RRF | 0.50 | 51ms | $0 |
+| RankGPT-3.5 | 0.62 | 30s | ~$0.30 |
+| RankGPT-4 | 0.65 | 45s | ~$2.50 |
+
+<Callout type="note" title="트레이드오프">
+두 단계 파이프라인의 진짜 결정은 "어디까지 돈과 시간을 쓸 것인가"다. retriever recall을 높이는 것(k를 키우거나 더 좋은 dense model)과 reranker precision을 높이는 것(MonoT5 → RankGPT-4) 사이에는 항상 비용 곡선이 존재한다. RankGPT-4를 쓰더라도 retriever recall이 낮으면 정답 자체가 후보에 없어 무의미해진다.
+</Callout>
+
+LLM-as-Reranker의 또 다른 문제는 position bias다. LLM은 초반 문서에 더 집중하고 후반부는 대충 처리하는 경향이 있다. NDCG@10은 우수해도 NDCG@100은 떨어지는 이유다. 하지만 RAG에서 LLM이 참조하는 것은 보통 top-5이므로, 실용적으로는 NDCG@10 최적화만으로 충분하다.
+
+## 정리
+
+- Dense retrieval은 recall을 위한 도구다. k를 크게 잡되, 그 안에서 순서는 보장하지 않는다.
+- Cross-encoder reranking(MonoBERT, MonoT5)은 joint encoding으로 precision을 높인다. +20% MRR은 공짜가 아니라 O(k) forward pass의 대가다.
+- RRF는 점수를 버리고 순위만으로 두 시스템을 합친다. 구현이 단순하고, BEIR에서 +19~25% gain으로 hybrid search의 baseline이 된다.
+- LLM-as-Reranker는 비교 능력으로 추가 +20%를 얻지만, API 비용과 latency라는 운영 제약이 따라온다.
+
+두 단계 파이프라인은 타협이 아니라 설계다. recall과 precision은 본질적으로 다른 문제이고, 각각 다른 도구가 필요하다.
+
+<Reference
+  title="Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods"
+  authors="Cormack, Clarke, Buettcher"
+  year={2009}
+  venue="SIGIR"
+  url="https://dl.acm.org/doi/10.1145/1571941.1572114"
+/>
+
+<Reference
+  title="Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents"
+  authors="Sun et al."
+  year={2023}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/2304.09542"
+/>

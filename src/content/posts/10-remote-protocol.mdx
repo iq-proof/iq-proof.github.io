@@ -1,0 +1,129 @@
+---
+title: "git push/fetch는 내부에서 무슨 일이 일어나는가"
+description: "Refspec 문법부터 Smart Protocol의 capability negotiation, want/have 협상, force push 안전성, atomic 트랜잭션까지 — git의 원격 동기화 메커니즘 전체를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, push, fetch, refspec, protocol]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git push origin main`을 입력하는 순간, 실제로는 여섯 단계 이상의 협상과 검증이 진행된다. 이 협상을 이해하지 못하면 "non-fast-forward" 거부가 왜 일어나는지, `--force-with-lease`가 `--force`와 왜 다른지, 다중 ref push가 왜 불일치 상태를 만드는지 영원히 막연하다. git의 원격 동기화는 어떤 철학 위에서 설계됐는가?
+
+## Refspec — push와 fetch의 방향을 결정하는 문법
+
+git의 모든 원격 동기화는 refspec이라는 단 하나의 문법 위에서 동작한다.
+
+```
+[+]<src>:<dst>
+```
+
+`src`와 `dst`의 의미는 방향에 따라 뒤집힌다. push에서 `src`는 로컬, `dst`는 원격이다. fetch에서는 반대로 `src`가 원격, `dst`가 로컬이다. `+`는 fast-forward가 아니어도 갱신을 허용한다는 뜻이다 — `--force`와 동등하다.
+
+`git clone` 직후 `.git/config`를 열면 이 문법의 기본값이 드러난다.
+
+```ini
+[remote "origin"]
+    url = git@github.com:foo/bar.git
+    fetch = +refs/heads/*:refs/remotes/origin/*
+```
+
+`+refs/heads/*:refs/remotes/origin/*`는 "원격의 모든 브랜치를 `origin/*`로 가져오되, fast-forward가 아니어도 갱신하라"는 뜻이다. `+`가 붙은 이유는 다른 사람이 force push한 브랜치를 fetch할 때도 거부 없이 갱신해야 하기 때문이다.
+
+`src`를 비우면 삭제가 된다. `git push origin :feature`는 원격 `feature` 브랜치를 삭제한다. 와일드카드는 경로 구조를 그대로 매핑한다 — `refs/heads/feature/foo`는 `refs/remotes/origin/feature/foo`로 대응된다.
+
+## Smart Protocol — 필요한 객체만 협상한다
+
+refspec이 "어디서 어디로"를 결정한다면, Smart Protocol은 "무엇을" 전송할지 협상한다.
+
+push와 fetch 모두 동일한 구조로 시작한다. 서버가 보유한 ref 목록과 지원하는 capability를 클라이언트에게 먼저 보낸다.
+
+```
+abc1234... refs/heads/main  report-status side-band-64k ofs-delta agent=git/2.40
+def5678... refs/heads/feature
+```
+
+클라이언트는 이 중 사용할 capability를 선택하고, "원하는 SHA"(want)와 "이미 가진 SHA"(have)를 서버에 전달한다. 서버는 want에서 도달 가능한 객체 중 클라이언트가 have로 알린 공통 조상 이후의 것만 pack에 담는다. 클라이언트에 이미 있는 객체는 전송하지 않는다.
+
+이것이 git fetch가 네트워크를 낭비하지 않는 이유다. 10,000개 커밋 중 새로운 커밋이 3개뿐이라면, 서버는 그 3개와 관련 tree·blob만 pack으로 보낸다.
+
+```bash
+# want/have 협상을 직접 관찰하려면
+GIT_TRACE=1 GIT_TRACE_PACKET=1 git fetch origin 2>&1 | head -30
+```
+
+Protocol v2(Git 2.18+)는 여기에 ref-prefix 필터링을 추가했다. 이전에는 서버가 모든 ref를 전송하고 클라이언트가 필터링했지만, v2에서는 클라이언트가 원하는 ref 접두사를 먼저 알려주면 서버가 매칭된 것만 보낸다. 수만 개의 ref를 보유한 모노레포에서 fetch 시간이 크게 줄어드는 이유다.
+
+shallow clone(`--depth N`)은 이 협상에서 depth 제약을 추가해 N개 커밋만 받는다. partial clone(`--filter=blob:none`)은 commit·tree는 즉시 받고 blob을 필요한 순간에 lazy fetch한다. CI 환경에서 `--depth 1`이 표준이 된 것은 이 메커니즘 덕분이다.
+
+## Push의 단계와 거부 지점
+
+push는 단순히 "ref를 갱신하는" 명령이 아니다. 다음 단계를 차례로 통과해야 한다.
+
+1. **capability negotiation** — 서버가 ref 목록과 지원 기능을 선언
+2. **pre-push hook** (클라이언트) — 실패 시 서버 호출 없이 중단
+3. **object negotiation** — 서버에 없는 객체만 식별
+4. **pack 생성·전송** — `--thin`으로 서버가 가진 base를 가정한 압축 pack
+5. **서버 검증** — SHA 무결성, fast-forward 여부, pre-receive hook
+6. **ref 갱신** — `update-ref`로 원자적 적용
+7. **update / post-receive hook** — CI 트리거, 배포 등
+8. **status report** — 각 ref의 성공/실패를 클라이언트에 반환
+
+"non-fast-forward" 오류는 5단계에서 발생한다. `pre-receive hook declined`도 5단계다. 반면 `pre-push hook` 실패는 2단계에서 서버에 패킷 하나 보내지 않고 중단된다.
+
+<Callout type="note" title="거부 위치에 따른 의미">
+pre-push는 클라이언트 정책(로컬 테스트), pre-receive는 서버 정책(커밋 메시지 규칙, 보호 브랜치)을 담당한다. 둘을 혼동하면 hook 작성 위치가 틀린다.
+</Callout>
+
+## Force Push의 안전성 계층
+
+rebase나 `commit --amend` 후 push하면 fast-forward가 아니기 때문에 서버에서 거부된다. 이때 세 가지 옵션이 있다.
+
+**`--force`**: 검사 없이 무조건 덮어쓴다. 다른 사람이 push한 커밋을 조용히 잃을 수 있다.
+
+**`--force-with-lease`**: "내가 마지막으로 fetch한 시점의 SHA와 원격의 현재 SHA가 일치할 때만 force"한다. 내가 fetch하지 않은 상태에서 다른 사람이 push했다면 원격의 SHA가 달라져 있으므로 거부된다.
+
+```
+예: origin/main = C5 (내 fetch 시점)
+    원격 main = C6 (Bob이 push)
+    --force-with-lease: expected=C5, current=C6 → 거부 (안전)
+```
+
+**`--force-if-includes`** (Git 2.30+): `--force-with-lease`에 한 가지 조건을 추가한다. 원격의 현재 SHA가 내 reflog에 존재해야 한다. 즉 "내가 fetch를 통해 그 커밋을 의식적으로 받은 적이 있어야만" force를 허용한다.
+
+<Aside label="실무 권장">
+`git config --global push.useForceIfIncludes true`를 설정하면 `--force-with-lease`가 자동으로 `--force-if-includes` 수준으로 동작한다. `--force` 자체를 alias로 막고 `fpush = push --force-with-lease`를 등록하는 것이 팀 표준으로 적합하다.
+</Aside>
+
+## Atomic Push — 다중 ref의 일관성
+
+`git push origin main feature`처럼 여러 ref를 한 번에 push하면 기본 동작은 per-ref 처리다. `main`이 성공하고 `feature`가 거부되면 `main`만 갱신된 불일치 상태가 된다. CI가 부분 상태에서 트리거되는 문제가 여기서 발생한다.
+
+`--atomic`은 "모두 성공 또는 모두 실패"를 보장한다. 서버는 모든 ref의 검증을 먼저 수행하고, 하나라도 실패하면 전체를 거부한다. 성공 시에는 모든 ref를 하나의 트랜잭션으로 갱신한다.
+
+```bash
+git push --atomic origin main release/v2 v2.0
+# 세 ref 중 하나라도 실패하면 세 ref 모두 거부
+```
+
+<Callout type="note" title="트레이드오프">
+atomic push는 일관성을 보장하지만 한 ref 실패가 무관한 ref까지 거부한다. 서로 독립적인 브랜치를 push할 때는 default가 더 유연하다. 모노레포처럼 브랜치 간 동기화가 필수인 환경에서 `push.atomic = true`를 글로벌 설정으로 사용하는 것이 적합하다.
+</Callout>
+
+## 정리
+
+- Refspec `[+]<src>:<dst>`에서 src/dst의 방향은 push와 fetch에서 반전된다. `+`는 fast-forward가 아니어도 갱신을 허용한다.
+- Smart Protocol은 want/have 협상으로 클라이언트에 없는 객체만 전송한다. Protocol v2는 ref-prefix 필터링으로 거대 레포에서 더 효율적이다.
+- push 거부 위치는 pre-push hook(클라이언트), fast-forward 검사(서버), pre-receive hook(서버) 세 곳이 다르다.
+- `--force` `<` `--force-with-lease` `<` `--force-if-includes` 순으로 안전성이 높아진다. 일상 작업에서는 `--force-with-lease` 이상을 사용한다.
+- `--atomic`은 다중 ref push의 일관성을 보장한다. 한 ref 실패 시 전체가 롤백된다.
+
+git의 원격 동기화는 "필요한 것만 전송하고, 의도치 않은 덮어쓰기를 막고, 다중 ref 갱신을 일관되게"라는 세 원칙의 조합이다. 이 원칙을 알면 대부분의 push/fetch 오류는 즉시 원인을 찾을 수 있다.

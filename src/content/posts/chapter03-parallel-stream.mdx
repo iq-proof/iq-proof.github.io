@@ -1,0 +1,121 @@
+---
+title: "parallelStream()은 왜 항상 빠르지 않은가"
+description: "ForkJoinPool의 work-stealing 메커니즘부터 NQ 모델 기반 의사결정까지, 자바 병렬 스트림이 빠른 경우와 느린 경우를 가르는 원리를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, fork-join-pool, parallel-stream, work-stealing, nq-model]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`parallelStream()`을 붙이면 빨라진다는 믿음은 절반만 맞다. 실제로는 데이터가 작거나, 박싱된 타입이거나, IO 작업이 섞여 있으면 순차 처리보다 느려진다. 그렇다면 병렬 스트림은 언제 빠르고 언제 느린가?
+
+## ForkJoinPool과 work-stealing의 구조
+
+`parallelStream()`의 내부 엔진은 `ForkJoinPool`이다. 일반 `ThreadPoolExecutor`가 모든 worker가 경합하는 중앙 큐를 쓰는 것과 달리, ForkJoinPool은 **각 worker 스레드가 자신만의 deque(double-ended queue)를 소유**한다.
+
+```
+ThreadPoolExecutor:              ForkJoinPool:
+  BlockingQueue (공유)             WorkQueue[1], [3], [5]...
+  [T1, T2, T3, T4, T5]            worker0: [T1, T3]
+  ← 모든 worker 경합 →            worker1: [T2, T4]
+                                   worker2: [T5]
+                                   (각자 자신의 deque)
+```
+
+task를 `fork()`하면 자신의 deque top에 `O(1)`으로 추가된다. 자신이 꺼낼 때는 LIFO(top에서), 다른 worker가 훔칠 때는 FIFO(base에서) 방식을 쓴다. 이 비대칭이 핵심이다 — LIFO로 꺼내면 최근에 생성된 task, 즉 부모 task의 자식이 스택 프레임과 함께 캐시에 남아 있으므로 L1/L2 히트율이 높다. FIFO로 훔치면 deque 바닥의 오래된 큰 task를 가져가므로 idle worker에게 더 많은 subtask를 분기할 기회를 준다.
+
+`join()`도 일반 스레드와 다르게 동작한다. ForkJoinWorkerThread 안에서 `join()`을 호출하면 대기하는 대신 **다른 queue에서 task를 훔쳐 처리하며 도움을 준다**. 외부 스레드에서 호출하면 그냥 park(대기)한다. 이 차이가 외부 스레드에서 `ForkJoinTask`를 직접 조합할 때 deadlock의 씨앗이 된다.
+
+## commonPool 공유와 격리의 문제
+
+`parallelStream()`과 `CompletableFuture.supplyAsync()`는 **둘 다 기본적으로 `ForkJoinPool.commonPool()`을 공유**한다. 병렬도는 `max(2, CPU코어 수 - 1)`로 고정된다. 4코어 머신이면 worker가 3개다.
+
+한쪽에서 모든 worker를 점유하면 다른 쪽이 큐에서 기다린다. 더 위험한 경우는 **IO-bound 작업을 commonPool에서 실행할 때**다. DB 조회나 HTTP 호출로 worker가 blocked 상태가 되면, CPU를 사용하지 않으면서도 스레드를 점유한다.
+
+```java
+// 위험한 패턴
+CompletableFuture.supplyAsync(() -> fetchFromDB())  // worker 블로킹!
+    .thenApply(data -> data.parallelStream()         // worker 없음
+        .map(this::heavyCompute)
+        .collect(toList()));
+
+// 안전한 패턴
+ExecutorService ioExecutor = Executors.newFixedThreadPool(
+    Runtime.getRuntime().availableProcessors() * 2
+);
+CompletableFuture.supplyAsync(() -> fetchFromDB(), ioExecutor)
+    .thenApply(data -> data.parallelStream()  // commonPool 여유 있음
+        .map(this::heavyCompute)
+        .collect(toList()));
+```
+
+<Callout type="warning" title="nested parallelStream 교착 위험">
+외부 `parallelStream`의 task 안에서 다시 내부 `parallelStream`을 호출하면, 외부 task가 `join()`으로 내부 task의 완료를 기다리는 동안 모든 worker가 외부 task 처리에 묶여 내부 task가 실행되지 못하는 교착 상태가 발생할 수 있다. 내부 stream은 순차(`stream()`)로 처리하거나 `flatMap`으로 펼쳐서 우회하라.
+</Callout>
+
+## 분할 효율이 병렬화 이득을 결정한다
+
+`parallelStream()`의 성능은 내부 `Spliterator`의 `trySplit()`이 얼마나 저렴하게 데이터를 반으로 나누느냐에 달렸다.
+
+`ArrayList`는 `SIZED | SUBSIZED` 특성을 가지므로 인덱스 중간값을 계산해 `O(1)`로 분할한다. `IntStream.range()`는 여기에 `IMMUTABLE | NONCONCURRENT`까지 갖춰 분할 비용이 사실상 0이다. 반면 `LinkedList`는 중간 노드를 찾기 위해 `O(N)` 순회가 필요하다. 분할 비용이 병렬화 이득보다 커지는 역전이 일어난다.
+
+```
+배열 합계 (1백만 원소, 4코어):
+
+자료구조          순차(ms)  병렬(ms)  결과
+ArrayList          200       35      5.7배 향상
+LinkedList         220       180     1.2배 향상 (거의 없음)
+IntStream.range    180       30      6.0배 향상
+```
+
+stateful 연산인 `sorted()`나 `distinct()`는 분할된 각 부분의 결과를 병합하는 단계가 필수이므로 병렬화 이득이 크게 줄어든다. `forEachOrdered()`는 만남 순서를 보장하기 위해 worker 간 동기화가 필요해 사실상 직렬화된다.
+
+<Aside label="박싱 함정">
+`Stream<Integer>`는 각 원소가 힙 객체이므로 worker가 병렬로 접근할 때 캐시 일관성 비용과 GC 압력이 증폭된다. `IntStream` 대비 5~10배 느린 결과가 일반적이다. 정수 연산은 항상 `IntStream` / `LongStream` / `DoubleStream`을 쓴다.
+</Aside>
+
+## NQ 모델 — 측정 없이 결정하는 프레임워크
+
+Brian Goetz가 제시한 **NQ 모델**은 `N(원소 수) × Q(원소당 비용)`으로 병렬화 적합성을 판단한다.
+
+병렬화 이득의 공식은 대략 다음과 같다.
+
+$$
+\text{speedup} = \frac{N \cdot Q}{N \cdot Q / P + \text{overhead}}
+$$
+
+`P`는 parallelism, overhead는 분할·task 생성·스케줄링 비용이다. overhead가 일정할 때 `N × Q`가 충분히 크면 speedup이 `P`에 수렴한다. 경험적 임계값은 `N × Q > 10,000`(마이크로초 단위)이지만, 박싱·캐시 미스·stateful 연산이 있으면 `N × Q > 1,000,000`을 기준으로 잡는 것이 안전하다.
+
+의사결정 기준을 정리하면 다음과 같다.
+
+| 조건 | 결정 |
+|:---|:---|
+| `N < 1,000` | 순차 |
+| IO-bound 작업 포함 | `ExecutorService` 분리 |
+| `sorted()` / `distinct()` 포함 | 순차로 먼저 수행 후 병렬 |
+| `LinkedList` / 연결 자료구조 | 순차 |
+| `N > 10,000`, CPU-bound | `parallelStream()` 적합 |
+| 박싱 타입 | `IntStream`으로 교체 후 재평가 |
+
+<Callout type="note" title="트레이드오프">
+병렬화는 코드 복잡도를 올리고 commonPool 공유라는 전역 부작용을 동반한다. 성능 향상이 측정으로 확인되지 않은 병렬화는 비용만 더한다. 의심스러우면 순차가 기본값이다.
+</Callout>
+
+## 정리
+
+- `ForkJoinPool`의 work-stealing은 LIFO(캐시 지역성) + FIFO steal(로드 밸런싱)의 비대칭 구조다.
+- `parallelStream()`과 `CompletableFuture`는 commonPool을 공유한다. IO-bound 작업은 반드시 별도 `ExecutorService`로 격리한다.
+- 자료구조의 분할 효율이 병렬화 이득을 결정한다. `LinkedList`는 병렬화해도 느리다.
+- `N × Q > 10,000`을 기준 삼되, 박싱·stateful 연산이 있으면 훨씬 높게 잡아야 한다.
+- `Stream<Integer>` 대신 `IntStream`을 쓰고, `sorted()`는 순차에서 먼저 처리한다.
+
+병렬 스트림은 도구다. 도구가 맞는 작업에만 꺼낸다.

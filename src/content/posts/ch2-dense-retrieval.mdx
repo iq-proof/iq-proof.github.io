@@ -1,0 +1,156 @@
+---
+title: "Dense Retrieval은 왜 BM25를 이겼는가"
+description: "어휘 부족 문제부터 In-Batch Negatives, Hard Negative Mining, 그리고 Weakly-Supervised 학습까지 — Dense Retrieval이 필연적으로 선택된 이유를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [dense-retrieval, rag, contrastive-learning, bm25, dpr]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 2
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+BM25는 40년간 정보 검색의 표준이었다. 그런데 2020년 이후 RAG 시스템의 거의 모든 구현이 Dense Retrieval로 이동했다. 단순히 "성능이 좋아서"가 아니다 — BM25가 구조적으로 해결할 수 없는 문제가 있었고, Dense Retrieval은 그 문제를 학습으로 우회했다. 왜 이 전환이 **필연적**이었는가?
+
+## BM25가 실패하는 지점
+
+BM25의 점수 함수는 다음과 같다.
+
+$$
+\text{BM25}(q, d) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{f(t,d) \cdot (k_1 + 1)}{f(t,d) + k_1 \left(1 - b + b \frac{|d|}{L_{\text{avg}}}\right)}
+$$
+
+이 수식에서 핵심은 단 하나다 — term $t$가 document $d$에 등장하지 않으면 contribution은 정확히 0이다. "자동차"와 "automobile"은 같은 개념이지만, BM25의 눈에는 완전히 다른 단어다.
+
+Furnas(1987)는 이를 **vocabulary problem**으로 정식화했다. 사용자가 3개 term으로 쿼리를 구성할 때, 각 term의 표현 불일치 확률이 30%라면 전체 miss rate는 다음과 같다.
+
+$$
+\mathbb{P}[\text{at least 1 term miss}] = 1 - (0.7)^3 \approx 65.7\%
+$$
+
+세 단어짜리 쿼리 중 3분의 2가 검색에서 실패한다. 이 한계는 튜닝으로 극복할 수 없다 — BM25의 설계 자체가 lexical matching이기 때문이다.
+
+<Theorem kind="proposition" number="1" title="BM25의 Paraphrase Recall 한계">
+BM25 점수는 query의 term이 document에 등장하는 빈도의 선형 결합이다. Paraphrase는 정의상 term overlap을 최소화하므로, $\text{BM25}(q, p) \approx 0$이더라도 semantic 거리는 0에 가까울 수 있다.
+</Theorem>
+
+<Proof>
+BM25는 $\sum_t \text{IDF}(t) \cdot \text{freq}(t, d)$ 형태다. Paraphrase passage $p$에 query term $t$가 없으면 $\text{freq}(t, p) = 0$이므로 해당 term의 contribution은 0. 모든 main term이 이 경우에 해당하면 $\text{BM25}(q, p) \approx 0$. 반면 semantic encoder로 측정한 $\cos(f(q), f(p))$는 학습에 의해 paraphrase를 가깝게 배치하므로 0에 가깝지 않다. $\square$
+</Proof>
+
+## Bi-Encoder가 만든 경제학
+
+DPR(Karpukhin 2020)은 이 문제를 해결하기 위해 **두 개의 분리된 BERT encoder**를 도입했다.
+
+$$
+s(q, p) = f_q(q)^\top f_p(p)
+$$
+
+이 수식이 혁명적인 이유는 점수 계산 방식이 아니라 **계산 순서** 때문이다. Passage embedding $f_p(p)$는 쿼리와 무관하게 미리 계산해 저장할 수 있다. Inference 시에는 쿼리 embedding 하나만 계산한 뒤 FAISS로 ANN 탐색하면 된다.
+
+```
+# Offline (한 번):
+for p in 100M_passages:
+    cache[p] = passage_encoder(p)   ← GPU 병렬 가능
+    
+# Inference (쿼리마다):
+q_emb = query_encoder(q)            ← 1회 encoding
+top_k = FAISS.search(q_emb, k=100) ← ~1ms
+```
+
+Cross-Encoder가 모든 (query, passage) 쌍을 실시간으로 계산해야 하는 것과 비교하면, Bi-Encoder의 per-query 비용은 다음 비율로 줄어든다.
+
+$$
+\frac{\text{Cross-Encoder cost}}{\text{Bi-Encoder cost}} = \frac{O(M \cdot d)}{O(\log M + d)} \approx 100\text{-}1000\times
+$$
+
+<Callout type="note" title="트레이드오프">
+Bi-Encoder는 query와 passage를 독립적으로 encoding하므로, cross-encoder처럼 두 텍스트의 상호작용을 직접 모델링하지 못한다. MRR 기준으로 cross-encoder가 3-5% 높다. 대규모 corpus에서는 Bi-Encoder로 top-100을 추린 뒤 cross-encoder로 rerank하는 2단계 파이프라인이 표준이다.
+</Callout>
+
+## InfoNCE와 In-Batch Negatives
+
+Bi-Encoder를 학습시키는 표준 손실 함수는 InfoNCE(Oord 2018)다.
+
+$$
+L_{\text{InfoNCE}} = -\log \frac{\exp(s(q, p^+) / \tau)}{\exp(s(q, p^+) / \tau) + \sum_{j \neq i} \exp(s(q, p_j^+) / \tau)}
+$$
+
+여기서 $p_j^+$는 **같은 batch 안의 다른 query에 대한 positive passage**다. 이것이 in-batch negatives의 핵심이다 — negative pair를 별도로 샘플링하지 않아도, batch size $B$에서 자동으로 $B(B-1)$개의 negative pair가 생긴다.
+
+Temperature $\tau$는 학습 난이도를 조절한다. $\tau$가 작아질수록 softmax가 sharp해져 가장 높은 점수의 negative에 gradient가 집중된다. 이는 curriculum learning 효과를 낸다 — 초기에는 높은 $\tau$로 global structure를 학습하고, 후반에는 낮은 $\tau$로 hard negative에 집중한다.
+
+hard negative $p_h$와 random negative $p_r$의 gradient magnitude 비율은 다음과 같다.
+
+$$
+\frac{\|\nabla L \text{ w.r.t. } p_h\|}{\|\nabla L \text{ w.r.t. } p_r\|} = e^{(s_h - s_r) / \tau}
+$$
+
+$s_h - s_r \approx 0.3$, $\tau = 0.07$이면 이 비율은 $e^{4.3} \approx 70$이다. Hard negative 하나가 random negative 70개만큼의 학습 신호를 준다.
+
+## ANCE와 Hard Negative Mining
+
+In-Batch Negatives의 한계는 명확하다 — batch 안의 passage들이 항상 진정한 hard negative가 아닐 수 있다. ANCE(Xiong et al. 2020)는 **현재 모델로 직접 top-k를 검색해 hard negative를 mining**하는 방식을 도입했다.
+
+```python
+# ANCE의 Async Checkpoint 구조
+for step in training:
+    if step % refresh_interval == 0:
+        # 현재 모델로 전체 corpus re-encoding
+        for p in corpus:
+            cache[p] = current_encoder(p)
+    
+    q_emb = current_encoder(query)
+    hard_negs = FAISS.search(cache, q_emb, k=30)  # stale cache
+    loss = InfoNCE(q_emb, pos_emb, hard_negs_emb)
+```
+
+"Async"라는 이름은 모델과 embedding cache가 동기화되지 않는다는 뜻이다. Cache는 100-200 iteration마다 갱신되므로, 그 사이 모델은 약간 stale한 hard negative로 학습한다. 이것이 오히려 안정성에 도움이 된다 — 매 iteration마다 hard negative가 바뀌면 학습이 불안정해진다.
+
+MS MARCO에서 DPR(in-batch negatives)이 MRR@10 38.2를 달성할 때, ANCE는 40.1을 달성했다. 같은 학습 시간에 5% relative 향상이다.
+
+## BM25에서 E5까지 — Label 의존성의 해방
+
+Dense Retrieval의 가장 큰 과제는 labeled 데이터의 부족이었다. DPR과 ANCE는 모두 NQ, TriviaQA 같은 수작업 라벨 데이터에 의존한다. 이 의존성을 끊는 방향으로 연구가 진화했다.
+
+**SBERT(2019)**는 NLI/STS 데이터로 supervised contrastive learning을 실현했다. **Contriever(2021)**는 labeled data를 완전히 제거했다 — document를 random crop해 같은 document의 두 조각을 positive pair로 사용하고, MoCo queue의 다른 document crop을 negative로 쓴다. 라벨이 전혀 없어도 Wikipedia + CC-News만으로 학습이 가능하다.
+
+**E5(2022)**는 그 중간 어딘가를 찾았다 — Web corpus의 검색 로그에서 (query, clicked document) 쌍을 자동으로 수집해 pseudo-label로 사용하는 weakly-supervised 방식이다. Instruction prefix (`search_query:` vs `search_document:`)를 붙여 single encoder가 query와 document의 역할을 구별하게 만든다.
+
+<Aside label="진화의 방향">
+SBERT → Contriever → E5의 진화 축은 **label 의존성 감소**다. E5 이후 dense retrieval의 실질적 표준은 weak supervision이 되었고, BGE, UAE, jina-embeddings 모두 이 패러다임을 따른다. 역설적으로, label이 없어질수록 더 일반적인 retrieval 능력이 생겼다.
+</Aside>
+
+## 정리
+
+- BM25는 vocabulary problem을 구조적으로 해결할 수 없다 — term이 없으면 점수가 0이다.
+- Bi-Encoder의 offline indexing은 `O(M·d)` 비용을 `O(log M)`으로 줄여 web-scale retrieval을 가능하게 했다.
+- InfoNCE + in-batch negatives는 dense retrieval의 표준 학습 레시피이고, ANCE hard negative mining은 그 위에서 5% relative 향상을 추가했다.
+- SBERT → Contriever → E5의 진화는 labeled data 의존성을 제거하면서 scale을 키우는 방향이었다.
+
+BM25가 진 이유는 neural network의 표현력 때문이 아니라, **학습으로 vocabulary problem을 확률적으로 우회할 수 있음**을 증명했기 때문이다.
+
+<Reference
+  title="Dense Passage Retrieval for Open-Domain Question Answering"
+  authors="Karpukhin et al."
+  year={2020}
+  venue="EMNLP"
+  url="https://arxiv.org/abs/2004.04906"
+/>
+
+<Reference
+  title="Approximate Nearest Neighbor Negative Contrastive Estimation for Dense Text Retrieval"
+  authors="Xiong et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2007.00808"
+/>

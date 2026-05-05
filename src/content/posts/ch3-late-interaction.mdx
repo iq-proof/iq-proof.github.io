@@ -1,0 +1,125 @@
+---
+title: "Cross-Encoder, ColBERT, 그리고 검색의 Pareto 경계"
+description: "Full attention의 정확성과 벡터 인덱싱의 속도를 동시에 가질 수 없다는 근본 제약부터, Late Interaction이 그 경계를 어떻게 밀어내는지 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [retrieval, rag, cross-encoder, colbert, late-interaction]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Dense retrieval은 빠르지만 query와 document가 embedding 시점에 "만나지 않는다". Cross-encoder는 정확하지만 문서 하나마다 BERT를 한 번씩 돌려야 한다. 이 두 제약이 만드는 삼각형 — storage, quality, latency — 안에서 검색 시스템은 항상 타협해야 한다. 그렇다면 이 경계를 이동시킬 수 있는가?
+
+## Full Attention의 정확성, 그리고 그 대가
+
+Cross-encoder는 `[CLS] query [SEP] document [SEP]` 형태로 query-document 쌍 전체를 BERT에 입력한다. 12개 레이어의 self-attention이 query token과 document token 사이를 자유롭게 교차하며, 최종 `[CLS]` hidden state가 relevance score를 만든다.
+
+$$
+s(q, d) = \sigma\!\left(\mathbf{w}^\top \mathbf{h}_{[\text{CLS}]}^{(L)}\right)
+$$
+
+DPR이 각각 독립적으로 인코딩된 두 벡터의 내적으로 점수를 매기는 것과 달리, cross-encoder는 attention matrix $\mathbf{A}^{(l)} \in \mathbb{R}^{(m+n+3) \times (m+n+3)}$에서 query token $i$와 document token $j$ 사이의 직접적인 상호작용을 포착한다. 이 token-level interaction이 MS MARCO에서 nDCG@10 ~0.42를 가능하게 한다.
+
+대가는 명확하다. $N$개 문서를 scoring할 때 $N$번의 forward pass가 필요하다. 100개 문서 reranking에 ~1초, 1만 개면 ~100초다. **first-stage retrieval로 쓸 수 없다**. Cross-encoder는 BM25나 dense retrieval이 좁혀온 후보 10~100개를 재정렬하는 2nd stage 전용 도구다.
+
+<Callout type="note" title="트레이드오프">
+Cross-encoder의 token-level full attention은 이론적으로 임의의 query-document relevance 함수를 근사할 수 있다(Transformer universal approximation, Pérez et al. 2019). 그러나 $O(N)$ inference cost는 billion-scale corpus에서 first-stage 사용을 불가능하게 만든다. 정확성과 확장성은 이 architecture에서 동시에 달성되지 않는다.
+</Callout>
+
+## Late Interaction — 인덱싱 가능한 상호작용
+
+ColBERT(Khattab & Zaharia 2020)의 핵심 아이디어는 단순하다: document token embedding은 **offline**에 계산해두고, query와의 상호작용만 **online**에 계산한다.
+
+각 document token $j$를 128차원으로 투영한 embedding $e_{d_j}$를 인덱싱해두면, query 시점에는 query token embedding $e_{q_i}$들과 MaxSim만 계산하면 된다.
+
+$$
+S(q, d) = \sum_{i=1}^{m} \max_{j=1}^{n} e_{q_i}^\top e_{d_j}
+$$
+
+직관은 이렇다: query의 각 token이 document 전체에서 자신과 가장 잘 맞는 token을 찾아 최고 점수를 취하고, 이를 query token 전체에 걸쳐 합산한다. DPR의 mean pooling이 $\mathbb{R}^{n \times 768} \to \mathbb{R}^{768}$로 정보를 압축하는 것과 달리, ColBERT는 $\mathbb{R}^{n \times 128}$ 그대로 보존한다.
+
+```
+DPR:            ColBERT:
+query → e_q     query token 1 → e_{q_1} ─┐
+doc   → e_d     query token 2 → e_{q_2}  ├─ MaxSim ─→ S(q,d)
+score = e_q·e_d query token 3 → e_{q_3} ─┘
+(토큰 만남 없음) doc token 1~n → e_{d_1..n} (indexed)
+```
+
+결과: DPR ~0.35에서 ColBERT ~0.39로, 단 4% 포인트지만 의미가 다르다. Single-vector가 버린 token-level 정보를 복원한 것이기 때문이다. 그러면서도 document embedding은 미리 계산되어 있으므로 ANN 인덱스와 결합하면 first-stage retrieval이 가능하다.
+
+## ColBERTv2 PLAID — 압축으로 경계를 밀다
+
+ColBERT의 남은 문제는 메모리다. 1M개 문서 × 평균 100 토큰 × 128차원 × 1바이트 = 12.8GB. 인덱스가 클수록 캐시 미스 증가, latency 증가다.
+
+ColBERTv2 + PLAID(Santhanam et al. 2022)는 **centroid + residual** 구조로 이를 2.6배 압축한다.
+
+모든 token embedding에 K-means를 적용해 256개 centroid를 학습한다. 각 embedding은 ①가장 가까운 centroid의 8-bit ID와 ②centroid와의 차이(residual)를 4-bit로 양자화한 두 조각으로 저장된다.
+
+$$
+\tilde{e}_{d_j} = c_{k^*} + r_{d_j}^{\text{quantized}}, \quad k^* = \arg\min_k \|e_{d_j} - c_k\|^2
+$$
+
+per-embedding 저장 비용이 1바이트(centroid ID) + 64바이트(4-bit × 128차원 / 8) = 65바이트로 줄어, 12.8GB → 4.6GB가 된다.
+
+retrieval도 두 단계로 나뉜다. Stage 1에서는 centroid score만으로 빠르게 상위 후보를 걸러내고($S_\text{centroid} \geq S_\text{exact}$이므로 upper bound로 쓸 수 있다), Stage 2에서만 residual을 복원해 정확한 MaxSim을 계산한다. 1M개 문서에 대한 linear scan이 10K개에 대한 exact MaxSim으로 줄어든다. latency는 ~80ms에서 ~50ms로 개선되고, nDCG@10은 0.39를 거의 그대로 유지한다.
+
+<Aside label="압축 산술">
+embedding당 원본: 128 × 32 = 4096비트. PLAID: 8 + 4 × 128 = 520비트. 이론적 압축비 7.9배. 실제 인덱스 전체 기준으로는 2.6배 — 오버헤드와 정렬 비용을 감안한 현실적 수치다.
+</Aside>
+
+## 세 방법의 Pareto 경계
+
+지금까지 본 방법들을 storage × quality × latency 세 축에 배치하면 어떤 것도 다른 것을 "지배"하지 않는다.
+
+<Theorem kind="proposition" number="1" title="Pareto non-dominance">
+DPR, ColBERT, Cross-Encoder는 (storage, quality, latency) 세 차원에서 서로 Pareto 지배 관계에 있지 않다.
+</Theorem>
+
+<Proof>
+DPR: (3GB, 0.35, 10ms). ColBERT: (4.6GB, 0.39, 50ms). Cross-Encoder: (~0GB index, 0.42, 10s/1K docs). DPR은 latency에서 ColBERT를 지배하지만 quality에서 지배되지 않는다. ColBERT는 quality에서 DPR을 앞서지만 storage와 latency에서 뒤진다. Cross-Encoder는 quality가 최고이나 latency가 압도적으로 길다. 세 방법 중 어느 것도 나머지 모두를 세 차원 동시에 지배하지 못한다. ∎
+</Proof>
+
+실무 선택은 이 경계 위에서 제약 조건과 매칭하는 문제다.
+
+- **1B scale, P99 10ms**: DPR ANN으로 top-1000 후보 → 선택적으로 Cross-Encoder rerank. first-stage latency 10ms 이내, 최종 quality 0.42 근접.
+- **100M scale, 100ms budget**: ColBERT PLAID single-stage. MaxSim이 50ms 안에 충분히 처리.
+- **1M 이하, offline batch**: Cross-Encoder 직접 사용. latency 무관, 최고 quality.
+
+corpus 크기 $N$이 커질수록 sub-linear latency가 필수가 되고, 그 안에서 quality를 최대화하는 방법이 달라진다. "최고 품질"이 아니라 "제약 조건에서의 최적"이 검색 시스템 설계의 실질적 목표다.
+
+## 정리
+
+- Cross-encoder는 token-level full attention으로 가장 정확하지만, $O(N)$ inference cost 때문에 reranking 전용이다.
+- ColBERT는 per-token embedding + MaxSim으로 token interaction을 인덱싱 가능한 형태로 근사한다. nDCG DPR 대비 +4%, latency는 first-stage 허용 범위.
+- ColBERTv2 PLAID는 centroid(8-bit) + residual(4-bit)로 2.6배 압축하며, two-stage retrieval로 latency를 추가 개선한다.
+- Storage, quality, latency는 근본적 trade-off다. 어떤 단일 방법도 세 차원 모두를 지배하지 않으며, 상황에 맞는 선택이 필요하다.
+
+세 방법의 역사는 "정확성"과 "확장성"이라는 두 목표 사이의 경계를 단계적으로 이동시켜온 과정이다.
+
+<Reference
+  title="ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT"
+  authors="Khattab & Zaharia"
+  year={2020}
+  venue="SIGIR"
+  url="https://arxiv.org/abs/2004.12832"
+/>
+
+<Reference
+  title="ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction"
+  authors="Santhanam et al."
+  year={2022}
+  venue="NAACL"
+  url="https://arxiv.org/abs/2112.01488"
+/>

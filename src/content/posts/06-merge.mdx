@@ -1,0 +1,129 @@
+---
+title: "Git merge는 어떻게 충돌을 판단하는가"
+description: "3-way merge의 결정 트리부터 LCA 알고리즘, ort 전략의 100x 가속, rerere의 자동 해결 재사용까지 — Git이 브랜치를 합치는 원리를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, merge, three-way-merge, lca, ort]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git merge`는 "두 브랜치를 어떻게든 합친다"가 아니다. 내부에는 명확한 결정 트리가 있고, 그 트리가 어떤 변경을 자동으로 합치고 어떤 변경을 conflict로 표시할지를 정확히 결정한다. 이 메커니즘을 모르면 conflict가 왜 발생했는지, 왜 발생하지 않았는지 — 둘 다 설명할 수 없다.
+
+## 3-way merge: 세 입력과 결정 트리
+
+3-way merge는 세 가지를 입력으로 받는다: `base`(두 브랜치의 공통 조상), `ours`(HEAD), `theirs`(merge 대상 브랜치 tip). 각 파일과 hunk에 대해 다음 결정을 내린다.
+
+```
+ours == base && theirs == base   → 변경 없음
+ours == base && theirs != base   → theirs 적용
+ours != base && theirs == base   → ours 보존
+ours == theirs                   → convergent (자동 통합)
+ours != base && theirs != base && ours != theirs → CONFLICT
+```
+
+마지막 경우만 conflict다. 한쪽만 변경했다면 Git은 조용히 그 변경을 가져온다. 같은 줄을 양쪽이 다르게 변경했을 때 비로소 사용자 개입을 요청한다.
+
+비교는 SHA로 이루어진다 — 파일 전체를 읽는 게 아니라 blob SHA를 비교한다. 이는 O(1) 연산이다. 파일 내용이 같으면 SHA가 같고, 결과도 동일하다.
+
+## LCA: base를 어떻게 찾는가
+
+3-way merge가 성립하려면 `base`가 정확해야 한다. base는 LCA(Lowest Common Ancestor) — 두 브랜치의 공통 조상 중 DAG에서 가장 가까운 것이다.
+
+```
+       o ── o ── o      main
+        \
+         o ── o ── o    feature
+
+LCA(main tip, feature tip) = 분기점 o
+```
+
+알고리즘은 BFS 기반이다. 양쪽에서 조상을 마킹하고, 둘 다에서 도달한 commit 집합(common)을 구한 뒤, common 중에 다른 common의 조상인 것을 제거하면 LCA가 남는다.
+
+문제는 criss-cross merge다. feature와 main이 서로의 일부 commit을 cherry-pick하면 두 브랜치 tip의 LCA가 여러 개가 될 수 있다. 단순 3-way merge는 LCA가 하나여야 동작하므로, `recursive` strategy는 여러 LCA를 먼저 서로 merge해 가상 base를 만들고 그것을 base로 삼는다 — 이것이 "recursive"라는 이름의 유래다.
+
+```bash
+$ git merge-base --all feature main
+abc1234
+def5678   # 다중 LCA — criss-cross 발생 신호
+```
+
+## ort: in-memory로 100x 빠르게
+
+Git 2.34부터 기본 merge strategy가 `recursive`에서 `ort`(Ostensibly Recursive's Twin)로 바뀌었다. 의미적 결과는 거의 동일하지만 동작 방식이 다르다.
+
+`recursive`는 매 파일마다 working directory에서 읽고 쓴다. 100,000개 파일이 변경된 두 브랜치를 합치면 수십만 번의 디스크 I/O가 발생한다.
+
+`ort`는 base/ours/theirs tree를 메모리에 로드하고, 모든 3-way merge를 in-memory에서 완료한 뒤, 결과를 한 번에 working directory에 적용한다.
+
+```
+recursive: 100k 파일 × {read, compute, write} ≈ 30~60초
+ort:       메모리 traversal + 끝에 한 번 write ≈ 0.5~1초
+```
+
+conflict 마커 형식은 동일하다. `merge.conflictStyle=zdiff3`(Git 2.35+)로 base 영역까지 표시하게 하면 conflict 해결에 더 많은 정보를 쓸 수 있다.
+
+```
+<<<<<<< HEAD
+ours version
+||||||| merged common ancestors
+base version          ← zdiff3에서만 보임
+=======
+theirs version
+>>>>>>> branch
+```
+
+<Callout type="note" title="트레이드오프">
+ort는 in-memory 처리로 극적인 성능을 얻지만 메모리 사용이 늘어난다. 수백만 파일 규모의 모노레포에서는 GB 단위 RAM이 필요할 수 있다. 이 경우 `git merge -s recursive`로 fallback하거나, sparse checkout으로 처리 범위를 줄이는 것이 대안이다.
+</Callout>
+
+## conflict 해결의 두 자동화
+
+같은 conflict를 반복해서 해결하는 두 가지 도구가 있다.
+
+**rerere**는 "REuse REcorded REsolution"이다. 처음 conflict를 해결하면 `.git/rr-cache/<hash>/`에 preimage(충돌 상태)와 postimage(해결 결과)를 저장한다. 같은 conflict가 다시 발생하면 preimage hash로 매칭해 postimage를 자동 적용한다.
+
+```bash
+$ git config --global rerere.enabled true
+$ git config --global rerere.autoUpdate true
+```
+
+long-lived feature branch를 자주 rebase할 때 효과가 크다. 첫 주에 30분 걸린 conflict 해결이 이후에는 자동으로 처리된다. 단, 자동 적용 결과는 항상 `git diff`로 검증해야 한다 — rerere는 context 없이 conflict 영역만 hash하므로 다른 파일의 같은 모양 conflict에 같은 해결을 적용한다.
+
+**custom merge driver**는 파일 형식별로 도메인 특화 자동 통합을 제공한다.
+
+```
+# .gitattributes (commit됨)
+package-lock.json merge=npmLock
+CHANGELOG.md      merge=union
+*.bin             merge=binary
+```
+
+```ini
+# .git/config (개인, setup script로 배포)
+[merge "npmLock"]
+    driver = npm-lock-merge %O %A %B
+```
+
+`%O`는 base, `%A`는 ours(결과도 여기에 쓴다), `%B`는 theirs다. driver가 exit 0을 반환하면 자동 통합 성공, non-0이면 일반 conflict로 표시된다. `CHANGELOG.md`에 `union` driver를 쓰면 양쪽 항목이 모두 포함되고, `package-lock.json`은 재생성 스크립트로 충돌을 통째로 우회할 수 있다.
+
+<Aside label="설계 철학">
+3-way merge, LCA, ort, rerere, custom driver — 이 모든 것은 하나의 문제를 풀고 있다: "자동화할 수 있는 것을 사람에게 미루지 마라." Git은 변경의 의미를 모른다. 하지만 어느 쪽이 변경했는지는 정확히 안다. 그 경계를 명확히 긋는 것이 3-way merge의 핵심이다.
+</Aside>
+
+## 정리
+
+- 3-way merge는 base(LCA)를 기준으로 어느 쪽이 변경했는지를 판단한다. 한쪽만 변경했으면 자동 통합, 양쪽이 다르게 변경했을 때만 conflict다.
+- LCA가 여러 개인 criss-cross 상황에서 `recursive`/`ort` strategy는 가상 base를 재귀적으로 생성해 단일 base로 환원한다.
+- `ort`는 in-memory 처리로 거대 모노레포에서 최대 100x 빠르다. Git 2.34부터 기본이다.
+- rerere는 conflict 해결을 기록해 반복을 자동화한다. custom merge driver는 파일 형식별 도메인 지식으로 conflict 자체를 줄인다.
+
+다음 글에서는 rebase가 왜 새 SHA를 만드는지, 그리고 interactive rebase의 각 명령이 내부적으로 어떤 객체 조작을 수행하는지 추적한다.

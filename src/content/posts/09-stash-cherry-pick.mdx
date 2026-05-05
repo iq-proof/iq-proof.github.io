@@ -1,0 +1,143 @@
+---
+title: "git stash는 어떻게 두 영역을 동시에 보존하는가"
+description: "임시 저장처럼 보이는 stash가 사실 multi-parent commit이라는 것부터, refs/stash 스택 구조, cherry-pick과 rebase의 본질적 동등성까지 Git 내부를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, stash, cherry-pick, rebase, internals]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git stash`는 변경을 "어딘가 임시 저장"하는 명령처럼 보인다. `git cherry-pick`은 commit을 "복사"하는 것처럼 보인다. 둘 다 직관적인 설명이지만, 실제 내부 구조는 전혀 다른 이야기를 한다. Git은 이 두 작업을 어떻게 구현했을까?
+
+## Stash는 commit이다
+
+`git stash`를 실행하면 Git은 두 개(혹은 세 개)의 commit 객체를 생성한다.
+
+```
+W (working commit, stash@{0})
+├── parent_1: HEAD          stash 시점의 HEAD
+├── parent_2: I (index)     stash 시점의 staged 상태
+└── parent_3: U (untracked) --include-untracked 사용 시
+```
+
+`I`는 현재 index(staging area)의 tree로 만든 commit이고, `W`는 working tree 전체 상태로 만든 commit이다. `W`의 parent가 여럿이기 때문에 stash는 **multi-parent commit**, 즉 구조적으로는 merge commit이다.
+
+```bash
+$ git cat-file -p stash@{0}
+tree <W-tree>
+parent <HEAD>
+parent <I-commit>
+author ...
+committer ...
+
+WIP on main: <subject>
+```
+
+working과 index라는 두 영역을 동시에 보존할 수 있는 이유가 여기에 있다. 단일 commit으로는 두 상태를 표현할 수 없으므로, Git은 parent를 하나 더 추가해 index 상태를 별도 commit으로 달아둔다. `stash apply`는 `W`의 tree와 `W^1`(HEAD 시점)의 diff를 현재 HEAD에 적용하고, `--index` 옵션이 있으면 `W^2`(I commit)의 diff를 index에 추가로 적용한다.
+
+## refs/stash와 스택의 정체
+
+"stash 스택"처럼 보이는 구조는 실제로는 **단일 ref + reflog**다.
+
+```
+.git/refs/stash       → 가장 최근 stash의 W commit SHA 하나만 저장
+.git/logs/refs/stash  → 모든 stash 이력 (reflog)
+```
+
+`stash@{0}`은 `refs/stash`가 가리키는 W commit이고, `stash@{1}`은 reflog의 직전 항목이다. 새 stash를 만들면 `refs/stash`가 새 W로 갱신되고 이전 W가 reflog에 기록된다. LIFO처럼 동작하는 것은 이 reflog 덕분이다.
+
+`git stash drop stash@{0}`은 reflog에서 해당 항목을 제거하고 `refs/stash`를 그 다음 항목으로 갱신할 뿐, **W commit 객체 자체는 즉시 사라지지 않는다**. reflog 만료 정책(기본 30일) 이후 GC가 수거한다. 그래서 drop 직후에도 SHA를 알면 복구할 수 있다.
+
+```bash
+# drop 후 복구
+$ git fsck --unreachable | grep commit
+unreachable commit abc1234
+
+$ git stash apply abc1234
+# 또는
+$ git update-ref refs/stash abc1234
+```
+
+<Callout type="warning" title="stash도 reflog 만료 대상">
+`git stash drop`은 영구 삭제가 아니다. 그러나 30일이 지나거나 `git gc --prune=now`를 실행하면 객체가 사라진다. 오래 보존해야 할 stash는 `git stash branch <name>`으로 브랜치화하는 것이 안전하다.
+</Callout>
+
+## Stash apply 시 충돌이 생기는 이유
+
+`stash apply`는 단순한 파일 덮어쓰기가 아니라 **3-way merge**다.
+
+```
+base  = W^1 (stash 시점의 HEAD)
+ours  = 현재 HEAD
+theirs = W (stash의 working tree)
+```
+
+stash를 만든 뒤 현재 HEAD가 진행했다면, `ours`와 `theirs`가 같은 영역을 다르게 변경했을 수 있다. 그럴 때 충돌이 발생한다. 중요한 것은 **`pop`이더라도 충돌 시 자동 drop하지 않는다**는 점이다. 사용자가 충돌을 해결하고 만족한 뒤에 명시적으로 `git stash drop`을 호출해야 한다.
+
+다른 브랜치에 stash를 apply할 때 충돌이 잦은 이유도 같다. base(`W^1`)가 현재 HEAD와 다른 브랜치에 있기 때문이다. 이럴 때는 `git stash branch <name> stash@{0}`을 사용하면 stash의 base 커밋에서 새 브랜치를 만들고 apply하므로 충돌 없이 깨끗하게 복원된다.
+
+## Cherry-pick은 rebase의 단위 작업이다
+
+`git cherry-pick <commit>`의 알고리즘을 보면 stash apply와 구조가 같다.
+
+```python
+forward = diff(commit.parent.tree, commit.tree)
+
+new_tree = three_way_merge(
+    base=commit.parent.tree,
+    ours=current_HEAD.tree,
+    theirs=commit.tree
+)
+
+new_commit = create_commit(
+    tree=new_tree,
+    parents=[current_HEAD],
+    author=commit.author,    # 원본 저자 보존
+    committer=current_user,  # committer는 갱신
+    message=commit.message
+)
+```
+
+cherry-pick은 commit을 복사하는 것이 아니라 **commit이 도입한 변경(diff)을 현재 HEAD에 3-way merge로 적용**한다. 따라서 결과 commit의 SHA는 원본과 다르다. 같은 변경이지만 parent가 다르기 때문이다.
+
+`git rebase main feature`는 내부적으로 feature의 각 commit을 main 위에 순서대로 cherry-pick하는 것과 동일하다.
+
+```
+rebase feature onto main
+  = cherry-pick F1 onto main → F1'
+  + cherry-pick F2 onto F1' → F2'
+  + cherry-pick F3 onto F2' → F3'
+  + feature ref = F3'
+```
+
+둘의 차이는 알고리즘이 아니라 **운영 방식**이다. abort 범위가 다르다 — `rebase --abort`는 전체를 취소해 ORIG_HEAD로 돌아가지만, `cherry-pick --abort`는 현재 패치 하나만 취소하고 이미 적용된 commit들은 그대로 둔다. reflog 메시지도 다르다(`rebase:` vs `cherry-pick:`). merge commit 처리도 다르다 — rebase는 기본적으로 평면화하고, cherry-pick은 `-m N`으로 부모를 명시해야 한다.
+
+<Aside label="선택 기준">
+단일 commit을 다른 브랜치에 적용할 때는 cherry-pick이 직관적이다. 여러 commit을 다른 base 위로 옮길 때는 rebase가 자동화해준다. hot-fix를 여러 release 브랜치에 backport할 때는 cherry-pick을 브랜치 루프로 돌리는 패턴이 단순하다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**Stash의 multi-parent 설계** — working과 index를 동시에 보존하고 표준 commit 형식을 유지하는 장점이 있다. 단점은 stash가 누적될수록 정리가 필요하고, 거대한 working tree에서 stash 생성 비용이 커진다는 것이다.
+
+**Cherry-pick vs Rebase** — cherry-pick은 단일 commit 적용에 명확하고 부분 abort가 가능하다. rebase는 여러 commit을 자동화하고 interactive 편집(`-i`)과 `--onto`를 지원한다. 같은 변경이 두 브랜치에 다른 SHA로 들어가는 것은 둘 다 동일하며, 이후 merge 시 같은 변경이 중복 인식되어 충돌을 일으킬 수 있다.
+</Callout>
+
+## 정리
+
+- `git stash`는 임시 저장이 아니라 multi-parent commit 객체다. working과 index 두 영역을 각각 commit으로 만들어 parent 슬롯에 달아둔다.
+- stash "스택"은 단일 ref(`refs/stash`)와 reflog의 조합이다. `drop`은 reflog 항목을 지울 뿐, 객체는 reflog 만료까지 살아있다.
+- `stash apply`와 `cherry-pick`은 둘 다 3-way merge 기반이다. base를 알기 때문에 단순 patch보다 정확하고, 그래서 충돌도 발생한다.
+- `rebase`는 여러 cherry-pick의 자동화다. 같은 알고리즘이 abort 범위, reflog 메시지, merge 처리 방식에서 다르게 드러날 뿐이다.
+
+다음 글에서는 cherry-pick과 rebase가 공유하는 3-way merge 알고리즘의 내부 — `ort` 전략이 어떻게 base를 찾고 충돌 마커를 생성하는지 — 를 추적한다.

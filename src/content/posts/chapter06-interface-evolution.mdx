@@ -1,0 +1,120 @@
+---
+title: "Java 인터페이스는 왜 이렇게 진화했는가"
+description: "Default Method의 바이트코드 원리부터 Sealed Interface의 ADT 표현까지, Java 인터페이스 설계 철학의 변곡점들을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, interface, default-method, sealed-interface, pattern-matching]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 인터페이스는 처음엔 순수한 "계약"이었다. 구현은 없고, 서명만 있었다. Java 8부터 default method가 들어오고, Java 9에서 private method가, Java 17에서 sealed interface가 추가되면서 인터페이스는 전혀 다른 것이 됐다. 이 변화들은 각각 독립적인 기능 추가처럼 보이지만, 하나의 공통 긴장감에서 비롯됐다 — **"라이브러리는 어떻게 진화하면서도 기존 코드를 깨지 않는가?"**
+
+## 문제의 시작: 인터페이스는 깨지기 쉬웠다
+
+Java 8 이전의 인터페이스에 새 메서드를 추가하는 것은 사실상 불가능했다. `Collection` 인터페이스에 `stream()`을 추가하는 순간, `ArrayList`, `TreeSet`, `LinkedList`를 비롯한 수백 개의 구현체가 전부 컴파일 에러를 낸다. 라이브러리 설계자가 실수를 인정하거나 기능을 추가하려 해도 방법이 없었다. 이것이 "부서지기 쉬운 라이브러리 문제(fragile base class problem)"다.
+
+Default method는 이 문제를 정면으로 해결한다. 인터페이스가 구현을 직접 제공하므로, 기존 구현체는 아무것도 수정하지 않아도 새 메서드를 자동으로 상속받는다.
+
+## invokeinterface와 메서드 탐색 순서
+
+Default method가 호출될 때 JVM은 `invokeinterface` 명령어를 사용한다. 이 명령어는 수신자의 실제 타입을 런타임에 확인해 올바른 메서드를 찾는다. 핵심은 탐색 순서다.
+
+```
+1단계: 객체의 실제 클래스에 메서드가 있는가?
+2단계: 구현한 인터페이스들을 선언 순서로 탐색
+3단계: 인터페이스 상속 체계를 따라 상위로 탐색
+```
+
+클래스 메서드가 항상 인터페이스 default method보다 우선한다. `ArrayList`가 `Collection.stream()`의 default 구현을 오버라이드해도 되고, 그냥 두어도 된다. 오버라이드하면 최적화된 구현이 쓰이고, 그렇지 않으면 인터페이스의 default가 동작한다.
+
+`Interface.super.method()` 문법은 이 맥락에서 등장한다. 다이아몬드 상속에서 어느 인터페이스의 default를 호출할지 명시해야 할 때, JVM은 `invokespecial`을 사용한다 — 런타임 탐색 없이 컴파일 시점에 특정 인터페이스의 메서드로 고정하는 정적 바인딩이다.
+
+<Callout type="warning" title="다이아몬드 충돌">
+무관한 두 인터페이스가 같은 default method를 제공하면 컴파일 에러가 발생한다. Java는 이를 런타임이 아닌 컴파일 시점에 강제로 해결하도록 설계했다 — "fail-fast" 원칙이다. 해결은 `I1.super.method()` 또는 `I2.super.method()`로 명시적으로 선택하는 것뿐이다.
+</Callout>
+
+## 캡슐화의 확장: private 메서드와 static 팩토리
+
+Default method가 여러 개 생기면 새로운 문제가 나타난다. 공통 로직을 어디에 두는가? Java 8에서는 방법이 없었다. `public helper class`를 만들거나, 같은 코드를 여러 default method에 중복 작성하는 수밖에 없었다.
+
+Java 9의 `private` 인터페이스 메서드는 이 틈을 채운다. 여러 default method가 공유하는 검증 로직이나 반복 패턴을 `private void helper()`로 추출하면, 인터페이스 계약(공개 API)에는 영향 없이 구현 상세를 내부화할 수 있다. `private static`은 인스턴스 상태가 필요 없는 순수 유틸리티 함수에 쓴다.
+
+```java
+interface Processor {
+    default void validateAndProcess(Data d) {
+        validateInput(d);   // private 메서드 호출
+        process(d);
+    }
+
+    default void processMultiple(List<Data> list) {
+        for (Data d : list) {
+            validateInput(d);   // 같은 로직, 한 곳에서 관리
+            process(d);
+        }
+    }
+
+    private void validateInput(Data d) {
+        if (d == null) throw new NullPointerException();
+    }
+
+    void process(Data d);
+}
+```
+
+같은 시기에 static 팩토리 메서드의 위치도 바뀌었다. Java 8 이전에는 `Collections.unmodifiableList()`, `Collections.emptyList()`처럼 별도 유틸리티 클래스에 있었다. Java 8+부터 `List.of()`, `Map.entry()`처럼 인터페이스 자체에 static method를 정의할 수 있다. 관련 메서드가 한곳에 모이므로 API 발견성이 개선되고, IDE 자동완성도 직관적이 된다.
+
+static method는 상속되지 않는다. `Animal.sleep()`을 정의해도 `Dog.sleep()`으로 호출할 수 없다. `invokestatic`은 정적 바인딩이므로 다형성이 없고, 따라서 상속 자체가 의미 없다. 이것은 제약이 아니라 설계다 — static method는 인터페이스 계약의 일부가 아니라 유틸리티다.
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+Default method는 라이브러리 진화 문제를 해결하지만 메서드 탐색 규칙을 복잡하게 만든다. Private method는 캡슐화를 강화하지만 Java 9 이상을 요구한다. Static factory는 API 응집도를 높이지만 생성자 관례를 깨고 상속되지 않는다. 각 기능은 "무엇을 얻고 무엇을 포기하는가"의 명확한 교환이다.
+</Callout>
+
+## Sealed Interface: 폐쇄성을 통한 안전성
+
+Java 17의 sealed interface는 방향이 다르다. 앞선 기능들이 "인터페이스가 더 많은 것을 표현하게"하는 방향이었다면, sealed는 "인터페이스가 무엇을 허용하지 않을지 명시"하는 방향이다.
+
+```java
+sealed interface Payment permits Card, Transfer {}
+
+record Card(String number) implements Payment {}
+record Transfer(String account) implements Payment {}
+```
+
+이 선언이 갖는 힘은 switch에서 드러난다.
+
+```java
+String process(Payment p) {
+    return switch (p) {
+        case Card c -> "Card: " + c.number();
+        case Transfer t -> "Transfer: " + t.account();
+        // default 필요 없음 — 컴파일러가 모든 경우를 안다
+    };
+}
+```
+
+컴파일러는 `Payment`의 모든 구현체가 `Card`와 `Transfer`뿐임을 알기 때문에, switch가 모든 경우를 처리했는지 검증할 수 있다. 6개월 뒤 `PayPal`을 추가하면 이 switch는 컴파일 에러가 된다 — 처리를 강제하는 안전망이다.
+
+`record`와 조합하면 함수형 언어의 Algebraic Data Type(ADT)이 Java에서 구현된다. 불변성(record)과 폐쇄성(sealed)이 만나, 컴파일러가 모든 경우를 완전하게 검증하는 타입 시스템이 완성된다.
+
+<Aside label="설계 철학">
+Sealed interface는 "확장하려는 사람을 막는" 것이 아니라 "이 타입 계층이 완결됐음을 선언"하는 것이다. 플러그인 API처럼 외부 확장이 필요하면 non-sealed를 쓰면 된다. 도메인 모델처럼 안정성이 중요하면 sealed가 정확한 선택이다.
+</Aside>
+
+## 정리
+
+- Default method는 `invokeinterface` 동적 탐색으로 동작하고, 클래스 메서드가 항상 우선한다. `Interface.super.method()`는 `invokespecial`로 컴파일되어 다이아몬드 충돌을 컴파일 시점에 해결한다.
+- Private 인터페이스 메서드(Java 9+)는 default method 간 공통 로직을 캡슐화하고, static 팩토리 메서드는 관련 API를 인터페이스에 응집시킨다.
+- Sealed interface(Java 17+)는 구현체를 명시적으로 제한하고, record와 조합해 exhaustive pattern matching을 가능하게 한다.
+
+Java 인터페이스의 진화는 기능 추가가 아니라 **"변경하지 않고 진화하는 방법"과 "열지 않고 안전하게 닫는 방법"** 사이의 긴장을 해소하는 과정이었다.

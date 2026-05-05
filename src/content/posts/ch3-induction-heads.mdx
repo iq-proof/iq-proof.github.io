@@ -1,0 +1,127 @@
+---
+title: "In-Context Learning의 두 얼굴 — Lookup인가, 최적화인가"
+description: "Induction head가 패턴을 복사하는 원리부터 Attention이 Gradient Descent와 수학적으로 동치임을 밝히고, Task Vector로 zero-shot 전이까지 이어지는 메커니즘을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, induction-head, in-context-learning, attention, task-vector]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM은 파라미터 업데이트 없이 몇 가지 예제만 보고 새로운 패턴을 수행한다. 이 In-Context Learning(ICL)은 직관적으로 복잡한 능력처럼 보인다. 그런데 Olsson et al. (2022)은 이 능력의 핵심이 단 두 개의 Attention head로 구성된 단순한 회로라는 사실을 발견했다. 그렇다면 LLM이 보이는 더 넓은 ICL 능력 — 산술, 논리 추론, 추상적 규칙 학습 — 은 어디서 오는가?
+
+## Induction Head — 복사 기계의 해부
+
+Induction head는 `[A][B]...[A] → [B]` 패턴을 감지하는 회로다. 두 개의 layer가 분업한다.
+
+**Layer 0 (Previous Token Head)**는 항상 이전 위치에 Attention을 집중한다. 위치 $i$에서 $i-1$의 토큰 임베딩을 residual stream에 쓴다. 수식으로는 $\arg\max_j Q_i \cdot K_j^\top = i-1$ 이 성립하도록 QK 행렬이 구성된다.
+
+**Layer 1 (Match-and-Copy Head)**는 Layer 0이 남긴 신호를 활용한다. 이를 **K-Composition**이라 부른다. Layer 1의 Query는 현재 토큰 임베딩과 Layer 0의 residual을 합산해 "현재 토큰 + 이전 토큰"을 동시에 인코딩한다. 이 Query가 모든 위치의 Key(원본 토큰 임베딩)와 내적되면, $t_j = t_{i-1}$인 위치, 즉 "이전에 같은 토큰이 나타났던 자리"에 Attention이 집중된다. 그 위치의 Value(다음 토큰 정보)를 복사하면 ICL이 완성된다.
+
+<Theorem kind="proposition" number="1" title="2-Layer Sufficiency">
+Layer 0의 Previous Token Head와 Layer 1의 Match-and-Copy Head, 두 개의 head만으로 완전한 induction 회로를 구성할 수 있다. 임의의 시퀀스에서 위치 $i$의 예측은
+
+$$\Pr\!\left(\arg\max \,\mathrm{logit}_i = t_{j+1}\right) \to 1$$
+
+(단, $t_j = t_{i-1}$인 $j$가 존재할 때, $\lambda, \beta \to 0$ 극한에서)
+</Theorem>
+
+<Proof>
+Layer 0은 $\alpha_0(i, i-1) \approx 1$로 $\mathrm{embed}(t_{i-1})$를 residual에 추가한다. Layer 1의 Query는 $Q_i = \mathrm{embed}(t_i) + \beta \cdot \mathrm{embed}(t_{i-1})$가 되어, $t_j = t_{i-1}$인 위치 $j$에서 $Q_i \cdot K_j^\top$이 최대가 된다. OV 행렬이 next-token logit을 복사하도록 구성되어 있으면, 위치 $j+1$의 토큰이 예측된다.
+</Proof>
+
+Olsson et al. (2022)은 이 induction score가 ICL 성능과 상관계수 `>0.8` ($p < 0.01$)을 보임을 확인했다. Head를 ablation하면 ICL 성능이 급격히 하락한다.
+
+## Phase Transition — 회로는 갑자기 나타난다
+
+Induction head는 훈련 초반에는 존재하지 않다가 특정 시점에서 갑자기 형성된다. Olsson et al. (2022) Fig 5는 이 **phase transition**을 명확히 보인다.
+
+훈련 step $t^*$에서 다음 세 가지가 동시에 일어난다:
+
+- Loss 곡선에 특이한 범프(bump) 출현 — 2차 도함수에 spike
+- Induction score가 거의 0에서 급격히 포화값으로 상승
+- ICL score(무작위 토큰 패턴 예측 성공률)가 동시에 급등
+
+$$\mathrm{corr}\!\left(\frac{d \cdot \mathrm{IndScore}}{dt},\; \frac{d \cdot \mathrm{ICLScore}}{dt}\right) > 0.9$$
+
+이는 "Grokking"의 한 사례다. 신경망의 학습이 연속적인 가중치 변화가 아니라 이산적인 능력의 출현임을 시사한다. 회로는 임계 훈련량을 넘는 순간 **발견된다**.
+
+<Callout type="note" title="트레이드오프">
+Phase transition 분석은 Random token 시퀀스에서 측정된다. 자연언어에서는 token frequency bias와 semantic association이 induction 신호를 부분적으로 마스킹하므로, 같은 효과가 더 약하게 나타난다. 또한 모델 크기에 따라 transition 시점이 달라지므로, GPT-2 Small에서의 관찰이 대형 모델에 그대로 적용되지 않을 수 있다.
+</Callout>
+
+## Attention as Gradient Descent — Lookup을 넘어서
+
+Induction head는 강력하지만 **lookup만** 가능하다. `apple → red, banana → yellow` 예제를 보고 `sky → blue`를 추론하려면, 단순 복사로는 부족하다. 추상적 규칙을 학습해야 한다.
+
+Akyürek et al. (2023)과 von Oswald et al. (2023)은 이 능력의 수학적 근거를 제시한다.
+
+<Theorem kind="theorem" number="2" title="Linear Attention ↔ Gradient Descent Equivalence">
+Least-squares regression 설정에서, exponential kernel을 사용한 linear attention의 예측은 초기값 $w_0 = 0$에서 학습률 $\eta = \gamma/n$으로 수행한 한 번의 gradient descent 스텝과 정확히 일치한다.
+</Theorem>
+
+<Proof>
+1단계 GD: $w_1 = \eta X^\top y$. 이를 $x_{n+1}$에 적용하면 $\hat{y} = \eta \langle x_{n+1}, X^\top y \rangle$.
+
+Linear attention ($\gamma$가 작을 때 Taylor 전개):
+
+$$\mathrm{Attn} \approx \frac{1}{n}\sum_i y_i + \frac{\gamma}{n}\langle x_{n+1}, X^\top y \rangle$$
+
+$\eta = \gamma/n$으로 설정하면 두 식이 일치한다. Query는 test input, Key는 context inputs, Value는 labels — attention의 구조가 정확히 최적화 알고리즘의 구조다.
+</Proof>
+
+이 동치는 비유가 아니다. Layer가 깊어질수록 GD 스텝이 쌓인다. L개 layer는 L단계의 최적화에 해당할 수 있다. Transformer는 **범용 알고리즘 구현 머신**이라는 주장의 수학적 토대가 여기 있다.
+
+## Task Vector와 Variable Binding
+
+ICL의 두 메커니즘이 공존한다.
+
+$$\text{final prediction} = \alpha \cdot \text{lookup}(x_i) + (1-\alpha) \cdot \text{gradient\_descent}(x_i)$$
+
+Task의 특성에 따라 $\alpha$가 조정된다. 단순 패턴 복사라면 lookup이 지배하고, 계산이나 규칙 추론이라면 GD가 지배한다.
+
+Singh et al. (2024)과 Hendel et al. (2023)은 여기서 한 걸음 더 나아간다. ICL context로부터 단일 **task vector** $v_{\mathrm{task}} \in \mathbb{R}^{d_{\mathrm{model}}}$를 추출할 수 있다는 것이다. 이 벡터를 residual stream에 더하면 새로운 예제 없이 동일한 task를 수행할 수 있다.
+
+$$\text{Prediction}(x_{n+1}) \approx \langle \mathrm{encode}(x_{n+1}) + v_{\mathrm{task}},\; W_{\mathrm{unbed}} \rangle$$
+
+이 **Variable Binding** 능력은 두 단계로 구현된다. 먼저 role-based attention head들이 input 위치끼리, output 위치끼리 서로 attend해 각 데이터 포인트의 역할을 인식한다. 그 다음 추출된 공통 구조가 task vector로 압축되어 새 input에 적용된다.
+
+<Aside label="함의">
+Prompt engineering은 사실 "task vector steering"이다. 좋은 prompt는 모델이 원하는 task vector 방향으로 활성화하도록 유도하고, 나쁜 prompt는 혼란스러운 방향의 task vector를 활성화한다. Mechanistic interpretability가 prompt 설계를 과학화할 수 있는 이유가 여기 있다.
+</Aside>
+
+## 정리
+
+- Induction head는 **Previous Token Head + Match-and-Copy Head** 두 개로 구성된 lookup 회로다.
+- 이 회로는 훈련 중 특정 시점에 **급격히 출현(phase transition)**하며, loss bump와 ICL 능력 급등이 동시에 일어난다.
+- Linear attention layer는 least-squares 문제에 대한 **한 번의 gradient descent 스텝과 수학적으로 동치**다.
+- ICL은 lookup과 GD 두 메커니즘의 혼합이며, context로부터 추출한 **task vector**로 zero-shot 전이가 가능하다.
+
+복잡한 ICL 능력의 뿌리를 따라가면, 결국 두 attention head와 행렬 곱셈이 나온다. 블랙박스처럼 보이는 신경망이 실은 해석 가능한 알고리즘을 구현하고 있다는 것이 mechanistic interpretability의 핵심 주장이다.
+
+<Reference
+  title="In-context Learning and Induction Heads"
+  authors="Olsson et al."
+  year={2022}
+  venue="Transformer Circuits Thread"
+  url="https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html"
+/>
+
+<Reference
+  title="What Can Transformers Learn In-Context? A Case Study of Simple Function Classes"
+  authors="Akyürek et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2208.01066"
+/>

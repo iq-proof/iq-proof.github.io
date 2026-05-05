@@ -1,0 +1,119 @@
+---
+title: "Git Branch는 왜 이렇게 가벼운가"
+description: "41바이트 텍스트 파일이 branch의 전부인 이유부터 switch의 3단계 갱신, tracking 설정, 명명 충돌까지 — Git branch 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, branch, ref, internals, version-control]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git에서 branch를 만드는 데 걸리는 시간은 수 밀리초다. SVN이나 Perforce에서 branch가 무거운 작업인 것과 대조적이다. 왜 이렇게 가벼운가? 그리고 이 가벼움이 어떤 제약을 함께 만들어내는가?
+
+## Branch의 본질 — 41바이트 파일
+
+Git에서 branch는 정확히 `.git/refs/heads/<name>` 위치에 있는 텍스트 파일 하나다. 내용은 40자 hex SHA와 줄바꿈 1자, 합계 41바이트가 전부다.
+
+```bash
+$ cat .git/refs/heads/main
+abc1234567890abcdef1234567890abcdef123456
+
+$ wc -c .git/refs/heads/main
+41
+```
+
+branch를 만드는 것은 이 파일을 생성하는 것이고, 삭제는 파일을 지우는 것이다. `git branch feature`는 내부적으로 `git update-ref refs/heads/feature HEAD`와 동등하다. branch에는 작성자도, 생성 시간도, 설명도 없다. 생성 기록은 reflog에, 설명은 `.git/config`의 `branch.<name>.description`에 따로 존재한다.
+
+이 단순함이 "branching is cheap"이라는 말의 근거다. 1,000개 branch를 만들어도 `.git/refs/heads`의 용량은 약 50KB에 불과하다. `git pack-refs --all`을 실행하면 loose ref 파일들이 `.git/packed-refs` 단일 파일로 압축되어 inode 부담도 사라진다.
+
+## `git switch`가 하는 세 가지 일
+
+branch가 파일 하나라면, branch 이동은 그 파일을 바꾸는 것처럼 들린다. 실제로는 세 영역을 동시에 갱신한다.
+
+```
+git switch feature 단계:
+
+  1. .git/HEAD → "ref: refs/heads/feature"
+  2. .git/index → feature가 가리키는 commit의 tree
+  3. Working directory → target tree에 맞게 파일 갱신
+```
+
+핵심은 3단계가 **변경된 파일만** 건드린다는 점이다. main과 feature가 공유하는 파일은 다시 쓰지 않는다. 그래서 같은 commit을 가리키는 branch 간 이동은 거의 즉각적이다.
+
+working directory에 commit되지 않은 변경이 있을 때 Git의 판단은 명확하다.
+
+- target branch에서 그 파일이 동일하다 → 변경을 보존하며 이동
+- target branch에서 그 파일이 다르다 → 이동 거부 ("would be overwritten")
+
+충돌이 없으면 Git은 사용자의 작업을 지우지 않는다. 충돌 가능성이 있을 때만 멈춘다. `git stash` 또는 `git commit` 후 다시 시도하면 된다.
+
+`git switch`는 Git 2.23에서 등장했다. 이전의 `git checkout`은 branch 이동과 파일 복원을 한 명령으로 처리해 모호했다. 이제 branch 이동은 `switch`, 파일 복원은 `restore`로 역할이 분리됐다.
+
+## Tracking — "어디로 push할 것인가"
+
+`.git/config`의 두 줄이 tracking의 전부다.
+
+```ini
+[branch "feature"]
+    remote = origin
+    merge = refs/heads/feature
+```
+
+이 설정이 있으면 `git push`, `git pull`, `git status`가 인자 없이 동작한다. `git push -u origin feature`는 push와 동시에 이 두 줄을 config에 기록한다.
+
+`git status`의 "ahead 2, behind 1" 표시는 이 설정으로 계산된다. 내부적으로 `git rev-list --left-right --count origin/feature...HEAD`와 동등하다. merge-base를 기준으로 로컬에만 있는 commit이 ahead, upstream에만 있는 commit이 behind다. 둘 다 0보다 크면 "diverged"다.
+
+<Callout type="note" title="권장 글로벌 설정">
+```bash
+git config --global push.default simple
+git config --global pull.rebase true
+git config --global pull.ff only
+```
+`push.default simple`은 upstream과 이름이 다르면 push를 거부해 의도치 않은 배포를 막는다. `pull.rebase true`는 fetch 후 merge commit 대신 rebase로 linear history를 유지한다.
+</Callout>
+
+## 명명 충돌 — 파일시스템의 제약
+
+branch 이름이 파일 경로라는 사실은 미묘한 제약을 만든다. `feature/foo`와 `feature/foo/bar`를 동시에 만들 수 없다.
+
+```bash
+$ git branch feature/foo
+$ git branch feature/foo/bar
+fatal: cannot lock ref 'refs/heads/feature/foo/bar':
+  'refs/heads/feature/foo' exists; cannot create 'refs/heads/feature/foo/bar'
+```
+
+`feature/foo`는 파일이고, `feature/foo/bar`는 그 파일을 디렉토리로 사용하려는 시도다. 파일시스템에서 같은 경로가 파일과 디렉토리를 동시에 될 수 없다. `git pack-refs --all`로 packed-refs로 이동해도 Git은 양쪽 모두에서 이 검사를 수행한다.
+
+`git check-ref-format --branch <name>`으로 이름의 유효성을 사전 검증할 수 있다. 이 외에도 공백, `~`, `^`, `:`, `?`, `*`, `[`, `\`, 연속 점(`..`), `.lock` 접미사, `@{` 시퀀스 등이 금지된다.
+
+<Aside label="안전한 명명 컨벤션">
+실무에서는 1-2 레이어를 권장한다 — `feature/oauth-login`, `fix/123-null-ptr`, `release/v2.5.0`. CI가 자동 생성하는 branch는 단일 레이어에 고유 식별자를 붙이는 것이 안전하다(`ci/run-1234567`). 같은 레이어 안에서 파일과 디렉토리가 충돌하지 않도록 prefix를 설계 단계에서 결정해야 한다.
+</Aside>
+
+## 트레이드오프
+
+<Callout type="note" title="트레이드오프">
+**가벼움의 대가**: branch가 파일 하나이기 때문에 생성·삭제는 수 밀리초지만, 수만 개 ref는 inode 부담을 준다(packed-refs로 완화). 파일 경로가 branch 이름이기 때문에 계층 구조 명명이 가능하지만 `feature/a`와 `feature/a/b` 충돌이 생긴다. `git branch -d`의 reachable 검사는 unmerged commit 손실을 막지만, `-D`로 강제 삭제 후 reflog 만료가 지나면 복구 불가다.
+</Callout>
+
+`git branch -d`는 upstream 또는 HEAD에 merge되지 않은 commit이 있으면 거부한다. 이는 실수를 막는 안전장치다. `-D`는 이 검사를 건너뛰고 ref, reflog, config를 모두 삭제한다. 객체 자체는 GC 전까지 살아있어 `git reflog`에서 SHA를 찾아 복구할 수 있다.
+
+`git branch -m old new`(rename)는 ref 갱신뿐 아니라 reflog 파일 이동과 `.git/config`의 `[branch "old"]` 섹션을 `[branch "new"]`로 함께 이동한다. upstream 설정이 보존된다. `-c`(copy)는 ref와 reflog만 복제하고 config는 새 branch에 별도 설정을 요구한다.
+
+## 정리
+
+- Branch는 `.git/refs/heads/<name>` 파일 하나, SHA 40자 + 줄바꿈이 전부다.
+- `git switch`는 HEAD ref → Index → Working 순으로 세 영역을 갱신하며, 변경된 파일만 건드린다.
+- Tracking은 `branch.<name>.remote/merge` 두 줄로, ahead/behind 계산과 인자 없는 push/pull의 기반이다.
+- Branch 이름은 파일 경로이므로 `feature/a`와 `feature/a/b`는 공존 불가 — 명명 컨벤션에서 사전에 결정해야 한다.
+
+이 설계의 근본은 "ref는 SHA를 가리키는 포인터일 뿐"이라는 단순함이다. 그 단순함 위에 tracking, 명명 규칙, reflog 같은 층이 쌓여 협업 워크플로우가 만들어진다.

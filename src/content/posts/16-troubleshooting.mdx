@@ -1,0 +1,132 @@
+---
+title: "Git이 Push를 거부할 때 — 7가지 거부의 구조"
+description: "non-fast-forward부터 permission denied까지, push 거부 메시지별 원인과 안전한 해결 흐름을 추적한다. force push의 함정과 history rewrite 후 협업 프로토콜까지."
+pubDate: 2026-05-05
+category: dev
+tags: [git, push, force-push, history-rewrite, rebase]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git은 push를 거부할 때 거짓말을 하지 않는다. 메시지 안에 정확한 원인이 있다. 그런데 개발자 대부분은 그 메시지를 읽기 전에 `--force`를 먼저 떠올린다. 왜 git은 push를 막는가? 그리고 force가 답이 아닐 때는 무엇이 답인가?
+
+## 거부 메시지는 진단서다
+
+push가 거부될 때 git이 내려 보내는 메시지는 서버 측 검사 파이프라인의 결과물이다. 인증 → 저장소 확인 → 파일 크기 → 태그 충돌 → fast-forward 검사 → pre-receive hook → protected branch 순서로 검사가 진행된다. 거부 메시지의 `(...)` 부분이 어느 단계에서 막혔는지 알려준다.
+
+```
+Permission denied (publickey)          → 인증 실패
+Repository not found                   → URL / 권한
+rejected (non-fast-forward)            → 원격이 진행함
+rejected (already exists)              → 태그 충돌
+remote rejected (pre-receive hook)     → 서버 정책
+remote rejected (protected branch)     → PR 흐름 필요
+GH001: Large files detected            → 100MB 초과
+```
+
+각 거부는 원인이 다르고 해결도 다르다. "거부됐으니 force"는 잘못된 지름길이다.
+
+## Non-fast-forward — 가장 흔한 거부
+
+원격 브랜치가 내가 마지막으로 fetch한 시점 이후에 새 커밋을 받았다. 내 로컬 브랜치는 그 진행을 모르는 채 push를 시도한다. 서버는 이 push가 원격의 커밋을 덮어쓸 것이기 때문에 막는다.
+
+```bash
+# 거부 메시지
+! [rejected] main -> main (non-fast-forward)
+
+# 올바른 흐름
+git fetch origin
+git rebase origin/main   # 또는 git merge origin/main
+git push origin main
+```
+
+`--force`로 밀어넣으면 원격에서 push한 다른 사람의 커밋이 소리 없이 사라진다. fetch + integrate가 언제나 정답이다. 어쩔 수 없이 force가 필요하다면 `--force-with-lease`를 써야 한다 — 내가 마지막으로 fetch한 이후 다른 push가 없었을 때만 force를 허용한다.
+
+<Callout type="warning" title="--force vs --force-with-lease">
+`--force`는 검사 없이 덮어쓴다. `--force-with-lease`는 내 origin 추적 브랜치와 원격이 일치할 때만 force를 허용한다. Git 2.30+ 의 `--force-if-includes`는 reflog까지 확인해 더 안전하다.
+</Callout>
+
+## 서버 정책 거부 — pre-receive hook과 protected branch
+
+pre-receive hook은 서버가 push를 받은 직후 실행하는 스크립트다. 커밋 메시지 컨벤션, 코드 스타일, 테스트 통과 여부 등을 강제할 수 있다. 거부 메시지의 `remote:` 프리픽스로 시작하는 줄들이 hook이 출력한 진단 정보다. 메시지를 읽고 그 조건을 충족시키는 것이 유일한 해결책이다.
+
+Protected branch는 GitHub 같은 호스팅 서비스가 추가한 두 번째 방어선이다. `main`에 직접 push하는 대신 feature 브랜치를 만들고 PR을 통해 통합해야 한다.
+
+```bash
+# protected branch 거부
+remote: error: GH006: Protected branch update failed for refs/heads/main.
+remote: error: Required pull request reviews not satisfied.
+
+# 올바른 흐름
+git switch -c feature/my-change
+git push -u origin feature/my-change
+# GitHub에서 PR 생성
+```
+
+## 손상과 대용량 — git fsck와 LFS
+
+`.git` 디렉토리 손상은 드물지만 발생한다. 디스크 오류, 강제 종료, 파일시스템 오류가 주요 원인이다. `git fsck --full`이 진단 도구다. 결과는 세 가지다 — missing(참조되지만 없음), broken(SHA 불일치), dangling(reachable하지 않지만 정상). missing과 broken은 다른 clone에서 객체를 복사해 복구한다.
+
+```bash
+git fsck --full
+# missing 객체 식별
+
+git remote add backup /path/to/mirror
+git fetch backup
+# missing 객체 자동 채움
+```
+
+100MB 이상 파일 push는 GitHub이 거부한다. 이미 커밋했다면 `git filter-repo`로 history에서 제거해야 한다.
+
+```bash
+git filter-repo --path huge.bin --invert-paths
+git push --force-with-lease origin main
+```
+
+<Callout type="note" title="시크릿 누출 시 우선순위">
+API 키나 비밀번호가 커밋에 포함됐다면 `git filter-repo`로 history를 정리하는 것보다 **즉시 키를 회전(rotate)시키는 것**이 우선이다. GitHub은 force push 후에도 30~90일간 구 커밋 URL을 보존한다. 누출된 키는 이미 외부에 노출됐다고 가정하고 행동해야 한다.
+</Callout>
+
+## History Rewrite 후 협업 — force push의 진짜 비용
+
+History rewrite는 협업자에게 큰 영향을 미친다. force push 후 협업자가 일반 `git pull`을 실행하면 구 커밋과 새 커밋이 merge되어 제거하려던 파일이 history에 다시 들어올 수 있다. 그래서 프로토콜이 필요하다.
+
+```
+T-24h: 사전 공지 (이유, 예정 시각, 영향 브랜치, 협업자 절차)
+T-0:   backup → filter-repo → --force-with-lease push
+T+10m: 완료 공지 + 동기화 스크립트 제공
+```
+
+협업자 동기화에는 두 가지 경로가 있다. 진행 중인 작업이 없으면 reclone이 가장 안전하다. 작업이 있으면 `git stash` → `git reset --hard origin/main` → `git stash pop` 순서로 처리한다. 충돌이 생기면 cherry-pick으로 작업을 새 history 위에 다시 올린다.
+
+## Rebase 충돌과 되돌리기 — 지속 가능한 선택
+
+큰 feature 브랜치가 오래 방치되면 rebase 시 커밋마다 충돌이 쌓인다. 해결책은 규모에 따라 달라진다.
+
+**rerere** — `git config --global rerere.enabled true`로 활성화하면 같은 패턴의 충돌을 자동으로 해결한다. 반복 충돌이 많을 때 효과적이다. 단, 의미가 다른 동일 패턴을 잘못 적용할 수 있어 결과를 반드시 검토해야 한다.
+
+**분할 rebase** — 50개 커밋을 10개씩 5번으로 나눠 진행한다. 각 단계가 더 관리하기 쉽고 실패 시 영향 범위가 작다.
+
+잘못 merge된 PR은 `git revert -m 1 <merge-SHA>`로 되돌린다. `-m 1`은 "main 입장에서의 첫 번째 부모를 기준으로 역패치를 만들어라"는 의미다. 이때 함정이 있다: revert 후 같은 브랜치를 다시 merge해도 변경이 들어오지 않는다. git은 그 변경이 history에 이미 있었다가 명시적으로 제거됐다고 판단하기 때문이다. 재적용하려면 revert commit을 다시 revert하거나 새 브랜치에 cherry-pick해야 한다.
+
+<Aside label="Detached HEAD">
+`git checkout <SHA>`, `git bisect`, `git worktree add --detach` 등은 HEAD를 브랜치 심볼릭 참조가 아닌 SHA에 직접 연결한다. 이 상태에서 만든 커밋은 어떤 브랜치도 가리키지 않아 다른 브랜치로 이동하면 reflog에만 남는다. 작업이 있으면 즉시 `git switch -c <name>`으로 브랜치를 만들어야 한다. 이미 이동했다면 `git reflog`에서 SHA를 찾아 `git branch rescue <SHA>`로 살릴 수 있다.
+</Aside>
+
+## 정리
+
+- Push 거부 메시지는 진단서다. `remote:` 프리픽스 이후의 텍스트가 핵심 원인이다.
+- Non-fast-forward의 정답은 fetch + integrate다. `--force`는 마지막 수단이며 그때도 `--force-with-lease`를 써야 한다.
+- 시크릿 누출 시 history 정리보다 키 회전이 먼저다.
+- History rewrite는 팀 전체에 사전 공지와 동기화 스크립트를 함께 제공해야 한다.
+- 큰 PR의 revert 후 재적용은 "revert의 revert" 또는 cherry-pick으로만 가능하다.
+
+git의 거부는 대부분 이유가 있다. 그 이유를 이해하면 우회가 아니라 해결이 가능해진다.

@@ -1,0 +1,136 @@
+---
+title: "RAG는 어떻게 진화했는가 — Vanilla부터 CRAG까지"
+description: "검색과 생성의 단순 연결에서 시작해 adaptive retrieval과 confidence-based routing까지, RAG 아키텍처의 설계 결정들을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [rag, retrieval, transformer, dense-retrieval, adaptive-retrieval]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RAG는 2020년 이후 단일 논문이 아니라 일련의 설계 결정들이 누적된 체계다. Vanilla RAG가 retriever와 generator를 처음으로 end-to-end로 연결했고, 이후 각 기법은 하나의 공통 질문에 답해왔다 — "검색된 문서를 어떻게, 얼마나, 언제 활용할 것인가?" 이 질문에 대한 답이 달라질 때마다 아키텍처도 달라졌다.
+
+## 출발점: marginal likelihood로 묶은 두 모듈
+
+Vanilla RAG(Lewis 2020)의 핵심 공식은 다음과 같다.
+
+$$
+p_{\mathrm{RAG}}(y|x) = \sum_{z \in Z} p(y|z,x;\theta) \cdot p(z|x;\phi)
+$$
+
+retriever $p(z|x)$와 generator $p(y|z,x)$를 marginal likelihood로 묶어 공동 학습한다는 아이디어다. 이전에는 두 모듈이 완전히 분리된 파이프라인이었다. Vanilla RAG는 "retriever가 좋은 passage를 가져오면 generator가 더 나은 답을 만든다"는 순환을 gradient로 연결한 첫 번째 시스템이다.
+
+RAG-Sequence와 RAG-Token의 차이는 이 공식의 product 위치에서 나온다.
+
+$$
+p_{\mathrm{Token}}(y|x) = \prod_{i=1}^{|y|} \sum_{z} p(y_i|y_{<i},z,x) \cdot p(z|x)
+$$
+
+RAG-Token은 각 생성 스텝마다 다른 passage 집합을 참조할 수 있어 더 유연하다. 계산량은 sequence 방식의 $|y|$배지만, 실험적으로 일관되게 우월하다.
+
+<Callout type="note" title="트레이드오프 — Vanilla RAG">
+marginal likelihood 계산은 top-$k$ passage에 대해 $k$번의 forward pass를 요구한다. retriever bottleneck은 피할 수 없다 — retriever의 top-k recall이 90%라면, 완벽한 generator를 써도 최종 정확도의 상한은 90%다.
+</Callout>
+
+## 내부로 끌어들인 retrieval: RETRO와 REALM
+
+Vanilla RAG의 retriever는 generator와 분리된 모듈이다. RETRO(Borgeaud 2022)는 이 경계를 허물었다 — retrieval을 transformer layer 내부로 가져왔다.
+
+RETRO는 입력 시퀀스를 64-token chunk로 분할하고, 각 chunk의 앞 32 token을 query로 삼아 corpus에서 top-2 nearest chunk를 검색한다. 이 retrieved chunk는 각 transformer layer에서 Chunked Cross-Attention(CCA)으로 통합된다.
+
+$$
+h^{(\ell)} = \mathrm{Norm}(h^{(\ell-1)} + \mathrm{CCA}(h^{(\ell-1)}, Z^{(\ell)}))
+$$
+
+표준 self-attention이 같은 시퀀스 내에서 Query/Key/Value를 모두 취한다면, CCA는 Query만 현재 시퀀스에서, Key와 Value는 retrieved chunk에서 취한다. 결과적으로 모든 레이어가 외부 지식을 직접 참조한다.
+
+이 구조의 실용적 함의는 스케일 효율성이다. RETRO-3B는 retrieval 없는 baseline-70B와 유사한 perplexity를 달성한다 — 약 23배 작은 모델이 같은 품질을 낸다는 의미다.
+
+REALM(Guu 2020)은 다른 방향에서 문제를 풀었다. RETRO의 retriever는 frozen이지만, REALM은 retriever 자체를 학습 가능하게 만든다. **Inverse cloze task**로 사전학습한다 — 문서에서 random span을 mask하고, MLM loss의 gradient가 retriever를 통해 흐르도록 설계한다. "어떤 문서를 가져왔을 때 masked token 복구가 쉬워지는가"를 학습 신호로 삼는 utility-driven retrieval이다.
+
+Atlas(Izacard 2023)는 REALM의 아이디어를 현대 스케일로 확장한다. Contriever(unsupervised dense retriever)와 T5-11B를 결합하고, few-shot in-context learning으로 유연성을 더했다.
+
+## generator bottleneck을 푼 FiD
+
+passage 수 $k$가 커질 때 Vanilla RAG의 encoder attention complexity는 $O((q + kL)^2)$로 폭증한다. FiD(Izacard 2021)는 이 문제를 encoder-decoder 비대칭으로 해결했다.
+
+```
+Vanilla RAG:  [P₁ SEP P₂ SEP ... Pₖ] → Encoder (O((kL)²)) → Decoder
+
+FiD:          P₁ → Encoder(Q, P₁) → h₁
+              P₂ → Encoder(Q, P₂) → h₂   (각각 O(L²), parallel)
+              ...
+              H = concat([h₁, h₂, ..., hₖ])  →  Decoder cross-attention
+```
+
+각 passage를 독립적으로 인코딩하고, decoder에서만 전체 passage encoding에 cross-attention한다. $k=10, L=128$일 때 FiD의 encoder FLOPs는 Vanilla의 약 7분의 1이다. 더 중요한 점은 decoder의 cross-attention이 passage 순서에 민감하지 않다는 것 — retrieval ranking의 노이즈에 더 robust하다.
+
+$$
+H = \mathrm{concat}([h_1, h_2, \ldots, h_k]), \quad p(y|q) = \prod_t p(y_t | y_{<t}, H)
+$$
+
+## 필요할 때만 검색하는 Self-RAG와 CRAG
+
+Vanilla RAG부터 FiD까지는 모든 입력에 항상 retrieval을 수행한다. "2+2는 얼마인가"도 검색한다는 의미다. Self-RAG(Asai 2024)는 이 가정을 버렸다.
+
+Self-RAG는 vocabulary에 reflection token을 추가한다 — `[Retrieve]`, `[IsREL]`, `[IsSUP]`, `[IsUSE]`. LLM이 `[Retrieve]=Yes`를 생성할 때만 retrieval이 일어나고, retrieved document의 relevance와 supportiveness를 `[IsREL]`, `[IsSUP]`로 self-평가한다. GPT-4로 생성한 reflection label로 fine-tuning하면, 7B 모델도 GPT-4 label과 ~92% agreement를 달성한다.
+
+decoding은 reflection score를 beam score에 통합한다.
+
+$$
+\mathrm{Score}(s_t) = \log p(y_t | y_{<t}) + \alpha \cdot R(y_t)
+$$
+
+실험적으로 optimal은 $k=4, \alpha=0.5$다. 전체 입력의 약 40%에서 retrieval을 skip해 latency를 줄이지만, 더 큰 효과는 품질 향상 — hallucination을 internal critic으로 걸러낸다.
+
+CRAG(Yan 2024)는 internal critic을 external signal로 보완한다. T5 기반 Retrieval Evaluator가 retrieved document의 utility를 세 가지 confidence 경로로 분류한다.
+
+$$
+\mathrm{Path} = \begin{cases}
+\mathrm{Retrieve} & \mathrm{Conf} > 0.7 \\
+\mathrm{Web} & \mathrm{Conf} < 0.5 \\
+\mathrm{Hybrid} & \mathrm{otherwise}
+\end{cases}
+$$
+
+corpus가 outdated일 때 web search로 fallback하는 구조다. Self-RAG의 reflection이 "모델이 스스로 판단"이라면, CRAG는 "외부 평가자가 corpus 품질을 판단하고 부족하면 web으로 보완"한다.
+
+<Aside label="설계 진화의 축">
+Vanilla RAG → RETRO는 "retrieval을 얼마나 깊이 통합할 것인가"의 축이다. REALM → Atlas는 "retriever를 어떻게 학습할 것인가"의 축이다. FiD는 "여러 passage를 어떻게 효율적으로 융합할 것인가"의 축이다. Self-RAG → CRAG는 "언제, 얼마나 신뢰할 것인가"의 축이다. 각 축은 독립적이며, 조합 가능하다.
+</Aside>
+
+## 정리
+
+- Vanilla RAG의 marginal likelihood는 retriever와 generator를 처음으로 gradient로 묶었다. 모든 후속 기법의 수식적 출발점이다.
+- RETRO는 retrieval을 layer 내부로 끌어들여 23배 스케일 효율을 달성했고, REALM은 MLM gradient로 retriever 자체를 학습 가능하게 만들었다.
+- FiD는 encoder-decoder 비대칭으로 $k$개 passage를 $O(kL^2)$에 처리하고, decoder cross-attention으로 passage 융합을 순서 독립적으로 수행한다.
+- Self-RAG는 reflection token으로 "항상 검색" 가정을 제거했고, CRAG는 confidence-based routing으로 corpus 한계를 web search로 보완했다.
+
+retrieval 품질의 상한이 generation 품질의 상한을 결정한다는 사실은 2020년과 2024년이 같다. 달라진 것은 그 상한을 어디서, 어떻게 끌어올릴 것인가에 대한 답이다.
+
+<Reference
+  title="Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"
+  authors="Lewis et al."
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2005.11401"
+/>
+
+<Reference
+  title="Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection"
+  authors="Asai et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2310.11511"
+/>

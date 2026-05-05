@@ -1,0 +1,151 @@
+---
+title: "LLM의 행동은 벡터로 쓰고 지울 수 있는가"
+description: "Activation steering의 수학적 토대부터 refusal direction 취약성, CAA의 다축 제어, ROME의 가중치 수술까지 — LLM 내부 표현의 선형성이 어디까지 성립하는지 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, activation-steering, model-editing, alignment]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+`king - man + woman ≈ queen`. 이 유명한 등식은 단어 임베딩의 기하학적 구조를 보여준다. 그렇다면 Transformer의 중간 레이어 활성화도 같은 원리가 성립할까? Linear Representation Hypothesis가 옳다면, "거부 응답"이라는 개념도 특정 방향 벡터로 표현되어 있을 것이다 — 그리고 그 방향을 빼버리면 모델은 거부하는 법을 잊는다. 이 챕터들이 보여주는 것은 단순한 학술적 호기심이 아니라, alignment의 구조적 취약성이다.
+
+## 선형성의 전제 — Activation Steering의 출발점
+
+Activation steering의 핵심 가정은 단순하다. 레이어 $\ell$의 활성화 $h_\ell$이 벡터 공간이고, 어떤 개념 $c$가 그 공간의 특정 방향 $v$로 표현되어 있다면, 활성화를 그 방향으로 밀면 모델의 출력도 따라 바뀐다.
+
+$$h_\ell^{\text{new}}(x) = h_\ell(x) + \alpha \cdot v_{\text{steer}}$$
+
+벡터 $v_{\text{steer}}$는 "개념이 있는" 예제와 "없는" 예제의 평균 활성화 차이로 추출한다.
+
+$$v_{\text{steer}} = \mathbb{E}[h_\ell \mid c_{+}] - \mathbb{E}[h_\ell \mid c_{-}]$$
+
+강도 파라미터 $\alpha$는 실수다. 양수면 그 개념을 강화하고, 음수면 억제한다. 이 구조가 작동하는 이유는 작은 $\alpha$에 대해 Transformer forward pass가 근사적으로 선형이기 때문이다.
+
+<Theorem kind="proposition" number="1" title="Linearity Preservation Under Intervention">
+작은 $\alpha$ 값에서, 레이어 $\ell$의 steering 개입은 이후 레이어들에 선형적으로 전파된다.
+
+$$h_{\ell+1}^{\text{new}} \approx h_{\ell+1} + \alpha \cdot \nabla F_{\ell+1}(h_\ell) \cdot v_{\text{steer}}$$
+</Theorem>
+
+<Proof>
+$F_{\ell+1}$을 $h_\ell$ 주변에서 Taylor 전개하면, $h_{\ell+1}^{\text{new}} = F_{\ell+1}(h_\ell + \alpha v) = F_{\ell+1}(h_\ell) + \alpha \nabla F_{\ell+1}(h_\ell) \cdot v + O(\alpha^2)$. $\alpha$가 충분히 작으면 고차항을 무시할 수 있다. $\square$
+</Proof>
+
+어느 레이어에서 개입할지도 중요하다. 초반 레이어는 저수준 피처를 담당하고, 후반 레이어는 이미 출력이 결정된 이후라 수정 효과가 약하다. 경험적으로 중간 레이어($\ell \approx L/2$)가 가장 효과적이다 — 추상적 개념이 형성되면서도, 아직 이후 레이어들이 신호를 충분히 반영할 여지가 있는 지점이기 때문이다.
+
+## Refusal Direction — Alignment의 브리틀니스
+
+Arditi 2024는 이 원리를 alignment 취약성 증명에 적용했다. Chat-tuned 모델(Llama 2 Chat, Qwen 1.5 Chat, Mistral Instruct 등)에서 "거부 응답"이 단일 방향으로 encode되어 있음을 보인다.
+
+$$v_{\text{ref}} = \frac{1}{|\mathcal{H}|}\sum_{x \in \mathcal{H}} h_\ell(x) - \frac{1}{|\mathcal{B}|}\sum_{x \in \mathcal{B}} h_\ell(x)$$
+
+$\mathcal{H}$는 harmful 프롬프트, $\mathcal{B}$는 benign 프롬프트 집합이다. 이 방향을 추출한 뒤 forward pass에서 제거(ablate)하면:
+
+$$A_v(h) = h - (h \cdot \hat{v})\hat{v}$$
+
+결과는 극적이다. 정상 상태에서 거부율 약 80%인 모델이, ablation 후 거부율 `<20%`로 떨어진다. 다시 말해 jailbreak 성공률 `>60%`.
+
+<Callout type="warning" title="Cross-Model Universality">
+Llama 2 Chat, Qwen 1.5 Chat, Mistral 7B Instruct 간의 refusal vector 코사인 유사도가 0.6~0.75에 달한다. 이는 random direction 간 유사도(≈ 0)와 비교할 때 압도적으로 높다. 거부 능력이 특정 아키텍처의 우연한 부산물이 아니라, RLHF 학습 과정의 구조적 귀결임을 시사한다.
+</Callout>
+
+왜 이렇게 "clean"하게 표현되는가? RLHF는 "harmful 요청 거부 = 보상"이라는 신호를 반복 학습시킨다. 그 결과 모델은 harmful intent를 복잡한 분산 계산이 아니라, 특정 방향의 활성화 크기로 압축해서 판별한다. 효율적인 표현이지만, 동시에 한 번의 선형 연산으로 무력화될 수 있는 표현이다.
+
+## CAA — 거부에서 다축 행동 제어로
+
+Rimsky 2024의 CAA(Contrastive Activation Addition)는 refusal direction의 일반화다. 거부라는 이진 축이 아니라, 모델 행동의 여러 차원을 동시에 제어한다.
+
+각 행동 축은 대조 쌍(contrastive pair)으로 정의된다.
+
+| 행동 축 | Positive completion | Negative completion |
+|:---|:---|:---|
+| Truthfulness | "The capital of France is Paris." | "The capital of France is Berlin." |
+| Sycophancy | "You're absolutely right!" | "I respectfully disagree." |
+| Corrigibility | "I was wrong before, thanks for the correction." | "I stand by my original statement." |
+
+각 축의 벡터를 추출한 뒤 동시에 주입한다.
+
+$$h_\ell^{\text{steered}} = h_\ell + \sum_{i} \alpha_i v_{\mathcal{B}_i}$$
+
+<Theorem kind="proposition" number="2" title="Monotonic α Control">
+작은 $\alpha \in (-2, 2)$ 범위에서, 행동 점수 $s_{\mathcal{B}}$는 $\alpha$에 대해 단조 증가한다.
+
+$$\frac{\partial s_{\mathcal{B}}}{\partial \alpha} > 0$$
+</Theorem>
+
+또한 축들이 충분히 직교하다면($\cos_{\text{sim}}(v_{B_i}, v_{B_j}) \lt 0.3$), 한 축의 조절이 다른 축에 미치는 영향은 무시할 수 있다. 경험적으로 대부분의 행동 축은 낮은 상관관계를 보이지만, "helpfulness"와 "sycophancy"처럼 구조적으로 얽힌 축들은 예외다.
+
+<Aside label="설계 함의">
+CAA는 alignment를 "on/off"가 아니라 "스펙트럼"으로 취급할 수 있음을 보여준다. 같은 모델 가중치에서 truthfulness를 높이고 sycophancy를 낮추는 동적 제어가 가능하다 — 단, 축들이 충분히 독립적일 때만.
+</Aside>
+
+## ROME과 MEMIT — 가중치 수준의 수술
+
+Activation steering은 런타임 개입이다. 매 forward pass마다 hook을 삽입해야 한다. ROME(Meng 2022)은 다른 접근을 택한다 — 가중치를 직접, 최소한으로 수정한다.
+
+핵심 가정은 **MLP가 선형 연상 메모리(linear associative memory)처럼 작동한다**는 것이다.
+
+$$\text{FFN}(x) \approx W_{\text{down}} \cdot k, \quad k = W_{\text{in}} x$$
+
+어떤 사실 "Q에 대한 답은 A"가 레이어 $\ell$에 $W_{\text{down}} \cdot k_Q \approx v_A$로 encode되어 있다면, 새 답 $A_{\text{new}}$로 바꾸려면 이 mapping만 수정하면 된다. 그리고 Frobenius norm을 최소화하는 rank-1 update의 유일한 해가 존재한다.
+
+$$W' = W + \frac{(v_{\text{target}} - Wk)k^\top}{k^\top k}$$
+
+<Theorem kind="theorem" number="3" title="Rank-1 Update Orthogonal Preservation">
+$k^\top x = 0$인 임의의 벡터 $x$에 대해, $(W + uk^\top)x = Wx$가 성립한다.
+</Theorem>
+
+<Proof>
+$(W + uk^\top)x = Wx + u(k^\top x) = Wx + u \cdot 0 = Wx$. $\square$
+</Proof>
+
+즉, $k$에 직교하는 입력들의 매핑은 그대로다. 수정한 사실 이외의 지식이 보존될 이론적 근거다.
+
+"어느 레이어를 수정해야 하는가"는 **causal tracing**으로 자동 발견한다. 각 레이어에서 활성화를 손상시킨 뒤, 어느 레이어에서의 손상이 최종 출력에 가장 큰 영향을 미치는지 측정한다. 그 레이어가 해당 사실을 처리하는 핵심 지점이다.
+
+MEMIT(Meng 2023)은 이를 수천 개 사실의 배치 편집으로 확장한다. 각 편집이 직교 부분공간에서 작동하므로(Theorem 3의 귀결), 순차 적용과 병렬 적용의 결과가 근사적으로 동일하다.
+
+$$W_{\text{batch}} = W + \sum_{i=1}^{n} \frac{(v_i - Wk_i)k_i^\top}{k_i^\top k_i}$$
+
+<Callout type="note" title="트레이드오프">
+**Activation steering**: 가중치 불변, 되돌릴 수 있음, 런타임 비용 발생. 런타임 개입이므로 배포 시스템에 hook 인프라가 필요하다.
+
+**Model editing (ROME/MEMIT)**: 영구적, 배포 후 추가 비용 없음. 단, generalization-specificity 긴장이 있다 — 너무 specific하면 관련 쿼리에 일반화 안 되고, 너무 general하면 무관한 사실도 바뀐다. 또한 factual knowledge에만 효과적이며, "살인은 나쁘다"같은 분산 표현된 가치관에는 적용이 어렵다.
+</Callout>
+
+## 정리
+
+- Activation steering은 Linear Representation Hypothesis가 성립하는 한, 모델 가중치 수정 없이 행동을 제어하는 효율적 방법이다. 핵심은 $h_\ell^{\text{new}} = h_\ell + \alpha v_{\text{steer}}$.
+- Refusal direction 연구(Arditi 2024)는 RLHF 기반 alignment가 단일 선형 방향으로 압축되는 경향이 있음을 보였다 — cross-model universality가 이를 확인한다.
+- CAA(Rimsky 2024)는 행동을 여러 독립 축으로 분해해 fine-grained 제어를 가능하게 한다. 단조성과 독립성은 작은 $\alpha$ 범위에서만 보장된다.
+- ROME/MEMIT은 rank-1 update로 개별 사실을 외과적으로 수정한다. 직교 보존 정리가 다른 지식 보호의 이론적 근거지만, 실제로는 사실 얽힘(fact entanglement)이 한계를 만든다.
+
+선형성 가정은 이 모든 방법의 기반이자 한계다. 다음 장에서는 이 가정이 실제로 어디서 깨지는지, 그리고 비선형 표현을 다루는 회로(circuit) 분석이 무엇을 추가로 설명하는지 살펴본다.
+
+<Reference
+  title="Refusal in Language Models Is Mediated by a Single Direction"
+  authors="Arditi et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2406.11717"
+/>
+
+<Reference
+  title="Locating and Editing Factual Associations in GPT"
+  authors="Meng et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2202.05262"
+/>

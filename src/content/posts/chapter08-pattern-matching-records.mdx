@@ -1,0 +1,148 @@
+---
+title: "Java는 왜 Record, Sealed, Pattern을 함께 설계했을까"
+description: "Record의 불변 데이터 구조부터 Sealed의 닫힌 계층, Pattern Matching의 구조 분해까지 — Java 16-21의 세 기능이 하나의 철학으로 수렴하는 과정을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [java, record, sealed-class, pattern-matching, adt]
+difficulty: intermediate
+series:
+  slug: modern-java-in-action
+  title: Modern Java In Action
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Java 16의 Record, Java 17의 Sealed Class, Java 21의 Pattern Matching — 이 세 기능은 각각 독립적인 개선처럼 보이지만, 실제로는 하나의 목표를 향해 수렴한다. **"데이터의 형태를 타입으로 봉인하고, 그 봉인을 컴파일러가 검증한다."** 왜 Java는 이 세 기능을 이 순서로, 이 형태로 설계했는가?
+
+## 출발점: 데이터 캐리어의 보일러플레이트
+
+Java에서 불변 데이터 구조를 만들려면 오랫동안 많은 것을 직접 써야 했다. `private final` 필드, 생성자, `equals`, `hashCode`, `toString`. Lombok이 어노테이션 프로세서로 이것을 자동화했지만, 그것은 언어가 아니라 도구의 개입이었다.
+
+Record는 이 문제를 언어 수준에서 해결한다.
+
+```java
+record Point(int x, int y) { }
+```
+
+컴파일러는 이 한 줄에서 `canonical constructor`, `x()`, `y()` 접근자, 그리고 `equals`/`hashCode`/`toString`을 생성한다. 주목할 점은 접근자 이름이 `getX()`가 아니라 `x()`라는 것이다. JavaBean 관례를 버리고 함수형 스타일을 택한 선택이다.
+
+내부적으로 `equals`와 `hashCode`는 `invokedynamic + ObjectMethods.bootstrap`으로 합성된다. 첫 호출 시 부트스트랩 오버헤드가 있지만, 이후에는 캐시된 메서드 핸들이 사용된다. 바이트코드 크기는 Lombok의 전체 메서드 생성 방식보다 작다.
+
+<Callout type="note" title="Record의 불변성은 얕다">
+`record Container(List<String> items)` 처럼 가변 객체를 필드로 가지면, 필드 참조는 불변이지만 내용은 변경 가능하다. 완전한 불변성이 필요하면 compact constructor 안에서 `List.copyOf(items)`로 방어적 복사를 해야 한다.
+</Callout>
+
+## 봉인: Sealed Class가 추가하는 것
+
+Record만으로는 충분하지 않다. `Point`와 `Circle`과 `Rectangle`이 모두 `Shape`를 구현한다면, `Shape`를 다루는 코드는 미래에 누군가가 `Triangle`을 추가할 가능성을 항상 고려해야 한다.
+
+Sealed Class는 이 불확실성을 제거한다.
+
+```java
+sealed interface Shape permits Circle, Rectangle, Triangle { }
+
+record Circle(Point center, int radius) implements Shape { }
+record Rectangle(Point topLeft, int width, int height) implements Shape { }
+record Triangle(Point p1, Point p2, Point p3) implements Shape { }
+```
+
+`permits` 목록이 계층을 봉인한다. `Shape`를 구현하는 타입은 오직 이 세 개다. 바이트코드 레벨에서는 `PermittedSubclasses` 어트리뷰트가 클래스 파일에 저장되며, `Class.getPermittedSubclasses()`로 런타임에도 조회할 수 있다.
+
+이 봉인이 가져오는 핵심 이점은 **exhaustiveness 검사**다. 컴파일러가 `Shape`의 모든 자식을 알고 있으므로, switch에서 세 case를 모두 다루면 `default`가 필요 없다. 반대로 하나라도 빠지면 컴파일 에러다.
+
+```java
+double area(Shape shape) {
+    return switch (shape) {
+        case Circle(Point _, int r)    -> Math.PI * r * r;
+        case Rectangle(Point _, int w, int h) -> w * h;
+        case Triangle(Point p1, Point p2, Point p3) -> heronsFormula(p1, p2, p3);
+        // default 불필요 — 컴파일러가 보증
+    };
+}
+```
+
+나중에 `Pentagon`을 추가하면, 이 switch는 자동으로 컴파일 에러를 낸다. 리팩토링 안전망이 언어에 내장된다.
+
+## 구조 분해: Pattern Matching이 완성하는 것
+
+`instanceof`와 switch expression은 Java 16-21을 거치며 점진적으로 진화했다. 핵심 흐름은 **타입 검사 → 자동 캐스팅 → 구조 분해**의 순서다.
+
+Java 16의 `instanceof` 패턴은 캐스팅 보일러플레이트를 제거했다.
+
+```java
+// Before
+if (obj instanceof String) {
+    String s = (String) obj;
+    System.out.println(s.length());
+}
+
+// After
+if (obj instanceof String s) {
+    System.out.println(s.length());
+}
+```
+
+패턴 변수 `s`의 스코프는 컴파일러의 control flow 분석으로 결정된다. `if` 블록 안에서만 가시적이며, `else` 블록이나 블록 밖에서는 정의되지 않는다. OR 조건(`||`)에서는 어느 경로에서 `s`가 정의됐는지 보장할 수 없으므로 컴파일 에러다.
+
+Java 14의 switch expression은 여기에 값 반환과 exhaustiveness를 더했다. 화살표 문법(`->`)은 fall-through를 언어 수준에서 제거하고, `yield`는 블록 안에서 값을 돌려주는 방법을 제공한다.
+
+Java 21의 record pattern은 이 진화의 정점이다.
+
+```java
+case Circle(Point(int x, int y), int r) -> ...
+```
+
+`Circle`을 매칭하는 동시에 `center`의 `x`, `y`까지 한 번에 분해한다. 내부적으로 컴파일러는 `instanceof` → `checkcast` → 각 accessor 호출의 바이트코드를 생성한다. JIT가 accessor를 인라인하면 수동으로 분해한 코드와 성능이 동일해진다.
+
+## 세 기능이 만드는 ADT
+
+이 세 기능을 합치면 함수형 언어의 **대수적 데이터 타입(ADT)** 을 Java에서 표현할 수 있다.
+
+```java
+sealed interface Expr permits Num, BinOp, Var { }
+
+record Num(int value) implements Expr { }
+record Var(String name) implements Expr { }
+record BinOp(Expr left, String op, Expr right) implements Expr { }
+
+int evaluate(Expr expr, Map<String, Integer> env) {
+    return switch (expr) {
+        case Num(int v)              -> v;
+        case Var(String name)        -> env.getOrDefault(name, 0);
+        case BinOp(var l, "+", var r) -> evaluate(l, env) + evaluate(r, env);
+        case BinOp(var l, "*", var r) -> evaluate(l, env) * evaluate(r, env);
+        case BinOp(var l, var op, var r) -> throw new IllegalArgumentException(op);
+    };
+}
+```
+
+Scala의 `sealed trait + case class + match`와 구조적으로 동일하다. Java가 더 장황한 것은 명시적 타입 선언 때문이지만, 그것이 컴파일 타임 안전성의 대가다.
+
+<Aside label="JPA와의 충돌">
+Record는 JPA 엔티티로 사용할 수 없다. JPA는 no-args constructor와 가변 필드를 요구하지만, Record는 둘 다 제공하지 않는다. 권장 아키텍처는 영속성 계층에는 Lombok `@Data`, 서비스 계층 이상에서는 Record를 DTO로 사용하는 분리다.
+</Aside>
+
+## 트레이드오프
+
+세 기능 모두 버전 요구사항이 높다. Record는 Java 16, Sealed는 Java 17, Record Pattern은 Java 21이다. 레거시 코드베이스에서는 단계적 도입이 필요하다.
+
+<Callout type="note" title="트레이드오프 요약">
+**Record**: 불변성 강제와 간결함의 대가는 JPA 엔티티 불가, 상속 불가. Lombok `@Value`보다 표준화됐지만 `@Builder` 같은 빌더 패턴은 직접 구현해야 한다.
+
+**Sealed**: exhaustiveness 검사의 대가는 permits 목록 관리 부담. `non-sealed` 자식을 허용하면 exhaustiveness가 깨지고 `default`가 다시 필요해진다.
+
+**Pattern Matching**: 선언적 구조 분해의 대가는 Java 21 필수. 깊은 중첩 패턴은 읽기 어려울 수 있으며, OR 조건에서 패턴 변수 스코프 규칙이 직관적이지 않다.
+</Callout>
+
+## 정리
+
+- Record는 데이터 캐리어를 언어 수준으로 끌어올렸다. `invokedynamic` 기반 합성으로 바이트코드 크기는 작고, 불변성은 강제된다.
+- Sealed Class는 계층을 봉인해 컴파일러가 exhaustiveness를 검증하게 한다. 새 타입 추가 시 모든 switch가 자동으로 에러를 내는 리팩토링 안전망이다.
+- Pattern Matching은 타입 검사, 자동 캐스팅, 구조 분해를 하나의 표현으로 합친다. Sealed와 결합하면 `default` 없는 exhaustive switch가 가능하다.
+- 세 기능을 함께 쓰면 Scala/Haskell 수준의 ADT를 Java에서 표현할 수 있다.
+
+다음 글에서는 이 불변 데이터 중심 설계가 Java 21 Virtual Thread와 어떻게 맞물리는지 — 불변 Record를 스레드 간에 공유할 때 락이 필요 없는 이유를 추적한다.

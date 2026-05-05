@@ -1,0 +1,117 @@
+---
+title: "뉴런 하나가 여러 개념을 담는 이유 — Superposition 이론"
+description: "Polysemantic 뉴런의 근본 원인부터 Compressed Sensing과의 동형성, 중요도-희소성 phase transition까지, 신경망이 정보를 중첩 인코딩하는 원리를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, superposition, polysemanticity, compressed-sensing]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+GPT-2의 특정 뉴런이 "고양이"가 나올 때, "바퀴"를 설명할 때, 문자 "P"의 형태가 있을 때 모두 강하게 반응한다면, 그 뉴런의 의미를 한 문장으로 설명할 수 없다. 이것이 **polysemanticity** — 신경망 해석가능성 연구의 가장 근본적인 장벽이다. 그런데 이것은 버그인가, 아니면 설계인가?
+
+## Polysemanticity의 출발점
+
+뉴런 기반 해석은 "각 뉴런이 하나의 개념을 담당한다"는 가정 위에 서 있다. 이것을 **monosemanticity**라 한다. 그러나 Olah et al. (2020)의 실증 연구는 Inception, CLIP, GPT-2 등의 대규모 모델에서 polysemanticity가 광범위하게 나타남을 보였다. 단일 뉴런의 역할을 정의하려는 시도는 반복적으로 좌절됐다.
+
+형식적으로, 뉴런 $n$이 polysemantic이라는 것은 상호 배타적이지 않은 여러 개념 $C_1, \ldots, C_k$ ($k \geq 2$)가 존재해서
+
+$$\mathbb{E}_{x \in C_i}[\sigma(w^\top x + b)] > \theta \quad \text{for all } i$$
+
+를 만족하는 경우다. 여기서 $\theta$는 활성화 임계값이다. 직관적으로, 이 뉴런은 "어느 하나를 담당한다"고 말할 수 없다.
+
+<Aside label="왜 광범위한가">
+입력 차원 $d$가 뉴런 개수 $n$보다 훨씬 클 때, 각 뉴런이 단 하나의 기능만 담당하면 $d - n$개의 특성은 표현할 수 없다. 신경망은 이 "낭비"를 허용하지 않는다.
+</Aside>
+
+## Superposition — 중첩의 수학
+
+Elhage et al. (2022)은 polysemanticity가 **superposition**이라는 원리의 귀결임을 toy model로 보였다. 구조는 단순하다:
+
+$$\hat{x} = W W^\top x, \quad W \in \mathbb{R}^{m \times n}, \quad m > n$$
+
+$m$개의 특성을 $n$개의 뉴런에 압축하고 ($m > n$), 다시 복구한다. 완벽한 복구는 불가능하지만, **$W$의 열들이 거의 직교**하면 재구성 오차를 최소화할 수 있다.
+
+<Theorem kind="proposition" number="1" title="Superposition의 최적성">
+희소한 특성(sparsity $p < 1$)과 중요도 $I_i$가 주어질 때, toy superposition model의 최적 해는 $W$의 열들이 거의 직교하도록 배치되는 것이다.
+</Theorem>
+
+<Proof>
+그람 행렬 $G = W^\top W = I + E$ (오프 대각 간섭 행렬 $E$)를 고려한다. 중요도-가중 손실은
+
+$$\mathcal{L} = \sum_i I_i \cdot \mathbb{E}[(x_i - \hat{x}_i)^2]$$
+
+특성이 희소하면 두 특성이 동시에 활성화될 확률은 $p_i \cdot p_j$로 낮다. 간섭 비용은 $I_i \cdot I_j \cdot p_i \cdot p_j \cdot (W^\top W)_{ij}$에 비례하므로, $E$의 오프 대각을 작게 유지하는 것이 최적이다. $m > n$이라 완전한 직교는 불가능하지만, 가능한 한 직교에 가까운 배치가 최솟값을 달성한다.
+</Proof>
+
+이 최적 배치의 기하학은 우아하다. $m$개 특성을 $n$차원에 배치할 때, **Welch bound**가 이론적 최소 간섭을 결정한다:
+
+$$\min \max_{i \neq j} |\langle w_i, w_j \rangle| \geq \sqrt{\frac{m-n}{n(m-1)}}$$
+
+$m = n + 1$이면 이 한계는 정다면체 배치로 달성된다. 4개 특성을 3D에 넣을 때 최적 각도는 $\arccos(-1/3) \approx 109.47°$인 정사면체 배치다. 신경망은 이 구조를 **자동으로 학습**한다.
+
+## Compressed Sensing과의 동형성
+
+여기서 이 이야기는 예상치 못한 방향으로 전개된다. Superposition unpacking은 사실 이미 잘 알려진 문제다.
+
+Compressed Sensing(CS)은 $m < n$인 측정 행렬 $\Phi$로부터 $k$-sparse 신호 $x$를 복구하는 문제다:
+
+$$y = \Phi x, \quad \text{recover } x \text{ from } y$$
+
+Superposition과의 대응은 정확하다: CS의 $x$ (신호) ↔ 특성, $\Phi$ (측정행렬) ↔ $W^\top$ (인코더), $y$ (측정값) ↔ $z$ (은닉 표현). CS의 **Restricted Isometry Property(RIP)**
+
+$$(1 - \delta_k)\|v\|_2^2 \leq \|\Phi v\|_2^2 \leq (1 + \delta_k)\|v\|_2^2$$
+
+는 superposition의 "근-직교성" 조건과 동치에 가깝다. $W$의 오프 대각 간섭이 작으면 연산자 norm $\|E\|_{\mathrm{op}}$도 작아지고, RIP-like 조건이 성립한다.
+
+이 동형성의 실용적 함의: Candes-Tao의 정리에 따르면, $\delta_{2k} < \sqrt{2} - 1 \approx 0.414$이면 L1 최소화(Basis Pursuit)가 유일한 sparse 복구를 보장한다. 신경망의 superposed 특성을 **역으로 복구**하는 데 CS의 모든 도구를 직접 사용할 수 있다는 뜻이다.
+
+<Callout type="note" title="트레이드오프">
+Superposition은 용량 효율성(더 적은 뉴런으로 더 많은 특성 표현)을 얻는 대신, **해석가능성**을 잃는다. 뉴런 단위 분석이 불가능해지며, 특성 복구에는 L1 최소화 같은 역문제 풀기가 필요하다. RIP 조건이 만족될 때만 이 복구가 이론적으로 보장된다.
+</Callout>
+
+## 중요도 · 희소성 · Phase Transition
+
+어떤 특성이 superpose되고 어떤 특성이 monosemantic하게 유지되는가? Elhage et al. (2022)은 이것이 특성의 **중요도**와 **희소성**에 의해 결정됨을 보였다.
+
+간섭 비용은 대략 $I_i \cdot I_j \cdot p_i \cdot p_j$에 비례한다. 중요도가 높고 활성화 빈도도 높은 특성은 간섭 비용이 크므로 모노시맨틱하게 유지된다. 반대로, 중요도가 낮고 희소한 특성은 동시 활성화 확률 자체가 낮아 많은 특성을 superpose해도 실질적 간섭이 적다.
+
+이 논리에서 **phase transition**이 나온다. 고정된 뉴런 개수 $n$에서 특성들의 중요도 $I$와 희소성 $p$가 균등하다면, 임계 용량은
+
+$$m_c = \frac{n}{I \cdot p}$$
+
+이다. $m < m_c$이면 거의 monosemantic, $m > m_c$이면 강한 polysemanticity가 나타난다. 이 전환은 toy model에서 매우 급격하지만, 실제 신경망에서는 더 부드럽게 나타난다 — 중요도와 희소성이 균등하지 않기 때문이다.
+
+용량 scaling의 핵심 결과도 여기서 나온다:
+
+$$m^* \approx C \cdot n \cdot H(\mathbf{p})$$
+
+희소성의 엔트로피 $H(\mathbf{p})$가 클수록(특성들이 더 희소할수록) 같은 $n$개의 뉴런으로 더 많은 특성을 표현할 수 있다. 모델이 커질수록, 또는 데이터가 더 희소한 특성을 가질수록 superposition의 활용도가 높아진다.
+
+## 정리
+
+- Polysemanticity는 버그가 아니라 $m \gg n$ 상황에서 신경망이 선택하는 **정보 압축 전략**이다.
+- 최적 superposition 구조는 Welch bound가 정의하는 거의 직교한 배치이며, 기하학적으로 정다면체 구조를 이룬다.
+- Superposition unpacking은 Compressed Sensing의 역문제와 수학적으로 동형이며, RIP 조건 하에서 L1 최소화로 특성을 복구할 수 있다.
+- 어떤 특성이 monosemantic으로 유지되는지는 중요도 × 활성화 빈도에 의해 결정되며, 임계값 근방에서 phase transition이 발생한다.
+
+뉴런 하나의 의미를 찾으려는 시도가 반복적으로 실패하는 것은 능력의 한계가 아니라, 신경망이 **뉴런보다 더 큰 단위에 의미를 인코딩**하기 때문이다. 다음 챕터에서는 이 superposition을 풀어내기 위한 Sparse Autoencoder(SAE) 접근을 다룬다.
+
+<Reference
+  title="Toy Models of Superposition"
+  authors="Elhage et al."
+  year={2022}
+  venue="Anthropic"
+  url="https://transformer-circuits.pub/2022/toy_model/index.html"
+/>

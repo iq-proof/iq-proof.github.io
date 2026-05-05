@@ -1,0 +1,132 @@
+---
+title: "Git의 모든 포인터는 어디에 살고 있는가"
+description: "로컬 브랜치부터 원격 추적 ref, packed-refs 압축, 특수 참조, detached HEAD까지 — .git 디렉토리 안에서 Git이 현재 위치를 추적하는 방식을 해부한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, refs, head, packed-refs, internals]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git을 쓰면서 "브랜치"라고 부르는 것의 실체는 무엇인가? `origin/main`은 왜 `git fetch` 전까지 바뀌지 않는가? 그리고 `git checkout HEAD~3` 한 줄이 왜 "위험 경고"를 동반하는가? 이 모든 질문의 답은 `.git/refs/`와 `.git/HEAD`라는 파일 몇 개에 들어 있다.
+
+## 브랜치는 파일이다
+
+`.git/refs/heads/main`을 열어보면 SHA 40자와 줄바꿈 1자, 총 41바이트가 전부다. 브랜치는 커밋들의 집합이 아니라 **단 하나의 커밋을 가리키는 포인터**다. 그 커밋의 부모 체인이 히스토리를 이룰 뿐이다.
+
+```bash
+$ cat .git/refs/heads/main
+abc1234567890123456789012345678901234567
+
+$ wc -c .git/refs/heads/main
+41
+```
+
+슬래시가 들어간 브랜치 이름(`feature/foo`)은 파일시스템에 디렉토리 + 파일로 표현된다. 그래서 `feature/foo` 브랜치가 존재하면 `feature/foo/bar`는 만들 수 없다 — `foo`가 이미 파일이기 때문이다.
+
+태그는 `refs/tags/`에 같은 방식으로 저장되지만, lightweight 태그는 커밋을 직접 가리키고 annotated 태그는 별도의 태그 객체를 가리킨다는 점이 다르다.
+
+## 원격 추적 ref는 캐시다
+
+`refs/remotes/origin/main`은 원격 서버와 연결된 실시간 포인터가 아니다. **마지막 `git fetch` 시점의 원격 상태 스냅샷**이다.
+
+```
+[로컬 디스크]                       [원격 서버]
+refs/remotes/origin/main            refs/heads/main
+  abc1234... (이전 fetch 시점)         def5678... (다른 사람이 push)
+                 ↑                           │
+                 └──── git fetch ────────────┘
+                 (이후에야 abc1234 → def5678 갱신)
+```
+
+`git ls-remote origin`은 실제 원격 상태를 보여주고, `refs/remotes/origin/main`은 로컬 캐시를 보여준다. 이 둘이 다를 수 있다는 사실을 모르면 "fetch했는데 왜 반영이 안 되지?"가 아니라 "fetch를 안 했는데 왜 반영됐지?"를 묻게 된다.
+
+ref 갱신은 `git update-ref`가 담당하며, 내부적으로 lock 파일 생성 → 새 SHA 쓰기 → compare-and-swap → atomic rename → reflog 기록 순서로 처리된다. `--force-with-lease`가 안전한 이유가 바로 이 compare-and-swap 덕분이다.
+
+## packed-refs — 수만 개 ref의 압축
+
+ref마다 별도 파일이라면 수만 개 브랜치를 가진 모노레포에서 `git fetch`는 수천 번의 파일 stat을 반복한다. `git gc`는 이를 해결하기 위해 `.git/packed-refs` 단일 파일로 압축한다.
+
+```
+# pack-refs with: peeled fully-peeled sorted
+abc1234... refs/heads/main
+def5678... refs/heads/feature/foo
+ghi9012... refs/tags/v1.0
+^jkl3456...    ← annotated tag의 peeled commit SHA
+```
+
+우선순위 규칙은 단순하다. **loose ref(개별 파일)가 항상 우선**이다. 새 커밋이 생기면 loose 파일이 만들어지고, 다음 `git gc` 때 다시 packed-refs에 통합된다. 개별 갱신은 loose로, 조회 최적화는 packed로 — 두 계층이 역할을 나눈다.
+
+<Callout type="note" title="트레이드오프">
+packed-refs는 inode 압박과 대규모 fetch 비용을 줄이지만, packed-refs 파일 자체가 거대해지면 전체 읽기 비용이 생긴다. 수백만 ref를 다루는 극단적 모노레포에서는 binary 포맷인 reftable이 차세대 대안으로 검토된다.
+</Callout>
+
+## HEAD — 현재 위치의 두 가지 표현
+
+`.git/HEAD`는 딱 두 가지 형태 중 하나다.
+
+```
+# Symbolic (정상)
+ref: refs/heads/main
+
+# Direct (detached)
+abc1234567890123456789012345678901234567
+```
+
+`git commit`이 두 형태에서 다르게 동작한다. Symbolic이면 새 커밋을 만들고 HEAD가 가리키는 브랜치(예: `refs/heads/main`)를 갱신한다. Direct(detached)이면 새 커밋을 만들고 HEAD 자체만 갱신한다 — 어떤 브랜치도 갱신되지 않는다. 이것이 detached HEAD에서 만든 커밋이 "orphan"이 되는 이유다.
+
+## 특수 참조 — 진행 중인 작업의 안전망
+
+`ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD` 같은 파일들은 Git이 장기 작업의 상태를 추적하는 방식이다.
+
+`ORIG_HEAD`는 `reset`, `merge`, `rebase` 직전의 HEAD를 백업한다. 일반 `git commit`으로는 갱신되지 않는다. "큰 실수를 했을 때 즉시 복원"을 가능하게 하는 안전망이다.
+
+```bash
+$ git reset --hard HEAD~10   # 위험!
+$ git reset --hard ORIG_HEAD # 즉시 복원
+```
+
+`MERGE_HEAD`는 merge가 진행 중일 때 "다른 쪽 tip"을 기록한다. `git status`는 이 파일의 존재 여부로 "merging" 상태를 판단한다. merge가 완료되거나 abort되면 즉시 삭제된다. 손으로 삭제하면 git은 일반 상태로 인식하지만 working directory에는 conflict marker가 남아 깨진 상태가 된다.
+
+## Detached HEAD — 위험이 아니라 도구
+
+```bash
+$ git checkout HEAD~3
+$ cat .git/HEAD
+abc1234...    ← detached
+```
+
+detached HEAD 자체는 위험한 상태가 아니다. `git bisect`는 의도적으로 이 상태를 활용해 중간 커밋들을 점프하며 버그를 이진 탐색한다. 특정 시점의 빌드를 재현할 때도 유용하다.
+
+위험은 **이 상태에서 커밋한 뒤 인지하지 못하고 다른 브랜치로 이동할 때** 발생한다. Git은 이동 시 "leaving N commits behind" 경고를 출력하지만, 이 경고를 무시하면 커밋은 reflog에만 남고 90일 후 영구히 사라진다.
+
+```bash
+# 살리기
+$ git switch -c rescue <orphan-sha>
+
+# 찾기
+$ git reflog | grep "orphan"
+```
+
+<Aside label="설계 철학">
+Git의 ref 시스템 전체는 하나의 원칙 위에 서 있다 — "포인터는 파일이고, 파일은 직접 열어볼 수 있다". `.git/HEAD`를 `cat`하고, `.git/refs/heads/main`을 `cat`하면 Git이 무엇을 알고 있는지 전부 보인다. 추상화 뒤에 숨기지 않는다.
+</Aside>
+
+## 정리
+
+- 브랜치는 SHA 40자 파일이다. 커밋의 집합이 아니라 단일 커밋 포인터다.
+- `refs/remotes/origin/main`은 원격 실시간 상태가 아니라 마지막 fetch 시점의 캐시다.
+- packed-refs는 수만 개 ref를 단일 파일로 압축하며, loose ref가 항상 우선한다.
+- HEAD는 symbolic(브랜치 attached)과 direct(detached) 두 형태이며, commit 동작이 다르다.
+- ORIG_HEAD, MERGE_HEAD 같은 특수 ref는 장기 작업의 상태 추적과 즉시 복원을 가능하게 한다.
+- detached HEAD에서 커밋하면 orphan이 된다. `git switch -c <name>`으로 즉시 살릴 수 있다.
+
+다음 글에서는 Git이 ref 이름 충돌을 어떻게 막는지, `git check-ref-format`이 강제하는 규칙의 설계 의도를 추적한다.

@@ -1,0 +1,131 @@
+---
+title: "SAE는 어떻게 신경망의 개념을 분리하는가"
+description: "초과완전 희소 기저로 LLM 내부 표현을 분해하는 원리부터 Dead Feature 해결, Top-K·JumpReLU 설계, Templeton 2024의 스케일링 법칙, Gemma Scope의 오픈소스 회로 분석까지 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [mechanistic-interpretability, sparse-autoencoder, monosemanticity, feature-circuit]
+difficulty: advanced
+series:
+  slug: mechanistic-interpretability-deep-dive
+  title: Mechanistic Interpretability Deep Dive
+  order: 5
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+신경망 내부의 뉴런 하나는 수십 개의 개념을 동시에 인코딩한다. 이 "얽힘(entanglement)"이 해석 가능성의 근본 장벽이다. Sparse Autoencoder(SAE)는 이 얽힌 표현을 초과완전(overcomplete) 희소 기저로 분해해 각 방향이 단 하나의 개념을 담도록 강제한다. 그렇다면 어떤 수학적 메커니즘이 이 분리를 가능하게 하며, 대규모 LLM에서도 실제로 작동하는가?
+
+## 초과완전 기저와 희소성의 수학
+
+SAE의 출발점은 단순한 관찰이다. $d_{\text{hidden}}$차원 활성화를 같은 차원의 기저로 분해하면 "하나의 뉴런 = 하나의 개념"이라는 목표를 달성할 여지가 없다. 그래서 SAE는 $d_{\text{SAE}} \gg d_{\text{hidden}}$인 초과완전 공간으로 투영한다.
+
+$$
+f = \text{ReLU}(W_{\text{enc}}(x - b_{\text{dec}}) + b_{\text{enc}}), \quad \hat{x} = W_{\text{dec}} f + b_{\text{dec}}
+$$
+
+학습 목표는 재구성과 희소성의 균형이다.
+
+$$
+\mathcal{L}(x) = \|x - \hat{x}\|_2^2 + \lambda \|f\|_1
+$$
+
+L1 항의 역할이 핵심이다. L2 제약은 기하학적으로 구(sphere)라서 최적점이 좌표축 위에 떨어질 확률이 낮다. 반면 L1 제약은 다이아몬드 형태라 꼭짓점(vertex), 즉 대부분의 좌표가 0인 해를 선호한다. 이것이 L1 정규화가 희소성을 유도하는 기하학적 이유다.
+
+<Theorem kind="proposition" number="1" title="재구성-희소성 파레토 관계">
+$\lambda$를 증가시키면 희소성 $\|f\|_1$은 증가하지만 재구성 오류 $\|x - \hat{x}\|_2^2$도 증가한다. 따라서 두 목표 사이에 파레토 프런티어가 형성된다.
+</Theorem>
+
+<Proof>
+$\lambda = 0$이면 완벽한 재구성이 가능하고 희소성 압력이 없다. $\lambda \to \infty$이면 $f \approx 0$으로 수렴해 재구성이 실패한다. 연속성에 의해 중간 어딘가에 최적 절충점 $\lambda^*$가 존재한다. $\square$
+</Proof>
+
+신호처리의 Basis Pursuit 이론은 여기서 더 강한 보장을 제공한다. 사전 행렬 $D$가 RIP(Restricted Isometry Property)를 만족하면, L1 최소화가 곧 L0 최소화, 즉 진정한 희소성과 동치다(Donoho-Tanner). SAE 학습에서 RIP를 직접 검증하기는 어렵지만, 경험적으로 초과완전 사전과 L1 조합은 충분한 희소성을 달성한다.
+
+## Dead Feature와 훈련 불안정성
+
+희소성을 강제하는 L1은 역설적으로 일부 자질을 영구적으로 죽인다. 초기화 불운으로 활성화되지 못한 자질이 있다고 하자. L1 정규화는 이를 0으로 밀어붙이고, 그래디언트가 끊기면 그 자질은 다시는 활성화되지 않는다. 이것이 **Dead Feature** 문제다.
+
+<Callout type="warning" title="Dead Feature의 누적 비용">
+훈련이 진행될수록 Dead Feature 비율이 높아지면 SAE의 유효 용량이 이론적 크기보다 훨씬 작아진다. 10만 개의 자질을 할당했어도 실제로 작동하는 자질이 5만 개라면, 절반의 계산 예산을 낭비한 셈이다.
+</Callout>
+
+Bricken 2023이 제안한 두 가지 해결책이 실용적으로 쓰인다. **Resampling**은 일정 주기마다 Dead Feature의 가중치를 무작위로 재초기화해 재시도 기회를 준다. **Ghost Gradient**는 활성화가 0인 자질의 사전활성화(pre-activation) 값에 약한 손실을 추가해 그래디언트 흐름을 유지한다.
+
+두 번째 문제는 **Feature Splitting**이다. `$d_{\text{SAE}}$`가 커질수록 하나의 개념이 여러 자질로 중복 표현될 가능성이 높아진다. "Golden Gate Bridge" 개념이 색감에 따라 서로 다른 자질에 분산되는 식이다. 이는 단순한 낭비를 넘어 해석을 어렵게 만든다.
+
+## Top-K와 JumpReLU: 하드 희소성
+
+L1의 "소프트" 희소성 한계를 넘기 위해 Top-K SAE와 JumpReLU SAE가 등장했다(Rajamanoharan 2024).
+
+**Top-K SAE**는 매 샘플마다 정확히 K개의 자질만 활성화하도록 강제한다. 사전활성화 벡터에서 상위 K개를 제외한 나머지를 모두 0으로 마스킹한다. Dead Feature 문제를 원천적으로 차단하는 강점이 있다. 충분히 많은 샘플에서 모든 자질이 "상위 K"에 들어갈 기회를 얻기 때문이다.
+
+**JumpReLU**는 한 걸음 더 나아가 각 자질이 자신의 임계값을 학습하도록 한다.
+
+$$
+f_i = (z_i - \theta_i) \cdot \mathbb{1}[z_i > \theta_i]
+$$
+
+여기서 $\theta_i$는 자질 $i$의 학습 가능한 임계값이다. 지시 함수 $\mathbb{1}[\cdot]$은 미분 불가능하므로 Straight-Through Estimator(STE)로 역전파한다. STE는 편향된 추정량이지만 경험적으로 잘 수렴한다.
+
+<Callout type="note" title="트레이드오프">
+Top-K는 샘플마다 활성화 수가 고정되어 있어 구현이 단순하지만, 개념마다 "필요한 자질 수"가 다를 수 있다는 사실을 무시한다. JumpReLU는 유연성이 높은 반면 STE 편향과 임계값 초기화 전략이라는 추가 하이퍼파라미터가 생긴다. 동일한 희소성 수준에서 두 방법 모두 L1보다 낮은 재구성 오류를 달성한다.
+</Callout>
+
+## 스케일링: Claude 3와 Power Law
+
+Templeton et al. 2024는 SAE를 Anthropic의 Claude 3 Sonnet에 적용해 1M~34M 크기의 SAE를 훈련했다. 결과는 두 가지 층위에서 의미 있다.
+
+첫째, **자질 수는 모델 크기의 Power Law를 따른다.**
+
+$$
+N_{\text{features}} \propto N_{\text{params}}^{\alpha}, \quad \alpha \approx 0.7 \sim 1.0
+$$
+
+모델이 클수록 더 복잡한 개념을 표현하고, 그 개념을 분리하려면 더 많은 자질이 필요하다.
+
+둘째, **멀티모달 자질의 존재가 확인됐다.** "Golden Gate Bridge" 자질은 텍스트("GG Bridge", "San Francisco")와 이미지(주황색 현수교 사진) 모두에서 높은 활성화를 보인다. 언어와 시각 정보가 LLM 내부에서 단일 방향으로 수렴한다는 증거다.
+
+셋째, **Activation Steering으로 인과성을 검증했다.** 특정 자질의 활성화를 강제로 증폭시키면 모델 출력이 해당 개념을 향해 편향된다. 자질이 단순한 상관 관계가 아니라 모델 행동의 인과적 원인임을 시사한다.
+
+<Aside label="직관">
+Activation Steering의 핵심은 "상관관계에서 인과관계로" 넘어가는 것이다. SAE가 학습한 방향 벡터를 직접 조작했을 때 모델이 예측 가능하게 반응한다면, 그 방향은 모델 내부에서 실제로 의미를 처리하는 표현이다.
+</Aside>
+
+## Gemma Scope와 오픈소스 회로 분석
+
+Lieberum et al. 2024의 Gemma Scope는 Templeton 2024의 논리를 공개 생태계로 확장했다. Gemma 2(9B, 27B)의 모든 주요 층에 걸쳐 400개 이상의 JumpReLU SAE를 훈련하고 가중치, 코드, 대시보드를 완전히 공개했다.
+
+**Sparse Feature Circuit**은 Gemma Scope가 추가한 분석 도구다. 자질들을 노드로, 자질 $i$의 활성화가 자질 $j$에 미치는 인과적 영향을 엣지 가중치로 삼는 방향성 그래프 $\mathcal{C} = (S, E)$를 구성한다. 전체 수백만 자질 중 특정 작업에 관여하는 최소 부분집합을 추출할 수 있다.
+
+경험적 관찰로, Gemma 2 9B와 27B에서 발견된 자질 중 40~60%가 의미론적으로 겹친다. 모델 크기와 무관하게 기본 개념들이 유사하게 학습되는 "자질 보편성"의 가능성을 열어준다.
+
+## 정리
+
+- SAE의 핵심 원리는 **초과완전성 + L1 희소성**: $d_{\text{SAE}} \gg d_{\text{hidden}}$으로 얽힌 개념을 분리하고, L1이 대부분의 자질을 0으로 만든다.
+- L1의 소프트 희소성 한계를 **Top-K와 JumpReLU**가 넘어선다. 동일 희소성에서 더 낮은 재구성 오류를 달성한다.
+- Templeton 2024는 $N_{\text{features}} \propto N_{\text{params}}^\alpha$의 **스케일링 법칙**과 멀티모달 자질, Activation Steering 기반 인과 검증을 실증했다.
+- Gemma Scope는 이 모든 기법을 **재현 가능한 오픈소스 생태계**로 제공하며, Sparse Feature Circuit으로 자질 간 정보 흐름 추적을 가능하게 했다.
+
+SAE는 신경망을 "블랙박스"에서 "해석 가능한 부품들의 조합"으로 바꾸려는 시도다. 아직 수백만 자질 모두를 이해하기는 불가능하지만, 방향은 분명해졌다.
+
+<Reference
+  title="Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet"
+  authors="Templeton et al."
+  year={2024}
+  venue="Anthropic"
+  url="https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html"
+/>
+
+<Reference
+  title="Gemma Scope: Open Sparse Autoencoders Everywhere All At Once on Gemma 2"
+  authors="Lieberum et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2408.05147"
+/>

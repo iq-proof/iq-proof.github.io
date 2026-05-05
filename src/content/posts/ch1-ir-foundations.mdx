@@ -1,0 +1,151 @@
+---
+title: "RAG의 상한선은 어디서 결정되는가"
+description: "IR의 수학적 정식화부터 BM25의 확률론적 유도, 평가 메트릭의 이론적 근거, two-stage pipeline의 recall bound까지 — retrieval 시스템의 설계 원리를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [rag, information-retrieval, bm25, ndcg, two-stage-pipeline]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+RAG(Retrieval-Augmented Generation) 시스템의 성능은 retrieval 단계에서 이미 상한선이 결정된다. 더 큰 언어 모델을 붙여도, 더 정교한 프롬프트를 설계해도, retrieval이 놓친 문서는 생성 단계에서 복구할 수 없다. 그렇다면 retrieval의 상한선은 어떻게 정의되고, 무엇이 그것을 결정하는가?
+
+## IR의 수학적 정식화 — 세 가지 패러다임
+
+Information Retrieval의 핵심 문제는 하나다: 쿼리 $q \in \mathcal{Q}$에 대해 문서 집합 $D$에서 실제 관련 문서 집합 $R(q) = \{d \in D : (q, d) \in \text{Rel}\}$을 얼마나 잘 추정하는가.
+
+세 패러다임은 이 문제를 다르게 해결한다.
+
+**Boolean Model**은 결정론적이다. term이 있으면 1, 없으면 0. 점수가 없으므로 순위도 없다. 정확하게 매칭되는 것만 반환하기 때문에 precision은 높지만 recall이 낮고, 유연성이 없다.
+
+**Vector Space Model(VSM)**은 query와 document를 같은 $m$차원 공간의 벡터로 표현하고 cosine similarity로 점수를 계산한다.
+
+$$f_{\text{VSM}}(q, d_i) = \frac{q \cdot d_i}{\|q\| \cdot \|d_i\|}$$
+
+정규화로 인해 문서 길이에 무관하게 방향(방향 = 내용)만 비교한다. soft relevance와 ranking이 가능해진다.
+
+**Probabilistic Model**은 relevance를 확률 변수 $R \in \{0, 1\}$로 모델링한다.
+
+$$f_{\text{Prob}}(q, d_i) = P(R=1 \mid q, d_i)$$
+
+이 세 관점은 같은 문제를 다른 가정으로 해결한다. 어떤 가정이 더 실제에 가까운가에 따라 성능이 달라진다.
+
+## TF-IDF와 BM25 — 정보이론에서 확률론으로
+
+TF-IDF는 60년간 default였다. 그 이유는 단순한 경험론이 아니라 정보이론적 정당성에 있다.
+
+$$\text{IDF}(t) = \log\left(\frac{N}{\text{df}(t)}\right) = \log\left(\frac{1}{p_t}\right) = I(t)$$
+
+IDF는 term $t$의 self-information이다. 드문 단어일수록 등장 자체가 더 많은 정보를 담는다. 이는 엔트로피 개념과 직결된다.
+
+그러나 TF-IDF는 선형 TF 가정을 한다 — term이 100번 등장하면 1번보다 100배 중요하다고 본다. 이는 비현실적이다.
+
+BM25는 이 가정을 2-Poisson Eliteness Model로 대체한다. 각 문서는 term $t$에 대해 "elite"(관련) 또는 "non-elite" 상태 중 하나이며, TF는 상태에 따른 Poisson 분포를 따른다고 가정한다. 이 likelihood ratio를 정리하면 다음이 나온다.
+
+$$\text{BM25}(d,q) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{\text{TF}(t,d) \cdot (k_1 + 1)}{\text{TF}(t,d) + k_1 \cdot \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
+
+TF 항 $\frac{x(k_1+1)}{x+k_1}$은 단조증가하지만 오목(concave)하다 — $f''(x) < 0$. term 빈도의 증가가 점수에 주는 한계효용이 감소한다. $k_1$은 얼마나 빨리 포화에 도달하는지, $b$는 문서 길이 정규화의 강도를 제어한다.
+
+<Aside label="왜 BM25는 30년 후에도 강력한가">
+BEIR benchmark(Thakur et al. 2021)에서 zero-shot dense 모델(DPR, Contriever)이 BM25에 뒤지는 경우가 빈번하다. 학습 데이터 없이 새로운 도메인에 적용할 때 BM25의 robustness는 dense 모델의 표현력보다 우세하다.
+</Aside>
+
+## Recall-Precision 트레이드오프의 필연성
+
+<Theorem kind="theorem" number="1" title="Recall-Precision Trade-off의 단조성">
+Retrieval threshold $\theta$를 상향 조정하면 $|\hat{R}(\theta)|$가 감소하여 Precision은 증가하고 Recall은 감소한다.
+</Theorem>
+
+<Proof>
+$|R|$을 전체 relevant 문서 수(고정), $|\hat{R}(\theta)|$를 threshold $\theta$에서의 retrieved 문서 수라 하자.
+
+$$\text{Precision}(\theta) = \frac{|\hat{R}(\theta) \cap R|}{|\hat{R}(\theta)|}, \quad \text{Recall}(\theta) = \frac{|\hat{R}(\theta) \cap R|}{|R|}$$
+
+$\theta$ 증가 시 $|\hat{R}(\theta)|$ 감소. 분자 $|\hat{R}(\theta) \cap R|$도 같거나 감소하지만, 분모가 더 빠르게 감소하므로 Precision은 일반적으로 증가한다. Recall은 분모 $|R|$이 고정된 상태에서 분자가 감소하므로 단조 감소한다. $\square$
+</Proof>
+
+이 트레이드오프는 응용에 따라 최적점이 다르다. 의료 진단은 false negative의 비용이 크므로 recall을 우선한다. 법률 문서 검색은 precision을 우선할 수 있다.
+
+## 평가 메트릭 — 무엇을 측정하는가
+
+단일 메트릭은 위험하다. 각 메트릭은 서로 다른 질문에 답한다.
+
+| 메트릭 | 측정 대상 | 적합한 응용 |
+|--------|-----------|------------|
+| Recall@k | top-k 중 relevant 포함 비율 | E-commerce (coverage 우선) |
+| MRR | 첫 번째 정답의 위치 | QA, fact retrieval |
+| MAP | 순위를 고려한 누적 precision | 웹 검색 |
+| NDCG@k | graded relevance의 위치 가중 누적 이득 | 추천, 뉴스 검색 |
+
+NDCG의 position discount $\log_2(i+1)$은 임의적으로 보이지만 정보이론적 근거가 있다. 사용자가 position $k$까지 탐색하는 데 필요한 "노력"은 $\log_2(k+1)$에 비례한다고 볼 수 있다 — binary search tree에서의 평균 탐색 깊이와 같은 논리다.
+
+$$\text{NDCG@k} = \frac{\text{DCG@k}}{\text{IDCG@k}} = \frac{\sum_{i=1}^{k} (2^{\text{rel}(i)}-1) / \log_2(i+1)}{\sum_{i=1}^{k} (2^{\text{rel}^{\text{ideal}}(i)}-1) / \log_2(i+1)}$$
+
+<Callout type="warning" title="메트릭 선택의 함정">
+MAP은 binary relevance만 지원하고, NDCG는 graded relevance label이 필요하다. 레이블 비용과 annotation 일관성을 고려하지 않고 메트릭을 선택하면, 실제로 측정하고 싶은 것을 측정하지 못할 수 있다.
+</Callout>
+
+## Two-Stage Pipeline의 수학적 필연성
+
+<Theorem kind="theorem" number="2" title="Recall Bound">
+Stage 1 retriever가 top-$k$ 에서 $\text{Recall}_1$을 달성할 때, Stage 2 reranker의 최대 달성 가능 recall은 $\text{Recall}_1$을 초과할 수 없다.
+
+$$\text{Recall}_2^{\max} \leq \text{Recall}_1$$
+</Theorem>
+
+<Proof>
+$R(q)$를 전체 relevant 문서 집합, $D_1(q)$를 Stage 1이 반환한 집합이라 하자. Stage 2는 $D_1(q)$ 내에서만 재순위화하므로 $D_2(q) \subseteq D_1(q)$.
+
+$$\text{Recall}_2 = \frac{|R(q) \cap D_2(q)|}{|R(q)|} \leq \frac{|R(q) \cap D_1(q)|}{|R(q)|} = \text{Recall}_1$$
+
+Stage 1이 놓친 relevant 문서는 Stage 2에서 복구 불가능하다. $\square$
+</Proof>
+
+이 정리가 two-stage pipeline을 단순한 효율 최적화가 아닌 **이론적 필연**으로 만든다. Single powerful ranker를 전체 문서에 적용하는 것은 현실적으로 불가능하다($N = 10^6$, cross-encoder 적용 시 수초 이상). 대신 fast retriever로 recall을 확보하고, expensive reranker로 precision을 높이는 구조가 최적이다.
+
+효율 이득은 명확하다. Stage 1이 $O(N)$, Stage 2가 $O(k \cdot d^2)$일 때,
+
+$$\frac{L_{\text{single}}}{L_{\text{two-stage}}} \approx \frac{N}{k}$$
+
+$N = 10^7, k = 100$이면 $10^5$배의 latency 절감이다.
+
+<Callout type="note" title="트레이드오프">
+$k$ 값이 two-stage의 모든 균형을 결정한다. $k$가 크면 Stage 1 recall이 높아지지만 Stage 2 latency가 증가한다. $k$가 작으면 반대다. 최적 $k$는 latency budget 제약 하에서 NDCG를 최대화하는 값이며, 경험적으로 $k = 100 \sim 500$이 일반적이다. BM25(recall stage) → dense reranker → cross-encoder 의 cascading이 현재 SOTA pipeline의 표준인 이유도 여기에 있다.
+</Callout>
+
+## 정리
+
+- IR의 세 패러다임(Boolean, VSM, Probabilistic)은 retrieval 문제를 다른 가정으로 해결하며, 각 가정의 정확성이 성능을 결정한다.
+- TF-IDF의 IDF는 self-information이고, BM25는 2-Poisson 모델에서 TF saturation을 이론적으로 유도한다.
+- Recall-Precision 트레이드오프는 threshold 조정의 수학적 귀결이며, 응용에 따라 최적점이 다르다.
+- NDCG의 position discount는 사용자 탐색 비용을 근거로 하며, 메트릭 선택은 측정 목적에 맞아야 한다.
+- Two-stage pipeline은 Recall Bound 정리의 귀결이다 — Stage 1의 recall이 전체 시스템의 상한선이다.
+
+RAG 시스템을 설계할 때 "어떤 LLM을 쓸까"보다 "Stage 1 recall@k는 충분한가"가 더 근본적인 질문이다.
+
+<Reference
+  title="Okapi at TREC-3"
+  authors="Robertson et al."
+  year={1995}
+  venue="TREC"
+  url="https://trec.nist.gov/pubs/trec3/papers/city.ps.gz"
+/>
+
+<Reference
+  title="BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models"
+  authors="Thakur et al."
+  year={2021}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2104.08663"
+/>

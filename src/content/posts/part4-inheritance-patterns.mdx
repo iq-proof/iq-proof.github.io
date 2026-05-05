@@ -1,0 +1,101 @@
+---
+title: "상속은 언제 올바른가 — 서브타이핑, LSP, 그리고 협력의 일관성"
+description: "is-a 관계의 어휘적 판단이 아니라 클라이언트 관점의 행동 호환성에서 올바른 상속이 시작된다. 리스코프 치환 원칙부터 일관성 있는 협력 패턴, 디자인 패턴까지 설계 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [oop, inheritance, lsp, design-patterns, refactoring]
+difficulty: intermediate
+series:
+  slug: object
+  title: Object
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+
+"펭귄은 새다." 이 문장은 생물학적으로 맞다. 그러면 `Penguin extends Bird`도 맞는 설계인가? 그 판단을 내리는 기준이 어휘가 아니라 행동이어야 한다면, 우리는 상속을 처음부터 다시 생각해야 한다.
+
+## 타입은 퍼블릭 인터페이스다
+
+객체지향에서 타입을 결정하는 것은 내부 속성이 아니라 외부에 노출하는 행동이다. `AmountDiscountPolicy`와 `PercentDiscountPolicy`는 내부 구현이 완전히 다르지만, 동일한 `calculateDiscountAmount()` 메시지를 수신할 수 있다면 `Movie` 클라이언트 관점에서 둘은 같은 타입이다.
+
+타입 계층은 이 관점에서 성립한다. 슈퍼타입은 더 일반적인 퍼블릭 인터페이스를, 서브타입은 그것을 특수화한 인터페이스를 제공한다. 그리고 서브타입의 인스턴스는 슈퍼타입의 인스턴스로 간주될 수 있어야 한다. 이것이 타입 계층의 핵심이다.
+
+## 서브클래싱과 서브타이핑의 분기점
+
+상속에는 두 가지 용도가 있다. 코드 재사용을 위한 **서브클래싱**과 타입 계층을 구성하기 위한 **서브타이핑**이다. 이 둘이 겉보기에 같은 문법을 쓰기 때문에 혼동이 생긴다.
+
+<Callout type="warning" title="서브클래싱의 함정">
+`Stack extends Vector`는 대표적인 서브클래싱 남용 사례다. `Stack`은 LIFO 자료구조인데, `Vector`의 `add(int index, E element)` 같은 임의 삽입 메서드가 그대로 노출된다. 클라이언트가 `Vector`를 기대하며 `Stack`을 사용할 때 계약이 깨진다.
+</Callout>
+
+판단 기준은 하나다. **클라이언트 입장에서 자식이 부모를 대체할 수 있는가.** 행동 호환성이 없으면 상속이 아니라 합성이나 인터페이스 분리를 고려해야 한다.
+
+펭귄 예시로 돌아가면, 해결책은 세 갈래다. `Bird`와 `FlyingBird`를 분리해 날 수 있는 새만 별도 계층으로 묶는 것, `Flyer`와 `Walker` 인터페이스를 분리해 클라이언트가 필요한 능력만 의존하게 하는 것, 또는 합성으로 행동을 조합하는 것. 세 방법 모두 공통점이 있다 — `flyBird(Bird bird)` 같은 메서드가 펭귄을 받아도 안전하게 동작한다.
+
+## 리스코프 치환 원칙 — 클라이언트가 판사다
+
+<Theorem kind="proposition" number="1" title="리스코프 치환 원칙 (LSP)">
+서브타입은 그것의 기반 타입에 대해 대체 가능해야 한다. 클라이언트가 차이점을 인식하지 못한 채 슈퍼타입의 인터페이스를 통해 서브타입을 사용할 수 있어야 한다.
+</Theorem>
+
+Rectangle과 Square 예시가 이 원칙의 핵심을 드러낸다. 수학적으로 정사각형은 직사각형이다. 하지만 `Rectangle` 클라이언트는 너비와 높이를 독립적으로 설정할 수 있다고 기대한다. `Square`는 둘을 항상 같게 유지하므로, `resize(rectangle, 50, 100)` 호출 후 단언문 `width == 50 && height == 100`이 실패한다. LSP 위반이다.
+
+is-a 문장 앞에 "클라이언트 입장에서"를 붙여보는 것이 실용적인 검증법이다. "클라이언트 입장에서 정사각형은 직사각형이다" — 이 문장이 거짓이면 상속 관계도 거짓이다.
+
+계약에 의한 설계(Design By Contract)는 LSP를 코드 수준에서 구체화한다. 서브타입은 슈퍼타입의 사전조건을 강화할 수 없고, 사후조건을 약화할 수 없다. 사전조건을 강화하면 클라이언트가 모르는 조건이 추가되고, 사후조건을 약화하면 클라이언트의 기대가 무너진다. `BrokenDiscountPolicy`가 "상영 종료 시간이 자정 이전"이라는 추가 사전조건을 요구하면, `Movie`는 `DiscountPolicy`와의 계약만 알고 있으므로 협력이 실패한다.
+
+## 일관성 있는 협력 — 변하는 것을 분리하라
+
+올바른 서브타이핑이 단일 클래스 쌍의 문제라면, 일관성 있는 협력은 시스템 전체에 걸친 설계 원칙이다. 4가지 요금 정책(고정요금, 시간대별, 요일별, 구간별)을 각각 다른 방식으로 구현하면 어떤 일이 벌어지는가? 새 정책을 추가할 때 "어떤 방식을 따라야 하지?"라는 혼란이 생기고, 코드를 읽는 사람은 4가지 패러다임을 각각 학습해야 한다.
+
+일관성의 출발점은 변하는 것과 변하지 않는 것을 분리하는 것이다. 4가지 요금 정책을 분석하면 공통 구조가 보인다 — **기본 정책 = 하나 이상의 규칙들의 집합**, 각 규칙 = **적용 조건 + 단위 요금**. 적용 조건이 변하고, 규칙과 단위 요금의 구조는 변하지 않는다.
+
+```java
+public interface FeeCondition {
+    List<DateTimeInterval> findTimeIntervals(Call call);
+}
+
+public class FeeRule {
+    private FeeCondition feeCondition;
+    private FeePerDuration feePerDuration;
+
+    public Money calculateFee(Call call) {
+        return feeCondition.findTimeIntervals(call)
+                .stream()
+                .map(each -> feePerDuration.calculate(each))
+                .reduce(Money.ZERO, (a, b) -> a.plus(b));
+    }
+}
+```
+
+변하는 부분(`FeeCondition`)이 인터페이스로 추상화됐다. 이제 시간대별 조건은 `TimeOfDayFeeCondition`, 요일별 조건은 `DayOfWeekFeeCondition`으로 구현하면 된다. 고정요금조차 `FixedFeeCondition` — "항상 전체 통화 시간을 반환하는 조건" — 으로 동일한 패턴 안에 담긴다.
+
+<Aside label="설계 철학">
+조건 로직(`if type == A ... else if type == B ...`)은 새 타입이 추가될 때마다 수정을 강제한다. 다형성은 이 조건 로직을 객체 사이의 탐색으로 바꾼다. `feeCondition.findTimeIntervals(call)` 한 줄이 조건 분기 전체를 대체한다.
+</Aside>
+
+## 디자인 패턴 — 검증된 협력 템플릿
+
+일관성 있는 협력을 반복적으로 발견하고 문서화한 것이 디자인 패턴이다. 패턴의 구성 요소는 클래스가 아니라 **역할**이다. STRATEGY 패턴은 "알고리즘을 캡슐화해 런타임에 교체 가능하게 하는 역할 구조"를 정의한다. Movie-DiscountPolicy 구조는 STRATEGY 패턴의 구현이다.
+
+DECORATOR 패턴은 선택적 행동의 순서와 개수를 캡슐화한다. `TaxablePolicy`가 `RateDiscountablePolicy`를 감싸거나, 그 반대로 감싸거나 — 런타임에 조합 가능하다. 이 유연성은 상속으로는 달성할 수 없다. 2가지 부가 정책 × 순서 = 상속 계층이 조합적으로 폭발하지만, 데코레이터는 2개 클래스로 모든 조합을 처리한다.
+
+<Callout type="note" title="트레이드오프">
+STRATEGY는 런타임 교체가 가능하고 결합도가 낮지만, 클래스 수가 늘어난다. TEMPLATE METHOD는 상속으로 단순하지만, 런타임 변경이 불가능하고 결합도가 높다. 알고리즘이 런타임에 바뀌어야 한다면 STRATEGY, 고정적이라면 TEMPLATE METHOD가 더 단순한 선택이다. 패턴 자체가 목표가 되어선 안 된다 — "정당한 이유 없이 사용된 패턴은 설계를 복잡하게 만드는 장애물이다."
+</Callout>
+
+프레임워크는 이 패턴들을 실행 가능한 코드로 굳힌다. 프레임워크의 핵심은 제어 역전(IoC)이다. 라이브러리는 개발자가 호출하지만, 프레임워크는 프레임워크가 개발자의 코드(훅)를 호출한다. `BasicRatePolicy.calculateFee()`는 프레임워크가 제공하고, `calculateCallFee()`를 개발자가 구현한다. 협력 흐름의 제어권이 프레임워크로 이전된 것이다.
+
+## 정리
+
+- 타입 계층의 유효성은 is-a 어휘가 아니라 **클라이언트 관점의 행동 호환성**으로 판단한다.
+- LSP는 "서브타입이 슈퍼타입을 대체할 수 있어야 한다"는 원칙이며, 계약에 의한 설계는 이를 코드 수준에서 구체화한다 — 사전조건 강화 금지, 사후조건 약화 금지.
+- 일관성 있는 협력은 변하는 것(FeeCondition)을 분리·추상화해, 새로운 기능 추가가 기존 코드 수정 없이 가능하게 만든다.
+- 디자인 패턴은 이 협력 구조의 검증된 이름이다. 패턴은 출발점이지 목적지가 아니다.
+
+이 챕터들이 공유하는 하나의 질문은 결국 "변경이 발생할 때 어디가 영향을 받는가?"다. 올바른 상속, 일관된 협력, 적절한 패턴 — 모두 그 질문에 대한 다른 규모의 답이다.

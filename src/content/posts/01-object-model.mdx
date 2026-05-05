@@ -1,0 +1,130 @@
+---
+title: "Git이 파일이 아닌 SHA로 세상을 보는 이유"
+description: "Content-Addressable Storage의 두 가지 결정부터 Merkle tree의 cascade 무결성, delta compression과 GC의 균형까지, Git 객체 저장소의 통합 철학을 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, object-store, content-addressable-storage, merkle-tree, pack-file]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Git은 파일 이름을 모른다. 정확하게 말하면, Git의 핵심 저장소는 이름 대신 SHA를 주소로 사용하는 KV 스토어다. `git log`, `git diff`, `git checkout` — 이 모든 명령은 `.git/` 안의 파일들을 읽고 쓰는 wrapper일 뿐이다. 그렇다면 왜 이런 설계를 선택했는가?
+
+## 모든 것은 Content-Addressable Storage에서 시작한다
+
+Git의 철학은 두 문장으로 압축된다.
+
+1. 데이터의 **주소 = 데이터의 해시**
+2. 같은 데이터는 단 한 번만 저장된다 (immutable)
+
+이 두 결정의 직접적 결과가 `.git/objects/` 디렉토리다. `echo "hello" | git hash-object --stdin`을 실행하면 `ce013625...`라는 SHA가 반환되고, 이 SHA의 앞 두 글자가 디렉토리명, 나머지 38자가 파일명이 된다.
+
+```bash
+$ printf 'blob 6\0hello\n' | sha1sum
+ce013625030ba8dba906f756967f9e9ca394464a
+$ echo "hello" | git hash-object --stdin
+ce013625030ba8dba906f756967f9e9ca394464a
+```
+
+두 결과가 완벽히 일치한다. Git은 마법이 없다 — `<type> SP <size> NUL <content>` 포맷으로 헤더를 붙이고, SHA를 계산하고, zlib으로 압축해 파일로 저장할 뿐이다.
+
+이 구조가 만들어내는 핵심 속성이 있다. 같은 내용을 가진 두 파일은 자동으로 같은 blob 하나를 공유한다. 100명이 같은 파일을 커밋해도 저장소에는 blob 1개만 존재한다. 그리고 SHA만 알면 어떤 clone에서든 같은 데이터를 찾을 수 있다 — 위치에 의존하지 않는 분산 주소 체계다.
+
+## 4가지 객체와 책임 분리
+
+CAS 위에서 Git은 4가지 객체 타입으로 모든 정보를 표현한다.
+
+- **blob**: 파일 내용. 이름도, 권한도, 시간도 없다.
+- **tree**: `(mode, name, SHA)` 엔트리 목록. 디렉토리 = "이름 → SHA의 매핑"
+- **commit**: tree + 부모 commit(s) + author/committer + 메시지
+- **tag**: annotated tag만 객체로 존재. lightweight tag는 ref 파일 한 줄이 전부다.
+
+책임 분리가 핵심이다. blob은 이름을 모른다 — 이름은 tree가 안다. tree는 시간을 모른다 — 시간은 commit이 안다. commit은 변경분을 저장하지 않는다 — 그 시점 전체 트리의 스냅샷 포인터를 저장한다. `git diff`가 보여주는 변경분은 두 commit의 tree를 비교해 **매번 계산**한 결과다.
+
+이 분리 때문에 `git mv`는 사실 rename을 추적하지 않는다. blob은 그대로고 tree 엔트리의 이름만 바뀐다. `git log --follow`의 "rename 추적"은 내용 유사도를 기반으로 한 휴리스틱이다.
+
+## Merkle Tree — SHA가 cascade된다
+
+4가지 객체가 SHA로 서로를 참조하는 구조는 자연스럽게 Merkle tree를 형성한다.
+
+```
+commit
+  └─ tree (root)
+      ├─ src/   → tree-A
+      │             └─ main.c → blob-1
+      └─ README → blob-2
+```
+
+`README`를 한 글자 수정하면 무슨 일이 벌어지는가?
+
+1. `blob-2` → `blob-3` (새 내용, 새 SHA)
+2. root tree → 새 tree (blob-2 대신 blob-3을 가리키므로 SHA 변경)
+3. commit → 새 commit (tree SHA가 바뀌었으므로 SHA 변경)
+
+byte 하나가 바뀌면 모든 조상 노드의 SHA가 cascade된다. 이 덕분에 commit SHA는 그 시점 전체 디렉토리 상태의 무결성 인증서가 된다. 별도 서명이나 체크섬 없이, SHA 하나만으로 하위 모든 데이터의 변조를 감지할 수 있다.
+
+실용적 함의도 크다. "이 디렉토리가 변했는가?"를 확인하는 데 byte 비교가 필요 없다 — 해당 tree SHA 하나만 비교하면 된다. `git diff`가 빠른 이유다: tree SHA가 같으면 그 하위 전체를 건너뛴다.
+
+<Callout type="note" title="Merkle tree는 Git만의 아이디어가 아니다">
+1979년 Ralph Merkle의 hash tree 논문이 원조다. Git(2005), Bitcoin(2008), IPFS, Certificate Transparency — 분산 환경에서 무결성을 보장해야 하는 시스템들이 같은 패턴을 독립적으로 채택했다. commit SHA는 Bitcoin의 block hash와 구조적으로 동일한 역할을 한다.
+</Callout>
+
+## 저장 효율 — Loose에서 Pack으로
+
+CAS는 immutable append-only 구조다. 변경은 항상 새 객체를 만들고 ref를 옮기는 방식이다. 100번 커밋하면 수백 개의 작은 파일이 생긴다. 모노레포에서는 수백만 개가 된다. 파일시스템은 inode 부담으로 느려진다.
+
+`git gc`는 이 문제를 해결한다. 수백 개의 loose object를 하나의 `.pack` 파일과 `.idx` 인덱스 파일로 통합한다. `.idx`는 256-entry fanout table + 정렬된 SHA 목록으로 구성되어 O(log N) lookup을 보장한다.
+
+pack이 진가를 발휘하는 곳은 **delta compression**이다. 1MB 파일을 한 줄 수정하면 새 blob이 1MB 그대로 생기지만, gc 후 pack 안에서는 `base + 변경분(수십 bytes)`으로 표현된다.
+
+```
+delta = COPY(0, 99999)   ← base의 앞부분 복사
+      + INSERT("수정된 줄", N)
+      + COPY(100001, ...)  ← 나머지 복사
+```
+
+Linux 커널처럼 1990년대부터 쌓인 history가 수 GB 수준에 머무는 이유가 여기 있다. `git clone`이 빠른 이유도 마찬가지 — 서버는 미리 만들어둔 pack을 그대로 스트리밍하고, 클라이언트는 받은 pack을 `.git/objects/pack/`에 그대로 저장한다.
+
+<Aside label="delta chain 주의">
+delta chain이 깊을수록 디스크는 절약되지만 읽기 비용이 늘어난다. 객체 하나를 읽으려면 chain 끝까지 거슬러 올라가 순서대로 reconstruct해야 하기 때문이다. Git의 기본 depth 제한은 50이다.
+</Aside>
+
+## 트레이드오프 — Append-only의 대가
+
+CAS와 Merkle tree의 조합은 강력하지만 공짜가 아니다.
+
+**얻는 것**: 자동 dedup, 자동 무결성 검증, 분산 동등성 비교 O(1), 동시성 문제 거의 없음.
+
+**잃는 것**: 변경이 항상 새 객체를 만들어 지속적으로 누적된다. 삭제도 즉시 반영되지 않는다.
+
+이를 관리하는 것이 Reachability와 GC다. `ref/reflog`에서 객체 그래프를 따라 도달 가능한 객체는 **reachable**, 그렇지 않은 것은 **dangling**이다. `git reset --hard`나 force push로 "삭제된" commit은 사실 reflog에서 30~90일간 살아있다. 이 grace period 덕분에 실수 복구가 가능하다.
+
+```bash
+$ git reflog
+abc1234 HEAD@{0}: reset: moving to HEAD~
+<ghost> HEAD@{1}: commit: 실수로 날린 커밋  ← 여기 있다
+```
+
+민감한 정보가 commit에 들어갔다면 force push로는 부족한 이유도 여기 있다. GitHub는 자체 GC 만료 전까지 객체를 보관한다. 비밀키가 커밋됐을 때의 정답은 "삭제"가 아니라 "키 교체(rotation)"다.
+
+<Callout type="warning" title="트레이드오프 요약">
+CAS는 무결성과 dedup을 공짜로 제공하는 대신, **삭제가 즉각적이지 않다**. 파일 기반 설계는 디버깅이 쉽고 이식성이 높지만, 수백만 객체가 쌓이면 GC와 pack 관리가 필요하다. 모노레포라면 `gc.auto`를 높이고 주기적으로 `git repack -ad`로 pack을 통합하라.
+</Callout>
+
+## 정리
+
+- Git의 모든 설계는 하나의 원칙으로 수렴한다 — **주소 = 해시(내용)**, 같은 내용은 한 번만 저장.
+- 4가지 객체(blob/tree/commit/tag)는 각자의 책임만 담당하며, SHA로 서로를 참조해 Merkle tree를 형성한다.
+- 한 byte가 바뀌면 commit SHA까지 cascade — 이것이 별도 메커니즘 없이 분산 무결성을 보장하는 방법이다.
+- Pack + delta compression은 이 immutable 구조의 공간 비용을 극단적으로 낮춘다.
+- GC의 grace period는 실수 복구 여유이자 race condition 방지책이다. "삭제"처럼 보이는 모든 Git 작업은 사실 ref를 옮기는 것이다.
+
+다음 글에서는 이 객체 저장소 위에 세워진 ref 시스템을 추적한다 — HEAD, branch, remote-tracking ref가 어떻게 단순한 텍스트 파일로 Git의 모든 "현재 위치"를 표현하는가.

@@ -1,0 +1,132 @@
+---
+title: "RAG의 다음 단계: 그래프, 이미지, 긴 문맥은 무엇을 바꾸는가"
+description: "entity-relation 그래프로 global question을 해결하는 GraphRAG부터 OCR 없이 PDF 페이지를 직접 임베딩하는 ColPali, Lost-in-the-Middle을 피하는 Late Chunking까지, RAG frontier의 설계 원리를 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [rag, graphrag, colpali, long-context, retrieval]
+difficulty: advanced
+series:
+  slug: retrieval-rag-deep-dive
+  title: Retrieval Rag Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Dense vector RAG는 쿼리와 passage 사이의 유사도를 측정하는 데 탁월하다. 그런데 "이 회사의 역사적 흐름을 요약해줘"나 "PDF 표의 3행 4열 값은?" 같은 질문에는 왜 실패하는가? 그리고 1M 토큰 context 창이 있는데도 왜 RAG가 여전히 필요한가?
+
+## 구조를 명시적으로 만드는 GraphRAG
+
+Dense retrieval은 passage-level similarity에만 의존한다. corpus 전체에 걸친 entity 간 관계, 시간적 흐름, 인과 구조는 임베딩 벡터 안에 암묵적으로 녹아 있을 뿐이다. GraphRAG(Microsoft, 2024)는 이 한계를 정면으로 공략한다.
+
+핵심 파이프라인은 세 단계다. LLM으로 corpus에서 entity와 relation을 추출해 knowledge graph $G = (V, E)$를 구성한다. 그 다음 Leiden 알고리즘으로 graph를 community로 분할하고, 각 community마다 LLM 요약을 생성한다. 검색 시에는 entity 기반 **local retrieval**과 community 요약 기반 **global retrieval**을 병행한다.
+
+Community 분할의 수학적 근거는 modularity 최적화다.
+
+$$
+Q(C) = \sum_{i=1}^{k} \left[ \frac{m_i}{m} - \left(\frac{\sum_{v \in C_i} d_v}{2m}\right)^2 \right]
+$$
+
+$m_i$는 community $C_i$ 내부 엣지 수, $m$은 전체 엣지 수, $d_v$는 노드 $v$의 degree다. Leiden은 이 값을 greedy하게 최대화하며, $O(E \log E)$ 시간에 local maximum에 수렴한다(Traag et al. 2019).
+
+<Callout type="note" title="트레이드오프">
+GraphRAG는 "회사 전체 역사 요약" 같은 global question에서 dense RAG 대비 1.5~2배 우월하다. 반면 LLM extraction 비용이 corpus 크기에 선형으로 증가하고, extraction 오류가 graph 자체를 오염시키면 복구가 어렵다. 한국어처럼 LLM extraction 정확도가 낮은 언어에서는 별도 검증이 필요하다.
+</Callout>
+
+## OCR 없이 PDF를 읽는 ColPali
+
+문서 RAG의 전통적 파이프라인은 OCR → 텍스트 임베딩 → 검색이다. 이 과정에서 세 가지가 무너진다. OCR 오류가 임베딩 오류로 이어지고, 표와 그림의 공간 구조가 선형 텍스트로 평탄화되며, 다국어·저해상도 문서에서 OCR 자체가 실패한다.
+
+ColPali(Faysse 2024)는 OCR 단계를 제거한다. PDF 페이지를 이미지로 받아 PaliGemma VLM의 ViT 인코더로 직접 패치 임베딩을 생성한다.
+
+$$
+P = \text{ViT}(I), \quad P_i \in \mathbb{R}^{768}, \quad i = 1, \ldots, N_p
+$$
+
+224×896 픽셀 페이지라면 $N_p = 14 \times 56 = 784$ 패치가 생성된다. 14×14 픽셀 패치 하나가 영문 12pt 기준 약 1단어 크기에 해당하므로, 표 셀 수준의 공간 해상도가 유지된다.
+
+검색은 ColBERT 방식의 MaxSim late interaction으로 수행된다.
+
+$$
+\text{SCORE}(Q, D) = \sum_{i=1}^{N_q} \max_{j=1}^{N_d} \cos(Q_i, D_j)
+$$
+
+각 query 토큰이 document 패치 중 가장 관련 있는 것을 찾아 매칭한다. global average pooling과 달리 표 셀, 수식, 그림 캡션 같은 국소 구조가 검색 신호로 살아남는다.
+
+<Theorem kind="proposition" number="1" title="MaxSim ≥ Global Pooling">
+MaxSim late interaction 점수는 global average pooling 기반 cosine similarity보다 항상 크거나 같다.
+</Theorem>
+
+<Proof>
+Global pooling은 $\bar{D} = \frac{1}{N_d}\sum_j D_j$로 문서를 단일 벡터로 압축한다. MaxSim은 각 query 토큰에 대해 $\max_j \cos(Q_i, D_j)$를 계산하는데, 이 최댓값은 항상 $\cos(Q_i, \bar{D})$ 이상이다(최대는 평균 이상). 따라서 $\sum_i$ 를 취해도 부등호는 보존된다. $\square$
+</Proof>
+
+ViDoRe 벤치마크에서 ColPali는 표 비중이 높은 문서에서 OCR+dense 대비 recall을 약 40%p 회복한다. 단, PaliGemma forward pass는 OCR보다 약 10배 느리고, 고해상도 이미지에서 패치 수가 제곱으로 증가한다.
+
+## 긴 문맥의 함정: Lost-in-the-Middle
+
+Gemini 2.0의 1M 토큰 context 창은 "RAG 불필요"라는 직관을 낳는다. Liu et al.(2023)은 이 직관이 틀렸음을 실증한다.
+
+RoPE(Rotary Positional Embedding) 기반 attention은 recency bias를 갖는다. context 길이 $N$이 커질수록 중간 위치 청크에 할당되는 attention weight가 감소한다.
+
+$$
+a_m \propto \frac{1}{\log(\text{pos}_m)}, \quad m \in [T_c/2,\ M - T_c/2]
+$$
+
+답이 context 중간에 있으면 LLM이 그것을 "보지 못한다". 실험적으로 정답이 중간에 위치할 때 성공률은 약 50%까지 떨어진다.
+
+Late Chunking(Jina AI, 2024)은 이 문제를 다른 방향에서 우회한다. 문서를 먼저 chunk 단위로 분리해 각각 임베딩하는 대신, **전체 문서를 하나의 긴 시퀀스로 임베딩한 후 chunk 경계를 슬라이싱한다**.
+
+$$
+d_i = \text{mean-pool}\left(\mathbf{d}_{\text{full}}[t_i : t_{i+1}]\right)
+$$
+
+토큰 수준 임베딩 $\mathbf{d}_{\text{full}}[j]$는 이미 $j$ 이전의 모든 토큰을 참조했으므로, chunk 경계를 넘나드는 long-range dependency가 각 $d_i$ 안에 암묵적으로 보존된다. "he"의 선행사가 이전 chunk에 있는 경우에도 임베딩이 그 정보를 갖고 있다.
+
+<Aside label="실용적 정리">
+RAG top-K 문서 선택 → Late Chunking으로 관련 span 추출 → 32K 내외로 정리된 context를 LLM에 전달하는 하이브리드가 현 frontier다. latency는 long-context 단독 대비 10배 이상 빠르고, recall은 dense RAG 단독보다 높다.
+</Aside>
+
+## 세 frontier의 공통 원리와 트레이드오프
+
+GraphRAG, ColPali, Late Chunking은 표면적으로 다르지만 같은 질문에 답한다: **dense vector가 놓치는 구조 정보를 어떻게 명시적으로 포착할 것인가?**
+
+GraphRAG는 entity-relation 그래프로, ColPali는 패치 수준 공간 구조로, Late Chunking은 문서 전체 context로 이 문제에 답한다.
+
+| 방식 | 구조 포착 방법 | 강점 | 주요 비용 |
+|------|--------------|------|----------|
+| Dense RAG | 없음 (암묵적) | 속도, 단순성 | global question 취약 |
+| GraphRAG | entity-relation 그래프 | global synthesis | LLM extraction 비용 |
+| ColPali | ViT 패치 공간 | 표·다국어 문서 | VLM inference 비용 |
+| Late Chunking | 문서 전체 임베딩 | cross-chunk coherence | 긴 임베딩 모델 필요 |
+
+세 접근 모두 비용을 치른다. GraphRAG는 graph 구축에 LLM 호출이 corpus 크기에 비례해 필요하고, ColPali는 패치 수 제곱의 MaxSim 연산이 있으며, Late Chunking은 embedding model의 context 한계(통상 32K)에 걸린다. "모든 쿼리에 최적인 단일 방법"은 없다.
+
+## 정리
+
+- GraphRAG는 entity-relation 구조를 명시적으로 구축하여 global question에서 dense RAG를 압도하지만, LLM extraction 비용과 오류 전파가 핵심 리스크다.
+- ColPali는 OCR 파이프라인을 제거하고 VLM 패치 임베딩 + MaxSim으로 표·다국어 문서의 retrieval 품질을 회복한다.
+- Lost-in-the-Middle은 context 창 크기로 해결되지 않는다. Late Chunking hybrid가 현재 가장 균형 잡힌 대안이다.
+- 세 기법 모두 "dense vector가 암묵적으로 처리하던 구조"를 명시화한다는 동일한 방향을 향하고 있다.
+
+<Reference
+  title="From Local to Global: A Graph RAG Approach to Query-Focused Summarization"
+  authors="Edge et al."
+  year={2024}
+  venue="arXiv"
+  url="https://arxiv.org/abs/2404.16130"
+/>
+
+<Reference
+  title="Lost in the Middle: How Language Models Use Long Contexts"
+  authors="Liu et al."
+  year={2023}
+  venue="TACL"
+  url="https://arxiv.org/abs/2307.03172"
+/>

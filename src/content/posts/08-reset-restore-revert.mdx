@@ -1,0 +1,133 @@
+---
+title: "Git에서 변경을 되돌린다는 것의 의미"
+description: "reset, restore, revert, merge revert, 그리고 reflog 만료까지 — Git이 '되돌리기'를 다섯 가지 다른 방식으로 구현하는 이유를 추적한다."
+pubDate: 2026-05-05
+category: dev
+tags: [git, reset, revert, reflog, version-control]
+difficulty: intermediate
+series:
+  slug: git-in-depth
+  title: Git In Depth
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+`git reset --hard`를 쓸 때 우리는 "변경을 되돌린다"고 말한다. `git revert`를 쓸 때도 같은 말을 한다. 그런데 이 두 명령은 근본적으로 다른 일을 한다. Git이 '되돌리기'를 하나의 명령으로 통일하지 않은 데는 이유가 있다 — 되돌리기의 의미 자체가 맥락마다 다르기 때문이다.
+
+## 되돌리기의 세 가지 층
+
+Git의 작업 공간은 세 층으로 나뉜다: HEAD(커밋 히스토리), Index(스테이징 영역), Working Directory. "되돌린다"는 말이 어느 층을 건드리느냐에 따라 명령이 달라진다.
+
+`git reset`은 이 세 층을 선택적으로 갱신한다.
+
+```
+           HEAD ref    Index    Working    위험도
+─────────────────────────────────────────────────
+--soft       ✓         ─        ─         낮음
+--mixed      ✓         ✓        ─         중간 (default)
+--hard       ✓         ✓        ✓         높음
+```
+
+`--soft HEAD~3`은 HEAD만 3단계 뒤로 옮긴다. Index와 Working은 그대로이므로, 세 커밋의 변경이 모두 스테이징 영역에 남는다. "세 커밋을 하나로 합치고 싶을 때"의 시작점이다. `--hard`는 셋 다 갱신한다. Working Directory의 미커밋 변경도 함께 사라진다.
+
+reset의 본질은 **ref를 옮기는 명령**이다. 커밋 객체를 삭제하지 않는다. ref만 다른 커밋을 가리키게 바꿀 뿐이다.
+
+## restore — checkout이 너무 많은 일을 하고 있었다
+
+Git 2.23 이전에는 `git checkout`이 브랜치 이동과 파일 복원을 동시에 담당했다. `git checkout main`이 브랜치를 이동하는지 `main`이라는 파일을 복원하는지, Git이 휴리스틱으로 추측했다.
+
+2019년 Git 2.23은 이 모호함을 분리했다. `git switch`는 브랜치 이동만, `git restore`는 파일 복원만 담당한다.
+
+```bash
+# 옛 스타일 — Git의 추측에 의존
+git checkout -- file
+git checkout HEAD~3 -- file
+
+# 새 스타일 — 의도가 명확
+git restore file                                    # Working ← Index
+git restore --staged file                           # Index ← HEAD
+git restore --staged --worktree file                # 둘 다 ← HEAD
+git restore --source=HEAD~3 --staged --worktree file  # 둘 다 ← HEAD~3
+```
+
+`--source`, `--staged`, `--worktree` 세 옵션의 조합으로 "어디서 어디로"를 정확하게 지정한다. `git restore --staged file`은 `git reset HEAD -- file`과 동등하다 — Index를 HEAD 상태로 복원(unstage)한다. Working은 건드리지 않는다.
+
+## revert — 되돌렸다는 사실도 기록한다
+
+reset은 히스토리를 짧게 만든다. revert는 히스토리를 길게 만든다.
+
+`git revert C`는 C가 만든 변경의 역방향 패치를 새 커밋으로 추가한다. 원본 커밋 C는 히스토리에 그대로 남는다.
+
+```
+Before:  A → B → C → D  (HEAD)
+After:   A → B → C → D → ~C  (HEAD)
+```
+
+공유 브랜치(main, develop)에서 이 차이가 중요해진다. reset은 다른 사람이 이미 fetch한 커밋을 지워버리므로 force push가 필요하다. revert는 새 커밋을 추가할 뿐이므로 force push가 불필요하다. 협업의 맥락에서 "되돌리기"는 revert가 표준이다.
+
+<Callout type="warning" title="재적용 함정">
+`git revert -m 1 <merge-SHA>`로 머지 커밋을 되돌린 후, 같은 브랜치를 다시 머지해도 변경이 들어오지 않는다. revert가 그 변경을 "이미 없는 것"으로 만들었기 때문이다. 재적용하려면 `git revert <revert-commit>` — revert의 revert가 필요하다.
+</Callout>
+
+머지 커밋은 부모가 2개이므로 "어느 부모 기준으로 되돌릴지" 명시해야 한다. `git revert -m 1 <merge-SHA>`의 `-m 1`은 첫 번째 부모(보통 main 직전 tip) 기준이다. GitHub의 "Revert" 버튼도 `-m 1`을 자동으로 사용한다.
+
+## reflog — 되돌리기의 안전망, 그리고 그 만료
+
+`reset --hard`로 커밋을 잃어도 즉시 영구 손실이 아니다. Git은 모든 HEAD 변경을 reflog에 기록한다.
+
+```bash
+git reflog
+# abc HEAD@{0}: reset: moving to HEAD~3
+# def HEAD@{1}: commit: C5   ← 이 SHA로 복구 가능
+# ...
+
+git reset --hard HEAD@{1}   # 복구
+```
+
+하지만 reflog는 영원히 남지 않는다.
+
+```
+gc.reflogExpire              = 90일   (reachable 커밋)
+gc.reflogExpireUnreachable   = 30일   (reset으로 잃은 커밋)
+gc.pruneExpire               = 2주    (객체 prune grace period)
+```
+
+`reset --hard`로 잃은 커밋은 unreachable이므로 30일 기준이 적용된다. `git gc` 실행 시 30일이 지난 unreachable reflog 항목이 만료되고, 이후 2주 grace period가 지나면 객체 자체가 prune된다. **실질적인 복구 안전 마진은 약 30일**이다.
+
+<Aside label="즉시 영구 삭제">
+시크릿 키가 커밋에 포함됐을 때는 반대로 즉시 prune이 필요하다.
+
+```bash
+git reflog expire --expire=now --all
+git gc --prune=now
+```
+
+단, 이미 push된 경우 원격 레포와 모든 클론에서도 처리해야 한다.
+</Aside>
+
+## 트레이드오프
+
+되돌리기 명령의 선택은 "내 브랜치냐, 공유 브랜치냐"에서 갈린다.
+
+<Callout type="note" title="트레이드오프">
+**reset**: 히스토리를 짧게 만든다. 내 브랜치에서 "없었던 일로"가 목적일 때. force push 필요, 공유 브랜치에서 위험.
+
+**revert**: 히스토리를 길게 만든다. 공유 브랜치에서 "되돌렸다는 사실도 기록"이 목적일 때. force push 불필요.
+
+**restore**: 히스토리를 건드리지 않는다. 파일 단위로 Index나 Working을 복원할 때.
+</Callout>
+
+Working Directory의 미커밋 변경은 어떤 명령도 reflog에 저장하지 않는다. `reset --hard` 전에 `git stash`로 보존하지 않으면 복구 방법이 없다. 한 번이라도 staged된 적이 있다면 `git fsck --lost-found`로 dangling blob을 찾을 수 있지만, 그렇지 않으면 영구 손실이다.
+
+## 정리
+
+- reset은 ref를 옮기는 명령이다. `--soft/--mixed/--hard`는 어느 층까지 따라가느냐의 차이다.
+- restore는 파일을 복원하는 명령이다. checkout의 모호한 역할을 분리한 결과다.
+- revert는 역방향 패치를 새 커밋으로 추가한다. 공유 브랜치의 표준 되돌리기 방법이다.
+- reflog는 약 30일의 복구 안전망이다. 그 이후는 진짜 사라진다.
+
+되돌리기가 하나의 명령이 아닌 이유는, "무엇을", "어느 층에서", "히스토리를 보존하면서"라는 세 질문의 조합이 상황마다 다르기 때문이다.
