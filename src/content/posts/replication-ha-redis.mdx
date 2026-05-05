@@ -1,0 +1,107 @@
+---
+title: "Redis 복제는 왜 데이터를 잃는가"
+description: "비동기 복제의 구조적 한계부터 PSYNC backlog 계산, Sentinel Failover, Cluster 리샤딩, WAIT 명령어까지 — Redis 고가용성 설계의 트레이드오프를 추적한다."
+pubDate: 2026-04-27
+category: dev
+tags: [redis, replication, sentinel, cluster, consistency]
+difficulty: intermediate
+series:
+  slug: redis-deep-dive
+  title: Redis Deep Dive
+  order: 4
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+Redis는 Master-Replica 복제를 기본으로 제공한다. 그런데 `SET order:123 "paid"`에서 OK를 받은 직후 Failover가 발생하면, 그 데이터가 사라질 수 있다. 비동기 복제가 성능을 위해 일관성을 포기하는 구조이기 때문이다. 그렇다면 언제 얼마나 잃고, 어떻게 줄일 수 있는가?
+
+## 복제의 출발점 — PSYNC와 두 가지 경로
+
+Replica가 Master에 처음 연결하면 `PSYNC ? -1`을 보낸다. Master는 두 가지 중 하나를 선택한다.
+
+**Full Resync**: Master가 `BGSAVE`로 RDB를 생성해 전송한다. 수 GB 인스턴스라면 수 분이 걸린다. 이 시간 동안 Replica는 구버전 데이터를 서빙하고, Master는 fork() 비용과 네트워크 대역폭을 소비한다.
+
+**Partial Resync**: Replica가 가진 `replid`와 `offset`이 `repl_backlog_buffer` 범위 안에 있으면 밀린 명령어만 전송한다. 수 ms~수 초로 재동기화가 끝난다.
+
+문제는 `repl_backlog_size`의 기본값이 1 MB라는 것이다. 초당 5 MB를 쓰는 서버에서 Replica가 30초 재배포로 내려가면, 밀린 데이터는 150 MB다. 이 경우 Full Resync로 폴백한다.
+
+```bash
+# 적절한 backlog 계산: 쓰기 속도 × 최대 단절 시간 × 2
+# 5 MB/s × 60초 × 2 = 600 MB
+redis-cli CONFIG SET repl-backlog-size 629145600
+```
+
+## 비동기 복제의 구조적 한계
+
+Master는 Replica ACK 없이 즉시 OK를 반환한다. Redis가 낮은 지연을 핵심 가치로 삼기 때문이다. 동기 복제를 하면 응답 시간이 최소 10배 이상 늘어난다.
+
+대신 타임라인에는 틈이 생긴다.
+
+```
+t=0ms:  Master SET order:123 "paid" → 클라이언트에게 OK
+t=1ms:  복제 스트림으로 Replica에 전송 시작
+t=2ms:  Replica에 적용 완료
+```
+
+`t=0`과 `t=2` 사이에 Master가 죽으면 `order:123`은 Replica에 없다. Sentinel이 Replica를 새 Master로 승격시키고, 클라이언트가 `GET order:123`을 보내면 `nil`이 돌아온다.
+
+<Callout type="warning" title="비동기 복제의 데이터 유실">
+`INFO replication`의 `master_repl_offset`과 `slave0: offset` 차이가 유실 범위다. Sentinel과 Cluster 모두 offset이 가장 높은 Replica를 새 Master로 선택하므로, 이 차이를 최소화하는 것이 유실 최소화의 핵심이다.
+</Callout>
+
+## Sentinel — sdown에서 odown까지
+
+Sentinel은 이 비동기 복제 위에서 자동 Failover를 제공한다. 동작 방식은 2단계다.
+
+**sdown (Subjective Down)**: 단일 Sentinel이 `down-after-milliseconds` 동안 ping 응답이 없으면 "죽은 것 같다"고 판단한다. 혼자만의 주관적 판단이다.
+
+**odown (Objective Down)**: quorum 수 이상의 Sentinel이 sdown에 동의하면 객관적 다운으로 확정되고 Failover가 시작된다.
+
+Sentinel을 3개 이상 홀수로 운영해야 하는 이유가 여기 있다. 2개면 1개 장애 시 과반수 동의가 불가능하다. 3개면 1개 장애에도 2/3 동의로 Failover를 진행할 수 있다.
+
+새 Master 선택 기준은 명확하다: ① `slave-priority` 낮은 것, ② 동점이면 `replication offset` 높은 것. offset 기준이 유실 최소화를 자동으로 보장한다.
+
+<Callout type="note" title="트레이드오프">
+`down-after-milliseconds`를 낮추면 빠른 Failover지만 네트워크 순간 지연으로 오탐이 생긴다. 높이면 안전하지만 장애 시 다운타임이 그만큼 길어진다. 일반 서비스에는 15,000~30,000ms를 권장한다.
+</Callout>
+
+## Cluster — 슬롯과 리샤딩
+
+Sentinel이 단일 Master의 가용성 문제를 해결한다면, Cluster는 용량 확장을 해결한다. 16384개 해시 슬롯을 노드에 나눠 담고, 각 키는 `CRC16(key) % 16384`로 슬롯을 결정한다.
+
+16384라는 숫자는 임의가 아니다. 슬롯 비트맵 크기가 2 KB가 되어 Gossip 메시지에 넣기 적당하다. 노드 1000개 클러스터에서도 메시지 크기가 관리 가능한 수준으로 유지된다.
+
+노드를 추가할 때 리샤딩이 필요하다. 슬롯이 이동하는 동안 두 종류의 리다이렉션이 발생한다.
+
+**MOVED**: 슬롯이 완전히 다른 노드에 있다. 클라이언트는 슬롯 매핑 캐시를 영구 업데이트하고 새 노드로 재요청한다.
+
+**ASK**: 슬롯이 이동 중이다. 일부 키는 출발 노드에, 일부는 목적지 노드에 있다. 클라이언트는 캐시를 업데이트하지 않고 목적지 노드에 `ASKING`을 먼저 보낸 뒤 요청을 재전송한다. ASKING 없이 재요청하면 무한 리다이렉션 루프에 빠진다.
+
+Lettuce와 Jedis는 이 처리를 자동으로 해준다. 커스텀 클라이언트를 작성할 때 주의가 필요한 부분이다.
+
+<Aside label="hash-tag 설계">
+`MGET user:1 user:2`는 두 키가 다른 슬롯에 있으면 `CROSSSLOT` 오류가 난다. `{user}:1`, `{user}:2`처럼 `{}` 안의 내용으로만 슬롯을 결정하게 하면 같은 슬롯에 배치할 수 있다. 단, 같은 태그를 과도하게 쓰면 특정 노드에 부하가 집중되는 핫스팟이 생긴다.
+</Aside>
+
+## 유실을 제어하는 도구
+
+비동기 복제의 유실을 줄이는 도구는 두 가지다.
+
+**WAIT numreplicas timeout**: 현재 시점까지의 쓰기가 N개 Replica에 복제됐는지 확인한다. 반환값은 실제로 복제 확인된 Replica 수다. 0이면 타임아웃 내 복제 미완료를 의미한다.
+
+매 쓰기마다 WAIT를 쓰면 처리량이 급락한다. 여러 쓰기를 일괄 실행한 뒤 마지막에 한 번만 쓰는 것이 올바른 패턴이다. 결제, 주문처럼 "반드시 보존되어야 하는 쓰기"에만 선택적으로 적용한다.
+
+**min-replicas-to-write + min-replicas-max-lag**: Replica가 N개 이상 T초 이하 지연으로 연결돼 있지 않으면 쓰기를 거부한다. Split-Brain 시 구 Master의 Replica가 새 Master로 이동하면, 구 Master는 조건 미달로 쓰기를 거부하게 되어 데이터 충돌을 막는다. 단, Replica 장애 시 Master도 쓰기 불가가 된다 — 일관성을 위해 가용성을 희생하는 선택이다.
+
+## 정리
+
+- Full Resync는 비싸다. `repl-backlog-size = 쓰기 속도 × 최대 단절 시간 × 2`로 Partial Resync를 보장하라.
+- 비동기 복제는 Failover 시 최근 쓰기를 잃을 수 있다. `INFO replication`의 offset 차이가 유실 범위다.
+- Sentinel은 3개 이상 홀수로, quorum = 과반수로. 클라이언트는 Master 주소를 하드코딩하지 않고 Sentinel을 통해 조회한다.
+- Cluster에서 MOVED는 캐시를 업데이트하고, ASK는 업데이트하지 않는다. 둘을 혼동하면 무한 루프가 생긴다.
+- WAIT는 중요한 쓰기에만 선택적으로. min-replicas-to-write는 가용성 희생을 감수할 수 있을 때만.
+
+Redis 복제의 모든 설정은 결국 하나의 질문으로 귀결된다 — "이 서비스에서 데이터 유실과 서비스 중단, 어느 쪽이 더 비싼가?"

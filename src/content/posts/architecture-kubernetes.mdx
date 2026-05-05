@@ -1,0 +1,102 @@
+---
+title: "쿠버네티스는 왜 모든 것을 API Server를 통해서만 통신하는가"
+description: "Control Plane과 Data Plane의 역할 분리부터 Reconciliation Loop의 실체, etcd Raft 합의, kubelet Probe, 클러스터 부트스트랩까지 — 하나의 아키텍처 원칙이 모든 설계를 관통하는 방식을 추적한다."
+pubDate: 2026-05-02
+category: dev
+tags: [kubernetes, control-plane, etcd, reconciliation, kubelet]
+difficulty: intermediate
+series:
+  slug: kubernetes-deep-dive
+  title: Kubernetes Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Aside from '@/components/mdx/Aside.astro';
+
+쿠버네티스의 모든 컴포넌트는 서로 직접 통신하지 않는다. Scheduler가 kubelet에게 직접 "이 파드를 실행해라"고 명령하지 않는다. Controller Manager가 etcd에 직접 쓰지 않는다. 모든 읽기와 쓰기는 API Server를 경유한다. 왜 이 원칙을 이렇게 철저하게 지키는가?
+
+## API Server 중심 설계의 출발점
+
+쿠버네티스 클러스터는 두 계층으로 나뉜다. Control Plane은 클러스터의 상태를 관리하는 두뇌다. API Server, etcd, Scheduler, Controller Manager가 여기에 속한다. Data Plane은 실제로 컨테이너를 실행하는 실행 환경이다. 각 노드의 kubelet, kube-proxy, Container Runtime이 여기에 속한다.
+
+두 계층 사이, 그리고 Control Plane 내부 컴포넌트들 사이의 모든 통신은 API Server를 통해서만 이루어진다. etcd에 직접 접근하는 컴포넌트는 API Server 단 하나뿐이다.
+
+이 설계의 이유는 단순하다. **진단 가능성**이다. 클러스터에서 무슨 일이 일어나든 API Server 로그 하나로 전체 흐름을 추적할 수 있다. 파드가 Pending에서 멈추면 Scheduler 로그를 본다. Deployment를 수정해도 반영되지 않으면 Controller Manager를 확인한다. 컴포넌트가 API Server를 우회해 통신한다면 이 진단 지도가 무너진다.
+
+## Watch — 폴링 없이 이벤트를 받는 방법
+
+API Server 중심 설계가 실용적일 수 있는 핵심 메커니즘이 Watch다. 컴포넌트들이 1초마다 "파드 목록 줘"라고 폴링한다면 API Server는 즉시 병목이 된다. 쿠버네티스는 다른 방식을 택했다.
+
+```
+폴링 방식:
+  컴포넌트 → "파드 목록 줘" → API Server  (변경 없어도 매번)
+
+Watch 방식:
+  컴포넌트 → "파드 변경 구독할게" → API Server
+  API Server → (파드 생성됨) → 이벤트 전송
+  API Server → (파드 삭제됨) → 이벤트 전송
+```
+
+HTTP/2 스트리밍으로 구현된 이 Watch API는 `kubectl get pods -w`가 사용하는 바로 그것이다. `resourceVersion`을 기준으로 어느 시점 이후의 변경만 받을 수 있어, 컴포넌트가 재시작돼도 누락 없이 이벤트를 이어받는다.
+
+`kubectl apply`를 실행하면 API Server는 인증 → 인가(RBAC) → Mutating Admission → Validating Admission → etcd 저장 파이프라인을 거친다. 저장이 완료되는 순간, 해당 리소스를 Watch하던 Controller Manager, Scheduler, kubelet이 순서대로 이벤트를 받아 각자의 역할을 수행한다.
+
+## Reconciliation — "선언형"이 내부에서 의미하는 것
+
+Controller Manager 안에는 수십 개의 컨트롤러가 고루틴으로 실행된다. 각 컨트롤러는 동일한 패턴으로 동작한다.
+
+```python
+while True:
+    desired = get_from_etcd()   # 원하는 상태
+    actual  = get_current()     # 실제 상태
+    if desired != actual:
+        reconcile(desired - actual)
+```
+
+ReplicaSet Controller가 파드 3개를 유지하는 것, Node Controller가 노드 장애를 감지해 파드를 다른 노드로 옮기는 것, Endpoint Controller가 Ready 파드 IP를 Service에 연결하는 것 — 전부 이 루프의 결과다.
+
+"선언형(Declarative)"이 내부에서 의미하는 것이 바로 이것이다. `kubectl delete pod my-app-xxx`를 실행해도 파드가 즉시 재생성되는 이유는 버그가 아니다. Deployment가 "파드 3개인 상태여야 한다"고 선언됐고, ReplicaSet Controller가 2개로 줄어든 것을 감지해 1개를 생성한다. 파드를 없애고 싶다면 파드가 아니라 Deployment를 수정해야 한다.
+
+<Callout type="note" title="트레이드오프">
+Reconciliation Loop는 이벤트 기반으로 동작하되, 주기적 재동기화(resync, 기본 10~30분)도 함께 수행한다. 이벤트만으로는 유실 가능성이 있기 때문이다. 재동기화는 안전망이다. 같은 Reconcile 함수가 여러 번 호출돼도 동일한 결과여야 하는 멱등성(Idempotency)이 이 구조를 안전하게 만든다.
+</Callout>
+
+## etcd — 단일 진실 공급원의 대가
+
+API Server가 읽고 쓰는 유일한 저장소인 etcd는 Raft 합의 알고리즘으로 분산 일관성을 보장한다. 모든 쓰기는 Leader를 통해 과반수(Quorum) 노드에 복제된 후 커밋된다.
+
+Quorum 공식은 단순하다: `Q = (N/2) + 1`. 3노드 클러스터는 Quorum 2로 1개 장애를 허용하고, 5노드 클러스터는 Quorum 3으로 2개 장애를 허용한다. 과반수가 없으면 etcd는 쓰기를 거부한다. 네트워크 파티션으로 클러스터가 3/2로 분리되면, 3노드 그룹만 쓰기가 가능하고 2노드 그룹은 쓰기를 거부한다. Split-Brain을 막는 방법이 바로 이것이다.
+
+이 Raft 커밋 과정에는 반드시 `fsync`가 필요하다. 쓰기 지연 = 네트워크 RTT + 디스크 fsync 시간이다. "kubectl이 느리다"는 현상의 상당수가 etcd 디스크 성능 문제다. etcd에는 NVMe SSD가 필요하고, `etcd_disk_wal_fsync_duration_seconds` p99가 10ms 이하여야 한다.
+
+## kubelet과 Probe — 노드 에이전트의 책임
+
+kubelet은 API Server를 Watch해 자기 노드에 배정된 파드 스펙을 받아오고, CRI(Container Runtime Interface) gRPC로 containerd에 컨테이너 실행을 지시한다. 파드 스펙을 로컬에 캐시하기 때문에 API Server 연결이 끊겨도 기존 컨테이너는 계속 실행된다. **Control Plane이 죽어도 이미 실행 중인 파드는 계속 동작한다.** 이 설계 덕분에 Control Plane 유지보수 중에도 서비스가 중단되지 않는다.
+
+Probe는 이 에이전트가 컨테이너 상태를 지속적으로 검사하는 메커니즘이다. 세 종류의 역할은 명확히 구분된다.
+
+```yaml
+startupProbe:   # 기동 시간 보장 — Liveness를 차단
+  failureThreshold: 30   # 최대 300초 허용
+
+livenessProbe:  # 데드락/무응답 감지 → 재시작
+  failureThreshold: 3
+
+readinessProbe: # 트래픽 수신 준비 → 실패 시 Service 엔드포인트에서 제거
+  failureThreshold: 3
+```
+
+Readiness Probe 실패는 재시작이 아니라 엔드포인트 제거다. kubelet이 `pod.status.conditions`를 업데이트하면, Endpoint Controller가 Endpoints 오브젝트를 갱신하고, kube-proxy가 iptables 규칙을 갱신한다. Service로 들어오는 트래픽에서 해당 파드가 제외된다. Probe 없이 배포하면 컨테이너가 시작되는 순간 트래픽이 들어온다. Spring Boot처럼 기동 시간이 긴 애플리케이션은 기동 중에 요청이 들어와 오류가 발생한다.
+
+## 정리
+
+- 모든 컴포넌트가 API Server를 경유하는 설계는 "진단 가능성"을 위한 선택이다. 아키텍처가 곧 진단 지도다.
+- Watch 메커니즘이 폴링 없이 이벤트를 전달하기 때문에 이 중앙화 방식이 실용적일 수 있다.
+- Reconciliation Loop가 "자가 치유"의 실체다. 선언형은 컨트롤러가 상태를 지속적으로 감시하고 유지한다는 의미다.
+- etcd의 Raft Quorum은 일관성을 위해 가용성을 희생하는 선택이다. 그리고 etcd의 fsync 지연이 Control Plane 전체 응답 속도를 결정한다.
+- Static Pod는 닭-달걀 순환 의존을 끊는 방법이다. kubelet이 파일을 직접 읽어 API Server 없이도 Control Plane을 부트스트랩한다.
+
+이 챕터의 다섯 컴포넌트 — API Server, etcd, Controller Manager, kubelet, kubeadm — 는 각각 다른 문제를 풀지만, 같은 원칙 위에 서 있다. **상태를 선언하면, 시스템이 그 상태로 수렴한다.** 다음 글에서는 파드 하나가 생성되는 전체 여정을 스텝별로 추적한다.

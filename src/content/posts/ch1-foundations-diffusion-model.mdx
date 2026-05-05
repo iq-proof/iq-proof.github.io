@@ -1,0 +1,125 @@
+---
+title: "Diffusion Model의 수학은 어디서 왔나"
+description: "Brownian motion과 Fokker-Planck 방정식에서 시작해 Forward Markov chain의 closed-form, Score function 학습, Posterior 유도까지 — DDPM의 물리적·수학적 기원을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [diffusion-model, score-matching, sde, markov-chain, ddpm]
+difficulty: advanced
+series:
+  slug: diffusion-model-deep-dive
+  title: Diffusion Model Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Diffusion model은 이미지를 생성하는 신경망이 아니다. 정확히 말하면, **동역학계(dynamical system)를 역으로 학습하는 신경망**이다. 1905년 Einstein의 Brownian motion, 1930년대 Fokker-Planck 방정식, 1982년 Anderson의 Reverse SDE — 이 모든 것이 2020년 Ho 등의 DDPM 한 편에 수렴한다. 왜 이 물리학이 이미지 생성의 수학이 됐는가?
+
+## 물리학에서 온 핵심 통찰
+
+Brownian motion은 입자가 열 요동에 의해 무작위로 움직이는 현상이다. 1차원에서 표준 Wiener process $W_t$로 기술하면 $X(t) \sim \mathcal{N}(0, t)$가 되고, **분산은 시간에 선형 비례**한다. 이것이 forward diffusion의 물리적 토대다 — 이미지에 노이즈를 점점 더해가는 과정은 입자가 열 요동에 의해 점점 퍼져나가는 과정과 identical하다.
+
+Fokker-Planck 방정식은 이 동역학을 확률 밀도 $p(x,t)$의 시간 진화로 기술한다.
+
+$$\frac{\partial p}{\partial t} = -\nabla \cdot (f(t) x \, p) + \frac{1}{2}\nabla^2 (g^2(t) p)$$
+
+첫 항은 drift에 의한 이동, 둘째 항은 diffusion에 의한 확산이다. Sohl-Dickstein et al.(2015)의 통찰은 이 방정식을 **역으로 푸는** 것이 가능하다는 것이었다. 비평형 열역학에서 시스템을 고온으로 annealing한 뒤 역으로 냉각하는 과정과 정확히 같은 구조다.
+
+<Aside label="생성 모델과의 비교">
+VAE는 잠재 변수를 압축·복원한다. GAN은 판별자와 생성자가 경쟁한다. Normalizing Flow는 가역 변환을 쌓는다. Diffusion은 이 중 어느 것도 아니다 — **확률적 동역학계를 시간 역전**한다. 이 차이가 학습 안정성과 샘플 품질에 근본적인 차이를 만든다.
+</Aside>
+
+## Forward Markov Chain과 분산 보존
+
+DDPM의 forward process는 이 연속 SDE를 이산화한 Markov chain이다.
+
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(\sqrt{1-\beta_t}\, x_{t-1},\; \beta_t I\right)$$
+
+왜 $\sqrt{1-\beta_t}$인가? scaling factor $(\sqrt{1-\beta_t})^2 + (\sqrt{\beta_t})^2 = 1$이 되어 **분산이 보존**된다. $x_0$의 분산이 $d$이면, 모든 $t$에서 $\mathbb{E}[\|x_t\|^2] \approx d$가 유지된다.
+
+<Theorem kind="lemma" number="1" title="Variance Preservation">
+$\mathbb{E}[\|x_0\|^2] = d$이면, forward Markov chain에서 모든 $t$에 대해 $\mathbb{E}[\|x_t\|^2] = d$이다.
+</Theorem>
+
+<Proof>
+귀납법. $t=1$: $\mathbb{E}[\|x_1\|^2] = (1-\beta_1)\mathbb{E}[\|x_0\|^2] + \beta_1 d = (1-\beta_1)d + \beta_1 d = d$. $t-1$에서 성립 가정 시, $\mathbb{E}[\|x_t\|^2] = (1-\beta_t)d + \beta_t d = d$. $\square$
+</Proof>
+
+$\beta_t$ 스케줄 선택도 여기서 나온다. DDPM의 linear schedule($\beta_{\min}=0.0001$, $\beta_{\max}=0.02$)은 간단하지만, 초반에 정보 손실이 빠르다. Nichol & Dhariwal(2021)의 cosine schedule은 $\bar{\alpha}_t = \cos^2\!\left(\frac{t/T+s}{1+s}\cdot\frac{\pi}{2}\right)$로 정보 손실을 더 고르게 분산시켜 FID 기준 약 2-3% 개선을 달성한다.
+
+## Closed-Form과 $O(T) \to O(1)$
+
+Markov chain을 T번 순차적으로 계산하지 않아도 된다. $\alpha_t := 1-\beta_t$, $\bar{\alpha}_t := \prod_{s=1}^t \alpha_s$로 정의하면 다음이 성립한다.
+
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar{\alpha}_t}\, x_0,\; (1-\bar{\alpha}_t)I\right)$$
+
+동치로, **reparameterization**하면:
+
+$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+이 한 줄이 DDPM 학습을 실용적으로 만든다. 임의의 $t$에서 $x_t$를 $O(1)$으로 생성할 수 있으므로, 학습 중 매 배치마다 $t$를 균등하게 샘플링해 병렬 처리가 가능하다. Closed-form 없이는 학습 시간이 $O(T)$배 증가한다.
+
+## Reverse SDE와 Score Function
+
+Anderson(1982)은 forward SDE의 역과정이 존재하며, 이 역시 SDE임을 보였다.
+
+<Theorem kind="theorem" number="2" title="Reverse SDE (Anderson 1982)">
+Forward SDE $dx_t = f(t)x_t\,dt + g(t)\,dW_t$에 대해, 역과정은 다음 SDE를 따른다.
+
+$$dx_t = \left[f(t)x_t - g^2(t)\nabla_x \log p(x_t, t)\right]dt + g(t)\,d\bar{W}_t$$
+
+여기서 $\nabla_x \log p(x_t, t)$는 **score function**이고, $\bar{W}_t$는 역시간 방향 Wiener process다.
+</Theorem>
+
+Score function $s(x,t) := \nabla_x \log p(x,t)$는 확률 밀도가 높아지는 방향을 가리킨다. Gaussian 분포 $\mathcal{N}(\mu, \sigma^2)$에서 score는 $-\frac{x-\mu}{\sigma^2}$ — 즉 평균 방향으로 끌어당기는 힘이다. **Diffusion의 역과정은 이 score function을 학습하는 것과 동치**다.
+
+DDPM에서 신경망이 실제로 학습하는 것은 score 자체가 아니라 노이즈 $\epsilon$이다. Closed-form reparameterization으로부터
+
+$$\nabla_{x_t} \log q(x_t \mid x_0) = -\frac{\epsilon}{\sqrt{1-\bar{\alpha}_t}}$$
+
+임을 보일 수 있으므로, noise prediction과 score matching은 수학적으로 동치다. 이 reparameterization이 학습을 안정시키는 이유는 명확하다 — noise $\epsilon$은 항상 $\mathcal{N}(0,I)$이라 gradient scale이 일정하지만, mean $\tilde{\mu}_t$를 직접 예측하면 $x_t$의 scale에 따라 gradient가 폭발할 수 있다.
+
+## Posterior와 학습 타겟
+
+Reverse process의 학습 타겟은 true posterior $q(x_{t-1} \mid x_t, x_0)$이다. Bayes' rule과 Gaussian의 곱 성질로부터 이 posterior도 정확히 Gaussian임을 유도할 수 있다.
+
+$$q(x_{t-1} \mid x_t, x_0) = \mathcal{N}(\tilde{\mu}_t,\; \tilde{\beta}_t I)$$
+
+$$\tilde{\mu}_t = \frac{\sqrt{\bar{\alpha}_{t-1}}\,\beta_t}{1-\bar{\alpha}_t}\,x_0 + \frac{\sqrt{\alpha_t}(1-\bar{\alpha}_{t-1})}{1-\bar{\alpha}_t}\,x_t, \quad \tilde{\beta}_t = \frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}\,\beta_t$$
+
+$\tilde{\mu}_t$의 두 항은 직관적이다. 첫 항($\propto x_0$)은 원본 신호에 대한 기억이고, 둘째 항($\propto x_t$)은 현재 관찰에 대한 신뢰다. $t$가 커질수록 $\bar{\alpha}_t \to 0$이므로 첫 항의 계수는 빠르게 줄고, 둘째 항이 지배적이 된다 — 노이즈가 많이 추가될수록 현재 상태만 믿을 수 있다는 뜻이다.
+
+<Callout type="note" title="트레이드오프">
+Posterior의 closed-form은 **Gaussian noise + Diagonal covariance** 가정 위에 서 있다. 이 단순한 가정이 해석적 tractability를 주지만, 픽셀 간 상관 구조를 명시적으로 모델링하지 못한다는 한계도 함께 따라온다. Continuous-time Score-SDE(Song et al. 2021)는 이론적 엄밀성을 높이지만, numerical ODE solver가 필요해 구현 복잡도가 증가한다.
+</Callout>
+
+## 정리
+
+- Diffusion model의 forward process는 Brownian motion의 이산화다. 분산은 $\beta_t$ 스케줄에 의해 시간 전반에 걸쳐 보존된다.
+- Closed-form $q(x_t \mid x_0) = \mathcal{N}(\sqrt{\bar{\alpha}_t}x_0, (1-\bar{\alpha}_t)I)$이 임의의 $t$에서 $O(1)$ 샘플링을 가능하게 해 학습을 실용화한다.
+- Reverse SDE의 핵심 항은 score function $\nabla_x \log p(x_t,t)$이며, DDPM에서 이는 noise prediction과 수학적으로 동치다.
+- True posterior $q(x_{t-1} \mid x_t, x_0)$는 closed-form Gaussian으로, DDPM의 학습 타겟이자 ELBO 유도의 출발점이 된다.
+
+물리학의 역과정이 신경망 학습 타겟이 되는 이 구조 위에서, 다음 글은 DDPM의 ELBO를 유도하고 noise prediction loss가 어떻게 VLB에서 나오는지를 추적한다.
+
+<Reference
+  title="Denoising Diffusion Probabilistic Models"
+  authors="Ho, Jain, Abbeel"
+  year={2020}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2006.11239"
+/>
+
+<Reference
+  title="Deep Unsupervised Learning using Nonequilibrium Thermodynamics"
+  authors="Sohl-Dickstein, Weiss, Maheswaranathan, Ganguli"
+  year={2015}
+  venue="ICML"
+  url="https://arxiv.org/abs/1503.03585"
+/>

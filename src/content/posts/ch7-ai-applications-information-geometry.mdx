@@ -1,0 +1,132 @@
+---
+title: "정보기하가 현대 AI를 어떻게 만드는가"
+description: "Natural Policy Gradient의 Fisher 역행렬부터 확산 모델의 Fisher divergence까지, 정보기하의 단일 철학이 RL·생성 모델·샘플링에 어떻게 관통하는지 추적한다."
+pubDate: 2026-04-28
+category: ai
+tags: [information-geometry, natural-gradient, diffusion-models, variational-inference, reinforcement-learning]
+difficulty: advanced
+series:
+  slug: information-geometry-deep-dive
+  title: Information Geometry Deep Dive
+  order: 7
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Amari가 1980년대에 세운 정보기하 이론은 당시에는 통계학의 한 귀퉁이처럼 보였다. 그런데 2020년대 생성 AI의 핵심 수식들을 들여다보면 같은 얼굴이 반복해서 나타난다 — Fisher 정보 행렬, KL의 최급강하, Bregman divergence. 왜 이 하나의 기하 언어가 강화학습, 변분 추론, 확산 모델을 동시에 관통하는가?
+
+## 유클리드 gradient의 실패
+
+Policy gradient의 표준 업데이트 $\theta \leftarrow \theta + \eta \nabla J$는 파라미터 공간의 유클리드 거리를 암묵적으로 가정한다. 그런데 파라미터가 확률 분포를 정의할 때, 같은 크기의 $\Delta\theta$가 분포를 전혀 다른 정도로 바꿀 수 있다. softmax의 끝 근처에서는 작은 파라미터 변화가 행동 분포를 붕괴시키고, plateau 구간에서는 큰 변화도 분포를 거의 움직이지 않는다.
+
+Kakade (2001)의 Natural Policy Gradient는 이 문제를 Fisher 정보 행렬 $F(\theta)$로 해결한다.
+
+$$
+\tilde{\nabla} J(\theta) = F(\theta)^{-1} \nabla_\theta J(\theta)
+$$
+
+$$
+F(\theta) = \mathbb{E}_{s \sim \rho^\pi}\left[\mathbb{E}_{a \sim \pi}[\nabla_\theta \log \pi(a|s)(\nabla_\theta \log \pi(a|s))^T]\right]
+$$
+
+$F^{-1}$은 정책에 민감한 방향은 작게, 둔감한 방향은 크게 스케일한다. 결과적으로 파라미터 한 걸음이 **행동 분포 공간에서 일정한 크기의 한 걸음**이 된다. TRPO는 이것을 KL-ball 제약 최적화로 정식화했고, 2차 근사 후의 해가 정확히 NPG다.
+
+$$
+\max_\theta \mathbb{E}\!\left[\frac{\pi_\theta}{\pi_{\text{old}}} A^{\pi_{\text{old}}}\right] \;\text{s.t.}\; \mathbb{E}_s[\mathrm{KL}(\pi_{\text{old}} \| \pi_\theta)] \leq \delta
+\;\Longrightarrow\; \Delta\theta = \sqrt{\frac{2\delta}{\nabla J^T F^{-1} \nabla J}} F^{-1} \nabla J
+$$
+
+## Mirror Descent — 기하를 고르는 최적화
+
+NPG와 독립적으로 Nemirovski & Yudin (1983)이 제안한 Mirror Descent는 같은 통찰을 최적화 이론의 언어로 표현한다.
+
+$$
+\theta_{k+1} = \arg\min_\theta \left[\langle g_k, \theta \rangle + \frac{1}{\eta} B_\phi(\theta, \theta_k)\right]
+$$
+
+proximal term을 유클리드 $\|\cdot\|^2/2$에서 Bregman divergence $B_\phi$로 교체하면, "어떤 기하에서 내려갈 것인가"를 $\phi$ 선택으로 지정할 수 있다.
+
+<Theorem kind="theorem" number="1" title="MD = NGD when φ = ψ">
+지수족 분포의 cumulant function $\psi$를 potential로 선택하면, Mirror Descent (쌍대 좌표에서의 Euclidean step)와 Natural Gradient Descent (원시 좌표에서의 Fisher-weighted step)는 수학적으로 동치다.
+</Theorem>
+
+<Proof>
+지수족에서 $\eta = \nabla\psi(\theta)$ (expectation parameter). MD 업데이트의 쌍대 형태는 $\nabla\psi(\theta_{k+1}) = \nabla\psi(\theta_k) - \alpha g_k$, 즉 $\eta_{k+1} = \eta_k - \alpha g_k$. NGD의 연속 flow는 $\dot\theta = -F(\theta)^{-1}g = -(\nabla^2\psi)^{-1}g$이므로 $\dot\eta = \nabla^2\psi \cdot \dot\theta = -g$. 두 업데이트 모두 $\eta$ 공간에서 Euclidean step이다. $\square$
+</Proof>
+
+simplex 위에서 $\phi = \sum p_k \log p_k$ (negative entropy)를 선택하면 Exponentiated Gradient가 나온다 — 이것이 강화학습의 softmax policy update와, 온라인 학습의 Hedge 알고리즘이 같은 수식으로 수렴하는 이유다.
+
+## VAE와 HMC — 두 방향의 projection
+
+VAE의 ELBO는 정보기하의 언어로 즉시 번역된다.
+
+$$
+\log p_\theta(x) = \underbrace{\mathcal{L}(\theta, \phi; x)}_{\text{ELBO}} + \mathrm{KL}(q_\phi(z|x) \| p_\theta(z|x))
+$$
+
+encoder $q_\phi$는 true posterior $p(z|x)$로의 **m-projection**, decoder $p_\theta$는 데이터 분포로의 **e-projection**이다. ELBO 최대화는 이 두 projection을 동시에 수행한다. Rate-distortion 분해 $-\mathcal{L} = D + R$에서 $\beta$-VAE의 $\beta$는 rate(KL)와 distortion(reconstruction loss)의 tradeoff를 명시적으로 제어하는 라그랑주 승수다.
+
+Riemannian HMC는 같은 Fisher 행렬을 샘플링에 가져온다. 표준 HMC의 고정 질량 행렬 $M = I$ 대신 위치 의존 Fisher $G(\theta)$를 쓰면:
+
+$$
+H(\theta, p) = U(\theta) + \frac{1}{2}\log|G(\theta)| + \frac{1}{2} p^\top G(\theta)^{-1} p
+$$
+
+<Callout type="note" title="트레이드오프">
+RMHMC는 비등방 사후분포의 조건수를 제거해 혼합 시간을 $O(\kappa) \to O(1)$로 줄이지만, 스텝당 비용이 $O(d^3)$이고 위치 의존 계량 때문에 implicit leapfrog가 필요하다. 사후분포가 근사적으로 등방이면 표준 HMC가 실용적으로 빠르다.
+</Callout>
+
+## 확산 모델 — Fisher divergence가 훈련 목표
+
+가장 놀라운 연결은 확산 모델에서 나온다. Denoising Score Matching 손실은 형태상 단순해 보이지만:
+
+$$
+\mathcal{L}_{\text{DSM}}(\theta) = \mathbb{E}_{x_0, x_t}\!\left[\|s_\theta(x_t, t) - \nabla_{x_t} \log p_{0t}(x_t | x_0)\|^2\right]
+$$
+
+Vincent (2011)의 핵심 정리는 이것이 SM 손실과 상수 차이로 동치임을 보인다. 그리고 SM 손실은 정확히 Fisher divergence다.
+
+$$
+\mathcal{L}_{\text{DSM}} = \int_0^T w(t)\, \mathcal{J}_F(p_t \| p_t^\theta)\, dt + \text{const}
+$$
+
+$$
+\mathcal{J}_F(p \| q) = \mathbb{E}_p\!\left[\|\nabla \log p(x) - \nabla \log q(x)\|^2\right]
+$$
+
+즉 **확산 모델의 훈련은 Fisher divergence의 시간 가중 적분을 최소화하는 것**이다. Reverse SDE가 스코어 함수 $\nabla_x \log p_t(x)$만으로 데이터를 복원할 수 있는 이유는 Anderson (1982)의 정리 덕분이고, 랑주뱅 샘플링이 수렴하는 이유는 분포 공간에서 Wasserstein 계량 하의 KL 기울기 흐름(Jordan-Kinderlehrer-Otto 1998)이기 때문이다 — 파라미터 공간에서 Fisher 계량 하의 KL 기울기 흐름이 NGD인 것과 정확히 대응한다.
+
+<Aside label="통합 관점">
+NPG·TRPO·PPO (파라미터 공간), Mirror Descent (쌍대 공간), VAE·ELBO (분포 공간), RMHMC (샘플링 공간), 확산 모델 (함수 공간) — 이 모두는 하나의 원칙의 다른 표현이다: **KL divergence를 적절한 계량(Fisher 또는 Wasserstein)으로 가장 빠르게 줄여라**.
+</Aside>
+
+## 정리
+
+- NPG와 TRPO는 파라미터 공간에 Fisher 계량을 부여해 policy 업데이트를 분포 공간의 일정 걸음으로 만든다.
+- Mirror Descent는 $\phi = \psi$ (지수족 cumulant)일 때 NGD와 수학적으로 동치다. "기하를 고른다"는 것이 같은 선택이다.
+- VAE의 ELBO 최대화는 m-projection과 e-projection의 동시 수행이며, $\beta$-VAE는 rate-distortion tradeoff의 명시적 제어다.
+- 확산 모델의 DSM 훈련 목표는 Fisher divergence의 시간 적분이고, Reverse SDE와 랑주뱅 샘플링은 분포 공간의 자연 기울기 흐름이다.
+
+Amari의 이론이 현대 AI의 엔진을 돌린다는 것은 비유가 아니다 — 수식이 문자 그대로 같다.
+
+<Reference
+  title="A Natural Policy Gradient"
+  authors="Kakade, S."
+  year={2001}
+  venue="NeurIPS"
+  url="https://papers.nips.cc/paper/2001/hash/4b86abe48d358ecf194c56c69108433-Abstract.html"
+/>
+
+<Reference
+  title="Score-Based Generative Modeling through Stochastic Differential Equations"
+  authors="Song, Y. et al."
+  year={2021}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2011.13456"
+/>

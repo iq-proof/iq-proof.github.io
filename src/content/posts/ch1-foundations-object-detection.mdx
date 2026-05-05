@@ -1,0 +1,136 @@
+---
+title: "Object Detection의 수학적 뼈대 — 왜 출력이 집합인가"
+description: "가변 크기 집합 출력이라는 정의 하나가 IoU loss 진화, mAP 계산 방식, NMS 알고리즘, 그리고 DETR의 set prediction까지 모두 도출하는 과정을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [object-detection, iou, map, nms, formalization]
+difficulty: advanced
+series:
+  slug: object-detection-deep-dive
+  title: Object Detection Deep Dive
+  order: 1
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Object detection의 모든 설계 결정 — anchor 배치, NMS 파라미터, DETR의 Hungarian matching — 은 하나의 출발점에서 나온다. 출력이 **가변 크기 집합**이라는 사실. 이 정의 하나가 어떻게 loss 함수의 진화, 평가 지표의 구조, 중복 억제 알고리즘, 그리고 NMS를 아예 없애려는 시도까지 전부 도출하는가?
+
+## 출력이 집합이라는 것의 의미
+
+분류는 이미지 한 장을 라벨 하나로 압축한다. Segmentation은 픽셀 수만큼 고정된 라벨 맵을 출력한다. Detection은 다르다. 이미지마다 사물의 수 $N$이 다르고, 모델의 예측 수 $\hat{N}$도 다르다.
+
+$$\hat{Y} = \{(\hat{b}_j, \hat{c}_j, \hat{s}_j)\}_{j=1}^{\hat{N}}, \quad \hat{s}_j \in [0, 1]$$
+
+이 출력은 순서가 없는 집합이다. "첫 번째 예측"과 "두 번째 예측"의 구분이 의미가 없다. 그리고 $\hat{N}$은 모델이 결정한다. 이 두 가지 성질 — **순서 무관성**과 **가변 크기** — 이 이후의 모든 문제를 만든다.
+
+Bounding box 표기법도 이 맥락에서 정리된다. Center-size form $(c_x, c_y, w, h)$와 corner form $(x_1, y_1, x_2, y_2)$는 서로 정보 손실 없이 변환된다. 변환 $\phi: (c_x, c_y, w, h) \mapsto (c_x - w/2, c_y - h/2, c_x + w/2, c_y + h/2)$의 Jacobian 행렬식은 1이므로 bijective하다. 그러나 두 표기법은 목적이 다르다 — center-size는 regression target으로 자연스럽고(YOLO), corner form은 IoU 계산에 자연스럽다(TorchVision, DETR).
+
+## IoU loss의 진화 — 집합이 만드는 proxy gap
+
+집합 출력의 품질은 IoU로 측정한다.
+
+$$\text{IoU}(A, B) = \frac{|A \cap B|}{|A \cup B|} \in [0, 1]$$
+
+그런데 학습 loss로 L1이나 L2를 쓰면 **평가-학습 불일치**가 생긴다. 좌표 오차가 작아도 IoU가 낮을 수 있고, 반대도 가능하다. IoU를 직접 loss로 쓰면 어떻게 될까?
+
+<Theorem kind="proposition" number="1" title="IoU loss의 disjoint plateau">
+두 박스가 겹치지 않으면($A \cap B = \emptyset$) 모든 disjoint pair에서 $\text{IoU}(A, B) = 0$이고, 따라서 거의 모든 disjoint 영역에서 $\nabla_{\hat{b}}\,\text{IoU} = 0$이다.
+</Theorem>
+
+<Proof>
+정의에 의해 $|A \cap B| = 0 \Rightarrow \text{IoU} = 0$. 작은 perturbation $\hat{b} + \varepsilon$이 여전히 disjoint하면 IoU는 0으로 유지. 따라서 거의 모든 disjoint 영역에서 gradient가 0. $\square$
+</Proof>
+
+학습 초기에 예측 박스와 GT가 겹치지 않는 경우는 흔하다. GIoU(Rezatofighi 2019)는 이를 해결하기 위해 두 박스를 모두 포함하는 최소 enclosing box $C$를 도입한다.
+
+$$\text{GIoU}(A, B) = \text{IoU}(A, B) - \frac{|C \setminus (A \cup B)|}{|C|} \in [-1, 1]$$
+
+$A \cap B = \emptyset$이면 $\text{GIoU} = -1 + (|A| + |B|)/|C|$로, $A$와 $B$의 상대 위치에 smooth하게 의존한다. Disjoint 영역에서도 gradient가 존재한다.
+
+그러나 GIoU에도 한계가 있다. $A \subset B$이면 $|C \setminus (A \cup B)| = 0$이므로 GIoU = IoU다 — 추가 신호가 없다. DIoU는 center distance penalty를 추가한다.
+
+$$\text{DIoU}(A, B) = \text{IoU}(A, B) - \frac{\|\rho_A - \rho_B\|_2^2}{d_C^2}$$
+
+CIoU는 여기에 aspect ratio term까지 추가한다. 같은 IoU를 가진 tall 박스와 wide 박스를 구분하기 위해서다.
+
+<Callout type="note" title="트레이드오프">
+IoU → GIoU → DIoU → CIoU 순으로 더 많은 기하학적 정보를 loss에 담는다. 대신 구현 복잡도와 수치 안정성 문제(CIoU의 arctan, aspect ratio term의 stop-gradient)가 추가된다. YOLOv8의 default는 CIoU지만 mAP 개선은 `+0.3~0.5` 수준이다. Dataset 분포에 따라 ablation이 필요하다.
+</Callout>
+
+## mAP — 집합 평가의 표준화
+
+집합 출력을 어떻게 평가할 것인가? confidence threshold $\theta$를 변화시키면 precision과 recall이 trade-off를 이룬다. 이 curve 아래 면적이 AP다.
+
+$$\text{AP} = \int_0^1 p_{\text{interp}}(r)\,dr, \quad p_{\text{interp}}(r) = \max_{\tilde{r} \geq r} P(\tilde{r})$$
+
+raw PR curve는 monotone-decreasing하지 않다. FP 직후 TP가 오면 precision이 잠깐 올라간다. Envelope $p_{\text{interp}}$로 보정한 후 적분하는 이유다.
+
+PASCAL VOC 2007 방식(11-point)과 COCO 방식(all-point)은 같은 curve를 다르게 적분한다. 11-point는 `recall ∈ {0, 0.1, ..., 1.0}` 11개 점의 평균이고, all-point는 모든 recall 변화점에서 step integral을 수행한다. 오래된 논문이 11-point AP를 보고하면 COCO all-point와 직접 비교할 수 없다.
+
+COCO의 mAP@[.5:.95]는 IoU threshold 10개(`{0.50, 0.55, ..., 0.95}`)의 평균이다.
+
+$$\text{mAP}_{\text{COCO}} = \frac{1}{|\mathcal{T}|} \frac{1}{C} \sum_{\tau \in \mathcal{T}} \sum_{c=1}^C \text{AP}_c(\tau)$$
+
+mAP@.5 = 0.7이지만 mAP@[.5:.95] = 0.3인 모델은 box localization이 부정확한 것이다 — class는 맞추지만 박스가 GT와 IoU 0.5~0.7 수준으로 대충 겹친다. 이 두 숫자의 gap이 localization 품질의 직접적인 지표다.
+
+## NMS — 집합 출력이 만드는 중복 문제
+
+<Theorem kind="proposition" number="2" title="중복 예측은 FP를 강제한다">
+같은 object에 대해 두 prediction $(\hat{b}_1, c, \hat{s}_1)$, $(\hat{b}_2, c, \hat{s}_2)$가 있고 $\text{IoU}(\hat{b}_1, \hat{b}_2) > \tau_{\text{eval}}$이면, 정의에 의해 둘 중 하나는 반드시 FP가 된다.
+</Theorem>
+
+<Proof>
+GT box $b$가 하나뿐이고 $\hat{b}_1, \hat{b}_2$ 모두 $b$와 $\text{IoU} \geq \tau$라 하자. TP/FP 매칭 규칙은 GT당 하나의 prediction만 TP로 인정한다. confidence 순으로 정렬 후 첫 번째만 매칭되고, 두 번째는 자동으로 FP가 된다. $\square$
+</Proof>
+
+Anchor-based detector는 dense prediction을 낸다. 같은 사람에 대해 인접한 여러 grid cell이 응답한다. 이는 학습의 robustness를 높이지만, 평가 시에는 위 정리에 의해 mAP를 깎는다. Greedy NMS는 이를 해결한다.
+
+```
+B ← ∅
+sort D by score desc
+while D ≠ ∅:
+    m ← argmax score
+    B ← B ∪ {m}
+    remove j if IoU(b_m, b_j) ≥ τ
+```
+
+시간복잡도는 $O(N^2)$이다. 실전에서 $N \approx 10^4$이면 $10^8$ 연산이지만, TorchVision은 CUDA kernel로 가속한다.
+
+Greedy NMS의 한계는 밀집 장면이다. 두 사람이 가까이 있어 IoU가 0.6이고 $\tau = 0.5$이면, 한 사람을 FN으로 만든다. Soft-NMS(Bodla 2017)는 hard remove 대신 score decay를 적용한다.
+
+$$s_j \leftarrow s_j \cdot \exp(-\text{IoU}^2 / \sigma)$$
+
+Gaussian decay는 모든 IoU에서 score를 비증가(non-increasing)하게 만든다. 가까운 박스를 제거하지 않고 score를 낮추므로, final threshold에서 자연스럽게 정리된다. COCO에서 $\sigma = 0.5$를 사용하면 `+1.7 mAP`가 보고된다.
+
+DETR은 이 문제를 training time에 해결한다. Hungarian matching으로 각 GT에 정확히 하나의 query를 배정해 중복 자체를 만들지 않는다. NMS가 필요 없다. 대신 학습이 느리고(500 epochs), fixed query 수가 small object recall을 제한한다.
+
+## 정리
+
+- Detection 출력이 **가변 크기 집합**이라는 정의 하나가 IoU loss의 필요성, mAP의 적분 방식, NMS, set prediction loss를 전부 도출한다.
+- IoU loss 진화는 disjoint plateau → 포함 관계 무감도 → aspect ratio 무감도를 차례로 해결한 과정이다.
+- mAP@.5와 mAP@[.5:.95]의 gap은 localization 품질의 직접 지표다. 두 숫자를 같이 봐야 한다.
+- NMS는 dense prediction의 사후 처리다. 밀집 장면에서 Soft-NMS가 낫고, DETR 계열은 아예 학습으로 우회한다.
+
+다음 글에서는 이 뼈대 위에서 R-CNN 계열이 어떻게 two-stage detection을 구성하는지, 그리고 region proposal의 수학적 의미를 추적한다.
+
+<Reference
+  title="Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression"
+  authors="Rezatofighi et al."
+  year={2019}
+  venue="CVPR"
+  url="https://arxiv.org/abs/1902.09630"
+/>
+
+<Reference
+  title="Improving Object Detection With One Line of Code (Soft-NMS)"
+  authors="Bodla et al."
+  year={2017}
+  venue="ICCV"
+  url="https://arxiv.org/abs/1704.04503"
+/>

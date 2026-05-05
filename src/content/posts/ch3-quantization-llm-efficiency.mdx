@@ -1,0 +1,136 @@
+---
+title: "LLM Quantization의 설계 철학 — 무엇을 희생하고 무엇을 보호할 것인가"
+description: "Quantization 오차의 수학적 구조부터 LLM.int8()·GPTQ·AWQ·SmoothQuant·NF4까지, 각 기법이 공유하는 하나의 설계 원칙을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [quantization, llm, int8, gptq, awq]
+difficulty: advanced
+series:
+  slug: llm-efficiency-deep-dive
+  title: LLM Efficiency Deep Dive
+  order: 3
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+LLM quantization 문헌을 읽다 보면 기법마다 이름과 수식이 달라 각각 독립된 트릭처럼 보인다. 그러나 INT8, GPTQ, AWQ, SmoothQuant, NF4는 모두 같은 질문에 다른 답을 내놓는다 — **정보 손실을 어디서, 어떻게 감당할 것인가?** 이 질문에 어떻게 답하느냐가 각 기법의 설계 공간 전체를 결정한다.
+
+## 오차의 수학적 구조
+
+모든 quantization의 출발점은 동일하다. 실수 $x$를 정수 grid에 올렸다가 복원할 때 발생하는 오차를 다음 수식으로 표현한다.
+
+$$
+\hat{x} = s \cdot \mathrm{round}\!\left(\frac{x - z}{s}\right) + z, \qquad e = x - \hat{x}
+$$
+
+$b$-bit uniform quantization에서 분포가 균등하다고 가정하면 closed-form MSE는 다음과 같다.
+
+$$
+\text{MSE} = \frac{s^2}{12}, \qquad s = \frac{\text{range}}{2^b}
+$$
+
+여기서 두 가지 결론이 즉시 따라온다. 첫째, **비트를 1 줄이면 MSE는 4배 증가**한다. 둘째, MSE는 level 간격 $s$의 제곱에 비례하므로 $s$를 얼마나 작게 만드느냐가 정밀도를 결정한다. per-channel quantization이 per-tensor보다 오차가 작은 이유도 같다 — 각 채널마다 최적의 $s$를 따로 쓸 수 있기 때문이다.
+
+<Theorem kind="lemma" number="1" title="Bit-width와 MSE의 관계">
+range $R$, $b$-bit uniform quantization에서
+
+$$\text{MSE}_b = \frac{R^2}{12 \cdot 4^b}$$
+
+따라서 비트 수 $b$가 1 감소할 때마다 MSE는 정확히 4배 증가한다.
+</Theorem>
+
+이 단순한 관계가 이후 모든 기법의 동기가 된다. 모두가 "4배 증가를 피할 방법"을 찾고 있다.
+
+## Outlier 문제와 혼합 정밀도
+
+CNN weight와 달리 Transformer activation에는 **특정 채널에서만 magnitude가 평균의 100배 이상인 outlier**가 존재한다. 이 outlier 하나가 per-tensor scale을 결정하면, 나머지 99.9%의 값이 INT8의 좁은 범위 안에 빽빽이 몰려 사실상 0으로 collapse한다.
+
+LLM.int8() (Dettmers 2022)의 해답은 간단하다 — **outlier channel은 FP16으로 보호하고, 나머지는 INT8**로 처리한다.
+
+<Callout type="warning" title="Outlier collapse 메커니즘">
+Outlier가 있는 per-tensor INT8에서 scale이 max 값 기준으로 설정되면, 정상 범위의 값들은 모두 0이나 1로 mapping된다. 정보가 실질적으로 사라지는 지점이다.
+</Callout>
+
+threshold $\tau = 6$으로 outlier channel을 식별하는 방식은 경험적으로 결정됐다. 중요한 것은 이 임계값이 아니라 **혼합 정밀도라는 아이디어** 자체다 — 정밀도 예산을 균등하게 쓰지 않고, 중요도에 따라 차등 배분한다.
+
+## 등가 변환 — 오차를 이전하는 두 가지 방법
+
+GPTQ, AWQ, SmoothQuant는 각자 다른 수단을 쓰지만 공통 구조를 공유한다: **등가 변환**으로 오차를 덜 중요한 곳으로 밀어낸다.
+
+**GPTQ** (Frantar 2023)는 weight quantization error를 최소화하는 방향으로 다른 weight를 업데이트한다. Hessian $H = 2XX^T/N$의 역행렬을 써서 $w_q$를 quantize할 때마다 나머지 weight에 보정을 가하는 OBS(Optimal Brain Surgeon) update다.
+
+$$
+\Delta w = (w_q - \hat{w}_q) \cdot \frac{H^{-1}_{:,q}}{H^{-1}_{qq}}
+$$
+
+Hessian 대각 원소가 큰 weight일수록 output에 민감하다 — 그 weight를 quantize할 때 다른 weight가 더 많이 보정한다.
+
+**AWQ** (Lin 2023)는 다른 관점에서 출발한다. $WX = (W \cdot s)(X/s)$는 수치적으로 동일하지만, 오른쪽에서 $W \cdot s$를 INT4로 quantize하면 큰 activation과 곱해지는 weight(salient weight)의 상대 오차가 줄어든다. activation magnitude에 비례하는 $s$를 선택하면 1%의 salient weight를 사실상 보호하면서 나머지 99%는 INT4로 압축할 수 있다.
+
+**SmoothQuant** (Xiao 2023)는 방향을 뒤집는다. $WX = (W/s)(X \cdot s)$로 outlier를 activation에서 weight로 흡수한 뒤, weight와 activation 모두 INT8로 처리하는 W8A8을 가능하게 만든다. 최적 $s$는 MSE를 weight와 activation 사이에 균등하게 분담하는 $\alpha = 0.5$에서 결정된다.
+
+$$
+s_j^* = \sqrt{\frac{R_x^j}{R_w^j}}
+$$
+
+세 방법 모두 "오차를 줄이는" 것이 아니라 **오차를 출력에 덜 영향을 미치는 곳으로 재배치**한다는 점에서 같다.
+
+## 분포를 아는 자의 이점 — NF4
+
+앞의 기법들이 outlier와 sensitivity를 다뤘다면, NF4 (Dettmers 2023)는 다른 질문을 던진다 — **weight의 분포를 미리 안다면, 그에 맞춘 quantization grid를 쓰면 어떤가?**
+
+LLM weight는 사전학습 이후 Gaussian에 가까운 분포를 보인다. INT4의 균등 grid는 이 분포에서 꼬리 부분에 level을 낭비한다. NF4는 16개 level을 표준정규분포의 quantile에 배치한다.
+
+$$
+q_i = \Phi^{-1}\!\left(\frac{i + 0.5}{16}\right), \quad i = 0, \ldots, 15
+$$
+
+이는 Lloyd-Max 최적 quantizer가 정규분포에 대해 수렴하는 지점과 일치한다. 같은 4-bit 예산에서 INT4보다 낮은 reconstruction error를 달성하며, QLoRA의 기반이 된다.
+
+<Aside label="설계 원칙">
+NF4의 핵심은 "더 좋은 알고리즘"이 아니라 "사전 지식의 활용"이다. 분포를 모르면 균등 grid가 최선이지만, 분포를 알면 그에 맞춘 grid가 항상 낫다. Rate-distortion 이론이 보장하는 결론이다.
+</Aside>
+
+## 트레이드오프
+
+다섯 기법은 서로 다른 축에서 precision budget을 소모한다.
+
+<Callout type="note" title="기법별 트레이드오프 요약">
+- **LLM.int8()**: outlier channel FP16 보호 → 메모리 `~50%` 절감, 추가 routing overhead
+- **GPTQ**: Hessian 계산 비용이 크지만, INT4 weight로 `~75%` 메모리 절감, near-FP16 정확도
+- **AWQ**: salience 기반 scaling, GPTQ보다 계산 빠름, 동등한 INT4 정확도
+- **SmoothQuant**: W8A8 하드웨어 의존, batch 클수록 latency 이득이 극적 (5-10배)
+- **NF4**: weight 분포가 Gaussian이어야 함, activation에는 적합하지 않음
+</Callout>
+
+서빙 환경에서는 SmoothQuant W8A8이 batch throughput을 극대화하고, 모델 배포·압축에는 GPTQ/AWQ INT4가 표준이 되고 있다. fine-tuning 효율화에는 NF4 + LoRA(QLoRA)가 현재 실용적 표준이다.
+
+## 정리
+
+- 모든 quantization의 오차는 $\text{MSE} = s^2/12$로 요약되고, 비트 하나가 4배의 오차를 의미한다.
+- LLM.int8(), AWQ, SmoothQuant는 각각 "outlier를 FP16으로 보호", "salient weight에 scale을 키워 보호", "outlier를 weight로 흡수"라는 방식으로 오차를 재배치한다.
+- GPTQ는 Hessian 기반 보정으로 weight quantization error를 다른 weight가 흡수하게 한다.
+- NF4는 분포 사전 지식을 활용해 같은 비트 예산에서 더 낮은 오차를 달성한다.
+
+다섯 기법 모두의 공통 질문은 하나다 — **오차의 예산을 어디에 쓸 것인가.** 그 답이 각 기법의 정체성을 결정한다.
+
+<Reference
+  title="LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale"
+  authors="Dettmers et al."
+  year={2022}
+  venue="NeurIPS"
+  url="https://arxiv.org/abs/2208.07339"
+/>
+<Reference
+  title="GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"
+  authors="Frantar et al."
+  year={2023}
+  venue="ICLR"
+  url="https://arxiv.org/abs/2210.17323"
+/>

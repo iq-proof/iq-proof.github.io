@@ -1,0 +1,141 @@
+---
+title: "Actor-Critic은 왜 두 역할로 나뉘는가"
+description: "Actor와 Critic의 분리가 만들어내는 분산 감소 원리부터, Advantage 추정의 bias-variance 트레이드오프, Deadly Triad까지 — AC 프레임워크의 설계 결정을 추적한다."
+pubDate: 2026-05-05
+category: ai
+tags: [reinforcement-learning, actor-critic, policy-gradient, advantage, function-approximation]
+difficulty: advanced
+series:
+  slug: model-free-rl-deep-dive
+  title: Model-Free RL Deep Dive
+  order: 6
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Theorem from '@/components/mdx/Theorem.astro';
+import Proof from '@/components/mdx/Proof.astro';
+import Aside from '@/components/mdx/Aside.astro';
+import Reference from '@/components/mdx/Reference.astro';
+
+Q-Learning과 SARSA는 가치 함수를 추정하고, 그 가치에서 암묵적으로 정책을 뽑아낸다. Actor-Critic은 이 두 역할을 명시적으로 분리한다 — 정책을 파라미터 $\theta$로 직접 표현하는 **Actor**, 그 정책을 평가하는 **Critic**. 왜 이 분리가 필요하고, 분리는 무엇을 가능하게 하는가?
+
+## GPI의 연속화: 두 역할의 기원
+
+강화학습의 핵심 루프는 **정책 평가(Policy Evaluation)**와 **정책 개선(Policy Improvement)**의 반복이다. Sutton & Barto의 Generalized Policy Iteration(GPI)에서 이 두 단계는 교대로 일어난다.
+
+Actor-Critic은 이 반복을 **매 시간 스텝마다** 동시에 수행한다.
+
+```
+Critic (TD):  V(s) ← V(s) + α_c [r + γV(s') - V(s)]
+Actor  (PG):  θ ← θ + α_a ∇_θ log π_θ(a|s) A(s,a)
+```
+
+각 경험 $(s, a, r, s')$마다 Critic은 한 스텝 TD로 가치를 갱신하고, Actor는 그 평가를 받아 정책을 조금씩 개선한다. GPI의 비동기 버전이다.
+
+이 구조가 Q-Learning과 다른 핵심은 **정책이 명시적**이라는 점이다. $\max_a Q(s,a)$는 이산 행동 공간에서만 계산 가능하지만, $\pi_\theta(a|s) = \mathcal{N}(\mu_\theta(s), \sigma^2_\theta(s))$는 연속 행동 공간에서도 그대로 작동한다. 로봇 제어, 연속 제어 도메인에서 AC 계열이 지배적인 이유다.
+
+## Advantage: Critic이 Actor에게 주는 신호
+
+Policy Gradient Theorem은 다음을 말한다.
+
+$$
+\nabla_\theta J(\pi_\theta) = \mathbb{E}_{s \sim d^\theta, a \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(a|s) \, Q^\pi(s,a)]
+$$
+
+$Q^\pi(s,a)$를 직접 Monte Carlo로 추정하면 gradient는 unbiased지만 분산이 매우 크다. 에피소드 전체의 누적 보상이 노이즈에 그대로 노출된다.
+
+해법은 **baseline**이다. 임의의 상태 의존 함수 $b(s)$를 빼도 gradient의 기댓값은 변하지 않는다.
+
+<Theorem kind="proposition" number="1" title="Baseline Unbiasedness">
+임의의 상태 의존 baseline $b(s)$에 대해,
+
+$$\mathbb{E}_{a \sim \pi_\theta(\cdot|s)}[\nabla_\theta \log \pi_\theta(a|s) \cdot b(s)] = 0$$
+</Theorem>
+
+<Proof>
+Tower property로 상태를 먼저 고정하면,
+
+$$\mathbb{E}_{s,a}[\nabla_\theta \log \pi(a|s) b(s)] = \mathbb{E}_s\!\left[b(s)\underbrace{\mathbb{E}_{a|s}[\nabla_\theta \log \pi(a|s)]}_{= \,\nabla_\theta \sum_a \pi(a|s) \,=\, \nabla_\theta 1 \,=\, 0}\right] = 0 \quad \square
+$$
+</Proof>
+
+따라서 $b(s) = V^\pi(s)$로 놓으면 gradient는 여전히 unbiased이면서, 추정의 분산이 대폭 줄어든다. $Q(s,a) - V(s)$를 **Advantage** $A(s,a)$라 부른다. Advantage의 기댓값은 on-policy에서 0이므로, gradient는 "평균 대비 얼마나 좋은가"라는 상대적 신호만 담는다.
+
+실전에서 Critic은 $V^\pi(s)$를 추정하고, TD error
+
+$$\delta_t = r_t + \gamma V_w(s_{t+1}) - V_w(s_t)$$
+
+를 Advantage의 근사치로 Actor에 전달한다. $V_w \approx V^\pi$이면 $\mathbb{E}[\delta_t] \approx A^\pi(s_t, a_t)$다.
+
+## Softmax, Gaussian, 그리고 온도
+
+Actor의 정책은 미분 가능해야 한다. 이산 행동에서는 softmax,
+
+$$\pi_\theta(a|s) = \frac{\exp(\theta_a(s)/\tau)}{\sum_{a'} \exp(\theta_{a'}(s)/\tau)}$$
+
+연속 행동에서는 Gaussian, $\pi_\theta(a|s) = \mathcal{N}(\mu_\theta(s), \sigma^2_\theta(s))$를 쓴다.
+
+두 경우 모두 log-derivative의 형태가 명확하다. Softmax의 경우,
+
+$$\nabla_\theta \log \pi_\tau(a|s) = \frac{1}{\tau}(e_a - \pi_\tau(a|s))$$
+
+온도 $\tau \to 0$이면 정책은 argmax로 수렴하고, $\tau \to \infty$이면 uniform 분포가 된다. Actor update $\theta \leftarrow \theta + \alpha_a A(s,a)\nabla_\theta \log \pi_\theta(a|s)$는 Advantage가 양수인 행동의 확률을 올리고, 음수인 행동의 확률을 내린다.
+
+<Aside label="Deterministic Policy Gradient">
+Silver et al. 2014는 Gaussian의 분산을 0으로 보내는 극한에서 deterministic policy gradient를 도출했다: $\mu \leftarrow \mu + \alpha \nabla_\mu Q(s,\mu(s))$. 이는 연속 제어에서 sample efficiency를 높이는 DDPG의 기반이다. 하지만 softmax의 $\tau \to 0$ 극한은 gradient가 발산할 수 있으므로 주의가 필요하다.
+</Aside>
+
+## Two-Timescale과 수렴
+
+Actor와 Critic이 같은 속도로 배우면 수렴이 불안정해진다. Actor가 움직이는 동안 Critic의 target이 계속 바뀌고, Critic이 수렴하기 전에 Actor가 그 부정확한 값으로 정책을 갱신한다.
+
+Konda & Tsitsiklis 2000은 **two-timescale** 조건을 제시했다.
+
+$$\lim_{t \to \infty} \frac{\alpha_{a,t}}{\alpha_{c,t}} = 0$$
+
+Critic의 학습률이 Actor보다 충분히 빠르면, Critic은 먼저 현재 정책의 $V^\pi$로 수렴하고, Actor는 그 안정된 값을 기반으로 정책을 개선한다. ODE 방법으로 two-timescale의 합성을 분석하면 $(w_t, \theta_t) \to (w^*, \theta^*)$ a.s.가 보장된다. 실전에서는 $\alpha_c \approx 10 \times \alpha_a$ 정도가 흔한 출발점이다.
+
+## 함수 근사와 Deadly Triad
+
+Critic을 선형 함수 근사 $\hat{V}(s;w) = w^\top \phi(s)$로 구현하면 이론이 깔끔하다. Tsitsiklis & Van Roy 1997은 on-policy linear TD(0)가 **projected Bellman fixed point** $w^*$로 a.s. 수렴함을 증명했다. 수렴점은 $V^\pi$의 정확한 추정이 아니라 선형 부분공간으로의 최소제곱 투영이지만, 추정 오차는 feature의 표현력에만 의존한다.
+
+문제는 **off-policy + bootstrapping + function approximation**의 조합이다.
+
+<Callout type="warning" title="Deadly Triad">
+세 조건이 동시에 성립하면 linear TD조차 발산할 수 있다.
+
+1. **Off-policy**: 행동 정책과 target 정책이 다름
+2. **Bootstrapping**: 다음 상태의 추정값으로 업데이트
+3. **Function Approximation**: 파라미터를 공유하는 가치 함수
+
+Baird 1995의 counterexample은 7개 상태 MDP에서 세 조건이 만나면 $\|w_t\| \to \infty$임을 보인다. 이것이 실전 AC(A3C, A2C)가 on-policy를 고수하는 이유다.
+</Callout>
+
+DQN은 experience replay와 target network라는 두 heuristic으로 이 불안정성을 경험적으로 완화했지만, 이론적 수렴 보장은 여전히 제한적이다.
+
+## 정리
+
+- Actor-Critic은 GPI를 매 스텝 비동기적으로 실행한다: Critic은 TD로 가치를 추정하고, Actor는 그 Advantage로 정책을 개선한다.
+- Baseline $V^\pi(s)$는 gradient를 unbiased로 유지하면서 분산을 줄인다. TD error $\delta_t$는 Advantage의 편향된 근사치다.
+- Two-timescale 조건 $\alpha_a \ll \alpha_c$는 수렴에 필수적이다: Critic이 먼저 안정되어야 Actor가 올바른 방향으로 움직인다.
+- On-policy linear TD(0)는 수렴이 보장되지만, off-policy + bootstrapping + function approximation의 조합은 발산 위험이 있다.
+
+Advantage를 어떻게 더 정확하게 추정할 것인가 — GAE($\lambda$)와 n-step returns은 bias-variance의 연속을 하나의 파라미터로 제어한다.
+
+<Reference
+  title="Actor-Critic Algorithms"
+  authors="Konda, V. R. and Tsitsiklis, J. N."
+  year={2000}
+  venue="NeurIPS"
+  url="https://proceedings.neurips.cc/paper/1999/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html"
+/>
+
+<Reference
+  title="High-Dimensional Continuous Control Using Generalized Advantage Estimation"
+  authors="Schulman, J. et al."
+  year={2016}
+  venue="ICLR"
+  url="https://arxiv.org/abs/1506.02438"
+/>
