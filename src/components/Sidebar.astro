@@ -438,7 +438,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
     left: 0;
     bottom: 0;
     background: linear-gradient(180deg, #0a0e1a 0%, #0f1424 100%);
-    border-right: 1px solid var(--color-border-subtle, #374151);
+    /* No border-right — fluid edge into content area */
     overflow: hidden;
   }
 
@@ -473,8 +473,12 @@ const hasCurrentInCat: Record<Category, boolean> = {
   @media (min-width: 1024px) {
     .sidebar {
       width: 56px;
-      transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+      transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1), background 0.22s ease;
       z-index: 30;
+    }
+    /* Collapsed: transparent — 햄버거 아이콘이 페이지 위에 floating */
+    .sidebar[data-state="collapsed"] {
+      background: transparent;
     }
     .sidebar[data-state="expanded"] {
       width: 300px;
@@ -552,7 +556,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
     appearance: none;
     background: transparent;
     border: none;
-    border-bottom: 1px solid var(--color-border-subtle, #374151);
+    /* No bottom border — clean handoff into tree content */
     color: var(--color-text-secondary, #9ca3af);
     width: 100%;
     /* Header와 정확히 동일 높이 — 바닥선 align */

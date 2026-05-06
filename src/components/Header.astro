@@ -1,26 +1,25 @@
 ---
 import { SITE, NAV } from '@/consts';
+import TopologicalLogo from '@/components/TopologicalLogo.astro';
 const currentPath = Astro.url.pathname;
 ---
 
-<header class="sticky top-0 z-40 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--color-border-subtle); height: var(--iq-header-height);">
-  <div class="mx-auto flex items-center justify-between h-full px-6" style="max-width: var(--container-max);">
-    <!-- Logo -->
-    <a href="/" class="flex items-center gap-2.5" aria-label={SITE.name}>
-      <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="12" cy="12" r="10" fill="none" stroke="var(--color-accent-cyan)" stroke-width="2" />
-        <circle cx="12" cy="12" r="5" fill="var(--color-accent-cyan)" />
-      </svg>
-      <span class="text-base font-medium tracking-tight" style="color: var(--color-text-primary);">{SITE.name}</span>
+<header
+  class="iq-header sticky top-0 z-40 backdrop-blur-md"
+  style="background: rgba(10, 14, 26, 0.72); height: var(--iq-header-height);"
+>
+  <div class="iq-header-inner">
+    <!-- Logo — flush left, bigger, animated topology -->
+    <a href="/" class="iq-logo" aria-label={SITE.name}>
+      <TopologicalLogo size={36} />
+      <span class="iq-logo-text">{SITE.name}</span>
     </a>
 
-    <!-- Nav -->
-    <nav class="hidden md:flex items-center gap-7" aria-label="Primary">
+    <!-- Nav — distributed across center, bigger items -->
+    <nav class="iq-nav" aria-label="Primary">
       {
         NAV.map(({ href, label }) => {
           const active = href === '/' ? currentPath === '/' : currentPath.startsWith(href);
-
-          // 카테고리별 active 색
           let activeColor = 'var(--color-accent-cyan)';
           if (href === '/categories/ai') activeColor = 'var(--color-accent-violet)';
           else if (href === '/categories/agent') activeColor = 'var(--color-accent-coral)';
@@ -28,7 +27,7 @@ const currentPath = Astro.url.pathname;
           return (
               <a
                   href={href}
-                  class="text-sm transition-colors"
+                  class="iq-nav-link"
                   style={`color: ${active ? activeColor : 'var(--color-text-secondary)'};`}
                   aria-current={active ? 'page' : undefined}
               >
@@ -39,20 +38,120 @@ const currentPath = Astro.url.pathname;
       }
     </nav>
 
-    <!-- Search trigger -->
-    <button
-        id="search-trigger"
-        type="button"
-        class="flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors"
-        style="background: var(--color-surface); border: 1px solid var(--color-border-subtle); color: var(--color-text-tertiary);"
-        aria-label="Search"
-    >
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-        <circle cx="11" cy="11" r="8"/>
-        <path d="m21 21-4.35-4.35"/>
+    <!-- Search trigger — flush right, bigger -->
+    <button id="search-trigger" type="button" class="iq-search" aria-label="Search">
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        aria-hidden="true"
+      >
+        <circle cx="11" cy="11" r="8" />
+        <path d="m21 21-4.35-4.35" />
       </svg>
-      <span class="hidden sm:inline text-xs">Search</span>
-      <kbd class="hidden sm:inline font-mono text-[10px]">⌘K</kbd>
+      <span class="iq-search-label">Search</span>
+      <kbd class="iq-search-kbd">⌘K</kbd>
     </button>
   </div>
 </header>
+
+<style>
+  .iq-header {
+    /* No bottom border — fluid handoff to hero */
+    border-bottom: none;
+  }
+
+  .iq-header-inner {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    /* Wider edge-aligned padding for "spread" feel */
+    padding: 0 1.25rem 0 1.5rem;
+    /* Allow content to span full width — no max-width constraint */
+    max-width: 100%;
+    gap: 1rem;
+  }
+
+  /* Logo — flush left, bigger */
+  .iq-logo {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-shrink: 0;
+  }
+  .iq-logo-text {
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--color-text-primary);
+  }
+
+  /* Nav — flex-1 to consume center space + space-around for distribution */
+  .iq-nav {
+    flex: 1;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(1.25rem, 3.2vw, 2.75rem);
+  }
+  @media (min-width: 768px) {
+    .iq-nav {
+      display: flex;
+    }
+  }
+
+  .iq-nav-link {
+    font-size: 0.95rem;
+    font-weight: 500;
+    transition: color 0.18s;
+    white-space: nowrap;
+  }
+  .iq-nav-link:hover {
+    color: var(--color-text-primary);
+  }
+
+  /* Search — flush right, bigger */
+  .iq-search {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    padding: 0.55rem 0.875rem;
+    border-radius: 0.5rem;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border-subtle);
+    color: var(--color-text-tertiary);
+    transition:
+      color 0.15s,
+      border-color 0.15s,
+      background 0.15s;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .iq-search:hover {
+    color: var(--color-text-primary);
+    border-color: var(--color-accent-cyan-line);
+  }
+  .iq-search-label {
+    font-size: 0.85rem;
+    display: none;
+  }
+  .iq-search-kbd {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--color-border-subtle);
+    color: var(--color-text-tertiary);
+    display: none;
+  }
+  @media (min-width: 640px) {
+    .iq-search-label,
+    .iq-search-kbd {
+      display: inline;
+    }
+  }
+</style>

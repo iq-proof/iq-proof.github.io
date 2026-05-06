@@ -1,0 +1,134 @@
+---
+/**
+ * TopologicalLogo.astro — animated trefoil knot logo.
+ *
+ * 사이트의 표지 — 정적 cyan 원에서 위상기하학(매듭)으로 교체.
+ * Pure SVG + CSS, no Three.js. Scales crisp at any size.
+ *
+ * 구성:
+ *   - 두 trefoil knot 경로(메인 + 백 — phase shift) 겹쳐 매듭의 깊이감.
+ *   - cyan → violet → coral 선형 그라디언트 (사이트 토큰 그대로).
+ *   - 19s 회전 + 6s scale breathe + drop-shadow glow.
+ *   - prefers-reduced-motion 시 정적.
+ */
+
+interface Props {
+  size?: number;
+}
+const { size = 36 } = Astro.props;
+
+// trefoil(3,2) 매듭 파라메트릭:
+//   x(t) = sin(t) + 2 sin(2t)
+//   y(t) = cos(t) - 2 cos(2t)
+// 범위: x,y ∈ [-3, 3]. viewBox 40 안에 중심 (20,20) + scale 5.
+function trefoilPath(samples = 240, phase = 0): string {
+  const cx = 20,
+    cy = 20,
+    s = 5.6;
+  let d = '';
+  for (let i = 0; i <= samples; i++) {
+    const t = phase + (i / samples) * Math.PI * 2;
+    const x = cx + (Math.sin(t) + 2 * Math.sin(2 * t)) * s;
+    const y = cy + (Math.cos(t) - 2 * Math.cos(2 * t)) * s;
+    d += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2) + ' ';
+  }
+  return d.trim();
+}
+
+const mainPath = trefoilPath(280, 0);
+const backPath = trefoilPath(280, Math.PI / 2);
+---
+
+<svg
+  viewBox="0 0 40 40"
+  width={size}
+  height={size}
+  class="topo-logo"
+  aria-hidden="true"
+>
+  <defs>
+    <linearGradient id="topo-grad-main" x1="0" y1="0" x2="40" y2="40">
+      <stop offset="0%" stop-color="#00d9ff" />
+      <stop offset="45%" stop-color="#a78bfa" />
+      <stop offset="100%" stop-color="#cc785c" />
+    </linearGradient>
+    <linearGradient id="topo-grad-back" x1="40" y1="0" x2="0" y2="40">
+      <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.35" />
+      <stop offset="60%" stop-color="#00d9ff" stop-opacity="0.2" />
+      <stop offset="100%" stop-color="#cc785c" stop-opacity="0.25" />
+    </linearGradient>
+    <filter id="topo-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="0.6" result="b" />
+      <feMerge>
+        <feMergeNode in="b" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g class="topo-rotate" filter="url(#topo-glow)">
+    <!-- Back knot — softer, slightly thicker for depth shadow -->
+    <path
+      d={backPath}
+      fill="none"
+      stroke="url(#topo-grad-back)"
+      stroke-width="3.2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <!-- Main knot -->
+    <path
+      d={mainPath}
+      fill="none"
+      stroke="url(#topo-grad-main)"
+      stroke-width="2.0"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </g>
+</svg>
+
+<style>
+  .topo-logo {
+    display: block;
+    overflow: visible;
+    /* Subtle outer glow */
+    filter: drop-shadow(0 0 6px rgba(0, 217, 255, 0.18))
+      drop-shadow(0 0 14px rgba(167, 139, 250, 0.12));
+  }
+
+  .topo-rotate {
+    transform-origin: 20px 20px;
+    transform-box: fill-box;
+    animation:
+      topo-spin 19s linear infinite,
+      topo-breathe 6s ease-in-out infinite;
+    will-change: transform;
+  }
+
+  @keyframes topo-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes topo-breathe {
+    0%,
+    100% {
+      transform-origin: 20px 20px;
+      filter: brightness(1);
+    }
+    50% {
+      filter: brightness(1.15);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .topo-rotate {
+      animation: none;
+    }
+  }
+</style>
