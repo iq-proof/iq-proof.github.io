@@ -1,0 +1,551 @@
+---
+/**
+ * SupernovaHero.astro — Home-page only "supernova" backdrop.
+ *
+ * 3-layer composition:
+ *   1. Canvas particle field (depth parallax stars, mouse-react)
+ *   2. Nova core — multi-stop radial gradient pulse
+ *   3. Shockwave rings — 3 concentric circles slowly expanding
+ *
+ * Designed to feel volumetric without Three.js. Pure canvas + CSS.
+ * Disabled / simplified on mobile and prefers-reduced-motion.
+ */
+
+import { SITE, CATEGORIES } from '@/consts';
+
+interface Props {
+  devCount: number;
+  aiCount: number;
+  agentCount: number;
+}
+
+const { devCount, aiCount, agentCount } = Astro.props;
+---
+
+<section class="supernova-hero" aria-label="hero">
+  <!-- Layer 1: star field (canvas) -->
+  <canvas id="nova-stars" class="nova-stars" aria-hidden="true"></canvas>
+
+  <!-- Layer 2: radial nova core -->
+  <div class="nova-core" aria-hidden="true"></div>
+  <div class="nova-bloom" aria-hidden="true"></div>
+
+  <!-- Layer 3: shockwave rings -->
+  <div class="nova-ring nova-ring--1" aria-hidden="true"></div>
+  <div class="nova-ring nova-ring--2" aria-hidden="true"></div>
+  <div class="nova-ring nova-ring--3" aria-hidden="true"></div>
+
+  <!-- Foreground content -->
+  <div class="hero-content">
+    <div class="mono-label hero-tagline">
+      {SITE.tagline}
+    </div>
+
+    <h1 class="hero-title">
+      표면적인 사용법이 아닌,<br />
+      <span class="hero-title-accent">본질을 증명하는</span> 기록.
+    </h1>
+
+    <p class="hero-sub">
+      시스템과 이론, 코드와 수식을 오가는 딥다이브 로그.
+    </p>
+
+    <div class="hero-badges">
+      <a href="/categories/dev" class="hero-badge hero-badge--dev">
+        <span class="hero-badge-name">Dev</span>
+        <span class="hero-badge-sep">·</span>
+        <span class="hero-badge-count">{devCount}</span>
+        <span class="hero-badge-suffix">posts</span>
+      </a>
+      <a href="/categories/ai" class="hero-badge hero-badge--ai">
+        <span class="hero-badge-name">AI</span>
+        <span class="hero-badge-sep">·</span>
+        <span class="hero-badge-count">{aiCount}</span>
+        <span class="hero-badge-suffix">posts</span>
+      </a>
+      <a href="/categories/agent" class="hero-badge hero-badge--agent">
+        <span class="hero-badge-name">Agent</span>
+        <span class="hero-badge-sep">·</span>
+        <span class="hero-badge-count">{agentCount}</span>
+        <span class="hero-badge-suffix">posts</span>
+      </a>
+    </div>
+  </div>
+
+  <!-- Bottom fade — cleanly transition into static post list area -->
+  <div class="hero-fade" aria-hidden="true"></div>
+</section>
+
+<style>
+  .supernova-hero {
+    position: relative;
+    min-height: 92vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    isolation: isolate;
+    /* Reserve some top room for fixed header */
+    padding: 6rem 1.5rem 9rem;
+  }
+
+  /* ───────── Layer 1: canvas star field ───────── */
+  .nova-stars {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: -3;
+  }
+
+  /* ───────── Layer 2: radial nova core ─────────
+     Central bright pulse — white → cyan → violet → coral → transparent.
+     Pulse animation creates "breathing" supernova feel. */
+  .nova-core {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: min(140vmin, 1400px);
+    height: min(140vmin, 1400px);
+    transform: translate(-50%, -50%);
+    z-index: -2;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        circle at center,
+        rgba(255, 255, 255, 0.18) 0%,
+        rgba(0, 217, 255, 0.16) 9%,
+        rgba(0, 217, 255, 0.10) 18%,
+        rgba(167, 139, 250, 0.08) 32%,
+        rgba(204, 120, 92, 0.04) 48%,
+        transparent 70%
+      );
+    filter: blur(2px);
+    animation: nova-breathe 7s ease-in-out infinite;
+  }
+
+  /* Inner extra bloom for sharper "core" */
+  .nova-bloom {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: min(60vmin, 540px);
+    height: min(60vmin, 540px);
+    transform: translate(-50%, -50%);
+    z-index: -2;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        circle at center,
+        rgba(255, 255, 255, 0.32) 0%,
+        rgba(180, 240, 255, 0.18) 18%,
+        rgba(0, 217, 255, 0.10) 36%,
+        transparent 60%
+      );
+    filter: blur(8px);
+    animation: nova-bloom-pulse 4.5s ease-in-out infinite;
+    mix-blend-mode: screen;
+  }
+
+  @keyframes nova-breathe {
+    0%,
+    100% {
+      transform: translate(-50%, -50%) scale(1);
+      opacity: 0.85;
+    }
+    50% {
+      transform: translate(-50%, -50%) scale(1.06);
+      opacity: 1;
+    }
+  }
+
+  @keyframes nova-bloom-pulse {
+    0%,
+    100% {
+      opacity: 0.55;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    50% {
+      opacity: 0.95;
+      transform: translate(-50%, -50%) scale(1.18);
+    }
+  }
+
+  /* ───────── Layer 3: shockwave rings ─────────
+     Three rings at different radii, scaling+fading on stagger. */
+  .nova-ring {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    z-index: -2;
+    pointer-events: none;
+    border: 1px solid rgba(0, 217, 255, 0.12);
+    box-shadow:
+      0 0 60px rgba(0, 217, 255, 0.08),
+      inset 0 0 80px rgba(167, 139, 250, 0.06);
+    will-change: transform, opacity;
+  }
+
+  .nova-ring--1 {
+    width: 420px;
+    height: 420px;
+    animation: nova-ring-expand 9s ease-out infinite;
+  }
+  .nova-ring--2 {
+    width: 720px;
+    height: 720px;
+    animation: nova-ring-expand 9s ease-out infinite;
+    animation-delay: -3s;
+    border-color: rgba(167, 139, 250, 0.10);
+  }
+  .nova-ring--3 {
+    width: 1080px;
+    height: 1080px;
+    animation: nova-ring-expand 9s ease-out infinite;
+    animation-delay: -6s;
+    border-color: rgba(204, 120, 92, 0.08);
+  }
+
+  @keyframes nova-ring-expand {
+    0% {
+      transform: translate(-50%, -50%) scale(0.6);
+      opacity: 0;
+    }
+    20% {
+      opacity: 0.9;
+    }
+    100% {
+      transform: translate(-50%, -50%) scale(1.6);
+      opacity: 0;
+    }
+  }
+
+  /* ───────── Bottom fade — fluid handoff to static section ───────── */
+  .hero-fade {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 14rem;
+    z-index: -1;
+    pointer-events: none;
+    background: linear-gradient(
+      to bottom,
+      transparent 0%,
+      var(--color-bg) 88%,
+      var(--color-bg) 100%
+    );
+  }
+
+  /* ───────── Foreground content ───────── */
+  .hero-content {
+    position: relative;
+    z-index: 1;
+    max-width: 56rem;
+    width: 100%;
+    margin: 0 auto;
+    text-align: left;
+  }
+
+  .hero-tagline {
+    color: var(--color-accent-cyan);
+    margin-bottom: 1.5rem;
+    text-shadow: 0 0 20px rgba(0, 217, 255, 0.4);
+  }
+
+  .hero-title {
+    font-size: clamp(2.5rem, 5.5vw, 4.5rem);
+    font-weight: 500;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    color: var(--color-text-primary);
+    margin-bottom: 1.75rem;
+    text-shadow: 0 2px 30px rgba(0, 0, 0, 0.5);
+  }
+
+  .hero-title-accent {
+    color: var(--color-accent-cyan);
+    background: linear-gradient(
+      135deg,
+      #00d9ff 0%,
+      #a78bfa 50%,
+      #cc785c 100%
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 0 24px rgba(0, 217, 255, 0.35));
+  }
+
+  .hero-sub {
+    font-size: clamp(1rem, 1.4vw, 1.25rem);
+    color: var(--color-text-secondary);
+    line-height: 1.7;
+    max-width: 38rem;
+    margin-bottom: 2.5rem;
+  }
+
+  /* Hero badges — bigger, glow on hover */
+  .hero-badges {
+    display: flex;
+    gap: 0.875rem;
+    flex-wrap: wrap;
+  }
+
+  .hero-badge {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    padding: 0.625rem 1rem;
+    border: 1px solid;
+    border-radius: 0.625rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.875rem;
+    backdrop-filter: blur(8px);
+    transition:
+      transform 0.25s ease,
+      box-shadow 0.25s ease,
+      background-color 0.25s ease;
+  }
+
+  .hero-badge:hover {
+    transform: translateY(-2px);
+  }
+
+  .hero-badge-name {
+    font-weight: 600;
+  }
+  .hero-badge-sep {
+    opacity: 0.5;
+  }
+  .hero-badge-count {
+    font-weight: 500;
+  }
+  .hero-badge-suffix {
+    opacity: 0.7;
+    font-size: 0.8em;
+  }
+
+  .hero-badge--dev {
+    background: rgba(0, 217, 255, 0.10);
+    color: #00d9ff;
+    border-color: rgba(0, 217, 255, 0.32);
+  }
+  .hero-badge--dev:hover {
+    background: rgba(0, 217, 255, 0.18);
+    box-shadow: 0 6px 24px rgba(0, 217, 255, 0.28);
+  }
+
+  .hero-badge--ai {
+    background: rgba(167, 139, 250, 0.10);
+    color: #a78bfa;
+    border-color: rgba(167, 139, 250, 0.32);
+  }
+  .hero-badge--ai:hover {
+    background: rgba(167, 139, 250, 0.18);
+    box-shadow: 0 6px 24px rgba(167, 139, 250, 0.28);
+  }
+
+  .hero-badge--agent {
+    background: rgba(204, 120, 92, 0.10);
+    color: #cc785c;
+    border-color: rgba(204, 120, 92, 0.32);
+  }
+  .hero-badge--agent:hover {
+    background: rgba(204, 120, 92, 0.18);
+    box-shadow: 0 6px 24px rgba(204, 120, 92, 0.28);
+  }
+
+  /* ───────── Reduced motion / mobile ───────── */
+  @media (prefers-reduced-motion: reduce) {
+    .nova-core,
+    .nova-bloom,
+    .nova-ring {
+      animation: none !important;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .supernova-hero {
+      min-height: 78vh;
+      padding: 4.5rem 1.25rem 6rem;
+    }
+    .nova-ring--3 {
+      display: none;
+    }
+    .hero-content {
+      text-align: left;
+    }
+  }
+</style>
+
+<script>
+  /**
+   * Canvas star field — depth parallax + mouse-react.
+   * Lightweight: no library, ~150 LOC, GPU-friendly composite ops.
+   */
+  function initNovaStars() {
+    const canvas = document.getElementById('nova-stars') as HTMLCanvasElement | null;
+    if (!canvas) return;
+
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      return;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    type Star = {
+      x: number;
+      y: number;
+      z: number;        // depth 0..1 — closer = larger + brighter
+      r: number;        // radius
+      tw: number;       // twinkle phase
+      twS: number;      // twinkle speed
+      hue: 'cyan' | 'violet' | 'white' | 'coral';
+      vx: number;
+      vy: number;
+    };
+
+    let stars: Star[] = [];
+    let w = 0,
+      h = 0;
+    let mouseX = 0,
+      mouseY = 0,
+      targetMx = 0,
+      targetMy = 0;
+    let raf: number | null = null;
+
+    const HUE_MAP = {
+      white: [255, 255, 255],
+      cyan: [0, 217, 255],
+      violet: [167, 139, 250],
+      coral: [204, 120, 92],
+    };
+
+    function resize() {
+      const rect = canvas!.getBoundingClientRect();
+      w = rect.width;
+      h = rect.height;
+      canvas!.width = w * dpr;
+      canvas!.height = h * dpr;
+      ctx!.scale(dpr, dpr);
+
+      // Re-init stars on resize (density ~ area)
+      const count = Math.min(260, Math.floor((w * h) / 5500));
+      stars = [];
+      for (let i = 0; i < count; i++) {
+        const z = Math.pow(Math.random(), 1.3); // bias toward distant
+        const hueRand = Math.random();
+        const hue: Star['hue'] =
+          hueRand < 0.55
+            ? 'white'
+            : hueRand < 0.78
+              ? 'cyan'
+              : hueRand < 0.93
+                ? 'violet'
+                : 'coral';
+        stars.push({
+          x: Math.random() * w,
+          y: Math.random() * h,
+          z,
+          r: 0.4 + z * 1.8,
+          tw: Math.random() * Math.PI * 2,
+          twS: 0.012 + Math.random() * 0.025,
+          hue,
+          vx: (Math.random() - 0.5) * 0.04,
+          vy: (Math.random() - 0.5) * 0.04,
+        });
+      }
+    }
+
+    function draw() {
+      if (!ctx) return;
+      // Smooth mouse easing
+      mouseX += (targetMx - mouseX) * 0.05;
+      mouseY += (targetMy - mouseY) * 0.05;
+
+      ctx.clearRect(0, 0, w, h);
+      ctx.globalCompositeOperation = 'lighter';
+
+      const cx = w / 2;
+      const cy = h / 2;
+      // Mouse offset normalized to [-1, 1]
+      const mox = (mouseX - cx) / cx || 0;
+      const moy = (mouseY - cy) / cy || 0;
+
+      for (const s of stars) {
+        // Parallax: closer stars (high z) shift more with mouse
+        const px = s.x + mox * s.z * 18;
+        const py = s.y + moy * s.z * 14;
+
+        // Twinkle alpha: 0.35 .. 1.0
+        s.tw += s.twS;
+        const tw = (Math.sin(s.tw) + 1) / 2;
+        const alpha = 0.35 + tw * 0.65 * (0.4 + s.z * 0.6);
+
+        const [r, g, b] = HUE_MAP[s.hue];
+        // Glow halo (low alpha, larger)
+        const grad = ctx.createRadialGradient(px, py, 0, px, py, s.r * 4);
+        grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+        grad.addColorStop(0.4, `rgba(${r},${g},${b},${alpha * 0.25})`);
+        grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(px, py, s.r * 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Core dot
+        ctx.fillStyle = `rgba(${r},${g},${b},${Math.min(1, alpha + 0.2)})`;
+        ctx.beginPath();
+        ctx.arc(px, py, s.r, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Slow drift
+        s.x += s.vx;
+        s.y += s.vy;
+        if (s.x < -10) s.x = w + 10;
+        if (s.x > w + 10) s.x = -10;
+        if (s.y < -10) s.y = h + 10;
+        if (s.y > h + 10) s.y = -10;
+      }
+
+      raf = requestAnimationFrame(draw);
+    }
+
+    resize();
+    window.addEventListener('resize', resize);
+
+    document.addEventListener('mousemove', (e) => {
+      const rect = canvas!.getBoundingClientRect();
+      targetMx = e.clientX - rect.left;
+      targetMy = e.clientY - rect.top;
+    });
+
+    // Pause when off-screen — IntersectionObserver
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && raf == null) {
+            draw();
+          } else if (!e.isIntersecting && raf != null) {
+            cancelAnimationFrame(raf);
+            raf = null;
+          }
+        }
+      },
+      { threshold: 0 },
+    );
+    io.observe(canvas);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initNovaStars);
+  } else {
+    initNovaStars();
+  }
+</script>
