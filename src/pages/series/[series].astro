@@ -2,6 +2,7 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import CursorLight from '@/components/CursorLight.astro';
 import PostCard from '@/components/PostCard.astro';
+import { withBase } from '@/lib/url';
 import { getAllSeries, getPostsBySeries } from '@/utils/posts';
 
 export async function getStaticPaths() {
@@ -26,7 +27,7 @@ const posts = await getPostsBySeries(slug);
   <CursorLight mode="blend" />
   <section class="mx-auto px-6 pt-16 pb-10" style="max-width: var(--container-max);">
     <a
-      href="/series"
+      href={withBase('/series')}
       class="inline-flex items-center gap-1 font-mono text-xs mb-6 transition-colors"
       style="color: var(--color-text-tertiary);"
     >

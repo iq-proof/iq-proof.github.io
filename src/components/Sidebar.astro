@@ -27,6 +27,7 @@
 
 import { getCollection } from 'astro:content';
 import { DEV_LAB_GROUPS, AI_LAB_LAYERS, NAV } from '@/consts';
+import { withBase, isActivePath, stripBase } from '@/lib/url';
 import Icon from '@/components/Icon.astro';
 
 type Category = 'dev' | 'ai' | 'agent';
@@ -55,8 +56,8 @@ const CATEGORY_COLOR: Record<Category, string> = {
 // 1. 모든 글 fetch (draft 제외)
 const allPosts = await getCollection('posts', ({ data }) => !data.draft);
 
-// 2. 현재 페이지 slug
-const pathMatch = Astro.url.pathname.match(/^\/posts\/([^/]+)\/?$/);
+// 2. 현재 페이지 slug (Astro.url.pathname은 base 포함이므로 strip 후 매칭)
+const pathMatch = stripBase(Astro.url.pathname).match(/^\/posts\/([^/]+)\/?$/);
 const currentSlug = pathMatch?.[1];
 
 // 3. 카테고리별 + seriesSlug별 인덱스
@@ -186,13 +187,13 @@ const hasCurrentInCat: Record<Category, boolean> = {
     {/* 모바일 전용 — Header nav 메뉴 (Home, Posts, Dev, AI, Agent, Projects, About) */}
     <nav class="mobile-nav" aria-label="Primary mobile">
       {NAV.map(({ href, label }) => {
-        const isActive = href === '/' ? Astro.url.pathname === '/' : Astro.url.pathname.startsWith(href);
+        const isActive = isActivePath(Astro.url.pathname, href);
         let activeClass = '';
         if (href === '/categories/dev') activeClass = 'nav-dev';
         else if (href === '/categories/ai') activeClass = 'nav-ai';
         else if (href === '/categories/agent') activeClass = 'nav-agent';
         return (
-          <a href={href} class={`mobile-nav-link ${isActive ? `active ${activeClass}` : ''}`}>
+          <a href={withBase(href)} class={`mobile-nav-link ${isActive ? `active ${activeClass}` : ''}`}>
             {label}
           </a>
         );
@@ -243,7 +244,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
                       <ol class="post-list">
                         {s.posts.map((p) => (
                           <li>
-                            <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                            <a href={withBase(`/posts/${p.slug}/`)} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
                               <span class="post-order">{p.seriesOrder}</span>
                               <span class="post-title">{p.title}</span>
                             </a>
@@ -300,7 +301,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
                       <ol class="post-list">
                         {s.posts.map((p) => (
                           <li>
-                            <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                            <a href={withBase(`/posts/${p.slug}/`)} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
                               <span class="post-order">{p.seriesOrder}</span>
                               <span class="post-title">{p.title}</span>
                             </a>
@@ -332,7 +333,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
             <ul class="post-list direct">
               {agentPosts.map((p) => (
                 <li>
-                  <a href={`/posts/${p.slug}/`} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
+                  <a href={withBase(`/posts/${p.slug}/`)} class={p.slug === currentSlug ? 'post-link active' : 'post-link'}>
                     <span class="post-title">{p.title}</span>
                   </a>
                 </li>

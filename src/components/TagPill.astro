@@ -1,4 +1,6 @@
 ---
+import { withBase } from '@/lib/url';
+
 interface Props {
   tag: string;
   count?: number;
@@ -8,7 +10,7 @@ const { tag, count } = Astro.props;
 ---
 
 <a
-  href={`/tags/${tag}`}
+  href={withBase(`/tags/${tag}`)}
   class="inline-flex items-center gap-1 font-mono text-xs px-2 py-0.5 rounded transition-colors"
   style="background: var(--color-elevated); color: var(--color-text-secondary); border: 1px solid var(--color-border-subtle);"
 >

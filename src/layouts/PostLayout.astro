@@ -4,6 +4,7 @@ import CategoryBadge from '@/components/CategoryBadge.astro';
 import DifficultyBadge from '@/components/DifficultyBadge.astro';
 import TagPill from '@/components/TagPill.astro';
 import Giscus from '@/components/Giscus.astro';
+import { withBase } from '@/lib/url';
 import type { Post } from '@/utils/posts';
 import {
   formatDate,
@@ -37,7 +38,7 @@ const seriesSiblings = post.data.series
   <article class="mx-auto px-6 pt-16 pb-12" style="max-width: var(--reading-max);">
     <!-- Back to posts -->
     <a
-        href="/posts"
+        href={withBase('/posts')}
         class="inline-flex items-center gap-1 font-mono text-xs mb-8 transition-colors"
         style="color: var(--color-text-tertiary);"
     >
@@ -73,7 +74,7 @@ const seriesSiblings = post.data.series
             >
               <div class="flex items-center justify-between mb-2">
                 <a
-                    href={`/series/${post.data.series.slug}`}
+                    href={withBase(`/series/${post.data.series.slug}`)}
                     class="font-mono text-[11px] transition-colors"
                     style="color: var(--color-accent-cyan);"
                 >
@@ -101,7 +102,7 @@ const seriesSiblings = post.data.series
                             <span style="color: var(--color-text-primary);">{sibling.data.title}</span>
                         ) : (
                             <a
-                                href={`/posts/${sibling.id}`}
+                                href={withBase(`/posts/${sibling.id}`)}
                                 class="transition-colors hover:text-[var(--color-accent-cyan)]"
                             >
                               {sibling.data.title}
@@ -146,7 +147,7 @@ const seriesSiblings = post.data.series
             <nav class="mt-12 pt-6 grid grid-cols-1 md:grid-cols-2 gap-4" style="border-top: 1px solid var(--color-border-subtle);">
               {prev ? (
                   <a
-                      href={`/posts/${prev.id}`}
+                      href={withBase(`/posts/${prev.id}`)}
                       class="p-4 rounded-md transition-colors"
                       style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
                   >
@@ -162,7 +163,7 @@ const seriesSiblings = post.data.series
               )}
               {next ? (
                   <a
-                      href={`/posts/${next.id}`}
+                      href={withBase(`/posts/${next.id}`)}
                       class="p-4 rounded-md transition-colors text-right"
                       style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
                   >

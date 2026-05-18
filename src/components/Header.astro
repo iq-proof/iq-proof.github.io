@@ -1,5 +1,6 @@
 ---
 import { SITE, NAV } from '@/consts';
+import { withBase, isActivePath } from '@/lib/url';
 import TopologicalLogo from '@/components/TopologicalLogo.astro';
 const currentPath = Astro.url.pathname;
 ---
@@ -10,7 +11,7 @@ const currentPath = Astro.url.pathname;
 >
   <div class="iq-header-inner">
     <!-- Logo — flush left, bigger, animated topology -->
-    <a href="/" class="iq-logo" aria-label={SITE.name}>
+    <a href={withBase('/')} class="iq-logo" aria-label={SITE.name}>
       <TopologicalLogo size={36} />
       <span class="iq-logo-text">{SITE.name}</span>
     </a>
@@ -19,14 +20,14 @@ const currentPath = Astro.url.pathname;
     <nav class="iq-nav" aria-label="Primary">
       {
         NAV.map(({ href, label }) => {
-          const active = href === '/' ? currentPath === '/' : currentPath.startsWith(href);
+          const active = isActivePath(currentPath, href);
           let activeColor = 'var(--color-accent-cyan)';
           if (href === '/categories/ai') activeColor = 'var(--color-accent-violet)';
           else if (href === '/categories/agent') activeColor = 'var(--color-accent-coral)';
 
           return (
               <a
-                  href={href}
+                  href={withBase(href)}
                   class="iq-nav-link"
                   style={`color: ${active ? activeColor : 'var(--color-text-secondary)'};`}
                   aria-current={active ? 'page' : undefined}

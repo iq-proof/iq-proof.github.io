@@ -2,6 +2,7 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import CursorLight from '@/components/CursorLight.astro';
 import CategoryBadge from '@/components/CategoryBadge.astro';
+import { withBase } from '@/lib/url';
 import { getArchive, formatDate } from '@/utils/posts';
 
 const archive = await getArchive();
@@ -63,7 +64,7 @@ const totalPosts = archive.reduce(
                       </span>
                       <CategoryBadge category={post.data.category} />
                       <a
-                        href={`/posts/${post.id}`}
+                        href={withBase(`/posts/${post.id}`)}
                         class="text-sm transition-colors"
                         style="color: var(--color-text-primary);"
                       >

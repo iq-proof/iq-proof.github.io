@@ -2,12 +2,12 @@
  * Site-wide constants: single source of truth.
  *
  * SITE.name        → user-facing brand name (shown in header, OG, etc.)
- * SITE.url         → canonical URL (GitHub Pages deployment target)
+ * SITE.url         → canonical URL including base path (project page under iq-universe)
  * SITE.github.org  → GitHub organization that owns the repo
  *
  * Note: brand name ≠ GitHub org by design.
  *   - Brand "IQ Lab" is the umbrella identity shared with `iq-dev-lab` / `iq-ai-lab`.
- *   - GitHub org `iq-proof` is the technical home; the name `iq-lab` was already taken.
+ *   - The repo now lives under `iq-universe` org as a project page (base: /iq-proof).
  */
 
 export const SITE = {
@@ -15,7 +15,7 @@ export const SITE = {
   tagline: 'deep-dive.engineering(ai)',
   description:
       '시스템과 이론, 코드와 수식을 오가는 딥다이브 로그. 표면의 사용법이 아닌, 본질을 증명하는 기록.',
-  url: 'https://iq-proof.github.io',
+  url: 'https://iq-universe.github.io/iq-proof',
   lang: 'ko',
   locale: 'ko-KR',
   timezone: 'Asia/Seoul',
@@ -25,9 +25,9 @@ export const SITE = {
     github: 'https://github.com/e9ua1',
   },
   github: {
-    org: 'iq-proof',
-    repo: 'iq-proof.github.io',
-    url: 'https://github.com/iq-proof/iq-proof.github.io',
+    org: 'iq-universe',
+    repo: 'iq-proof',
+    url: 'https://github.com/iq-universe/iq-proof',
   },
 } as const;
 
@@ -83,7 +83,7 @@ export const SOCIAL = {
 } as const;
 
 export const GISCUS = {
-  repo: 'iq-proof/iq-proof.github.io',
+  repo: 'iq-universe/iq-proof',
   repoId: 'R_kgDOSE5sbQ',
   category: 'Comments',
   categoryId: 'DIC_kwDOSE5sbc4C7CBO',

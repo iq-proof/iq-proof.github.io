@@ -12,6 +12,7 @@
  */
 
 import { SITE, CATEGORIES } from '@/consts';
+import { withBase } from '@/lib/url';
 
 interface Props {
   devCount: number;
@@ -51,19 +52,19 @@ const { devCount, aiCount, agentCount } = Astro.props;
     </p>
 
     <div class="hero-badges">
-      <a href="/categories/dev" class="hero-badge hero-badge--dev">
+      <a href={withBase('/categories/dev')} class="hero-badge hero-badge--dev">
         <span class="hero-badge-name">Dev</span>
         <span class="hero-badge-sep">·</span>
         <span class="hero-badge-count">{devCount}</span>
         <span class="hero-badge-suffix">posts</span>
       </a>
-      <a href="/categories/ai" class="hero-badge hero-badge--ai">
+      <a href={withBase('/categories/ai')} class="hero-badge hero-badge--ai">
         <span class="hero-badge-name">AI</span>
         <span class="hero-badge-sep">·</span>
         <span class="hero-badge-count">{aiCount}</span>
         <span class="hero-badge-suffix">posts</span>
       </a>
-      <a href="/categories/agent" class="hero-badge hero-badge--agent">
+      <a href={withBase('/categories/agent')} class="hero-badge hero-badge--agent">
         <span class="hero-badge-name">Agent</span>
         <span class="hero-badge-sep">·</span>
         <span class="hero-badge-count">{agentCount}</span>

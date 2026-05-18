@@ -71,13 +71,16 @@
     if (pagefindUILoading) return pagefindUILoading;
 
     pagefindUILoading = (async () => {
-      const base = window.location.origin;
-      const uiJs = `${base}/pagefind/pagefind-ui.js`;
-      const uiCss = `${base}/pagefind/pagefind-ui.css`;
+      // Pagefind output lives at <base>/pagefind/* — derive from current pathname's leading segment.
+      // import.meta.env.BASE_URL is inlined at build time and matches Astro's `base` config.
+      const baseUrl = (import.meta.env.BASE_URL ?? '/').replace(/\/$/, '');
+      const origin = window.location.origin;
+      const uiJs = `${origin}${baseUrl}/pagefind/pagefind-ui.js`;
+      const uiCss = `${origin}${baseUrl}/pagefind/pagefind-ui.css`;
 
       try {
         // Check index exists first — gives a cleaner error in dev mode
-        const probe = await fetch(`${base}/pagefind/pagefind.js`, { method: 'HEAD' });
+        const probe = await fetch(`${origin}${baseUrl}/pagefind/pagefind.js`, { method: 'HEAD' });
         if (!probe.ok) throw new Error('pagefind index missing');
 
         loadStylesheet(uiCss);

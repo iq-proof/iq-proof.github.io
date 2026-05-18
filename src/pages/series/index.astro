@@ -1,6 +1,7 @@
 ---
 import CursorLight from '@/components/CursorLight.astro';
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import { withBase } from '@/lib/url';
 import { getAllSeries } from '@/utils/posts';
 import { formatDate } from '@/utils/posts';
 
@@ -37,7 +38,7 @@ const series = await getAllSeries();
         <div class="space-y-3">
           {series.map(({ slug, title, count, latest }) => (
             <a
-              href={`/series/${slug}`}
+              href={withBase(`/series/${slug}`)}
               class="block p-5 rounded-md transition-colors"
               style="background: var(--color-surface); border: 1px solid var(--color-border-subtle);"
             >

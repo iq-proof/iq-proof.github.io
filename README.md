@@ -3,13 +3,13 @@
 > **Deep-dive logs on backend systems and AI.**
 > 표면적인 사용법이 아닌, 본질을 증명하는 기록.
 >
-> 🌐 **Live**: https://iq-proof.github.io
+> 🌐 **Live**: https://iq-universe.github.io/iq-proof
 
 <br/>
 
 <p align="center">
-  <a href="https://github.com/iq-proof/iq-proof.github.io/actions/workflows/deploy.yml">
-    <img src="https://github.com/iq-proof/iq-proof.github.io/actions/workflows/deploy.yml/badge.svg" alt="Deploy"/>
+  <a href="https://github.com/iq-universe/iq-proof/actions/workflows/deploy.yml">
+    <img src="https://github.com/iq-universe/iq-proof/actions/workflows/deploy.yml/badge.svg" alt="Deploy"/>
   </a>
   <img src="https://img.shields.io/badge/Astro-5-BC52EE?logo=astro&logoColor=white" alt="Astro 5"/>
   <img src="https://img.shields.io/badge/Tailwind-4-06B6D4?logo=tailwindcss&logoColor=white" alt="Tailwind 4"/>
@@ -157,9 +157,9 @@ IQ Lab은 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**
                   │  build → upload → deploy│
                   └────────────┬────────────┘
                                ▼
-                  ┌─────────────────────────┐
-                  │ https://iq-proof.github.io │
-                  └─────────────────────────┘
+                  ┌─────────────────────────────────────┐
+                  │ https://iq-universe.github.io/iq-proof │
+                  └─────────────────────────────────────┘
                                ▲
                     ┌──────────┼──────────┐
                     │          │          │
@@ -172,7 +172,7 @@ IQ Lab은 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**
 ## Project Structure
 
 ```
-iq-proof.github.io/
+iq-proof/
 ├── .github/
 │   └── workflows/
 │       └── deploy.yml             # GitHub Actions: build + Pages deploy
@@ -437,7 +437,7 @@ Tailwind 기본 스케일 (4px 단위). 포스트 본문은 `prose` 클래스로
    - `dist/`를 Pages artifact로 업로드
 4. **Deploy job**:
    - `actions/deploy-pages@v4`로 GitHub Pages에 배포
-5. ~2분 내 `https://iq-proof.github.io` 반영
+5. ~2분 내 `https://iq-universe.github.io/iq-proof` 반영
 
 ### GitHub Pages 설정
 
@@ -459,13 +459,13 @@ Actions 탭에서 빨간 X 클릭 → 실패한 step 펼쳐 로그 확인. 일�
 ```ts
 export const SITE = {
   name: 'IQ Lab',
-  url: 'https://iq-proof.github.io',
+  url: 'https://iq-universe.github.io/iq-proof',
   description: '...',
   author: { name: '한동희', github: 'e9ua1' },
 };
 
 export const GISCUS = {
-  repo: 'iq-proof/iq-proof.github.io',
+  repo: 'iq-universe/iq-proof',
   repoId: 'R_kgDOxxxxxxx',        // giscus.app에서 생성
   category: 'Comments',
   categoryId: 'DIC_kwDOxxxxxxx',  // giscus.app에서 생성
@@ -640,7 +640,7 @@ ReferenceError: cipher is not defined
 
 외부 PR은 받지 않지만 **오탈자 / 사실 오류 / 증명 오류** 신고는 언제나 환영합니다.
 
-- GitHub Issues: https://github.com/iq-proof/iq-proof.github.io/issues
+- GitHub Issues: https://github.com/iq-universe/iq-proof/issues
 - Giscus 댓글로 직접
 
 ---

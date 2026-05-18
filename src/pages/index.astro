@@ -4,6 +4,7 @@ import CursorLight from '@/components/CursorLight.astro';
 import SupernovaHero from '@/components/SupernovaHero.astro';
 import PostCard from '@/components/PostCard.astro';
 import { SITE, CATEGORIES } from '@/consts';
+import { withBase } from '@/lib/url';
 import { getPostsByCategory } from '@/utils/posts';
 
 const devPosts = (await getPostsByCategory('dev')).slice(0, 5);
@@ -32,7 +33,7 @@ const agentCount = (await getPostsByCategory('agent')).length;
         </h2>
       </div>
       <a
-          href="/categories/dev"
+          href={withBase('/categories/dev')}
           class="font-mono text-xs transition-colors"
           style="color: var(--color-text-tertiary);"
       >
@@ -70,7 +71,7 @@ const agentCount = (await getPostsByCategory('agent')).length;
         </h2>
       </div>
       <a
-          href="/categories/ai"
+          href={withBase('/categories/ai')}
           class="font-mono text-xs transition-colors"
           style="color: var(--color-text-tertiary);"
       >
@@ -108,7 +109,7 @@ const agentCount = (await getPostsByCategory('agent')).length;
         </h2>
       </div>
       <a
-          href="/categories/agent"
+          href={withBase('/categories/agent')}
           class="font-mono text-xs transition-colors"
           style="color: var(--color-text-tertiary);"
       >
