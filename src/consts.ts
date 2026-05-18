@@ -7,7 +7,7 @@
  *
  * Note: brand name ≠ GitHub org by design.
  *   - Brand "IQ Lab" is the umbrella identity shared with `iq-dev-lab` / `iq-ai-lab`.
- *   - The repo now lives under `iq-universe` org as a project page (base: /iq-proof).
+ *   - The repo now lives under `iq-universe` org as a project page (base: /iq-blog).
  */
 
 export const SITE = {
@@ -15,7 +15,7 @@ export const SITE = {
   tagline: 'deep-dive.engineering(ai)',
   description:
       '시스템과 이론, 코드와 수식을 오가는 딥다이브 로그. 표면의 사용법이 아닌, 본질을 증명하는 기록.',
-  url: 'https://iq-universe.github.io/iq-proof',
+  url: 'https://iq-universe.github.io/iq-blog',
   lang: 'ko',
   locale: 'ko-KR',
   timezone: 'Asia/Seoul',
@@ -26,8 +26,8 @@ export const SITE = {
   },
   github: {
     org: 'iq-universe',
-    repo: 'iq-proof',
-    url: 'https://github.com/iq-universe/iq-proof',
+    repo: 'iq-blog',
+    url: 'https://github.com/iq-universe/iq-blog',
   },
 } as const;
 
@@ -83,7 +83,7 @@ export const SOCIAL = {
 } as const;
 
 export const GISCUS = {
-  repo: 'iq-universe/iq-proof',
+  repo: 'iq-universe/iq-blog',
   repoId: 'R_kgDOSE5sbQ',
   category: 'Comments',
   categoryId: 'DIC_kwDOSE5sbc4C7CBO',

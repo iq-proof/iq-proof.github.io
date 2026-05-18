@@ -8,7 +8,7 @@ import rehypeKatex from 'rehype-katex';
 // https://astro.build/config
 export default defineConfig({
   site: 'https://iq-universe.github.io',
-  base: '/iq-proof',
+  base: '/iq-blog',
   trailingSlash: 'ignore',
 
   integrations: [

@@ -5,14 +5,14 @@
  * Use these helpers for every internal absolute path.
  */
 
-/** Trailing-slash-free base, e.g. "/iq-proof" or "". */
+/** Trailing-slash-free base, e.g. "/iq-blog" or "". */
 const RAW_BASE = (import.meta.env.BASE_URL ?? '/').replace(/\/$/, '');
 
 /**
  * Prefix an absolute internal path with the configured base.
  *
- * - `withBase('/posts/foo')` → `/iq-proof/posts/foo`
- * - `withBase('posts/foo')`  → `/iq-proof/posts/foo`
+ * - `withBase('/posts/foo')` → `/iq-blog/posts/foo`
+ * - `withBase('posts/foo')`  → `/iq-blog/posts/foo`
  * - At dev/root deploy (base="/"), returns the path unchanged: `/posts/foo`.
  *
  * Idempotent for absolute external URLs (returned as-is).
@@ -29,8 +29,8 @@ export function withBase(path: string): string {
  * Test whether `pathname` (from `Astro.url.pathname`, which includes the base
  * at build time) matches an unprefixed nav href. Used for active-link styling.
  *
- * - `isActivePath('/iq-proof/categories/ai', '/categories/ai')` → true
- * - `isActivePath('/iq-proof/', '/')` → true (root-exact)
+ * - `isActivePath('/iq-blog/categories/ai', '/categories/ai')` → true
+ * - `isActivePath('/iq-blog/', '/')` → true (root-exact)
  */
 export function isActivePath(pathname: string, href: string): boolean {
   const target = withBase(href);

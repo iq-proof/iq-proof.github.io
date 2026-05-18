@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://iq-universe.github.io/iq-proof/sitemap-index.xml
+Sitemap: https://iq-universe.github.io/iq-blog/sitemap-index.xml
