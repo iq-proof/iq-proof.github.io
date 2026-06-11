@@ -632,7 +632,6 @@ ReferenceError: cipher is not defined
 - **iq-blogger** — 양산 자동화 도구 (이 사이트의 컨텐츠 입력원): https://github.com/iq-agent-lab/iq-blogger
 - **iq-dev-lab** — Backend deep-dive studies: https://github.com/iq-dev-lab
 - **iq-ai-lab** — AI / ML deep-dive studies: https://github.com/iq-ai-lab
-- **dev-book-lab** — 기술 서적 분석 저장소: https://github.com/dev-book-lab
 
 ---
 
