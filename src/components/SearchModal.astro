@@ -6,8 +6,8 @@
  * (specifically the `pagefind --site dist` step after `astro build`).
  *
  * `pagefind-ui.js` is a UMD bundle that attaches `PagefindUI` to `window` — it
- * is NOT an ES module, so we must load it via <script> tag. Dynamic import()
- * of the UI bundle will fail with a "not a module" error.
+ * is NOT an ES module, so we load it through a classic script element.
+ * Dynamic import of the UI bundle will fail with a "not a module" error.
  *
  * In dev mode the index doesn't exist yet; we show a graceful empty state.
  */
@@ -15,7 +15,7 @@
 
 <div
   id="search-modal"
-  class="fixed inset-0 z-50 hidden items-start justify-center pt-[15vh] px-4"
+  class="search-overlay fixed inset-0 z-50 hidden items-start justify-center px-4"
   style="background: rgba(10, 14, 26, 0.85); backdrop-filter: blur(4px);"
   aria-hidden="true"
   role="dialog"
@@ -23,8 +23,7 @@
   aria-label="Search"
 >
   <div
-    class="w-full max-w-2xl rounded-lg overflow-hidden"
-    style="background: var(--color-surface); border: 1px solid var(--color-border-strong);"
+    class="search-panel w-full max-w-2xl overflow-hidden"
   >
     <div id="pagefind-search-container"></div>
   </div>
@@ -34,7 +33,7 @@
   // --- Pagefind UI loader (script-tag based) ---
   //
   // pagefind-ui.js is a UMD bundle, not an ES module. We load it by injecting
-  // <script> and <link> tags and waiting for window.PagefindUI to be defined.
+  // script and stylesheet elements and waiting for window.PagefindUI.
 
   const modal = document.getElementById('search-modal');
   const trigger = document.getElementById('search-trigger');
@@ -58,13 +57,20 @@
     });
   }
 
-  function loadStylesheet(href: string): void {
-    if (document.querySelector(`link[data-pagefind-ui]`)) return;
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = href;
-    link.dataset.pagefindUi = 'true';
-    document.head.appendChild(link);
+  function loadStylesheet(href: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (document.querySelector(`link[data-pagefind-ui]`)) {
+        resolve();
+        return;
+      }
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = href;
+      link.dataset.pagefindUi = 'true';
+      link.onload = () => resolve();
+      link.onerror = () => reject(new Error(`Failed to load ${href}`));
+      document.head.appendChild(link);
+    });
   }
 
   async function loadPagefindUI(): Promise<boolean> {
@@ -83,8 +89,7 @@
         const probe = await fetch(`${origin}${baseUrl}/pagefind/pagefind.js`, { method: 'HEAD' });
         if (!probe.ok) throw new Error('pagefind index missing');
 
-        loadStylesheet(uiCss);
-        await loadScript(uiJs);
+        await Promise.all([loadStylesheet(uiCss), loadScript(uiJs)]);
 
         // @ts-expect-error — PagefindUI is a global set by the loaded script
         if (typeof window.PagefindUI !== 'function') {
@@ -131,6 +136,7 @@
     modal.classList.remove('hidden');
     modal.classList.add('flex');
     modal.setAttribute('aria-hidden', 'false');
+    trigger?.setAttribute('aria-expanded', 'true');
     document.body.style.overflow = 'hidden';
 
     loadPagefindUI().then((ok) => {
@@ -148,7 +154,9 @@
     modal.classList.add('hidden');
     modal.classList.remove('flex');
     modal.setAttribute('aria-hidden', 'true');
+    trigger?.setAttribute('aria-expanded', 'false');
     document.body.style.overflow = '';
+    trigger?.focus();
   }
 
   trigger?.addEventListener('click', openModal);
@@ -170,10 +178,35 @@
   });
 </script>
 
+<style>
+  .search-overlay {
+    padding-top: clamp(1rem, 10dvh, 6rem);
+  }
+
+  .search-panel {
+    background: rgba(13, 18, 32, 0.96);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 14px;
+    box-shadow:
+      0 24px 70px rgba(0, 0, 0, 0.42),
+      0 0 0 1px rgba(0, 217, 255, 0.025);
+  }
+
+  @media (max-width: 640px) {
+    .search-overlay {
+      padding-top: clamp(1rem, 8dvh, 3.5rem);
+      padding-right: 0.75rem;
+      padding-left: 0.75rem;
+    }
+  }
+</style>
+
 <style is:global>
-  /* Pagefind UI theming — tokens override Pagefind's defaults */
-  :root {
-    --pagefind-ui-scale: 0.9;
+  /* Scope tokens to the widget so Pagefind's late-loaded :root defaults cannot win. */
+  #pagefind-search-container {
+    --search-field-height: 60px;
+    --search-icon-size: 20px;
+    --pagefind-ui-scale: 1;
     --pagefind-ui-primary: var(--color-accent-cyan);
     --pagefind-ui-text: var(--color-text-primary);
     --pagefind-ui-background: var(--color-surface);
@@ -184,26 +217,99 @@
     --pagefind-ui-image-border-radius: 6px;
     --pagefind-ui-image-box-ratio: 3 / 2;
     --pagefind-ui-font: var(--font-sans);
+    padding: 0.875rem;
   }
 
-  /* Remove Pagefind's own box since we're rendering inside our modal frame */
+  /* One shared coordinate system keeps the field, icon, and clear control centered. */
   .pagefind-ui__form {
+    position: relative !important;
     border: none !important;
-    padding: 0.75rem 0.75rem 0 !important;
+    padding: 0 !important;
+  }
+  .pagefind-ui__form::before {
+    width: var(--search-icon-size) !important;
+    height: var(--search-icon-size) !important;
+    top: calc((var(--search-field-height) - var(--search-icon-size)) / 2) !important;
+    left: 1.125rem !important;
+    background-color: var(--color-text-secondary) !important;
+    opacity: 0.9 !important;
+    -webkit-mask-size: 100% 100% !important;
+    mask-size: 100% 100% !important;
   }
   .pagefind-ui__search-input {
+    width: 100% !important;
+    height: var(--search-field-height) !important;
+    box-sizing: border-box !important;
+    padding: 0 6.5rem 0 3.25rem !important;
     background: var(--color-surface) !important;
     color: var(--color-text-primary) !important;
     border: 1px solid var(--color-border-subtle) !important;
+    border-radius: 10px !important;
+    font-family: var(--font-sans) !important;
+    font-size: 1rem !important;
+    font-weight: 550 !important;
+    line-height: 1.2 !important;
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    transition:
+      border-color 0.15s ease,
+      box-shadow 0.15s ease !important;
+  }
+  .pagefind-ui__search-input::placeholder {
+    color: var(--color-text-tertiary) !important;
+    opacity: 0.72 !important;
+    font-weight: 450 !important;
   }
   .pagefind-ui__search-input:focus {
     border-color: var(--color-accent-cyan) !important;
     outline: none !important;
+    box-shadow:
+      0 0 0 3px var(--color-accent-cyan-dim),
+      inset 0 0 0 1px rgba(0, 217, 255, 0.08) !important;
+  }
+  .pagefind-ui__search-clear {
+    position: absolute !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    top: calc((var(--search-field-height) - 34px) / 2) !important;
+    right: 0.75rem !important;
+    height: 34px !important;
+    margin: 0 !important;
+    padding: 0 0.7rem !important;
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    background: var(--color-elevated) !important;
+    border: 1px solid var(--color-border-subtle) !important;
+    border-radius: 8px !important;
+    color: var(--color-text-secondary) !important;
+    font-family: var(--font-sans) !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    box-shadow: none !important;
+    transform: none !important;
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease,
+      background-color 0.15s ease !important;
+  }
+  .pagefind-ui__search-clear:hover {
+    background: var(--color-accent-cyan-dim) !important;
+    border-color: var(--color-accent-cyan-line) !important;
+    color: var(--color-accent-cyan) !important;
+  }
+  .pagefind-ui__search-clear:focus-visible {
+    outline: 2px solid var(--color-accent-cyan) !important;
+    outline-offset: 2px !important;
   }
   .pagefind-ui__drawer {
-    max-height: 60vh;
+    max-height: min(60vh, calc(100dvh - 12rem));
     overflow-y: auto;
-    padding: 0 0.75rem 0.75rem !important;
+    padding: 0 !important;
+  }
+  .pagefind-ui__results-area {
+    margin-top: 0.875rem !important;
   }
   .pagefind-ui__result {
     border-bottom: 1px solid var(--color-border-subtle) !important;
@@ -241,6 +347,38 @@
   }
   .pagefind-ui__message {
     color: var(--color-text-secondary) !important;
-    padding: 0.5rem 0 !important;
+    height: auto !important;
+    min-height: 2rem;
+    padding: 0.375rem 0 0.75rem !important;
+  }
+
+  @media (max-width: 640px) {
+    #pagefind-search-container {
+      --search-field-height: 56px;
+      --search-icon-size: 18px;
+      padding: 0.75rem;
+    }
+
+    .pagefind-ui__form::before {
+      left: 1rem !important;
+    }
+
+    .pagefind-ui__search-input {
+      padding-right: 5.75rem !important;
+      padding-left: 2.875rem !important;
+      font-size: 1rem !important;
+    }
+
+    .pagefind-ui__search-clear {
+      top: calc((var(--search-field-height) - 32px) / 2) !important;
+      right: 0.625rem !important;
+      height: 32px !important;
+      padding: 0 0.6rem !important;
+      font-size: 0.7rem !important;
+    }
+
+    .pagefind-ui__drawer {
+      max-height: calc(100dvh - 10rem);
+    }
   }
 </style>
