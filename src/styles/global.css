@@ -6,7 +6,7 @@
 /* ========== Design tokens (exposed to Tailwind as utilities via @theme) ========== */
 @theme {
   /* Layout — header / sidebar toggle 정렬 동기화 */
-  --iq-header-height: 65px;
+  --iq-header-height: 76px;
 
   /* Surfaces */
   --color-base: #0a0e1a;
@@ -44,6 +44,12 @@
   /* Layout */
   --container-max: 1152px;
   --reading-max: 720px;
+}
+
+@media (max-width: 1023px) {
+  :root {
+    --iq-header-height: 68px;
+  }
 }
 
 /* ========== Base ========== */

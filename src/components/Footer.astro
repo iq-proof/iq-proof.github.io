@@ -1,6 +1,5 @@
 ---
 import { SITE, SOCIAL } from '@/consts';
-const year = new Date().getFullYear();
 ---
 
 <footer class="mt-24" style="border-top: 1px solid var(--color-border-subtle);">
@@ -15,7 +14,16 @@ const year = new Date().getFullYear();
           <span class="text-sm font-medium" style="color: var(--color-text-primary);">{SITE.name}</span>
         </div>
         <p class="font-mono text-xs" style="color: var(--color-text-tertiary);">
-          © {year} {SITE.author.name} · built with Astro
+          made by
+          <a
+            href={SITE.author.github}
+            target="_blank"
+            rel="me noopener noreferrer"
+            class="footer-author"
+            aria-label={`${SITE.author.name} GitHub 프로필`}
+          >
+            {SITE.author.name}
+          </a>
         </p>
       </div>
 
@@ -36,3 +44,20 @@ const year = new Date().getFullYear();
     </div>
   </div>
 </footer>
+
+<style>
+  .footer-author {
+    color: var(--color-text-secondary);
+    text-decoration: underline;
+    text-decoration-color: var(--color-accent-cyan-line);
+    text-underline-offset: 4px;
+    transition:
+      color 0.15s ease,
+      text-decoration-color 0.15s ease;
+  }
+
+  .footer-author:hover {
+    color: var(--color-accent-cyan);
+    text-decoration-color: currentColor;
+  }
+</style>

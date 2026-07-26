@@ -6,17 +6,14 @@ const currentPath = Astro.url.pathname;
 ---
 
 <header
-  class="iq-header sticky top-0 z-40 backdrop-blur-md"
-  style="background: rgba(10, 14, 26, 0.72); height: var(--iq-header-height);"
+  class="iq-header sticky top-0 z-40"
 >
   <div class="iq-header-inner">
-    <!-- Logo — flush left, bigger, animated topology -->
     <a href={withBase('/')} class="iq-logo" aria-label={SITE.name}>
-      <TopologicalLogo size={36} />
+      <TopologicalLogo size={40} />
       <span class="iq-logo-text">{SITE.name}</span>
     </a>
 
-    <!-- Nav — distributed across center, bigger items -->
     <nav class="iq-nav" aria-label="Primary">
       {
         NAV.map(({ href, label }) => {
@@ -29,7 +26,7 @@ const currentPath = Astro.url.pathname;
               <a
                   href={withBase(href)}
                   class="iq-nav-link"
-                  style={`color: ${active ? activeColor : 'var(--color-text-secondary)'};`}
+                  style={`--nav-accent: ${activeColor};`}
                   aria-current={active ? 'page' : undefined}
               >
                 {label}
@@ -39,11 +36,10 @@ const currentPath = Astro.url.pathname;
       }
     </nav>
 
-    <!-- Search trigger — flush right, bigger -->
     <button id="search-trigger" type="button" class="iq-search" aria-label="Search">
       <svg
-        width="16"
-        height="16"
+        width="18"
+        height="18"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
@@ -61,98 +57,181 @@ const currentPath = Astro.url.pathname;
 
 <style>
   .iq-header {
-    /* No bottom border — fluid handoff to hero */
-    border-bottom: none;
+    height: var(--iq-header-height);
+    background: rgba(10, 14, 26, 0.84);
+    border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
   }
 
   .iq-header-inner {
     display: flex;
     align-items: center;
     height: 100%;
-    /* Wider edge-aligned padding for "spread" feel */
-    padding: 0 1.25rem 0 1.5rem;
-    /* Allow content to span full width — no max-width constraint */
-    max-width: 100%;
-    gap: 1rem;
+    padding: 0 0.75rem 0 4.5rem;
+    gap: 0.75rem;
   }
 
-  /* Logo — flush left, bigger */
   .iq-logo {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.7rem;
     flex-shrink: 0;
+    min-height: 44px;
+    border-radius: 10px;
   }
+
   .iq-logo-text {
-    font-size: 1.05rem;
-    font-weight: 600;
-    letter-spacing: -0.02em;
+    font-size: 1.125rem;
+    font-weight: 650;
+    letter-spacing: -0.025em;
     color: var(--color-text-primary);
   }
 
-  /* Nav — flex-1 to consume center space + space-around for distribution */
   .iq-nav {
-    flex: 1;
     display: none;
     align-items: center;
     justify-content: center;
-    gap: clamp(1.25rem, 3.2vw, 2.75rem);
-  }
-  @media (min-width: 768px) {
-    .iq-nav {
-      display: flex;
-    }
   }
 
   .iq-nav-link {
-    font-size: 0.95rem;
-    font-weight: 500;
-    transition: color 0.18s;
+    position: relative;
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 0.625rem;
+    border-radius: 9px;
+    color: var(--color-text-secondary);
+    font-size: 1rem;
+    font-weight: 550;
+    line-height: 1;
     white-space: nowrap;
-  }
-  .iq-nav-link:hover {
-    color: var(--color-text-primary);
+    transition:
+      color 0.18s ease,
+      background-color 0.18s ease;
   }
 
-  /* Search — flush right, bigger */
+  .iq-nav-link::after {
+    content: '';
+    position: absolute;
+    right: 28%;
+    bottom: 3px;
+    left: 28%;
+    height: 2px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0;
+    transform: scaleX(0.55);
+    transition:
+      opacity 0.18s ease,
+      transform 0.18s ease;
+  }
+
+  .iq-nav-link:hover {
+    color: var(--color-text-primary);
+    background: rgba(255, 255, 255, 0.035);
+  }
+
+  .iq-nav-link[aria-current='page'] {
+    color: var(--nav-accent);
+    font-weight: 650;
+  }
+
+  .iq-nav-link[aria-current='page']::after {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+
   .iq-search {
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: 0.625rem;
-    padding: 0.55rem 0.875rem;
-    border-radius: 0.5rem;
-    background: var(--color-surface);
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border-radius: 10px;
+    background: rgba(13, 18, 32, 0.78);
     border: 1px solid var(--color-border-subtle);
     color: var(--color-text-tertiary);
     transition:
-      color 0.15s,
-      border-color 0.15s,
-      background 0.15s;
+      color 0.15s ease,
+      border-color 0.15s ease,
+      background-color 0.15s ease,
+      box-shadow 0.15s ease;
     flex-shrink: 0;
     margin-left: auto;
   }
+
   .iq-search:hover {
     color: var(--color-text-primary);
     border-color: var(--color-accent-cyan-line);
+    background: var(--color-surface);
+    box-shadow: 0 0 0 3px var(--color-accent-cyan-dim);
   }
+
   .iq-search-label {
-    font-size: 0.85rem;
+    font-size: 0.9rem;
+    font-weight: 500;
     display: none;
   }
+
   .iq-search-kbd {
     font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 0.7rem;
-    padding: 1px 6px;
-    border-radius: 4px;
+    font-size: 0.68rem;
+    padding: 2px 6px;
+    border-radius: 5px;
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid var(--color-border-subtle);
     color: var(--color-text-tertiary);
     display: none;
   }
+
   @media (min-width: 640px) {
     .iq-search-label,
     .iq-search-kbd {
       display: inline;
+    }
+
+    .iq-search {
+      width: auto;
+      padding: 0 0.875rem;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .iq-header-inner {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      column-gap: clamp(0.75rem, 1.5vw, 1.5rem);
+      padding: 0 clamp(1.5rem, 2vw, 2rem);
+    }
+
+    .iq-logo {
+      justify-self: start;
+    }
+
+    .iq-nav {
+      display: flex;
+      gap: clamp(0.25rem, 1vw, 1rem);
+    }
+
+    .iq-search {
+      justify-self: end;
+      margin-left: 0;
+    }
+  }
+
+  @media (min-width: 1024px) and (max-width: 1279px) {
+    .iq-search {
+      width: 44px;
+      padding: 0;
+    }
+
+    .iq-search-label,
+    .iq-search-kbd {
+      display: none;
     }
   }
 </style>
