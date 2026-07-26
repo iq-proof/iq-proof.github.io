@@ -7,7 +7,7 @@
 @theme {
   /* Layout — header / sidebar toggle 정렬 동기화 */
   --iq-header-height: 76px;
-  --iq-sidebar-rail-width: 72px;
+  --iq-sidebar-rail-width: 56px;
   --iq-sidebar-panel-width: 300px;
 
   /* Surfaces */

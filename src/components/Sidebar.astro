@@ -14,7 +14,7 @@
  *   - body padding-left로 main을 옆으로 밀어냄 (collapsed/expanded 동기화)
  *
  * 동작:
- *   - collapsed (default 72px): 패널 열기 아이콘 + 라벨
+ *   - collapsed (default 56px): 투명 영역 위 패널 열기 아이콘
  *   - expanded (300px): 트리 풀 노출
  *   - localStorage('iq-sidebar-expanded') 영속화
  *   - 현재 글 페이지: 해당 카테고리·그룹·시리즈 자동 펼침 + 글 항목 강조
@@ -153,7 +153,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
   aria-expanded="false"
   aria-controls="iq-sidebar-content"
 >
-  <Icon name="panel-left-open" size={24} />
+  <Icon name="panel-left-open" size={24} class="mobile-sidebar-icon" />
 </button>
 
 {/* 모바일 backdrop — 사이드바 expanded 시 본문 위에 어두운 overlay */}
@@ -168,8 +168,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
     aria-expanded="false"
     aria-controls="iq-sidebar-content"
   >
-    <Icon name="panel-left-open" size={28} class="icon-open" />
-    <Icon name="panel-left-close" size={28} class="icon-close" />
+    <Icon name="panel-left-open" size={26} class="sidebar-toggle-icon" />
     <span class="toggle-label">목차</span>
   </button>
 
@@ -404,7 +403,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
   /* 데스크톱 — 사이드바가 본문 옆으로 push */
   @media (min-width: 1024px) {
     body {
-      padding-left: var(--iq-sidebar-rail-width, 72px);
+      padding-left: var(--iq-sidebar-rail-width, 56px);
       transition: padding-left 0.22s cubic-bezier(0.4, 0, 0.2, 1);
     }
     body[data-sidebar-expanded="true"] {
@@ -423,7 +422,7 @@ const hasCurrentInCat: Record<Category, boolean> = {
 <style>
   /* ──────────────────────────────────────────────────────────
      레이아웃
-     - 데스크톱(≥1024px): fixed sidebar, collapsed 72px ↔ expanded 300px (본문 옆으로 push)
+     - 데스크톱(≥1024px): fixed sidebar, collapsed 56px ↔ expanded 300px (본문 옆으로 push)
      - 모바일(<1024px): drawer overlay, transform translateX로 슬라이드 인/아웃
      ────────────────────────────────────────────────────────── */
   .sidebar {
@@ -451,12 +450,9 @@ const hasCurrentInCat: Record<Category, boolean> = {
       transform: translateX(0);
       box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
     }
-    /* 모바일에선 사이드바 안 .sidebar-toggle은 close 역할 — close 아이콘 + 라벨 항상 보임 */
-    .sidebar > .sidebar-toggle .icon-open { display: none; }
-    .sidebar > .sidebar-toggle .icon-close { display: block; }
+    /* 모바일 drawer 안에서는 토글이 닫기 역할 — 아이콘 방향과 라벨로 표시 */
     .sidebar > .sidebar-toggle .toggle-label {
-      opacity: 1;
-      transition-delay: 0s;
+      display: inline;
     }
     /* 모바일에선 사이드바 안에서 항상 트리 표시 (collapsed/expanded 구분 없음) */
     .sidebar .sidebar-content {
@@ -465,24 +461,21 @@ const hasCurrentInCat: Record<Category, boolean> = {
     }
   }
 
-  /* 데스크톱 — 기존 collapsed/expanded width 토글 */
+  /* 데스크톱 — collapsed는 배경 없는 affordance, expanded만 실제 패널 */
   @media (min-width: 1024px) {
     .sidebar {
-      width: var(--iq-sidebar-rail-width, 72px);
-      border-right: 1px solid rgba(148, 163, 184, 0.1);
-      box-shadow: 4px 0 18px rgba(0, 0, 0, 0.1);
+      width: var(--iq-sidebar-rail-width, 56px);
       transition:
         width 0.22s cubic-bezier(0.4, 0, 0.2, 1),
         background 0.22s ease;
       z-index: 30;
     }
     .sidebar[data-state="collapsed"] {
-      background: rgba(10, 14, 26, 0.86);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+      background: transparent;
     }
     .sidebar[data-state="expanded"] {
       width: var(--iq-sidebar-panel-width, 300px);
+      box-shadow: 4px 0 24px rgba(0, 0, 0, 0.28);
     }
   }
 
@@ -515,9 +508,9 @@ const hasCurrentInCat: Record<Category, boolean> = {
       background: rgba(34, 211, 238, 0.15);
       color: var(--color-accent-cyan, #22d3ee);
     }
-    .mobile-hamburger svg {
-      width: 20px;
-      height: 20px;
+    .mobile-hamburger :global(.mobile-sidebar-icon) {
+      width: 24px;
+      height: 24px;
     }
     /* 사이드바 expanded 시 햄버거 숨김 (사이드바 안 close 버튼 사용) */
     :global(body[data-sidebar-expanded="true"]) .mobile-hamburger {
@@ -567,7 +560,9 @@ const hasCurrentInCat: Record<Category, boolean> = {
     gap: 0.75rem;
     padding: 0 1rem;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition:
+      background 0.15s,
+      color 0.15s;
     flex-shrink: 0;
     box-sizing: border-box;
   }
@@ -575,54 +570,45 @@ const hasCurrentInCat: Record<Category, boolean> = {
     background: rgba(34, 211, 238, 0.06);
     color: var(--color-accent-cyan, #22d3ee);
   }
-  .sidebar-toggle svg {
+  .sidebar-toggle :global(.sidebar-toggle-icon) {
     width: 26px;
     height: 26px;
     flex-shrink: 0;
+    transition: transform 0.18s ease;
+  }
+  .sidebar[data-state="expanded"] :global(.sidebar-toggle-icon) {
+    transform: scaleX(-1);
   }
 
-  .icon-open { display: block; }
-  .icon-close { display: none; }
-  .sidebar[data-state="expanded"] .icon-open { display: none; }
-  .sidebar[data-state="expanded"] .icon-close { display: block; }
-
   .toggle-label {
+    display: none;
     font-size: 0.85rem;
     font-weight: 600;
     letter-spacing: 0.02em;
-    opacity: 1;
-    transition:
-      color 0.15s,
-      opacity 0.15s;
     white-space: nowrap;
+  }
+  .sidebar[data-state="expanded"] .toggle-label {
+    display: inline;
   }
 
   @media (min-width: 1024px) {
     .sidebar[data-state="collapsed"] .sidebar-toggle {
-      flex-direction: column;
+      width: 44px;
+      height: 44px;
       justify-content: center;
-      gap: 0.3rem;
       padding: 0;
+      margin: calc((var(--iq-header-height, 76px) - 44px) / 2) 6px 0;
+      border-radius: 10px;
       color: var(--color-text-secondary, #94a3b8);
     }
 
     .sidebar[data-state="collapsed"] .sidebar-toggle:hover {
       background: rgba(34, 211, 238, 0.08);
-      box-shadow: inset -2px 0 var(--color-accent-cyan-line);
       color: var(--color-accent-cyan, #22d3ee);
     }
 
-    .sidebar[data-state="collapsed"] .sidebar-toggle .icon-open {
-      width: 28px;
-      height: 28px;
-    }
-
-    .sidebar[data-state="collapsed"] .toggle-label {
-      color: currentColor;
-      font-size: 0.65rem;
-      font-weight: 650;
-      line-height: 1;
-      letter-spacing: 0.08em;
+    .sidebar[data-state="collapsed"] .sidebar-toggle:focus-visible {
+      background: rgba(34, 211, 238, 0.08);
     }
 
     .sidebar[data-state="expanded"] .sidebar-toggle {
