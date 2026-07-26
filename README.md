@@ -1,4 +1,4 @@
-# IQ Lab Blog
+# IQ Blog
 
 > **Deep-dive logs on backend systems and AI.**
 > 표면적인 사용법이 아닌, 본질을 증명하는 기록.
@@ -40,7 +40,7 @@
 
 ## Philosophy
 
-IQ Lab은 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**를 기록하는 블로그입니다. 튜토리얼이 아닌 제1원리 분석, 벤치마크가 있는 주장, 증명 가능한 설명을 지향합니다.
+IQ Blog는 **"어떻게 쓰는가"가 아니라 "왜 그렇게 작동하는가"**를 기록하는 블로그입니다. 튜토리얼이 아닌 제1원리 분석, 벤치마크가 있는 주장, 증명 가능한 설명을 지향합니다.
 
 - **Dev** — 백엔드 시스템의 내부 구조, JVM/DB/네트워크 근본 원리, 아키텍처 의사결정
 - **AI** — 머신러닝의 수학적 기반, 논문 재현, 알고리즘 유도 과정
@@ -458,7 +458,7 @@ Actions 탭에서 빨간 X 클릭 → 실패한 step 펼쳐 로그 확인. 일�
 
 ```ts
 export const SITE = {
-  name: 'IQ Lab',
+  name: 'IQ Blog',
   url: 'https://iq-universe.github.io/iq-blog',
   description: '...',
   author: { name: '한동희', github: 'e9ua1' },

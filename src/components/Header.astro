@@ -1,6 +1,7 @@
 ---
 import { SITE, NAV } from '@/consts';
 import { withBase, isActivePath } from '@/lib/url';
+import TopologicalLogo from '@/components/TopologicalLogo.astro';
 const currentPath = Astro.url.pathname;
 ---
 
@@ -9,14 +10,7 @@ const currentPath = Astro.url.pathname;
 >
   <div class="iq-header-inner">
     <a href={withBase('/')} class="iq-logo" aria-label={SITE.name}>
-      <img
-        src={withBase('/favicon.svg')}
-        width="40"
-        height="40"
-        class="iq-logo-mark"
-        alt=""
-        aria-hidden="true"
-      />
+      <TopologicalLogo size={40} />
       <span class="iq-logo-text">{SITE.name}</span>
     </a>
 
@@ -94,15 +88,6 @@ const currentPath = Astro.url.pathname;
     flex-shrink: 0;
     min-height: 44px;
     border-radius: 10px;
-  }
-
-  .iq-logo-mark {
-    display: block;
-    width: 40px;
-    height: 40px;
-    flex: none;
-    border-radius: 8px;
-    box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.08);
   }
 
   .iq-logo-text {

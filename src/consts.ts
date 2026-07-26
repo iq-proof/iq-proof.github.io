@@ -6,12 +6,12 @@
  * SITE.github.org  → GitHub organization that owns the repo
  *
  * Note: brand name ≠ GitHub org by design.
- *   - Brand "IQ Lab" is the umbrella identity shared with `iq-dev-lab` / `iq-ai-lab`.
+ *   - Brand "IQ Blog" is the publishing identity for this project.
  *   - The repo now lives under `iq-universe` org as a project page (base: /iq-blog).
  */
 
 export const SITE = {
-  name: 'IQ Lab',
+  name: 'IQ Blog',
   tagline: 'deep-dive.engineering(ai)',
   description:
       '시스템과 이론, 코드와 수식을 오가는 딥다이브 로그. 표면의 사용법이 아닌, 본질을 증명하는 기록.',
